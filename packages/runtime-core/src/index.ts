@@ -242,6 +242,12 @@ import { createFooterLineGuard, neutralizeFooterLines } from "./forged-footer";
 import { admitJudgeFeedback } from "./grader-feedback";
 import { attachIncidentCollector } from "./incident-collector";
 import { contextForSeed, refuseBlockedSeed, seedVerdict } from "./input-origin";
+import {
+  type ContinuityTailRead,
+  createKnowledgeUsage,
+  readContinuityTail,
+  tailRegions,
+} from "./knowledge-usage";
 import { type AdvertisedToolSummary, LIST_TOOLS_NAME, buildListToolsTool } from "./list-tools";
 import { createSpanUnionTracker, modelLatencyMs } from "./model-latency";
 import {
@@ -284,6 +290,7 @@ import {
   type LedgerAnchor,
   type RecallLineOutcome,
   type RecalledItem,
+  type RecalledRef,
   SEED_SOURCE_LABEL,
   type SeedSource,
   contextDigestKey,
@@ -2453,6 +2460,13 @@ export type RunChatLoopOptions = {
      * is read the `inside` way only. Forwarded to sub-agents.
      */
     readonly storeFiles?: readonly string[];
+    /**
+     * What the last `loadPlan` / `onPlanDirty` render showed, by reference:
+     * the focus, the active plan and each open goal. Read after each plan
+     * load; the run records them as knowledge usage (`via: "tail"`) and on
+     * the plan block of each context manifest. Ids only, never text.
+     */
+    readonly tailRefs?: () => Promise<readonly RecalledRef[]>;
   };
   /**
    * Item #56 — absolute paths to per-user preference files injected at run
@@ -5788,6 +5802,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // The last rendered plan snapshot (loadPlan at boot, onPlanDirty on a
   // `plan.dirty` refresh) — also the deterministic handoff's plan field.
   let lastPlanText: string | null = null;
+  // The last plan load, screened, with the refs of what it rendered.
+  let lastTail: ContinuityTailRead | undefined;
   let handoffFired = false;
 
   /** Fold one evicted user message into the ledger. Dedupe (role, text) —
@@ -5869,7 +5885,14 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     if (continuity === undefined) return [];
     if (runState.get()[PLAN_DIRTY_STATE_KEY] === true) {
       try {
-        lastPlanText = await (continuity.onPlanDirty ?? continuity.loadPlan)();
+        const read = await readContinuityTail(
+          continuity.onPlanDirty ?? continuity.loadPlan,
+          continuity.tailRefs,
+          runContext.logger,
+        );
+        lastPlanText = read.text;
+        lastTail = read;
+        await knowledgeUsage.noteTail(read);
       } catch (err) {
         runContext.logger.warn("continuity plan refresh failed", {
           error: (err as Error).message,
@@ -5908,7 +5931,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   // degrade; provider failures halt).
   if (continuity !== undefined) {
     try {
-      lastPlanText = await continuity.loadPlan();
+      const read = await readContinuityTail(
+        continuity.loadPlan,
+        continuity.tailRefs,
+        runContext.logger,
+      );
+      lastPlanText = read.text;
+      lastTail = read;
     } catch (err) {
       runContext.logger.warn("continuity loadPlan failed", { error: (err as Error).message });
     }
@@ -6039,6 +6068,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     opts.continuity !== undefined
       ? {
           loadPlan: opts.continuity.loadPlan,
+          ...(opts.continuity.tailRefs !== undefined ? { tailRefs: opts.continuity.tailRefs } : {}),
           ...(opts.continuity.storeFiles !== undefined
             ? { storeFiles: opts.continuity.storeFiles }
             : {}),
@@ -6087,6 +6117,16 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         .join(", ")}\n`,
     );
   }
+  // The loop's digest key, resolved once for its manifests and its
+  // knowledge usage alike.
+  let loopDigestKey: Promise<CryptoKey | undefined> | undefined;
+  const digestKey = (): Promise<CryptoKey | undefined> => {
+    loopDigestKey ??= contextDigestKey(
+      ledgerRoot(opts, opts.settingsDir),
+      opts.runLedgerDir !== null,
+    );
+    return loopDigestKey;
+  };
   // Run records (`./run-records`): what each main model call is given, by
   // reference, and the counts-only `context_assembled` event.
   const manifestRecorder = createManifestRecorder({
@@ -6094,11 +6134,26 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     bus,
     records: runRecorded,
     write: createRecordEvent((event) => eventLog.append(event), runContext.logger),
-    digestKey: () =>
-      contextDigestKey(ledgerRoot(opts, opts.settingsDir), opts.runLedgerDir !== null),
+    digestKey,
     inSpec: effectiveTools.length,
     files: projectMemory.files,
   });
+  // Which knowledge the run used (`./knowledge-usage`): `knowledge_read`
+  // lines in the session log, and content-free usage lines beside the
+  // loop's other control records.
+  const knowledgeUsage = createKnowledgeUsage({
+    runContext,
+    records: runRecorded,
+    write: manifestRecorder.write,
+    usageRoot:
+      opts.runLedgerDir !== null && currentTenantContext() === undefined
+        ? ledgerRoot(opts, opts.settingsDir)
+        : undefined,
+    digestKey,
+    sessionId,
+    execution: () => runFactsOf(runContext, opts, sessionId).execution,
+  });
+  if (lastTail !== undefined) await knowledgeUsage.noteTail(lastTail);
   // Once per run and session log, before the first turn: what started the
   // run and what it runs under.
   await recordRunStamp({
@@ -6153,13 +6208,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const items = await recallItems(seed, k);
       const lines = items.map((item) => item.text);
       const rendered = await renderRecalledMemory(lines, runContext);
-      manifestRecorder.noteRecall({
-        at: "session-start",
+      const recallNote = {
+        at: "session-start" as const,
         query: seed,
         requested: k,
         items,
         outcomes: rendered?.outcomes ?? [],
-      });
+      };
+      manifestRecorder.noteRecall(recallNote);
+      await knowledgeUsage.noteRecall(recallNote);
       if (rendered !== undefined) {
         const text = rendered.text;
         memoryRecallBlock = [{ type: "text", text, cache_control: { type: "ephemeral" } }];
@@ -6195,13 +6252,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       const lines = items.map((item) => item.text);
       const rendered = await renderRecalledMemory(lines, runContext);
       volatileRecallBlocks = rendered !== undefined ? [{ type: "text", text: rendered.text }] : [];
-      manifestRecorder.noteRecall({
-        at: "per-turn",
+      const recallNote = {
+        at: "per-turn" as const,
         query,
         requested: k,
         items,
         outcomes: rendered?.outcomes ?? [],
-      });
+      };
+      manifestRecorder.noteRecall(recallNote);
+      await knowledgeUsage.noteRecall(recallNote);
       if (lines.length > 0) {
         out.write(`[memory] refreshed ${lines.length} recalled memory(ies) for this turn\n`);
       }
@@ -8182,9 +8241,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           ...(servingPlan.profile !== undefined ? { profile: servingPlan.profile } : {}),
         }
       : undefined;
+    // The knowledge items this call returns, as the tool reports them
+    // (`./knowledge-usage`); only when the loop records.
+    const reads = knowledgeUsage.collector();
     const raw = await executeTool(tool, operativeInput, {
       toolUseId: tu.id,
       signal: toolAbort.signal,
+      ...(reads !== undefined ? { recordReads: reads.recordReads } : {}),
       ...(planModel !== undefined ? { model: planModel } : {}),
       ...(planToolConfig !== undefined ? { toolConfig: planToolConfig } : {}),
       // #160 follow-up — the bridge (built on every run, above) carries
@@ -8243,11 +8306,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     // notice; on suspicious it's kept but the trace event records a
     // warning. Tools opt out by setting `classifyOutput: false` (only the
     // in-process Task wrapper does today).
+    const checked: { status: "included" | "warned" | "redacted" } = { status: "included" };
     const finalPreview = await applyInjectionClassification(
       tool,
       tu,
       stored.previewContent,
       toolSpan,
+      checked,
     );
     // Pillar 3 sink-side fabric — tag the (post-classification) tool result
     // into run-context's dataLineage so the egress classifier can detect
@@ -8274,6 +8339,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         tagContent(runContext, taggable, "tool");
       }
     }
+    await knowledgeUsage.noteToolRead({
+      tool: tu.name,
+      toolUseId: tu.id,
+      span: toolSpan.id,
+      collector: reads,
+      status: checked.status,
+      isError: raw.isError === true,
+      classified: tool.classifyOutput !== false,
+    });
     return finish({
       type: "tool_result",
       tool_use_id: tu.id,
@@ -8302,6 +8376,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     tu: TsmToolUseBlock,
     previewContent: string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>,
     toolSpan: ToolSpan,
+    checked?: { status: "included" | "warned" | "redacted" },
   ): Promise<string | ReadonlyArray<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>> {
     // Runs on ALL tool results, including `is_error` ones: an error preview is
     // just as prompt-injectable as a successful one (e.g. an MCP error string),
@@ -8338,6 +8413,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         toolUseId: tu.id,
       });
       await spans.verdict(toolSpan.id, { gate: "post-tool", outcome: "redacted", rules: ruleIds });
+      if (checked !== undefined) checked.status = "redacted";
       runContext.logger.warn("tool output redacted (prompt injection detected)", {
         toolUseId: tu.id,
         toolName: tu.name,
@@ -8358,6 +8434,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       toolUseId: tu.id,
     });
     await spans.verdict(toolSpan.id, { gate: "post-tool", outcome: "warned", rules: ruleIds });
+    if (checked !== undefined) checked.status = "warned";
     if (!injectionWarningEmitted) {
       injectionWarningEmitted = true;
       runContext.logger.warn(
@@ -9755,7 +9832,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
             const assembledReq = manifestRecorder.assembled(req, {
               frozen: systemBlockKinds,
               volatileRecall: volatileRecallBlocks.length,
-              tail: continuityTail,
+              tail: tailRegions(continuityTail, lastTail?.refs),
               guide: guideBlocks.length,
               overlay: plan.overlayBlock !== undefined,
               hookAppend: hookSystemAppend !== undefined,

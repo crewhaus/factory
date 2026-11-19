@@ -37,7 +37,7 @@
  */
 import type Anthropic from "@anthropic-ai/sdk";
 import type { EffectiveParams, ProviderRequest } from "@crewhaus/adapter-anthropic";
-import type { Trigger } from "@crewhaus/control-contract";
+import { SESSION_ID_PATTERN, type Trigger } from "@crewhaus/control-contract";
 import { ensureDigestKey, keyedDigest, readDigestKey } from "@crewhaus/control-records";
 import {
   type ContextBlockKind,
@@ -124,7 +124,12 @@ export type RecordAppend = (event: {
 }) => Promise<void>;
 
 /** The run records a loop writes. */
-export type RecordKind = "run_stamp" | "context_manifest" | "span_closed" | "verdict";
+export type RecordKind =
+  | "run_stamp"
+  | "context_manifest"
+  | "span_closed"
+  | "verdict"
+  | "knowledge_read";
 
 /** Append one run record, on `span` when given; never throws. */
 export type RecordEvent = (kind: RecordKind, payload: unknown, span?: string) => Promise<void>;
@@ -387,8 +392,11 @@ export type RequestRegions = {
   /** One kind per block of the frozen prefix (instructions, project memory, recalled memory, skills). */
   readonly frozen: readonly ContextBlockKind[];
   readonly volatileRecall: number;
-  /** The continuity tail's blocks: a plan block, a ledger block, or both. */
-  readonly tail: ReadonlyArray<{ readonly text: string }>;
+  /**
+   * The continuity tail's blocks: a plan block, a ledger block, or both. A
+   * plan block carries the refs of what it rendered when the seam gives them.
+   */
+  readonly tail: ReadonlyArray<{ readonly text: string; readonly refs?: readonly RecalledRef[] }>;
   readonly guide: number;
   readonly overlay: boolean;
   readonly hookAppend: boolean;
@@ -436,10 +444,24 @@ export function contextAssembledCounts(
   };
 }
 
+/** The refs each system block a request built from `regions` carries, in order: only a plan block's. */
+export function regionRefs(regions: RequestRegions): Array<readonly RecalledRef[] | undefined> {
+  return [
+    ...regions.frozen.map(() => undefined),
+    ...Array.from({ length: regions.volatileRecall }, () => undefined),
+    ...regions.tail.map((b) => b.refs),
+    ...Array.from({ length: regions.guide }, () => undefined),
+    ...(regions.overlay ? [undefined] : []),
+    ...(regions.hookAppend ? [undefined] : []),
+  ];
+}
+
 /** One request, assembled: what {@link ManifestRecorder.manifest} records. */
 export type AssembledRequest = {
   readonly req: ProviderRequest;
   readonly kinds: readonly ContextBlockKind[];
+  /** Per block, in order: the refs a plan block rendered, when it has any. */
+  readonly refs?: ReadonlyArray<readonly RecalledRef[] | undefined>;
 };
 
 /** One recall, as the loop ran it. */
@@ -495,21 +517,58 @@ export type ManifestRecorder = {
 /** Calls made per run, so a manifest's `call` counts the run's calls, whichever loop made them. */
 const callsByRun = new WeakMap<RunContext, { n: number }>();
 
-const REF_STORES = new Set(["fact", "wiki", "session"]);
-const REF_BACKENDS = new Set(["local", "thredz"]);
+const REF_STORES: ReadonlySet<string> = new Set([
+  "fact",
+  "wiki",
+  "session",
+  "plan",
+  "goal",
+  "focus",
+  "document",
+]);
+const REF_BACKENDS: ReadonlySet<string> = new Set(["local", "thredz"]);
+/** A ref's `spec`: a spec name as the stores accept it. */
+const REF_SPEC_RE = /^[A-Za-z0-9_.-]{1,128}$/;
+/** A ref's `partition`: the spec's own (`-`), a session's, or a tenant's. */
+const REF_PARTITION_RE = new RegExp(
+  `^(?:-|s\\.${SESSION_ID_PATTERN}|t\\.[A-Za-z0-9][A-Za-z0-9_-]{0,63})$`,
+);
+/** A string `version`: a content revision, 8-16 lowercase hex. */
+const REF_VERSION_RE = /^[0-9a-f]{8,16}$/;
 
-/** A ref fit for a record: known store and backend, an id in the ref grammar, an integer version. */
-function recordableRef(ref: RecalledRef | null | undefined): RecalledRef | null {
+/**
+ * A ref fit for a record: a known store and backend, an id in the ref
+ * grammar, and a `spec` and `partition`, when given, each in its own grammar
+ * (they name where the item lives, so a ref whose `spec` or `partition` does
+ * not fit is not written at all). A `version` is kept only when it is a whole
+ * number or 8-16 lowercase hex. `null` for anything else: a ref that does not
+ * fit is never written.
+ */
+export function recordableRef(ref: RecalledRef | null | undefined): RecalledRef | null {
   if (ref === null || ref === undefined || typeof ref !== "object") return null;
   if (!REF_STORES.has(ref.store) || !REF_BACKENDS.has(ref.backend)) return null;
   if (typeof ref.localId !== "string" || !RUN_REF_RE.test(ref.localId)) return null;
+  if (ref.spec !== undefined && (typeof ref.spec !== "string" || !REF_SPEC_RE.test(ref.spec))) {
+    return null;
+  }
+  if (
+    ref.partition !== undefined &&
+    (typeof ref.partition !== "string" || !REF_PARTITION_RE.test(ref.partition))
+  ) {
+    return null;
+  }
   const version =
-    typeof ref.version === "number" && Number.isSafeInteger(ref.version) && ref.version >= 0
+    (typeof ref.version === "number" && Number.isSafeInteger(ref.version) && ref.version >= 0) ||
+    (typeof ref.version === "string" && REF_VERSION_RE.test(ref.version))
       ? ref.version
       : undefined;
+  const spec = ref.spec;
+  const partition = ref.partition;
   return {
     store: ref.store,
     backend: ref.backend,
+    ...(spec !== undefined ? { spec } : {}),
+    ...(partition !== undefined ? { partition } : {}),
     localId: ref.localId,
     ...(version !== undefined ? { version } : {}),
   };
@@ -639,7 +698,12 @@ export function createManifestRecorder(args: {
           ...contextAssembledCounts(req, current?.counts ?? NO_RECALL, args.inSpec),
         });
       }
-      return { req, kinds: regionKinds(regions) };
+      const refs = regionRefs(regions);
+      return {
+        req,
+        kinds: regionKinds(regions),
+        ...(refs.some((r) => r !== undefined && r.length > 0) ? { refs } : {}),
+      };
     },
     async manifest(assembled, call) {
       if (!args.records) return undefined;
@@ -661,11 +725,15 @@ export function createManifestRecorder(args: {
         const blocks = await Promise.all(
           req.system.map(async (block, i) => {
             const kind = kinds[i] as ContextBlockKind;
+            const refs = (assembled.refs?.[i] ?? [])
+              .map(recordableRef)
+              .filter((r): r is RecalledRef => r !== null);
             return {
               kind,
               bytes: bytesOf(block.text),
               fingerprint: await digest(kind, block.text, FROZEN_KINDS.has(kind)),
               cached: block.cache_control !== undefined,
+              ...(refs.length > 0 ? { refs } : {}),
             };
           }),
         );

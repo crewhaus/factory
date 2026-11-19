@@ -160,6 +160,35 @@ describe("tagContent (Pillar 3 data-lineage)", () => {
     expect(ctx.dataLineage?.has("tagged string number 0005 payload")).toBe(true);
   });
 
+  test("with keepHeld every held entry stays, with its origin and place, and new pieces stop at the cap", () => {
+    const ctx = createRunContext();
+    for (let i = 0; i < DATA_LINEAGE_CAP - 2; i++) {
+      tagContent(ctx, `held string number ${i.toString().padStart(4, "0")} payload`, "tool");
+    }
+    tagContent(ctx, "a remembered line of taggable length", "memory");
+    const before = [...(ctx.dataLineage?.entries() ?? [])];
+    expect(before).toHaveLength(DATA_LINEAGE_CAP - 1);
+    const summary = [
+      "a remembered line of taggable length",
+      "first new summary line of taggable length",
+      "second new summary line of taggable length",
+    ].join("\n");
+    tagContent(ctx, summary, "compaction", { keepHeld: true });
+    const after = [...(ctx.dataLineage?.entries() ?? [])];
+    expect(after).toHaveLength(DATA_LINEAGE_CAP);
+    // Every held entry, in its place, with its origin; the repeated line kept "memory".
+    expect(after.slice(0, before.length)).toEqual(before);
+    // The one free slot went to the summary's first piece, the whole summary.
+    expect(after[DATA_LINEAGE_CAP - 1]).toEqual([summary, "compaction"]);
+    expect(ctx.dataLineage?.has("first new summary line of taggable length")).toBe(false);
+  });
+
+  test("with keepHeld a run context with no lineage gains one", () => {
+    const ctx = createRunContext();
+    tagContent(ctx, "a summary of taggable length here", "compaction", { keepHeld: true });
+    expect(ctx.dataLineage?.get("a summary of taggable length here")).toBe("compaction");
+  });
+
   test("ignores non-string input gracefully", () => {
     const ctx = createRunContext();
     // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
