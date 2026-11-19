@@ -24,8 +24,12 @@
  *   environments, the graders, the judge calibration, the evals, datasets,
  *   retention pins, audit trail, graph checkpoints, advice, the knowledge-sync
  *   marker, the staged proposals, the routing freeze marker, the scope-audit
- *   baseline, the security corpus, the specs watchme synthesizes, the
- *   recorded ratings and the few-shot pools.
+ *   baseline, the security corpus, watchme's records (its judgments and the
+ *   specs it synthesizes), the recorded ratings and the few-shot pools.
+ * - Each steward workspace's git directory, `.crewhaus/workspaces/<binding>/repo`:
+ *   the managed clone `@crewhaus/tool-work/workspace` publishes from. Its
+ *   worktrees are where the agent works, so they are not roots; the `.git` file
+ *   in each is a `.git` name the floor already denies a write to.
  * - The operator's configuration in the working directory: the environment
  *   files Bun loads there, any file `manager.envFiles` declares, and the
  *   `bunfig.toml` and `.npmrc` there.
@@ -106,14 +110,37 @@ const GATE_RECORDS: readonly string[] = [
   // The SLO intake gate the monitor flips: exactly that file. The operator record is a
   // separate file under `.crewhaus/run`.
   join(".crewhaus", "slo", "intake.json"),
-  // The specs `crewhaus watchme synthesize` writes for a person to review and adopt.
-  join(".crewhaus", "watchme", "synthesized"),
+  // watchme's records: the judgments `crewhaus watchme report` appends and the specs
+  // `crewhaus watchme synthesize` writes for a person to review and adopt.
+  join(".crewhaus", "watchme"),
   // The ratings and feedback the web UI host, the gateway and the CLI record, which
   // distill, the janitor's auto-distill and `lessons update` read.
   join(".crewhaus", "feedback"),
   // The few-shot pools `crewhaus fewshot harvest` writes and `optimize --few-shot` reads.
   join(".crewhaus", "fewshot"),
 ];
+
+/** Where the steward workspace engine keeps one directory per repository binding. */
+export const WORKSPACES_DIR = join(".crewhaus", "workspaces");
+
+/**
+ * Each steward workspace's git directory: `<cwd>/.crewhaus/workspaces/<name>/repo` for
+ * every entry under {@link WORKSPACES_DIR} when the run starts. Roots are computed once
+ * per run, so the engine creates each binding's directory at boot, before any run reads
+ * them; a clone made later in the run is already named here. The worktrees beside it
+ * (`wt/`) are not roots.
+ */
+export function workspaceGitRoots(cwd: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(join(cwd, WORKSPACES_DIR), { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+  return names.sort().map((name) => resolve(cwd, WORKSPACES_DIR, name, "repo"));
+}
 
 /** Where the durable-execution idempotency store keeps its records by default. */
 const IDEMPOTENCY_DIR = join(".crewhaus", "idempotency");
@@ -559,6 +586,9 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   write them, and an operator edits them. The same names under another
  *   directory (a clone, a worktree, `docs/AGENTS.md`) are not roots, and plugin
  *   skill directories are not either.
+ * - Each steward workspace's git directory, `<cwd>/.crewhaus/workspaces/<name>/repo`,
+ *   for every entry there when the run starts ({@link workspaceGitRoots}). The
+ *   engine's own git calls write it; they are not tool calls.
  *
  * The floor reads calls that write. A read of the run's record, a spilled
  * output's parts included, goes on as before.
@@ -632,6 +662,8 @@ export function runtimeStateRoots(
     { roots: specRecordRoots(specDir, cwd), holdingCwd: "skip" },
     // Project memory and skills on a channel or managed run, which an operator edits.
     { roots: memoryFloorRoots(cwd), holdingCwd: "skip" },
+    // Each steward workspace's git directory. It lies inside the working directory.
+    { roots: workspaceGitRoots(cwd), holdingCwd: "protect" },
   ];
   const roots = new Set<string>();
   for (const group of groups) {
