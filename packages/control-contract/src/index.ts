@@ -103,6 +103,7 @@ export {
   type BudgetHistory,
   type BudgetPeriodView,
   type BudgetRead,
+  type BudgetRights,
 } from "./areas/runtime-budget.js";
 export {
   AUDIENCE_BASES,

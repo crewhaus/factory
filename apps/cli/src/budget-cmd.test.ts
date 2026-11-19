@@ -79,6 +79,51 @@ describe("crewhaus budget", () => {
     expect(extend.exitCode).toBe(EXIT_FOR_ERROR.conflict);
   });
 
+  test("a directory with no spec is not a harness: every verb refuses, never 'no limit'", async () => {
+    const empty = temp("empty");
+    const run = (argv: readonly string[]) =>
+      runBudgetCommand(argv, { env: { HOME: empty }, cwd: empty, now: () => NOW });
+    for (const argv of [["show"], ["history"], ["extend", "--usd", "5", "--reason", "other"]]) {
+      const out = await run(argv);
+      expect([argv[0], out.exitCode]).toEqual([argv[0], EXIT_FOR_ERROR.not_found]);
+      expect(out.lines.join("\n")).toContain("no harness here (no crewhaus.yaml)");
+      expect(out.lines.join("\n")).not.toContain("No spending limit");
+    }
+  });
+
+  test("a spec whose period cannot be used refuses naming the problem, never 'no limit'", async () => {
+    for (const budget of [
+      "budget:\n  usd: 5\n  period: {every: month, usd: 10, timezone: Mars/Olympus}\n",
+      "budget: [unclosed\n",
+    ]) {
+      const { run } = setup(budget);
+      for (const argv of [["show"], ["extend", "--usd", "5", "--reason", "other"]]) {
+        const out = await run(argv);
+        expect([argv[0], out.exitCode]).toEqual([argv[0], EXIT_FOR_ERROR.invalid]);
+        const text = out.lines.join("\n");
+        expect(text).toContain("could not be read, so its spending limit is unknown");
+        expect(text).toContain("crewhaus lint crewhaus.yaml");
+        expect(text).not.toContain("No spending limit");
+      }
+    }
+    // The optimizer's reader answers no ledger, as before.
+    expect(
+      specPeriodOf(
+        harness("budget:\n  usd: 5\n  period: {every: month, usd: 10, timezone: Mars/Olympus}\n"),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("the renewal day is read in the period's own zone", async () => {
+    const { run } = setup(
+      "budget:\n  usd: 5\n  period: {every: month, usd: 10, timezone: Europe/Berlin}\n",
+    );
+    const show = await run(["show"]);
+    expect(show.exitCode).toBe(0);
+    // A Berlin month renews at local midnight on 1 Dec (23:00 UTC on 30 Nov).
+    expect(show.lines.join("\n")).toContain("It renews on 1 Dec 2026.");
+  });
+
   test("show prints this period's spend, unknown calls and the renewal", async () => {
     const { dir, run } = setup(PERIOD);
     const def = specPeriodOf(dir);

@@ -1145,7 +1145,15 @@ async function daemonSubmit(
   const runnable = assertRunnable(harness.dir, { mode: "run", ignorePause });
   if (!runnable.ok) {
     return {
-      lines: [entryRefusalLine(harness.specName, runnable.reason, harness.dir, runnable.renewsAt)],
+      lines: [
+        entryRefusalLine(
+          harness.specName,
+          runnable.reason,
+          harness.dir,
+          runnable.renewsAt,
+          runnable.timezone,
+        ),
+      ],
       exitCode: EXIT_FOR_ERROR[runnable.exitName],
     };
   }

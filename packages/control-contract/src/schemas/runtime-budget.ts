@@ -21,6 +21,7 @@ const budgetFold = z
   .object({
     periodId,
     every: oneOf(BUDGET_PERIOD_EVERY),
+    timezone: z.string().min(1).optional(),
     startsAt: timestamp,
     renewsAt: timestamp,
     capUsdMicros: micros,
@@ -39,11 +40,27 @@ const absent = z
   .object({ present: z.literal(false), note: z.string(), verb: z.string() })
   .passthrough();
 
+const budgetRights = z.object({ extend: z.boolean() }).passthrough();
+
 export const budgetRead = z.union([
   z
-    .object({ present: z.literal(true), note: z.string(), verb: z.string(), fold: budgetFold })
+    .object({
+      present: z.literal(true),
+      note: z.string(),
+      verb: z.string(),
+      fold: budgetFold,
+      you: budgetRights.optional(),
+    })
     .passthrough(),
-  absent,
+  z
+    .object({
+      present: z.literal(false),
+      note: z.string(),
+      verb: z.string(),
+      why: z.enum(["no_period", "spec_unreadable"]).optional(),
+      you: budgetRights.optional(),
+    })
+    .passthrough(),
 ]);
 
 export const budgetHistory = z.union([

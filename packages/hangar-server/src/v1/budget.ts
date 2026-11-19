@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import { BUDGET_CAPABILITY_KEYS } from "@crewhaus/control-contract";
 import { periodOf, sweepBudgetPeriods } from "@crewhaus/control-records/budget";
 import { applyBudgetExtend } from "@crewhaus/control-service";
-import { declaredBudgetPeriod, readBudget, readBudgetHistory } from "../budget";
+import { budgetPeriodOf, declaredBudgetPeriod, readBudget, readBudgetHistory } from "../budget";
 import { resolveContained } from "../safety";
 import type { Sweep } from "../scheduler-host";
 import type { HomePorts } from "../sweeps";
@@ -28,33 +28,59 @@ import { acceptedAnswer, submitCommand } from "./submit";
 /** The most of a spec Home reads to find its period. */
 const SPEC_MAX_BYTES = 1024 * 1024;
 
-/** The harness's spec text, read contained to its directory; "" when there is none. */
-export function specTextOf(harnessDir: string): string {
+/**
+ * The harness's spec text, read contained to its directory; `undefined` when it is
+ * missing, cannot be read or is larger than Home reads.
+ */
+export function readSpecText(harnessDir: string): string | undefined {
   const path = resolveContained(harnessDir, "crewhaus.yaml");
-  if (path === undefined) return "";
+  if (path === undefined) return undefined;
   try {
     const text = readFileSync(path, "utf8");
-    return text.length > SPEC_MAX_BYTES ? "" : text;
+    return text.length > SPEC_MAX_BYTES ? undefined : text;
   } catch {
-    return "";
+    return undefined;
   }
 }
 
+/** The harness's spec text, or "" when {@link readSpecText} has none. */
+export function specTextOf(harnessDir: string): string {
+  return readSpecText(harnessDir) ?? "";
+}
+
 const get: V1Handler = async (ctx) => {
-  const dir = liveDirOr409(harnessOf(ctx));
-  return { status: 200, body: readBudget(dir, specTextOf(dir), ctx.deps.now()) };
+  const entry = harnessOf(ctx);
+  const dir = liveDirOr409(entry);
+  // What the screen offers: the raise only to a caller that holds it.
+  const you = {
+    extend: ctx.access.authorize("h.budget.extend", { harness: entry.id }).allow,
+  };
+  return {
+    status: 200,
+    body: { ...readBudget(dir, readSpecText(dir), ctx.deps.now(), entry.id), you },
+  };
 };
 
 const periods: V1Handler = async (ctx) => {
-  const dir = liveDirOr409(harnessOf(ctx));
-  return { status: 200, body: readBudgetHistory(dir) };
+  const entry = harnessOf(ctx);
+  const dir = liveDirOr409(entry);
+  return { status: 200, body: readBudgetHistory(dir, entry.id) };
 };
 
 const extend: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
   const dir = liveDirOr409(entry);
-  const def = declaredBudgetPeriod(specTextOf(dir));
-  if (def === undefined) {
+  const read = budgetPeriodOf(readSpecText(dir));
+  if (read.kind === "unreadable") {
+    throw new V1Error({
+      status: 409,
+      code: "conflict",
+      reason: "spec_unreadable",
+      message: "This harness's spec could not be read, so its spending limit is unknown.",
+      remedy: "Run `crewhaus lint crewhaus.yaml` in its directory to see why.",
+    });
+  }
+  if (read.kind === "none") {
     throw new V1Error({
       status: 409,
       code: "conflict",
@@ -63,6 +89,7 @@ const extend: V1Handler = async (ctx) => {
       remedy: "Add `budget.period` to its spec to give it one.",
     });
   }
+  const def = read.def;
   const usd = Number(ctx.body["usd"]);
   const reasonCode = String(ctx.body["reasonCode"]);
   const expect = String(ctx.body["expect"]);

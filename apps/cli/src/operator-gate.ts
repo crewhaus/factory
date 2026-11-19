@@ -48,6 +48,7 @@ import {
   assertRunnable,
   readOperatorRecord,
 } from "@crewhaus/control-records";
+import { renewalDay } from "@crewhaus/control-records/budget";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
 import { type ParseArgsSchema, type ParsedArgs, parseArgs } from "@crewhaus/infra-utils";
 import {
@@ -207,21 +208,10 @@ function harnessName(harnessDir: string): string {
   return basename(resolve(harnessDir));
 }
 
-/** A renewal instant as a person reads it: `1 Dec 2026`, in UTC. */
-function renewalDate(renewsAt: string | undefined): string | undefined {
-  const at = renewsAt === undefined ? Number.NaN : Date.parse(renewsAt);
-  if (!Number.isFinite(at)) return undefined;
-  return new Date(at).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  });
-}
-
 /**
- * The one line a refused entry point prints. A used-up budget names when its
- * period renews (`renewsAt`) and the verb that raises it.
+ * The one line a refused entry point prints. A used-up budget names the day
+ * its period renews (`renewsAt`, read in the period's `timezone`) and the verb
+ * that raises it.
  *
  * First consumers: {@link gateEntryPoint} and `crewhaus daemon submit`.
  */
@@ -230,10 +220,11 @@ export function entryRefusalLine(
   reason: Extract<RunnableVerdict, { ok: false }>["reason"],
   harnessDir: string,
   renewsAt?: string,
+  timezone?: string,
 ): string {
   switch (reason) {
     case "budget": {
-      const when = renewalDate(renewsAt);
+      const when = renewalDay(renewsAt, timezone);
       return `${name} has used its budget for this period, so this doesn't run${
         when !== undefined ? ` until it renews on ${when}` : ""
       }. \`crewhaus budget extend --usd <amount> --reason <code>\` raises the limit.`;
@@ -379,7 +370,7 @@ export function gateEntryPoint(
     return { pauseIgnored };
   }
   io.write(
-    `${entryRefusalLine(harnessName(refused.dir), refused.verdict.reason, refused.dir, refused.verdict.renewsAt)}\n`,
+    `${entryRefusalLine(harnessName(refused.dir), refused.verdict.reason, refused.dir, refused.verdict.renewsAt, refused.verdict.timezone)}\n`,
   );
   io.exit(EXIT_FOR_ERROR[refused.verdict.exitName]);
   return { pauseIgnored: false };

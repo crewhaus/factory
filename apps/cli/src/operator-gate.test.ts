@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { readOperatorRecord } from "@crewhaus/control-records";
-import { entryPointMode, gateEntryPoint } from "./operator-gate";
+import { entryPointMode, entryRefusalLine, gateEntryPoint } from "./operator-gate";
 import { resolveScheduleJob } from "./schedule-generate";
 
 const roots: string[] = [];
@@ -443,6 +443,15 @@ describe("a used-up budget period", () => {
     }
   });
 
+  test("the refusal names the day the period renews in its own zone", () => {
+    const dir = harness("absent");
+    const line = (zone?: string) =>
+      entryRefusalLine("spend", "budget", dir, "2026-11-30T23:00:00.000Z", zone);
+    // A Berlin month renews at local midnight on 1 Dec, 23:00 UTC the day before.
+    expect(line("Europe/Berlin")).toContain("until it renews on 1 Dec 2026");
+    expect(line()).toContain("until it renews on 30 Nov 2026");
+  });
+
   test("a disable outranks the budget, and the budget outranks a pause", () => {
     expect(gate(exhausted("disabled"), ["run", "crewhaus.yaml", "--prompt", "x"]).exit).toBe(38);
     expect(gate(exhausted("paused"), ["run", "crewhaus.yaml", "--prompt", "x"]).exit).toBe(33);
@@ -618,4 +627,40 @@ describe("the run stamp records --ignore-pause", () => {
     expect(exportedStamp).toBeDefined();
     expect(exportedStamp !== undefined && "intake" in exportedStamp).toBe(false);
   }, 20_000); // three CLI subprocesses, each loading the whole entry file
+
+  test("--budget-usd caps the run and keeps the harness's period: the run still reserves against it", async () => {
+    const dir = harness("absent");
+    writeFileSync(
+      join(dir, "crewhaus.yaml"),
+      [
+        "name: gate-fixture",
+        "target: cli",
+        "models:",
+        "  stub:",
+        `    model: local/stub@http://127.0.0.1:${stub.port}/v1`,
+        "    price: {input_per_1m: 1, output_per_1m: 2}",
+        "agent:",
+        "  model: $stub",
+        "  instructions: Reply briefly.",
+        "budget:",
+        "  usd: 50",
+        "  period: {every: month, usd: 100}",
+        "",
+      ].join("\n"),
+    );
+    const out = await runOnce(dir, ["--prompt", "x", "--budget-usd", "5"]);
+    expect(out.exitCode).toBe(0);
+    const budget = join(dir, ".crewhaus", "run", "control", "budget");
+    const ops: string[] = [];
+    for (const period of readdirSync(budget)) {
+      if (!period.startsWith("month-")) continue;
+      for (const seg of readdirSync(join(budget, period))) {
+        for (const line of readFileSync(join(budget, period, seg), "utf8").split("\n")) {
+          if (line !== "") ops.push(String((JSON.parse(line) as { op?: unknown }).op));
+        }
+      }
+    }
+    expect(ops).toContain("reserve");
+    expect(ops).toContain("settle");
+  }, 20_000); // one CLI subprocess loading the whole entry file
 });

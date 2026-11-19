@@ -6641,4 +6641,51 @@ describe("0.9.0 — spend is never a guessed $0", () => {
       ),
     ).toBe(true);
   });
+
+  test("a run's own budget stop answers 429 budget_exceeded, not retryable, and a bullet says so", async () => {
+    const gateway = await import("../packages/gateway-server/src/index");
+    const { InMemoryBudgetStore } = await import("../packages/durable-state/src/index");
+    const { buildTenant } = await import("../packages/tenancy/src/index");
+    const { RunFailedError, EXIT_CODES } = await import("../packages/errors/src/index");
+    const root = mkdtempSync(join(tmpdir(), "default-on-run-cap-"));
+    try {
+      const secret = ["default", "on", "run", "cap"].join("-");
+      const server = gateway.createGatewayServer({
+        jwtSecret: secret,
+        tenantsRoot: root,
+        budgetStore: new InMemoryBudgetStore(),
+        tenantOverrides: { "tenant-a": buildTenant("tenant-a", { tenantsRoot: root }) },
+        handler: async () => {
+          throw new RunFailedError({
+            class: "crewhaus_budget",
+            title: "budget reached",
+            detail: "spent the run's cap",
+            exitCode: EXIT_CODES.crewhaus_budget,
+          });
+        },
+      });
+      const res = (await server.handle({
+        bearer: gateway.signJwt({ tenant_id: "tenant-a" }, secret),
+        body: {
+          protocol: gateway.PROTOCOL_VERSION,
+          id: "1",
+          method: "runs.create",
+          params: { spec: "s", input: "hello" },
+        },
+      })) as { error: { code: string; data?: unknown } };
+      expect(res.error.code).toBe("budget_exceeded");
+      expect(gateway.statusFor(res.error.code)).toBe(429);
+      expect(res.error.data).toEqual({ retryable: false });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(
+      later().some(
+        (b) =>
+          b.includes("429 `budget_exceeded`") &&
+          b.includes("`data.retryable: false`") &&
+          b.includes("500"),
+      ),
+    ).toBe(true);
+  });
 });

@@ -26,6 +26,7 @@ import {
   openBudgetLedger,
   periodOf,
   readBudgetPeriods,
+  renewalDay,
 } from "@crewhaus/control-records/budget";
 import type { BudgetExtendAnswer, ControlService } from "@crewhaus/control-service";
 import { applyBudgetExtend } from "@crewhaus/control-service";
@@ -105,41 +106,76 @@ function harnessDirOf(raw: string | undefined, deps: BudgetDeps): string {
   );
 }
 
-/** The period the harness's spec declares, or `undefined` for none. */
-export function specPeriodOf(harnessDir: string): BudgetPeriodDef | undefined {
+/**
+ * What the harness's spec says about its period. "Could not tell" is not "none": a
+ * directory with no spec, a spec that cannot be read or parsed, and a period the
+ * runtime cannot use each answer their own kind, and only a valid spec without
+ * `budget.period` answers `none`.
+ */
+export type SpecPeriod =
+  | { readonly kind: "period"; readonly def: BudgetPeriodDef }
+  | { readonly kind: "none" }
+  | { readonly kind: "no-spec" }
+  | { readonly kind: "unreadable"; readonly detail: string };
+
+/** The harness's spec, read and parsed, and the period it declares. */
+export function readSpecPeriod(harnessDir: string): SpecPeriod {
   let text: string;
   try {
     text = readFileSync(join(harnessDir, "crewhaus.yaml"), "utf8");
-  } catch {
-    return undefined;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "no-spec" }
+      : { kind: "unreadable", detail: (err as Error).message };
   }
   let spec: ReturnType<typeof parseSpec>;
   try {
     spec = parseSpec(text);
-  } catch {
-    return undefined;
+  } catch (err) {
+    return { kind: "unreadable", detail: firstLine((err as Error).message) };
   }
   const period = "budget" in spec ? spec.budget?.period : undefined;
-  if (period === undefined) return undefined;
+  if (period === undefined) return { kind: "none" };
   const def: BudgetPeriodDef = {
     every: period.every,
     usdMicros: Math.round(period.usd * 1_000_000),
     ...(period.starts !== undefined ? { starts: period.starts } : {}),
     ...(period.timezone !== undefined ? { timezone: period.timezone } : {}),
   };
-  return budgetPeriodProblem(def) === undefined ? def : undefined;
+  const problem = budgetPeriodProblem(def);
+  return problem === undefined
+    ? { kind: "period", def }
+    : { kind: "unreadable", detail: `budget.period: ${problem}` };
+}
+
+const firstLine = (text: string): string => text.split("\n")[0] ?? text;
+
+/** The period the harness's spec declares, or `undefined` when it declares none or cannot be read. */
+export function specPeriodOf(harnessDir: string): BudgetPeriodDef | undefined {
+  const read = readSpecPeriod(harnessDir);
+  return read.kind === "period" ? read.def : undefined;
+}
+
+/** A directory with no spec, or a spec that cannot be read, refused in words: never "no limit". */
+function refuseUnknownPeriod(label: string, read: SpecPeriod): never {
+  if (read.kind === "no-spec") {
+    throw new Refused(
+      `${label}: no harness here (no crewhaus.yaml). Pass --harness <id>, or run it from the harness's directory.`,
+      exitFor("not_found"),
+    );
+  }
+  const detail = read.kind === "unreadable" ? read.detail : "it could not be read";
+  throw new Refused(
+    `${label}: the harness's spec could not be read, so its spending limit is unknown (${detail}). \`crewhaus lint crewhaus.yaml\` in its directory says what to fix.`,
+    exitFor("invalid"),
+  );
 }
 
 const dollars = (micros: number): string => `$${(micros / 1_000_000).toFixed(2)}`;
 
-/** `1 Dec 2026`, in UTC. */
-const dateOf = (iso: string): string =>
-  new Date(iso).toLocaleDateString("en-GB", {
-    day: "numeric",
-    month: "short",
-    year: "numeric",
-    timeZone: "UTC",
-  });
+/** `1 Dec 2026`: the day the period renews, in the period's own zone. */
+const dateOf = (fold: Pick<BudgetFold, "renewsAt" | "timezone">): string =>
+  renewalDay(fold.renewsAt, fold.timezone) ?? fold.renewsAt;
 
 const PERIOD_WORD: Readonly<Record<BudgetFold["every"], string>> = {
   day: "today",
@@ -169,8 +205,8 @@ export function foldLines(fold: BudgetFold): string[] {
   }
   lines.push(
     fold.exhausted
-      ? `The limit is used up: new work waits until it renews on ${dateOf(fold.renewsAt)}. \`crewhaus budget extend --usd <amount> --reason <code>\` raises it.`
-      : `It renews on ${dateOf(fold.renewsAt)}.`,
+      ? `The limit is used up: new work waits until it renews on ${dateOf(fold)}. \`crewhaus budget extend --usd <amount> --reason <code>\` raises it.`
+      : `It renews on ${dateOf(fold)}.`,
   );
   if (fold.truncated || fold.gaps > 0) {
     lines.push("Some ledger lines could not be read, so these totals are lower bounds.");
@@ -230,15 +266,17 @@ export async function runBudgetCommand(
     const args = parseArgs(label, argv.slice(1), CLI_FAMILY.sub[verb].flags);
     const json = args.booleans.has("json");
     const dir = harnessDirOf(args.values.get("harness")?.[0], deps);
-    const def = specPeriodOf(dir);
+    const read = readSpecPeriod(dir);
+    if (read.kind === "no-spec") refuseUnknownPeriod(label, read);
     if (verb === "history") {
-      const read = readBudgetPeriods(dir);
+      const history = readBudgetPeriods(dir);
       return {
-        lines: json ? [JSON.stringify(read, null, 2)] : historyLines(read.periods),
+        lines: json ? [JSON.stringify(history, null, 2)] : historyLines(history.periods),
         exitCode: 0,
       };
     }
-    if (def === undefined) {
+    if (read.kind === "unreadable") refuseUnknownPeriod(label, read);
+    if (read.kind === "none") {
       const line =
         "No spending limit for a period: each run keeps only its own cap. Add `budget.period` to the spec to set one.";
       if (verb === "show") {
@@ -249,6 +287,7 @@ export async function runBudgetCommand(
       }
       return { lines: [`budget extend: ${line}`], exitCode: exitFor("conflict") };
     }
+    const def = read.def;
     if (verb === "show") {
       const fold = foldBudget(dir, def, now());
       return {
@@ -327,7 +366,7 @@ export async function runBudgetCommand(
     }
     return {
       lines: [
-        `Raised by ${dollars(Math.round(usd * 1_000_000))} for ${PERIOD_WORD[value.fold.every]}. It resets on ${dateOf(value.fold.renewsAt)}.`,
+        `Raised by ${dollars(Math.round(usd * 1_000_000))} for ${PERIOD_WORD[value.fold.every]}. It resets on ${dateOf(value.fold)}.`,
         `receipt ${answer.receipt.id}`,
       ],
       exitCode: 0,

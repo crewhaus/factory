@@ -2181,6 +2181,7 @@
       "name": "@crewhaus/spec",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
         "yaml": "^2.6.0",

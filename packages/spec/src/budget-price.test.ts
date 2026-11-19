@@ -117,6 +117,40 @@ describe("models.<name>.price", () => {
       "models.b.price: models.b.price differs from models.a.price for the same model: a model has one price.",
     ]);
   });
+
+  test("two strings the runtime prices as one model carry one price", () => {
+    const price = { input_per_1m: 1, output_per_1m: 2 };
+    expect(
+      refusals(
+        withModels({
+          a: { model: "local/qwen3@http://a/v1", price },
+          b: { model: "local/qwen3@http://b/v1", price: { input_per_1m: 5, output_per_1m: 5 } },
+        }),
+      ),
+    ).toEqual([
+      "models.b.price: models.b.price differs from models.a.price for the same model: a model has one price.",
+    ]);
+    expect(
+      refusals(
+        withModels({
+          a: { model: "bedrock/us.anthropic.claude-sonnet-4-5-v1:0", price },
+          b: {
+            model: "bedrock/eu.anthropic.claude-sonnet-4-5-v1:0",
+            price: { ...price, output_per_1m: 9 },
+          },
+        }),
+      ),
+    ).toHaveLength(1);
+    // Different models keep their own prices.
+    expect(
+      refusals(
+        withModels({
+          a: { model: "local/qwen3@http://a/v1", price },
+          b: { model: "local/qwen3-coder@http://a/v1", price: { ...price, output_per_1m: 9 } },
+        }),
+      ),
+    ).toEqual([]);
+  });
 });
 
 describe("budget.period", () => {

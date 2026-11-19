@@ -327,7 +327,7 @@ import {
   reserveModelCall,
   settleModelCall,
 } from "./spend-wiring";
-export { spendMeterOf } from "./spend-wiring";
+export { openPeriodSpendMeter, spendMeterOf } from "./spend-wiring";
 import { type CliOutput, createCliOutput, isSpinnerEnabled } from "./spinner";
 import {
   credentialFileRoots,
@@ -8774,7 +8774,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   /** The classified `crewhaus_budget` report a stop before `where` carries. */
   const budgetStopReport = (
     where: string,
-    scope: "run" | "share" | "period" = "run",
+    scope: "run" | "share" | "period" | "period_held" = "run",
   ): FailureReport => {
     const spentMicros =
       resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
@@ -8784,13 +8784,15 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       detail:
         scope === "period"
           ? `the harness's budget for this period is used up before ${where}`
-          : scope === "share"
-            ? `this sub-agent's share of the budget is used up before ${where}`
-            : `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
-                (opts.budget?.usdMicros ?? 0) / 1_000_000
-              ).toFixed(4)} cap before ${where}${
-                budgetDegraded ? " (degraded rung also reached the cap)" : ""
-              }`,
+          : scope === "period_held"
+            ? `the harness's budget for this period is held by calls that never finished before ${where}`
+            : scope === "share"
+              ? `this sub-agent's share of the budget is used up before ${where}`
+              : `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
+                  (opts.budget?.usdMicros ?? 0) / 1_000_000
+                ).toFixed(4)} cap before ${where}${
+                  budgetDegraded ? " (degraded rung also reached the cap)" : ""
+                }`,
       remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
       exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
     };
@@ -9887,12 +9889,13 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 reservation,
                 estimateRequestMicros(spendMeter, req, reqProviderId, reqWireModelId),
                 { run: runContext.runId, model: reqWireModelId },
+                turnAbort.signal,
               );
               if (!held.admitted) {
                 throw new RunFailedError(
                   budgetStopReport(
                     `model call ${toolIterations + 1} of turn ${runContext.turnNumber}`,
-                    held.scope,
+                    held.held === true ? "period_held" : held.scope,
                   ),
                 );
               }

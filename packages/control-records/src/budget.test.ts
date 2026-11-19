@@ -4,7 +4,15 @@
  * clocks only; no timers are waited on.
  */
 import { afterAll, describe, expect, spyOn, test } from "bun:test";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import {
   type BudgetPeriodDef,
@@ -14,6 +22,7 @@ import {
   openBudgetLedger,
   periodOf,
   readBudgetState,
+  renewalDay,
   sweepBudgetPeriods,
   writeBudgetState,
 } from "./budget";
@@ -129,10 +138,27 @@ describe("period identity", () => {
     const ids = new Set([
       periodOf({ every: "month", usdMicros: 1 }, now).periodId,
       periodOf({ every: "month", usdMicros: 1, timezone: BERLIN }, now).periodId,
-      periodOf({ every: "month", usdMicros: 1, starts: "2026-01-01" }, now).periodId,
+      periodOf({ every: "month", usdMicros: 1, starts: "2026-01-05" }, now).periodId,
       periodOf({ every: "week", usdMicros: 1 }, now).periodId,
     ]);
     expect(ids.size).toBe(4);
+  });
+
+  test("a definition that keeps the default grid keeps the default id", () => {
+    const now = at("2026-11-17T08:00:00Z");
+    const month = periodOf({ every: "month", usdMicros: 1 }, now).periodId;
+    expect(month).toBe("month-2026-11-01");
+    expect(periodOf({ every: "month", usdMicros: 1, timezone: "UTC" }, now).periodId).toBe(month);
+    expect(periodOf({ every: "month", usdMicros: 1, starts: "2026-01-01" }, now).periodId).toBe(
+      month,
+    );
+    const week = periodOf({ every: "week", usdMicros: 1 }, now).periodId;
+    // 2026-11-02 is a Monday: on the default grid.
+    expect(periodOf({ every: "week", usdMicros: 1, starts: "2026-11-02" }, now).periodId).toBe(
+      week,
+    );
+    const day = periodOf({ every: "day", usdMicros: 1 }, now).periodId;
+    expect(periodOf({ every: "day", usdMicros: 1, starts: "2026-03-14" }, now).periodId).toBe(day);
   });
 
   test("a monthly anchor past the 28th, an unknown zone and a non-date are refused", () => {
@@ -254,6 +280,84 @@ describe("the period ledger", () => {
     ).toEqual(bytes);
   });
 
+  test("a process that runs across a renewal reserves into the new period, and settles where it reserved", async () => {
+    const dir = tempDir();
+    const day: BudgetPeriodDef = { every: "day", usdMicros: 100 };
+    let clock = at("2026-11-17T23:59:00Z");
+    const live = probeOf(new Set([1]));
+    const port = openBudgetLedger(dir, day, { now: () => clock, pid: 1, host: "h", probe: live });
+    expect(port.periodId).toBe("day-2026-11-17");
+    // Yesterday: one call reserved before midnight, then the day used up.
+    expect(await port.reserve({ id: "late", usdMicros: 10 })).toEqual({ admit: true });
+    await openBudgetLedger(dir, day, { now: () => clock }).settle({ id: "x", usdMicros: 100 });
+    clock = at("2026-11-18T00:00:30Z");
+    expect(port.periodId).toBe("day-2026-11-18");
+    // The new day has its full limit: yesterday's exhaustion does not refuse it.
+    expect(await port.reserve({ id: "fresh", usdMicros: 10 })).toEqual({ admit: true });
+    expect(readBudgetState(dir).state).toBe("absent");
+    // The call reserved yesterday settles into yesterday; today's settles today.
+    await port.settle({ id: "late", usdMicros: 9 });
+    await port.settle({ id: "fresh", usdMicros: 4 });
+    expect(foldBudget(dir, day, clock, { probe: live, host: "h" })).toMatchObject({
+      periodId: "day-2026-11-18",
+      spentUsdMicros: 4,
+      reservedUsdMicros: 0,
+    });
+    expect(
+      foldBudget(dir, day, at("2026-11-17T12:00:00Z"), { probe: live, host: "h" }),
+    ).toMatchObject({ periodId: "day-2026-11-17", spentUsdMicros: 109, reservedUsdMicros: 0 });
+    expect(port.fold().periodId).toBe("day-2026-11-18");
+  });
+
+  test("a reservation records its holder's start time when the probe knows it", async () => {
+    const dir = tempDir();
+    const probe: LeaseProbe = { isAlive: () => true, startTimeMs: () => 1_700_000_000_000 };
+    const port = openBudgetLedger(dir, DEF, { now: () => NOW, pid: 9, host: "h", probe });
+    await port.reserve({ id: "r", usdMicros: 5 });
+    const seg = join(dir, ".crewhaus/run/control/budget/month-2026-11-01");
+    const line = JSON.parse(
+      readFileSync(join(seg, readdirSync(seg)[0] as string), "utf8").trim(),
+    ) as { holder: unknown };
+    expect(line.holder).toEqual({ pid: 9, startedAt: 1_700_000_000_000, host: "h" });
+    // A recycled pid (another start time) is provably another process.
+    const recycled: LeaseProbe = { isAlive: () => true, startTimeMs: () => 1_800_000_000_000 };
+    expect(
+      foldBudget(dir, DEF, NOW + 60 * 60_000, { probe: recycled, host: "h" }).reservedUsdMicros,
+    ).toBe(0);
+  });
+
+  test("reservations past their lease that cannot be proved dead end the wait with a final refusal", async () => {
+    const dir = tempDir();
+    // A holder on another host, or one that answers alive: never provably dead.
+    const alive: LeaseProbe = { isAlive: () => true, startTimeMs: () => undefined };
+    const crashed = openBudgetLedger(dir, DEF, {
+      now: () => NOW,
+      pid: 4,
+      host: "other-host",
+      probe: alive,
+      leaseMs: 60_000,
+    });
+    expect(await crashed.reserve({ id: "leaked", usdMicros: 1_000 })).toEqual({ admit: true });
+    let clock = NOW + 30_000;
+    const port = openBudgetLedger(dir, DEF, { now: () => clock, pid: 5, host: "h", probe: alive });
+    // Inside the lease: worth waiting for.
+    const waiting = await port.reserve({ id: "mine", usdMicros: 200 });
+    expect(waiting.admit === false && waiting.on).toBe("others");
+    // Past it: a final answer, never another wait, and no exhaustion state.
+    clock = NOW + 24 * 60 * 60_000;
+    let answer = await port.reserve({ id: "mine", usdMicros: 200 });
+    let tries = 1;
+    while (answer.admit === false && answer.on === "others" && tries < 3) {
+      answer = await port.reserve({ id: "mine", usdMicros: 200 });
+      tries += 1;
+    }
+    expect(answer).toEqual({ admit: false, on: "spent", held: true });
+    expect(tries).toBe(1);
+    expect(readBudgetState(dir).state).toBe("absent");
+    // The leaked reservation still counts in the fold.
+    expect(foldBudget(dir, DEF, clock, { probe: alive, host: "h" }).reservedUsdMicros).toBe(1_000);
+  });
+
   test("a torn final line waits; a malformed middle line is a counted gap", () => {
     const dir = tempDir();
     const seg = join(dir, ".crewhaus/run/control/budget/month-2026-11-01");
@@ -343,6 +447,46 @@ describe("closed periods", () => {
   });
 });
 
+describe("the closed-period sweep never leaves the harness", () => {
+  test("a period directory that is a link is neither read nor emptied", async () => {
+    const dir = tempDir();
+    const outside = tempDir();
+    writeFileSync(join(outside, "keep.txt"), "precious");
+    writeFileSync(join(outside, "000001.jsonl"), "{}\n");
+    const budget = join(dir, ".crewhaus/run/control/budget");
+    mkdirSync(budget, { recursive: true });
+    symlinkSync(outside, join(budget, "day-2026-01-01"));
+    writeFileSync(
+      join(budget, "periods.jsonl"),
+      `${JSON.stringify({ v: 1, periodId: "day-2026-01-01", closedAt: "x", spentUsdMicros: 0, extensionsUsdMicros: 0, unknownCalls: 0, truncated: false })}\n`,
+    );
+    const def: BudgetPeriodDef = { every: "day", usdMicros: 100 };
+    expect(sweepBudgetPeriods(dir, def, at("2026-11-04T12:00:00Z"))).toEqual({
+      summarized: [],
+      removed: [],
+    });
+    expect(readdirSync(outside).sort()).toEqual(["000001.jsonl", "keep.txt"]);
+    expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("precious");
+  });
+
+  test("a link inside a period directory is left, and so is the directory", async () => {
+    const dir = tempDir();
+    const outside = tempDir();
+    writeFileSync(join(outside, "keep.txt"), "precious");
+    const def: BudgetPeriodDef = { every: "day", usdMicros: 100 };
+    await openBudgetLedger(dir, def, { now: () => at("2026-11-01T12:00:00Z") }).settle({
+      id: "a",
+      usdMicros: 1,
+    });
+    const seg = join(dir, ".crewhaus/run/control/budget/day-2026-11-01");
+    symlinkSync(join(outside, "keep.txt"), join(seg, "000002.jsonl"));
+    sweepBudgetPeriods(dir, def, at("2026-11-03T12:00:00Z"));
+    expect(sweepBudgetPeriods(dir, def, at("2026-11-04T12:00:00Z")).removed).toEqual([]);
+    expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("precious");
+    expect(existsSync(join(seg, "000001.jsonl"))).toBe(false);
+  });
+});
+
 describe("the budget intake reason", () => {
   const STATE = {
     v: 1,
@@ -422,6 +566,46 @@ describe("the budget intake reason", () => {
         }) as never,
     });
     expect(renewed).toMatchObject({ state: "closed", code: "paused" });
+  });
+
+  test("a period in a zone carries the zone from the refusal to the reason, so its renewal reads as that local day", async () => {
+    const dir = tempDir();
+    const berlin: BudgetPeriodDef = { every: "month", usdMicros: 10, timezone: "Europe/Berlin" };
+    const now = at("2026-11-19T12:00:00Z");
+    const port = openBudgetLedger(dir, berlin, { now: () => now });
+    await port.settle({ id: "x", usdMicros: 10 });
+    expect(await port.reserve({ id: "y", usdMicros: 1 })).toEqual({ admit: false, on: "spent" });
+    const state = readBudgetState(dir);
+    expect(state.state === "present" && state.record).toMatchObject({
+      renewsAt: "2026-11-30T23:00:00.000Z",
+      timezone: "Europe/Berlin",
+    });
+    const verdict = intakeVerdict(dir, { now: () => now });
+    expect(verdict.state === "closed" && verdict.reasons[0]).toMatchObject({
+      kind: "budget",
+      timezone: "Europe/Berlin",
+    });
+    const clock = spyOn(Date, "now").mockReturnValue(now);
+    try {
+      expect(assertRunnable(dir, { mode: "run" })).toMatchObject({ timezone: "Europe/Berlin" });
+    } finally {
+      clock.mockRestore();
+    }
+    expect(foldBudget(dir, berlin, now).timezone).toBe("Europe/Berlin");
+    expect(foldBudget(dir, { every: "month", usdMicros: 10 }, now).timezone).toBe("UTC");
+    // The local day it renews on, not the UTC one.
+    expect(renewalDay("2026-11-30T23:00:00.000Z", "Europe/Berlin")).toBe("1 Dec 2026");
+    expect(renewalDay("2026-11-30T23:00:00.000Z", undefined)).toBe("30 Nov 2026");
+    expect(renewalDay("2026-11-19T23:00:00.000Z", "Europe/Berlin", { year: false })).toBe("20 Nov");
+    expect(renewalDay("2026-11-30T15:00:00.000Z", "Asia/Tokyo")).toBe("1 Dec 2026");
+    expect(renewalDay("not a date", "UTC")).toBeUndefined();
+  });
+
+  test("a state written without a zone, or with one the runtime does not know, carries none", () => {
+    const dir = tempDir();
+    plant(controlFile(dir, "budget-state.json"), jsonLine({ ...STATE, timezone: "Mars/Olympus" }));
+    const read = readBudgetState(dir);
+    expect(read.state === "present" && "timezone" in read.record).toBe(false);
   });
 
   test("assertRunnable: a run refuses with budget_exceeded even with ignorePause; start and the REPL pass", () => {

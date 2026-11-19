@@ -869,6 +869,13 @@ these on: they reach every harness that uses what each one names.
   answering with the notice, and its refusal carries `Retry-After` until the
   renewal.
 
+- **A run stopped by its own budget answers 429 `budget_exceeded` on a
+  gateway.** On a managed or gateway harness, a run that stops at its own
+  `budget.usd` cap answers HTTP 429 `budget_exceeded` with
+  `data.retryable: false` and no `Retry-After`, where it answered 500
+  `internal_error`. Sending the same request again starts a new run that
+  spends again, so a client that retries a 429 should check `retryable` first.
+
 ## [0.8.3] - 2026-11-15
 
 A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers

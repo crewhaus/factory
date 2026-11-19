@@ -311,7 +311,7 @@ describe("while the harness's budget period is used up", () => {
     expect(handled).toEqual(["runs.create"]);
   });
 
-  test("a run's own budget stop answers budget_exceeded with no retryAfter", async () => {
+  test("a run's own budget stop answers budget_exceeded, not retryable, with no retryAfter", async () => {
     const { server } = admissionServer({
       handler: async () => {
         throw new RunFailedError({
@@ -326,6 +326,7 @@ describe("while the harness's budget period is used up", () => {
       error: { code: string; data?: unknown };
     };
     expect(res.error.code).toBe(ErrorCode.BudgetExceeded);
-    expect(res.error.data).toBeUndefined();
+    expect(statusFor(res.error.code)).toBe(429);
+    expect(res.error.data).toEqual({ retryable: false });
   });
 });

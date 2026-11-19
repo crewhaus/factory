@@ -348,13 +348,17 @@ function budgetRaises(before: unknown, after: unknown): string[] {
   return raised;
 }
 
-/** How long each period lasts, for {@link periodRaises}: a shorter one renews sooner. */
-const PERIOD_LENGTH: Readonly<Record<string, number>> = { day: 1, week: 2, month: 3 };
+/** A period's zone, with the default (UTC) for an absent one. */
+function periodZone(period: Record<string, unknown>): unknown {
+  return period["timezone"] === undefined ? "UTC" : period["timezone"];
+}
 
 /**
- * The `budget.period` paths a change raises: a higher `usd`, a shorter
- * `every` (month to week to day renews the limit sooner), and a removed
- * period. A first period is a new limit, not a raise.
+ * The `budget.period` paths a change raises: a higher `usd`, a removed
+ * period, and any change to `every`, `starts` or `timezone`. Those three name
+ * the period itself, so changing one opens a different period whose spend
+ * starts at zero: a fresh limit in the middle of the current one. A first
+ * period is a new limit, not a raise.
  */
 function periodRaises(before: unknown, after: unknown): string[] {
   const was = plainObject(before);
@@ -368,11 +372,9 @@ function periodRaises(before: unknown, after: unknown): string[] {
     if (usdAfter === undefined) raised.push("budget.period.usd");
     else if (typeof usdAfter === "number" && usdAfter > usdBefore) raised.push("budget.period.usd");
   }
-  const lengthBefore = PERIOD_LENGTH[String(was["every"])];
-  const lengthAfter = PERIOD_LENGTH[String(now["every"])];
-  if (lengthBefore !== undefined && (lengthAfter === undefined || lengthAfter < lengthBefore)) {
-    raised.push("budget.period.every");
-  }
+  if (was["every"] !== now["every"]) raised.push("budget.period.every");
+  if (was["starts"] !== now["starts"]) raised.push("budget.period.starts");
+  if (periodZone(was) !== periodZone(now)) raised.push("budget.period.timezone");
   return raised;
 }
 
@@ -381,8 +383,9 @@ function periodRaises(before: unknown, after: unknown): string[] {
  * schema defaults not applied). A changed `name:` needs the name typed again,
  * because history, baselines and memory are kept under the name. Raising the
  * budget (a higher `usd`, the cap or `usd` removed, a `session` scope widened,
- * `on_exceed` moved from `stop` to `degrade`, a higher or shorter
- * `budget.period`, or the period removed) needs the security edit
+ * `on_exceed` moved from `stop` to `degrade`, a higher `budget.period.usd`,
+ * any change to the period's `every`, `starts` or `timezone` (each opens a
+ * new period whose spend starts at zero), or the period removed) needs the security edit
  * permission. A first budget and a lowered one need nothing. Loosening a
  * protected quality bar (`protectedBarChanges`) needs the security edit
  * permission too, as one escalation whose `paths` name every loosened key and

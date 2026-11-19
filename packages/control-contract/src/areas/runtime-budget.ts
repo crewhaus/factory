@@ -30,6 +30,8 @@ export const BUDGET_PERIOD_EVERY = deepFreeze(["day", "week", "month"] as const)
 export type BudgetFoldView = {
   readonly periodId: string;
   readonly every: (typeof BUDGET_PERIOD_EVERY)[number];
+  /** The IANA zone the period renews in (`UTC` by default): a renewal day is read in it. */
+  readonly timezone?: string;
   readonly startsAt: string;
   readonly renewsAt: string;
   readonly capUsdMicros: number;
@@ -44,6 +46,9 @@ export type BudgetFoldView = {
   readonly gaps: number;
 };
 
+/** What the caller may do with the period: `extend` when it holds `h.budget.extend`. */
+export type BudgetRights = { readonly extend: boolean };
+
 /** `budget.get`: the current period, or why there is none. */
 export type BudgetRead =
   | {
@@ -51,8 +56,16 @@ export type BudgetRead =
       readonly note: string;
       readonly verb: string;
       readonly fold: BudgetFoldView;
+      readonly you?: BudgetRights;
     }
-  | { readonly present: false; readonly note: string; readonly verb: string };
+  | {
+      readonly present: false;
+      readonly note: string;
+      readonly verb: string;
+      /** Why there is no period: none declared, or a spec that could not be read. */
+      readonly why?: "no_period" | "spec_unreadable";
+      readonly you?: BudgetRights;
+    };
 
 /** One closed period's summary. */
 export type BudgetPeriodView = {

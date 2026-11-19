@@ -25,7 +25,12 @@
 import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { intakeRoot } from "@crewhaus/control-records";
 import { type BudgetPeriodDef, openBudgetLedger } from "@crewhaus/control-records/budget";
-import type { PricingTable } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  type DeclaredPricing,
+  type PricingTable,
+  mergeDeclaredPricing,
+} from "@crewhaus/cost-tracker";
 import {
   type SpendMeter,
   type SpendReserveMeta,
@@ -85,17 +90,44 @@ export function attachSpendMeter(args: {
     ...(args.budget.onExceed.kind === "stop" ? { capMicros: args.budget.usdMicros } : {}),
     seedMicros: args.seedMicros,
     pricing: args.pricing,
-    ...(period !== undefined
-      ? {
-          ledger: openBudgetLedger(intakeRoot() ?? process.cwd(), period, {
-            ...(args.trigger !== undefined ? { trigger: args.trigger } : {}),
-          }),
-        }
-      : {}),
+    ...(period !== undefined ? { ledger: periodLedger(period, args.trigger) } : {}),
   });
   if (args.sharedWith !== undefined) shared.set(args.sharedWith, meter);
   meters.set(args.runContext, meter);
   return meter;
+}
+
+/**
+ * The harness's period ledger, rooted where loop admission roots, else `root` (a
+ * caller's harness directory), else the working directory.
+ */
+function periodLedger(period: BudgetPeriodDef, trigger: string | undefined, root?: string) {
+  return openBudgetLedger(intakeRoot() ?? root ?? process.cwd(), period, {
+    ...(trigger !== undefined ? { trigger } : {}),
+  });
+}
+
+/**
+ * A meter with no cap of its own over the harness's period ledger, for a
+ * caller that runs many loops under one budget of its own (an eval's samples)
+ * and hands each loop this meter as `spendMeter`: every call they make
+ * reserves and settles on the period, as a run's calls do.
+ *
+ * First consumer: eval-runner's sample loops.
+ */
+export function openPeriodSpendMeter(args: {
+  readonly period: BudgetPeriodDef;
+  /** The spec's declared prices, merged over the installed table as a run merges them. */
+  readonly declaredPricing?: DeclaredPricing;
+  /** What started the spend, recorded on the ledger. */
+  readonly trigger?: string;
+  /** The harness directory, when loop admission has none (the spec's own directory). */
+  readonly root?: string;
+}): SpendMeter {
+  return createSpendMeter({
+    pricing: mergeDeclaredPricing(DEFAULT_PRICING, args.declaredPricing),
+    ledger: periodLedger(args.period, args.trigger, args.root),
+  });
 }
 
 /** Characters of what a request sends: its system, messages and tools, serialized. */
@@ -121,22 +153,68 @@ export function estimateRequestMicros(
   );
 }
 
+/** The error an aborted wait for a reservation ends with: the loop reads it as an abort. */
+function abortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error && reason.name === "AbortError") return reason;
+  const err = new Error("the run was stopped while its model call waited for budget");
+  err.name = "AbortError";
+  return err;
+}
+
+/** `settled`, or the signal's abort, whichever comes first; throws on the abort. */
+function untilSettledOrAborted(settled: Promise<void>, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    settled.then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 /**
  * Reserve call `id` before it is dispatched. Waits while only other calls'
- * reservations stand in the way (each ends on its own deadline) and asks
- * again; answers which cap refused when spend so far reaches one.
+ * reservations stand in the way and asks again; answers which cap refused
+ * when spend so far reaches one. The wait ends when `signal` aborts (the
+ * run's stop, its deadline, the turn's timeout), throwing an `AbortError`;
+ * and the period ledger itself answers finally once only reservations past
+ * their lease are left (`held`), so the wait is bounded by those leases.
  */
 export async function reserveModelCall(
   meter: SpendMeter,
   id: string,
   estimateMicros: number | undefined,
   meta: SpendReserveMeta,
-): Promise<{ readonly admitted: true } | { readonly admitted: false; readonly scope: SpendScope }> {
+  signal: AbortSignal,
+): Promise<
+  | { readonly admitted: true }
+  | { readonly admitted: false; readonly scope: SpendScope; readonly held?: true }
+> {
   for (;;) {
+    if (signal.aborted) throw abortError(signal);
     const answer = await meter.reserve(id, estimateMicros, meta);
-    if (answer.admit) return { admitted: true };
-    if (answer.on === "spent") return { admitted: false, scope: answer.scope ?? "run" };
-    await answer.settled;
+    if (answer.admit) {
+      if (!signal.aborted) return { admitted: true };
+      await meter.release(id);
+      throw abortError(signal);
+    }
+    if (answer.on === "spent") {
+      return {
+        admitted: false,
+        scope: answer.scope ?? "run",
+        ...(answer.held === true ? { held: true as const } : {}),
+      };
+    }
+    await untilSettledOrAborted(answer.settled, signal);
   }
 }
 

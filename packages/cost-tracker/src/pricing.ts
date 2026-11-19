@@ -59,6 +59,16 @@ export type PricingTable = {
    * {@link effectiveSunsets} (feed.ts). Absent on the built-in table.
    */
   readonly sunsets?: SunsetTable;
+  /**
+   * Prices a harness declares for its own models, per provider, keyed by the
+   * exact wire id (a Bedrock id without its geo segment). Unlike `providers`,
+   * whose keys are family prefixes, a declared row prices only the model it
+   * names: {@link resolvePricing} looks it up by exact id, before the prefix
+   * walk. Built by {@link mergeDeclaredPricing}; absent on every other table.
+   */
+  readonly declared?: {
+    readonly [P in ProviderId]?: Readonly<Record<string, PricingRow>>;
+  };
 };
 
 /**
@@ -281,9 +291,12 @@ export function resolvePricing(
   provider: ProviderId,
   modelId: string,
 ): PricingRow | undefined {
+  const bareId = provider === "bedrock" ? modelId.replace(BEDROCK_GEO_PREFIX, "") : modelId;
+  // A declared price names one model exactly; it never prices a model whose id merely extends it.
+  const declared = table.declared?.[provider];
+  if (declared !== undefined && Object.hasOwn(declared, bareId)) return declared[bareId];
   const providerTable = table.providers[provider];
   if (!providerTable) return undefined;
-  const bareId = provider === "bedrock" ? modelId.replace(BEDROCK_GEO_PREFIX, "") : modelId;
   // Sort prefixes longest-first for deterministic specificity.
   const prefixes = Object.keys(providerTable).sort((a, b) => b.length - a.length);
   for (const prefix of prefixes) {
@@ -420,12 +433,13 @@ export function declaredPricingKey(
 }
 
 /**
- * The effective table: each declared row merged over `table` under the
- * `(provider, wire id)` {@link declaredPricingKey} gives it, so
- * {@link resolvePricing} finds it for that model's calls (a declared `$0`
- * included: it is a known price). A declared row replaces a table row with
- * the same key; a model string the router would refuse is skipped. Pure:
- * `table` is not changed, and with nothing declared it is returned as is.
+ * The effective table: each declared row added to `table` under the
+ * `(provider, wire id)` {@link declaredPricingKey} gives it, in the table's
+ * exact-match `declared` map, so {@link resolvePricing} finds it for that
+ * model's calls and for no other model (a declared `$0` included: it is a
+ * known price). A declared row wins over a table row for the same model; a
+ * model string the router would refuse is skipped. Pure: `table` is not
+ * changed, and with nothing declared it is returned as is.
  */
 export function mergeDeclaredPricing(
   table: PricingTable,
@@ -434,16 +448,16 @@ export function mergeDeclaredPricing(
   if (declared === undefined) return table;
   const entries = Object.entries(declared);
   if (entries.length === 0) return table;
-  const providers: Record<string, Record<string, PricingRow>> = {};
-  for (const [provider, rows] of Object.entries(table.providers)) {
-    if (rows !== undefined) providers[provider] = { ...rows };
+  const exact: Record<string, Record<string, PricingRow>> = {};
+  for (const [provider, rows] of Object.entries(table.declared ?? {})) {
+    if (rows !== undefined) exact[provider] = { ...rows };
   }
   for (const [modelString, row] of entries) {
     const key = declaredPricingKey(modelString);
     if (key === undefined) continue;
-    const rows = providers[key.provider] ?? {};
+    const rows = exact[key.provider] ?? {};
     rows[key.modelId] = row;
-    providers[key.provider] = rows;
+    exact[key.provider] = rows;
   }
-  return { ...table, providers: providers as PricingTable["providers"] };
+  return { ...table, declared: exact as NonNullable<PricingTable["declared"]> };
 }

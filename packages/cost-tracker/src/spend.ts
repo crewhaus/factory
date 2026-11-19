@@ -49,8 +49,16 @@ export type SpendAdmission =
   /**
    * Spend so far alone reaches a cap: waiting cannot help. `scope` says
    * which cap (the meter sets it; a ledger's own answer may omit it).
+   * `held` (period scope only): the cap is reached only with reservations
+   * past their lease whose holders cannot be proved gone; they still count,
+   * and nothing would ever settle them, so the answer is final.
    */
-  | { readonly admit: false; readonly on: "spent"; readonly scope?: SpendScope }
+  | {
+      readonly admit: false;
+      readonly on: "spent";
+      readonly scope?: SpendScope;
+      readonly held?: true;
+    }
   /**
    * Only other calls' reservations stand in the way: `settled` resolves when
    * one of them settles or releases, and the caller asks again. It never
@@ -231,7 +239,13 @@ function meterFor(
       }
       if (!answer.admit) {
         drop(id);
-        return answer.on === "spent" ? { admit: false, on: "spent", scope: "period" } : answer;
+        if (answer.on !== "spent") return answer;
+        return {
+          admit: false,
+          on: "spent",
+          scope: "period",
+          ...(answer.held === true ? { held: true as const } : {}),
+        };
       }
       onLedger.add(id);
       return answer;

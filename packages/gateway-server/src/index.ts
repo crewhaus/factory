@@ -472,7 +472,12 @@ export const PAUSED_RETRY_AFTER_SECONDS = 30;
  */
 function intakeClosedError(
   id: string,
-  closed: { readonly code: string; readonly notice: string | null; readonly retryAfter?: number },
+  closed: {
+    readonly code: string;
+    readonly notice: string | null;
+    readonly retryAfter?: number;
+    readonly final?: true;
+  },
 ): ResponseEnvelopeT {
   const retryAfter =
     closed.retryAfter ??
@@ -483,7 +488,11 @@ function intakeClosedError(
     id,
     closed.code,
     closed.notice ?? `${closed.code} by its operator`,
-    retryAfter !== undefined ? { retryAfter } : undefined,
+    retryAfter !== undefined
+      ? { retryAfter }
+      : closed.final === true
+        ? { retryable: false }
+        : undefined,
   );
 }
 
@@ -491,12 +500,14 @@ function intakeClosedError(
  * A loop the runtime refused at its start because intake closed meanwhile: a
  * `RunFailedError` whose report class is `paused` or `disabled`, or
  * `crewhaus_budget` (a used-up budget period, or the run's own cap), which
- * answers the wire code `budget_exceeded`. Checked by shape, not
- * `instanceof`, because a bundle can carry two copies of `@crewhaus/errors`.
+ * answers the wire code `budget_exceeded` marked `final`: the run stopped on
+ * spend, so sending the same request again would only start another run and
+ * spend again. Checked by shape, not `instanceof`, because a bundle can carry
+ * two copies of `@crewhaus/errors`.
  */
 function intakeRefusalOf(
   err: unknown,
-): { readonly code: string; readonly notice: string | null } | undefined {
+): { readonly code: string; readonly notice: string | null; readonly final?: true } | undefined {
   const report = (err as { report?: { class?: unknown; detail?: unknown } } | null | undefined)
     ?.report;
   if (typeof report !== "object" || report === null) return undefined;
@@ -510,6 +521,7 @@ function intakeRefusalOf(
   return {
     code,
     notice: typeof report.detail === "string" ? report.detail : null,
+    ...(code === ErrorCode.BudgetExceeded ? { final: true as const } : {}),
   };
 }
 
@@ -1161,8 +1173,10 @@ export function statusFor(code: string): number {
  *     the runtime refused at its start) → that code, as `handleEnvelope`
  *     answers it
  *   - a `RunFailedError` whose report class is `crewhaus_budget` (a used-up
- *     budget period, or the run's own cap stop) → `budget_exceeded`, with no
- *     `retryAfter`: a run's own cap has no renewal to wait for
+ *     budget period, or the run's own cap stop) → `budget_exceeded` (HTTP
+ *     429), with no `retryAfter` and `data.retryable: false`: a run's own cap
+ *     has no renewal to wait for, and sending the request again starts a new
+ *     run that spends again
  *   - a `GatewayCodedError` with `input_blocked`, `unsupported`,
  *     `bad_request` or `conflict` (a managed-runs handler that recorded a
  *     refused input, a method this daemon does not serve, params it refuses,

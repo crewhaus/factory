@@ -4,6 +4,7 @@
  * (`@crewhaus/control-records/budget`), and the share of the period used, for the
  * harness signal. Reads only: nothing here writes a file.
  */
+import { BUDGET_EXTEND_REASONS } from "@crewhaus/control-contract";
 import {
   type BudgetFold,
   type BudgetPeriodDef,
@@ -14,28 +15,50 @@ import {
 } from "@crewhaus/control-records/budget";
 import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
 
-/** The period a spec text declares, or `undefined` for none (or one it cannot use). */
-export function declaredBudgetPeriod(yamlText: string): BudgetPeriodDef | undefined {
+/**
+ * What a spec text says about its period. "Could not tell" is not "none": a spec that
+ * could not be read (`undefined`), does not parse, or declares a period the runtime
+ * cannot use answers `unreadable`; only a readable spec without `budget.period` answers
+ * `none`.
+ */
+export type SpecBudgetPeriod =
+  | { readonly kind: "period"; readonly def: BudgetPeriodDef }
+  | { readonly kind: "none" }
+  | { readonly kind: "unreadable" };
+
+/** The period a spec text declares; `undefined` text is a spec that could not be read. */
+export function budgetPeriodOf(yamlText: string | undefined): SpecBudgetPeriod {
+  if (yamlText === undefined) return { kind: "unreadable" };
   let doc: unknown;
   try {
     doc = parseYamlOnly(yamlText);
   } catch {
-    return undefined;
+    return { kind: "unreadable" };
   }
-  const period = (doc as { budget?: { period?: Record<string, unknown> } } | null)?.budget?.period;
-  if (typeof period !== "object" || period === null) return undefined;
-  const every = period["every"];
-  const usd = period["usd"];
+  const budget = (doc as { budget?: unknown } | null)?.budget;
+  if (typeof budget !== "object" || budget === null) return { kind: "none" };
+  if (!Object.hasOwn(budget, "period")) return { kind: "none" };
+  const period = (budget as { period?: unknown }).period;
+  if (typeof period !== "object" || period === null) return { kind: "unreadable" };
+  const fields = period as Record<string, unknown>;
+  const every = fields["every"];
+  const usd = fields["usd"];
   if ((every !== "day" && every !== "week" && every !== "month") || typeof usd !== "number") {
-    return undefined;
+    return { kind: "unreadable" };
   }
   const def: BudgetPeriodDef = {
     every,
     usdMicros: Math.round(usd * 1_000_000),
-    ...(typeof period["starts"] === "string" ? { starts: period["starts"] } : {}),
-    ...(typeof period["timezone"] === "string" ? { timezone: period["timezone"] } : {}),
+    ...(typeof fields["starts"] === "string" ? { starts: fields["starts"] } : {}),
+    ...(typeof fields["timezone"] === "string" ? { timezone: fields["timezone"] } : {}),
   };
-  return budgetPeriodProblem(def) === undefined ? def : undefined;
+  return budgetPeriodProblem(def) === undefined ? { kind: "period", def } : { kind: "unreadable" };
+}
+
+/** The period a spec text declares, or `undefined` for none or one that cannot be read. */
+export function declaredBudgetPeriod(yamlText: string): BudgetPeriodDef | undefined {
+  const read = budgetPeriodOf(yamlText);
+  return read.kind === "period" ? read.def : undefined;
 }
 
 /** How long a harness's fold is reused for the fleet-wide signal. */
@@ -79,12 +102,24 @@ export function budgetUsedRatio(
   return ratio;
 }
 
-/** The CLI twin of each budget read and of the raise. */
-export const BUDGET_VERBS = {
-  show: "crewhaus budget show",
-  history: "crewhaus budget history",
-  extend: "crewhaus budget extend --usd <amount> --reason <code>",
-} as const;
+/**
+ * The exact CLI twin of each budget read and of the raise, for the harness `harness`
+ * names (its id): run from anywhere, each reaches that harness, not the working
+ * directory.
+ */
+export function budgetVerbs(harness: string): {
+  readonly show: string;
+  readonly history: string;
+  readonly extend: string;
+} {
+  const at = `--harness ${harness}`;
+  const reasons = `<${BUDGET_EXTEND_REASONS.join("|")}>`;
+  return {
+    show: `crewhaus budget show ${at}`,
+    history: `crewhaus budget history ${at}`,
+    extend: `crewhaus budget extend ${at} --usd <amount> --reason ${reasons}`,
+  };
+}
 
 /** `budget.get`: the current period's fold, or why there is none. */
 export type BudgetRead =
@@ -94,19 +129,43 @@ export type BudgetRead =
       readonly verb: string;
       readonly fold: BudgetFold;
     }
-  | { readonly present: false; readonly note: string; readonly verb: string };
+  | {
+      readonly present: false;
+      readonly note: string;
+      readonly verb: string;
+      /** Why there is no fold: no period declared, or a spec that could not be read. */
+      readonly why: "no_period" | "spec_unreadable";
+    };
 
-/** The current period's fold for Home, answered `{present, note, verb}`. Reads only. */
-export function readBudget(harnessDir: string, yamlText: string, nowMs: number): BudgetRead {
-  const def = declaredBudgetPeriod(yamlText);
-  if (def === undefined) {
+/**
+ * The current period's fold for Home, answered `{present, note, verb}`. `yamlText` is
+ * `undefined` when the spec could not be read. Reads only.
+ */
+export function readBudget(
+  harnessDir: string,
+  yamlText: string | undefined,
+  nowMs: number,
+  harness: string,
+): BudgetRead {
+  const verbs = budgetVerbs(harness);
+  const read = budgetPeriodOf(yamlText);
+  if (read.kind === "unreadable") {
     return {
       present: false,
-      note: "No spending limit for a period: each run keeps only its own cap.",
-      verb: BUDGET_VERBS.show,
+      why: "spec_unreadable",
+      note: "The harness's spec could not be read, so its spending limit is unknown. Lint it in the harness's directory to see why.",
+      verb: "crewhaus lint crewhaus.yaml",
     };
   }
-  const fold = foldBudget(harnessDir, def, nowMs);
+  if (read.kind === "none") {
+    return {
+      present: false,
+      why: "no_period",
+      note: "No spending limit for a period: each run keeps only its own cap.",
+      verb: verbs.show,
+    };
+  }
+  const fold = foldBudget(harnessDir, read.def, nowMs);
   return {
     present: true,
     note: fold.exhausted
@@ -114,13 +173,16 @@ export function readBudget(harnessDir: string, yamlText: string, nowMs: number):
       : fold.unknownCalls > 0
         ? "Some calls have no price, so the spend shown is a lower bound."
         : "Spend so far this period.",
-    verb: BUDGET_VERBS.show,
+    verb: verbs.show,
     fold,
   };
 }
 
 /** `budget.periods`: the closed periods' summaries, newest first. Reads only. */
-export function readBudgetHistory(harnessDir: string):
+export function readBudgetHistory(
+  harnessDir: string,
+  harness: string,
+):
   | {
       readonly present: true;
       readonly note: string;
@@ -129,19 +191,20 @@ export function readBudgetHistory(harnessDir: string):
       readonly gaps: number;
     }
   | { readonly present: false; readonly note: string; readonly verb: string } {
+  const verbs = budgetVerbs(harness);
   const read = readBudgetPeriods(harnessDir);
   if (read.periods.length === 0) {
     return {
       present: false,
       note: "No period has closed yet.",
-      verb: BUDGET_VERBS.history,
+      verb: verbs.history,
     };
   }
   return {
     present: true,
     note:
       read.gaps > 0 ? "Some summary lines could not be read and are left out." : "Closed periods.",
-    verb: BUDGET_VERBS.history,
+    verb: verbs.history,
     periods: [...read.periods].reverse(),
     gaps: read.gaps,
   };

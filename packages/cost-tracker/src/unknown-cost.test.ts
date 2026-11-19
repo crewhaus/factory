@@ -200,5 +200,21 @@ describe("declared prices", () => {
       outputPer1M: 1,
     });
     expect(resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4")?.inputPer1M).toBe(15);
+    // It names that model only: a longer id in the family keeps the table's price.
+    expect(resolvePricing(merged, "anthropic", "claude-opus-4-1")).toEqual(
+      resolvePricing(DEFAULT_PRICING, "anthropic", "claude-opus-4-1"),
+    );
+  });
+
+  test("a declared price prices only the model it names, never one whose id extends it", () => {
+    const merged = mergeDeclaredPricing(DEFAULT_PRICING, {
+      "local/qwen3@http://127.0.0.1:11434/v1": { inputPer1M: 0, outputPer1M: 0 },
+    });
+    expect(resolvePricing(merged, "openai", "qwen3")).toEqual({ inputPer1M: 0, outputPer1M: 0 });
+    for (const other of ["qwen3-coder", "qwen3@x", "qwen3-coder@http://127.0.0.1:11434/v1"]) {
+      expect(resolvePricing(merged, "openai", other)).toBeUndefined();
+    }
+    // An inherited name is not a declared model.
+    expect(resolvePricing(merged, "openai", "constructor")).toBeUndefined();
   });
 });

@@ -36,6 +36,8 @@ export type RunnableVerdict =
       /** The used-up budget period, and when it renews. */
       readonly periodId?: string;
       readonly renewsAt?: string;
+      /** The zone the period renews in, when the spec names one. */
+      readonly timezone?: string;
     };
 
 type OperatorReason = Extract<IntakeReason, { kind: "operator" }>;
@@ -89,6 +91,7 @@ export function assertRunnable(
       reason: "budget",
       periodId: budget.periodId,
       renewsAt: budget.renewsAt,
+      ...(budget.timezone !== undefined ? { timezone: budget.timezone } : {}),
     };
   }
 

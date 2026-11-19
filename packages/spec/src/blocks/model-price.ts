@@ -1,3 +1,4 @@
+import { declaredPricingKey } from "@crewhaus/cost-tracker/pricing";
 import { z } from "zod";
 import type { Spec } from "../index";
 import type { SpecAddIssue } from "./delta-090";
@@ -45,9 +46,21 @@ function samePrice(
 }
 
 /**
+ * The key a model's price is kept under: the `(provider, wire id)` the
+ * runtime prices its calls by, so two strings naming one model (another
+ * `@url`, another Bedrock region) share it. A string the router would refuse
+ * keys as written.
+ */
+function priceKeyOf(model: string): string {
+  const key = declaredPricingKey(model);
+  return key === undefined ? `raw\u0000${model}` : `${key.provider}\u0000${key.modelId}`;
+}
+
+/**
  * A price belongs to one model: a `cheapest` / `strongest` profile has none
- * (the model it resolves to is chosen by price), and two profiles naming the
- * same model declare the same price or only one of them does.
+ * (the model it resolves to is chosen by price), and profiles naming the same
+ * model, as the runtime prices it, declare the same price or only one of
+ * them does.
  */
 export function modelPriceIssues(data: Spec, custom: SpecAddIssue): void {
   const models = "models" in data ? data.models : undefined;
@@ -66,9 +79,10 @@ export function modelPriceIssues(data: Spec, custom: SpecAddIssue): void {
       );
       continue;
     }
-    const seen = first.get(profile.model);
+    const key = priceKeyOf(profile.model);
+    const seen = first.get(key);
     if (seen === undefined) {
-      first.set(profile.model, { name, price });
+      first.set(key, { name, price });
     } else if (!samePrice(seen.price, price)) {
       custom(
         ["models", name, "price"],

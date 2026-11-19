@@ -4648,6 +4648,10 @@ async function runRunCli(
       // 0.6.0 — the flag overrides the ceiling only; the spec's `scope`
       // (when declared) rides along like its `on_exceed` ladder does.
       ...(ir.target === "cli" && ir.budget?.scope !== undefined ? { scope: ir.budget.scope } : {}),
+      // The harness's period is not this run's to drop: the run still reserves against it.
+      ...(ir.target === "cli" && ir.budget?.period !== undefined
+        ? { period: ir.budget.period }
+        : {}),
     };
   } else if (ir.target === "cli" && ir.budget !== undefined) {
     runBudget = ir.budget;

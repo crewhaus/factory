@@ -17,7 +17,7 @@
  * time come from the caller. No new dependency.
  */
 import { createHash } from "node:crypto";
-import { closeSync, readdirSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
+import { closeSync, lstatSync, readdirSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
@@ -176,10 +176,23 @@ export function budgetPeriodProblem(def: BudgetPeriodDef): string | undefined {
   return undefined;
 }
 
-/** The short digest a definition with a declared anchor or zone carries in its period id. */
+/**
+ * The short digest a definition carries in its period id when its grid is not
+ * the default one. Only what changes the grid counts: the zone when it is not
+ * UTC (an explicit `UTC` is the default), a monthly anchor day other than the
+ * 1st, a weekly anchor off the Monday grid. A daily period ignores `starts`.
+ */
 function definitionTag(def: BudgetPeriodDef): string {
-  if (def.starts === undefined && def.timezone === undefined) return "";
-  const text = `${def.every}|${def.starts ?? ""}|${def.timezone ?? "UTC"}`;
+  const tz = def.timezone ?? "UTC";
+  const anchor = def.starts !== undefined ? parseIsoDate(def.starts) : undefined;
+  let grid = "";
+  if (anchor !== undefined && def.every === "month" && anchor.d !== 1) grid = `d${anchor.d}`;
+  if (anchor !== undefined && def.every === "week") {
+    const shift = (((dayNumber(anchor) - DEFAULT_WEEK_ANCHOR) % 7) + 7) % 7;
+    if (shift !== 0) grid = `w${shift}`;
+  }
+  if (tz === "UTC" && grid === "") return "";
+  const text = `${def.every}|${grid}|${tz}`;
   return `-${createHash("sha256").update(text).digest("hex").slice(0, 6)}`;
 }
 
@@ -292,6 +305,12 @@ export type BudgetLine = {
 export type BudgetFold = {
   readonly periodId: string;
   readonly every: BudgetEvery;
+  /**
+   * The IANA zone the period starts and renews in (`UTC` when the spec names
+   * none). A renewal date is read in this zone: a period that renews at local
+   * midnight renews on that local day.
+   */
+  readonly timezone: string;
   readonly startsAt: string;
   readonly renewsAt: string;
   readonly capUsdMicros: number;
@@ -356,11 +375,21 @@ function applyLine(state: FoldState, line: Record<string, unknown>): void {
   }
 }
 
-/** Whether a reservation still counts: until its holder is provably dead AND its lease has passed. */
-function stillCounts(r: Active, nowMs: number, probe: LeaseProbe, host: string): boolean {
+/**
+ * Where a reservation stands: `live` inside its lease; `held` past its lease
+ * while its holder is not provably dead (it still counts, but nothing can be
+ * waited for); `gone` once its holder is provably dead and its lease has
+ * passed (it no longer counts).
+ */
+function standing(
+  r: Active,
+  nowMs: number,
+  probe: LeaseProbe,
+  host: string,
+): "live" | "held" | "gone" {
   const leaseLive = r.leaseUntilMs === undefined || nowMs < r.leaseUntilMs;
-  if (leaseLive) return true;
-  if (r.holder === undefined || typeof r.holder.pid !== "number") return false;
+  if (leaseLive) return "live";
+  if (r.holder === undefined || typeof r.holder.pid !== "number") return "gone";
   const dead = holderProvablyDead(
     {
       pid: r.holder.pid,
@@ -370,7 +399,12 @@ function stillCounts(r: Active, nowMs: number, probe: LeaseProbe, host: string):
     probe,
     host,
   );
-  return !dead;
+  return dead ? "gone" : "held";
+}
+
+/** Whether a reservation still counts: until its holder is provably dead AND its lease has passed. */
+function stillCounts(r: Active, nowMs: number, probe: LeaseProbe, host: string): boolean {
+  return standing(r, nowMs, probe, host) !== "gone";
 }
 
 /** Bytes a fold reads per segment at most; past it the fold reports `truncated`. */
@@ -447,6 +481,7 @@ function summarize(
   return {
     periodId: period.periodId,
     every: def.every,
+    timezone: def.timezone ?? "UTC",
     startsAt: period.startsAt,
     renewsAt: period.renewsAt,
     capUsdMicros: def.usdMicros,
@@ -485,6 +520,30 @@ export function foldBudget(
   );
 }
 
+/**
+ * The day a period renews, as a person reads it: `1 Dec 2026` (`1 Dec` with
+ * `year: false`), in the period's own zone, so a period that renews at local
+ * midnight names that local day. An unknown zone reads in UTC; an instant that
+ * does not parse answers `undefined`.
+ *
+ * First consumers: `crewhaus budget`, the CLI's refusal line.
+ */
+export function renewalDay(
+  renewsAt: string | undefined,
+  timezone: string | undefined,
+  options: { readonly year?: boolean } = {},
+): string | undefined {
+  const at = renewsAt === undefined ? Number.NaN : Date.parse(renewsAt);
+  if (!Number.isFinite(at)) return undefined;
+  const timeZone = timezone !== undefined && isKnownTimeZone(timezone) ? timezone : "UTC";
+  return new Date(at).toLocaleDateString("en-GB", {
+    day: "numeric",
+    month: "short",
+    ...(options.year === false ? {} : { year: "numeric" as const }),
+    timeZone,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Exhaustion state
 // ---------------------------------------------------------------------------
@@ -494,6 +553,8 @@ export type BudgetState = {
   readonly periodId: string;
   readonly exhaustedAt: string;
   readonly renewsAt: string;
+  /** The zone the period renews in, when the spec names one: a reader shows the renewal day in it. */
+  readonly timezone?: string;
 };
 
 export type BudgetStateRead =
@@ -530,7 +591,17 @@ export function readBudgetState(harnessDir: string): BudgetStateRead {
   ) {
     return { state: "unreadable", reason: "the budget state is not a budget state record" };
   }
-  return { state: "present", record: { v: 1, periodId, exhaustedAt, renewsAt } };
+  const timezone = body["timezone"];
+  return {
+    state: "present",
+    record: {
+      v: 1,
+      periodId,
+      exhaustedAt,
+      renewsAt,
+      ...(typeof timezone === "string" && isKnownTimeZone(timezone) ? { timezone } : {}),
+    },
+  };
 }
 
 export type BudgetStateWrite =
@@ -548,6 +619,7 @@ export function writeBudgetState(harnessDir: string, record: BudgetState): Budge
       periodId: record.periodId,
       exhaustedAt: record.exhaustedAt,
       renewsAt: record.renewsAt,
+      ...(record.timezone !== undefined ? { timezone: record.timezone } : {}),
     };
     const written = writeFileSafe(harnessDir, rel, `${JSON.stringify(body)}\n`, {
       overwrite: true,
@@ -580,7 +652,12 @@ export function clearBudgetState(harnessDir: string): BudgetStateWrite {
 /** How a refusal answers, matching the spend meter's admission. */
 export type BudgetAdmission =
   | { readonly admit: true }
-  | { readonly admit: false; readonly on: "spent" }
+  /**
+   * The period's cap is reached. `held` says it is reached only because of
+   * reservations past their lease whose holders are not provably dead: they
+   * still count, but no settle can be waited for, so the answer is final.
+   */
+  | { readonly admit: false; readonly on: "spent"; readonly held?: true }
   | { readonly admit: false; readonly on: "others"; readonly settled: Promise<void> };
 
 /** What a reservation names, content-free. */
@@ -610,6 +687,7 @@ export type BudgetLedgerOptions = {
 
 /** The port the spend meter reserves the period through (cost-tracker's `SpendLedgerPort`). */
 export type BudgetLedgerPort = {
+  /** The period a reserve made now lands in. */
   readonly periodId: string;
   reserve(entry: {
     readonly id: string;
@@ -628,10 +706,25 @@ export type BudgetLedgerPort = {
 const DEFAULT_LEASE_MS = 15 * 60_000;
 const DEFAULT_RETRY_MS = 250;
 
+/** One period's ledger as a spending process holds it. */
+type OpenPeriod = {
+  readonly period: BudgetPeriod;
+  readonly ledger: Ledger;
+  readonly reader: PeriodReader;
+};
+
 /**
- * Open the period ledger for one spending process. The period is fixed at
- * open (a run that crosses a renewal settles into the period it reserved in);
- * a reserve refused on the period cap writes `budget-state.json`.
+ * Open the period ledger for one spending process. Each reserve lands in the
+ * period the clock is in when it is made, so a process that runs across a
+ * renewal reserves into the new period; a settle or release goes to the
+ * period its reservation was made in. A reserve refused on the period cap
+ * writes `budget-state.json`.
+ *
+ * A reservation records its holder's pid, host and (when the probe can tell)
+ * start time, so a recycled pid is provably another process. A refusal that
+ * only reservations past their lease stand in the way of is final
+ * (`on: "spent"`, `held: true`): nothing would ever settle them, so waiting
+ * could not end.
  *
  * First consumers: runtime-core's spend meter and the optimizer's mutation calls.
  */
@@ -644,11 +737,22 @@ export function openBudgetLedger(
   const probe = options.probe ?? defaultLeaseProbe;
   const host = options.host ?? hostname();
   const pid = options.pid ?? process.pid;
+  const startedAt = probe.startTimeMs(pid);
+  const holder = { pid, ...(startedAt !== undefined ? { startedAt } : {}), host };
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const retryMs = options.retryMs ?? DEFAULT_RETRY_MS;
-  const period = periodOf(def, now());
-  const ledger = budgetLedger(harnessDir, period.periodId);
-  const reader = periodReader(ledger);
+  let open: OpenPeriod | undefined;
+  /** The period in effect at `nowMs`: a new ledger and reader once the period renews. */
+  const periodAt = (nowMs: number): OpenPeriod => {
+    const period = periodOf(def, nowMs);
+    if (open === undefined || open.period.periodId !== period.periodId) {
+      const ledger = budgetLedger(harnessDir, period.periodId);
+      open = { period, ledger, reader: periodReader(ledger) };
+    }
+    return open;
+  };
+  /** Each open reservation's period, so its settle or release lands where it was made. */
+  const reservedIn = new Map<string, OpenPeriod>();
   const at = (): string => new Date(now()).toISOString();
   const lineOf = (
     op: BudgetLine["op"],
@@ -673,14 +777,21 @@ export function openBudgetLedger(
       const timer = setTimeout(resolve, retryMs);
       (timer as { unref?: () => void }).unref?.();
     });
-  const appendOrThrow = (line: BudgetLine): void => {
-    const written = append(ledger, line);
+  /** Append a settle or release to the period `id` was reserved in (the current one if unknown). */
+  const appendFor = (id: string, line: BudgetLine): void => {
+    const where = reservedIn.get(id) ?? periodAt(now());
+    reservedIn.delete(id);
+    const written = append(where.ledger, line);
     if (!written.ok) throw new Error(`budget ledger: ${written.reason}`);
   };
 
   return {
-    periodId: period.periodId,
+    get periodId() {
+      return periodAt(now()).period.periodId;
+    },
     async reserve({ id, usdMicros, meta }) {
+      const target = periodAt(now());
+      const { period, ledger, reader } = target;
       const answer = await withLedgerLock(ledger, (lockedAppend): BudgetAdmission => {
         const state = reader.read();
         const nowMs = now();
@@ -692,35 +803,50 @@ export function openBudgetLedger(
             periodId: period.periodId,
             exhaustedAt: new Date(nowMs).toISOString(),
             renewsAt: period.renewsAt,
+            ...(def.timezone !== undefined ? { timezone: def.timezone } : {}),
           });
           return { admit: false, on: "spent" };
         }
-        const own = state.active.get(id);
-        const others =
-          fold.reservedUsdMicros -
-          (own !== undefined && stillCounts(own, nowMs, probe, host) ? own.usdMicros : 0);
-        if (fold.spentUsdMicros + others >= cap) {
-          return { admit: false, on: "others", settled: wait() };
+        let live = 0;
+        let held = 0;
+        for (const [rid, r] of state.active) {
+          if (rid === id) continue;
+          const where = standing(r, nowMs, probe, host);
+          if (where === "live") live += r.usdMicros;
+          else if (where === "held") held += r.usdMicros;
+        }
+        if (fold.spentUsdMicros + live + held >= cap) {
+          // A reservation inside its lease settles, releases or passes its lease, so
+          // the wait is bounded by the leases; past them only `held` ones are left.
+          if (live > 0) {
+            return { admit: false, on: "others", settled: wait() };
+          }
+          return { admit: false, on: "spent", held: true };
         }
         const written = lockedAppend({
           ...lineOf("reserve", id, Math.max(0, usdMicros), meta),
-          holder: { pid, host },
+          holder,
           leaseUntil: new Date(nowMs + leaseMs).toISOString(),
         });
         if (!written.ok) throw new Error(`budget ledger: ${written.reason}`);
         return { admit: true };
       });
-      if ("admit" in answer) return answer;
+      if ("admit" in answer) {
+        if (answer.admit) reservedIn.set(id, target);
+        return answer;
+      }
       throw new Error(`budget ledger: ${answer.reason}`);
     },
     async settle({ id, usdMicros, meta }) {
-      appendOrThrow(lineOf("settle", id, usdMicros, meta));
+      appendFor(id, lineOf("settle", id, usdMicros, meta));
     },
     async release(id) {
-      appendOrThrow(lineOf("release", id, null, undefined));
+      appendFor(id, lineOf("release", id, null, undefined));
     },
     fold() {
-      return summarize(def, period, reader.read(), now(), probe, host);
+      const nowMs = now();
+      const { period, reader } = periodAt(nowMs);
+      return summarize(def, period, reader.read(), nowMs, probe, host);
     },
   };
 }
@@ -847,10 +973,12 @@ export function sweepBudgetPeriods(
 ): { readonly summarized: readonly string[]; readonly removed: readonly string[] } {
   const current = periodOf(def, nowMs).periodId;
   const paths = budgetPaths(harnessDir);
-  const at = resolveContained(harnessDir, paths.budgetDir, { followLeaf: false });
+  // The budget directory itself, followed and still inside the harness.
+  const at = resolveContained(harnessDir, paths.budgetDir);
   if (!at.ok) return { summarized: [], removed: [] };
   let names: string[];
   try {
+    if (!lstatSync(at.real).isDirectory()) return { summarized: [], removed: [] };
     names = readdirSync(at.real);
   } catch {
     return { summarized: [], removed: [] };
@@ -860,6 +988,8 @@ export function sweepBudgetPeriods(
   const removed: string[] = [];
   for (const name of names.sort()) {
     if (!isPeriodId(name) || name === current) continue;
+    // Only a real directory is a period: a link, or anything else, is never read or emptied.
+    if (!isPlainDirectory(join(at.real, name))) continue;
     const span = periodSpan(name);
     if (span === undefined) continue;
     // Closed: the period cannot still be running (a generous bound, never early).
@@ -891,16 +1021,46 @@ export function sweepBudgetPeriods(
     }
     // Summarized: its segments go once the period after it has closed too.
     if (nowMs < span.startMs + (2 * span.spanDays + 1) * DAY_MS) continue;
-    const segDir = resolveContained(harnessDir, join(paths.budgetDir, name), { followLeaf: false });
-    if (!segDir.ok) continue;
-    try {
-      // One flat directory of segments: unlink each file, then the directory.
-      for (const file of readdirSync(segDir.real)) unlinkSync(join(segDir.real, file));
-      rmdirSync(segDir.real);
-      removed.push(name);
-    } catch {
-      // Left for the next sweep.
-    }
+    if (removePeriodDir(harnessDir, paths.budgetDir, at.real, name)) removed.push(name);
   }
   return { summarized, removed };
+}
+
+/** Whether `abs` is a directory itself, not a link to one. */
+function isPlainDirectory(abs: string): boolean {
+  try {
+    const st = lstatSync(abs);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove one closed period's directory: only when it is a real directory that
+ * resolves inside the harness, and only its regular files, each judged without
+ * following it. Anything else is left, and so is the directory.
+ */
+function removePeriodDir(
+  harnessDir: string,
+  budgetRel: string,
+  budgetReal: string,
+  name: string,
+): boolean {
+  const lexical = join(budgetReal, name);
+  if (!isPlainDirectory(lexical)) return false;
+  const followed = resolveContained(harnessDir, join(budgetRel, name));
+  if (!followed.ok || followed.real !== lexical) return false;
+  try {
+    for (const file of readdirSync(lexical)) {
+      const entry = join(lexical, file);
+      if (!lstatSync(entry).isFile()) continue;
+      unlinkSync(entry);
+    }
+    rmdirSync(lexical);
+    return true;
+  } catch {
+    // Left for the next sweep.
+    return false;
+  }
 }

@@ -10,8 +10,10 @@ import { join, relative } from "node:path";
 import { openBudgetLedger } from "@crewhaus/control-records/budget";
 import {
   BUDGET_SIGNAL_TTL_MS,
+  budgetPeriodOf,
   budgetSignalFolds,
   budgetUsedRatio,
+  budgetVerbs,
   declaredBudgetPeriod,
   readBudget,
   readBudgetHistory,
@@ -72,14 +74,43 @@ describe("the harness signal", () => {
 describe("the budget reads", () => {
   test("without a period: present false, the reason, and the verb", () => {
     const dir = harness();
-    expect(readBudget(dir, NO_PERIOD_SPEC, NOW)).toEqual({
+    expect(readBudget(dir, NO_PERIOD_SPEC, NOW, "h_1")).toEqual({
       present: false,
+      why: "no_period",
       note: "No spending limit for a period: each run keeps only its own cap.",
-      verb: "crewhaus budget show",
+      verb: "crewhaus budget show --harness h_1",
     });
-    expect(readBudgetHistory(dir)).toMatchObject({
+    expect(readBudgetHistory(dir, "h_1")).toMatchObject({
       present: false,
-      verb: "crewhaus budget history",
+      verb: "crewhaus budget history --harness h_1",
+    });
+  });
+
+  test("a spec that could not be read, does not parse or declares a period it cannot use is unknown, never no limit", () => {
+    const dir = harness();
+    for (const text of [
+      undefined,
+      "budget: [unclosed",
+      "budget:\n  usd: 5\n  period: {every: fortnight, usd: 10}\n",
+      "budget:\n  usd: 5\n  period: {every: month, usd: 10, timezone: Mars/Olympus}\n",
+      "budget:\n  usd: 5\n  period: {every: month, usd: 10, starts: 2026-01-30}\n",
+    ]) {
+      expect([text, budgetPeriodOf(text).kind]).toEqual([text, "unreadable"]);
+      const read = readBudget(dir, text, NOW, "h_1");
+      expect(read).toMatchObject({ present: false, why: "spec_unreadable" });
+      expect(read.note).not.toContain("No spending limit");
+    }
+    expect(budgetPeriodOf(NO_PERIOD_SPEC).kind).toBe("none");
+    expect(budgetPeriodOf("name: h\n").kind).toBe("none");
+    expect(budgetPeriodOf(PERIOD_SPEC).kind).toBe("period");
+  });
+
+  test("each twin names the harness, and the raise names its reasons", () => {
+    expect(budgetVerbs("h_1")).toEqual({
+      show: "crewhaus budget show --harness h_1",
+      history: "crewhaus budget history --harness h_1",
+      extend:
+        "crewhaus budget extend --harness h_1 --usd <amount> --reason <planned-work|incident|one-off|other>",
     });
   });
 
@@ -92,13 +123,13 @@ describe("the budget reads", () => {
     await ledger.reserve({ id: "rsv_a", usdMicros: 100 });
     await ledger.settle({ id: "rsv_a", usdMicros: null });
     const before = tree(dir);
-    const read = readBudget(dir, PERIOD_SPEC, NOW);
+    const read = readBudget(dir, PERIOD_SPEC, NOW, "h_1");
     expect(read.present).toBe(true);
     if (read.present) {
       expect(read.fold.unknownCalls).toBe(1);
       expect(read.note).toContain("lower bound");
     }
-    readBudgetHistory(dir);
+    readBudgetHistory(dir, "h_1");
     budgetUsedRatio(dir, PERIOD_SPEC, NOW + 10 * BUDGET_SIGNAL_TTL_MS);
     expect(tree(dir)).toEqual(before);
   });

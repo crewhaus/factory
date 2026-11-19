@@ -16,7 +16,7 @@ import type {
   StreamEvent,
 } from "@crewhaus/adapter-anthropic";
 import { registerIntakeRoot, unregisterIntakeRoot } from "@crewhaus/control-records";
-import { foldBudget } from "@crewhaus/control-records/budget";
+import { foldBudget, openBudgetLedger } from "@crewhaus/control-records/budget";
 import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
 import { createSpendMeter } from "@crewhaus/cost-tracker/spend";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
@@ -26,6 +26,7 @@ import { buildTool } from "@crewhaus/tool-builder";
 import type { BudgetUnpricedEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { runChatLoop } from "./index";
+import { reserveModelCall } from "./spend-wiring";
 
 const ROOTS: string[] = [];
 const tempDir = (label: string): string => {
@@ -289,5 +290,68 @@ describe("budget.period", () => {
     } finally {
       unregisterIntakeRoot(harness);
     }
+  });
+});
+
+describe("a reservation that waits on another process's call", () => {
+  const PERIOD = { every: "month" as const, usdMicros: 1_000 };
+  const NOW = Date.parse("2026-11-17T08:00:00Z");
+
+  test("ends when the run is stopped, and leaves nothing reserved", async () => {
+    const dir = tempDir("foreign");
+    // A call on another host, inside its lease, holds the whole period.
+    await openBudgetLedger(dir, PERIOD, {
+      now: () => NOW,
+      pid: 4,
+      host: "other-host",
+      leaseMs: 60 * 60_000,
+    }).reserve({ id: "theirs", usdMicros: 1_000 });
+    const meter = createSpendMeter({
+      pricing: DEFAULT_PRICING,
+      ledger: openBudgetLedger(dir, PERIOD, { now: () => NOW, retryMs: 5 }),
+    });
+    const stop = new AbortController();
+    let asks = 0;
+    const counting = {
+      ...meter,
+      reserve: (...args: Parameters<typeof meter.reserve>) => {
+        asks += 1;
+        if (asks === 3) stop.abort();
+        return meter.reserve(...args);
+      },
+    };
+    const waited = reserveModelCall(counting, "rsv_mine", 200, {}, stop.signal);
+    await expect(waited).rejects.toMatchObject({ name: "AbortError" });
+    expect(asks).toBe(3);
+    expect(meter.snapshot().activeReservations).toBe(0);
+    expect(foldBudget(dir, PERIOD, NOW).reservedUsdMicros).toBe(1_000);
+  });
+
+  test("an already-stopped run never reserves", async () => {
+    const meter = createSpendMeter({ pricing: DEFAULT_PRICING, capMicros: 10 });
+    const stop = new AbortController();
+    stop.abort();
+    await expect(reserveModelCall(meter, "rsv_x", 1, {}, stop.signal)).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    expect(meter.snapshot().activeReservations).toBe(0);
+  });
+
+  test("past the other call's lease the answer is a final budget refusal, not another wait", async () => {
+    const dir = tempDir("held");
+    const alive = { isAlive: () => true, startTimeMs: () => undefined };
+    await openBudgetLedger(dir, PERIOD, {
+      now: () => NOW,
+      pid: 4,
+      host: "other-host",
+      probe: alive,
+      leaseMs: 1,
+    }).reserve({ id: "theirs", usdMicros: 1_000 });
+    const meter = createSpendMeter({
+      pricing: DEFAULT_PRICING,
+      ledger: openBudgetLedger(dir, PERIOD, { now: () => NOW + 60_000, probe: alive }),
+    });
+    const answer = await reserveModelCall(meter, "rsv_mine", 200, {}, new AbortController().signal);
+    expect(answer).toEqual({ admitted: false, scope: "period", held: true });
   });
 });

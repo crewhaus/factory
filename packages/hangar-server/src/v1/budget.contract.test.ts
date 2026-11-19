@@ -82,13 +82,48 @@ describe("the budget operations", () => {
     }
   });
 
-  test("without a period: present false, the reason and the verb; nothing written", async () => {
+  test("without a period: present false, the reason and the verb for this harness; nothing written", async () => {
     const before = tree(none.dir);
     const res = await home.call("GET", path(none.id));
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ present: false, verb: "crewhaus budget show" });
+    expect(res.body).toMatchObject({
+      present: false,
+      why: "no_period",
+      verb: `crewhaus budget show --harness ${none.id}`,
+    });
     expect(String(res.body["note"])).toContain("No spending limit");
     expect(tree(none.dir)).toEqual(before);
+  });
+
+  test("a spec that cannot be read is an unknown limit, never no limit, and a raise is refused saying so", async () => {
+    const broken = await home.harness("spend-broken", {
+      specExtra: "budget:\n  usd: 5\n  period: {every: fortnight, usd: 10}",
+    });
+    const res = await home.call("GET", path(broken.id));
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      present: false,
+      why: "spec_unreadable",
+      verb: "crewhaus lint crewhaus.yaml",
+    });
+    expect(String(res.body["note"])).not.toContain("No spending limit");
+    const raise = await home.call("POST", path(broken.id, "/extensions"), {
+      body: { usd: 5, reasonCode: "incident", expect: "month-2026-11-01" },
+    });
+    expect(raise.status).toBe(409);
+    expect((raise.body["error"] as { reason?: string }).reason).toBe("spec_unreadable");
+  });
+
+  test("the answer says whether the caller may raise the limit", async () => {
+    const owner = await home.call("GET", path(a.id));
+    expect(owner.body["you"]).toEqual({ extend: true });
+    const maintainer = await home.member("Max-viewer", "maintainer");
+    const asMaintainer = await home.call("GET", path(a.id), { secret: maintainer.secret });
+    expect(asMaintainer.body["you"]).toEqual({ extend: true });
+    const operator = await home.member("Opal-viewer", "operator");
+    const asOperator = await home.call("GET", path(a.id), { secret: operator.secret });
+    expect(asOperator.status).toBe(200);
+    expect(asOperator.body["you"]).toEqual({ extend: false });
   });
 
   test("with a period: the fold and the closed periods, and every GET leaves the harness as it was", async () => {
@@ -100,6 +135,7 @@ describe("the budget operations", () => {
     const history = await home.call("GET", path(a.id, "/periods"));
     expect(history.status).toBe(200);
     expect(history.body["present"]).toBe(false);
+    expect(history.body["verb"]).toBe(`crewhaus budget history --harness ${a.id}`);
     expect(tree(a.dir)).toEqual(before);
   });
 

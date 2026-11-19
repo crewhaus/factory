@@ -24,6 +24,8 @@ export type IntakeReason =
       readonly kind: "budget";
       readonly periodId: string;
       readonly renewsAt: string;
+      /** The zone the period renews in, when the spec names one. */
+      readonly timezone?: string;
     };
 
 export type IntakeVerdict =
@@ -66,7 +68,14 @@ function budgetReasons(read: BudgetStateRead, nowMs: number): readonly IntakeRea
   if (read.state !== "present") return [];
   const renews = Date.parse(read.record.renewsAt);
   if (!(nowMs < renews)) return [];
-  return [{ kind: "budget", periodId: read.record.periodId, renewsAt: read.record.renewsAt }];
+  return [
+    {
+      kind: "budget",
+      periodId: read.record.periodId,
+      renewsAt: read.record.renewsAt,
+      ...(read.record.timezone !== undefined ? { timezone: read.record.timezone } : {}),
+    },
+  ];
 }
 
 function operatorReasons(read: OperatorRead): readonly IntakeReason[] {
