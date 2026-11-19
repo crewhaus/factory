@@ -109,7 +109,12 @@ describe("the read models", () => {
   });
 
   test("every composed projection rebuilt from records answers the same, apart from when", async () => {
-    expect(PROJECTIONS.map((p) => p.name).sort()).toEqual(["attention", "overview", "runs"]);
+    expect(PROJECTIONS.map((p) => p.name).sort()).toEqual([
+      "attention",
+      "overview",
+      "runs",
+      "work",
+    ]);
     await project();
     const first = { answers: await answers(), saved: saved() };
     expect((first.answers.list["items"] as Record<string, unknown>[])[0]?.["freshness"]).toBe(
@@ -144,10 +149,10 @@ describe("the read models", () => {
       expect(items.every((item) => item["freshness"] === "direct-fold")).toBe(true);
       const segments = opened.filter((given) => given.endsWith(".jsonl"));
       expect(segments.length).toBeGreaterThan(0);
-      // At most each of the overview's four sources' files and the inbox's own four (its
-      // two ledgers, the approvals file and the review queue), once per harness, and the
-      // approvals file once more for its count.
-      expect(segments.length).toBeLessThanOrEqual(items.length * 9);
+      // At most each of the overview's four sources' files, the inbox's own four (its two
+      // ledgers, the approvals file and the review queue) and the work model's one, once
+      // per harness, and the approvals file once more for its count.
+      expect(segments.length).toBeLessThanOrEqual(items.length * 10);
     } finally {
       _setIoTapForTest(undefined);
     }

@@ -30,11 +30,14 @@ describe("every configurable package's documented block reaches its registrar", 
         key: true,
         family: true,
       });
-      // The code-execution block is the one the spec layer constrains.
+      // The code-execution block is the one the spec layer constrains, and the work
+      // block is closed: compile refuses any key but accept and ranking.
       const [yaml, json] =
         symbol === "registerCodeExecutionConfig"
           ? ["{ defaultTimeoutMs: 1 }", '{"defaultTimeoutMs":1}']
-          : ["{ a: 1 }", '{"a":1}'];
+          : symbol === "registerWorkConfig"
+            ? ["{ accept: [fix] }", '{"accept":["fix"]}']
+            : ["{ a: 1 }", '{"a":1}'];
       const ts = file(cli(`tools: [${key}]\ntool_config:\n  ${family}: ${yaml}\n`), "agent.ts");
       expect({ symbol, emitted: ts.includes(`${symbol}(${json});`) }).toEqual({
         symbol,
@@ -44,8 +47,8 @@ describe("every configurable package's documented block reaches its registrar", 
     }
     // fetch, webFetch, codeExecution, imageGenerate, http, codehost, notify,
     // obs, defi, chainread, federationDiscover, objectstore, secure,
-    // vectorDelete, proc, token, chaincall.
-    expect(swept).toBe(17);
+    // vectorDelete, proc, token, chaincall, work.
+    expect(swept).toBe(18);
   });
 
   test("tool_config.http configures the http tools, and the README says so", () => {

@@ -529,6 +529,57 @@ describe("autoCompact — a kept summary carries its origin into the run", () =>
     expect(ctx.dataLineage?.get(own)).toBe("compaction");
     expect(ctx.dataLineage?.get(`${own}\n${input}`)).toBe("compaction");
   });
+
+  const words = ["amber", "birch", "cedar", "delta", "ember", "fjord", "grove", "harbor"];
+  /** A distinct, plain line of at least 16 characters with no credential-shaped token. */
+  const plainLine = (kind: string, i: number): string =>
+    `${kind} note ${words[i % 8]} ${words[Math.floor(i / 8) % 8]} ${words[Math.floor(i / 64) % 8]} item ${i}`;
+
+  test("a kept summary keeps every entry the run held before it, and stays within the cap", async () => {
+    const ctx = createRunContext();
+    const memoryLine = "Remembered: the finance list wants the report on Fridays.";
+    tagContent(ctx, memoryLine, "memory");
+    const toolLines = Array.from({ length: 200 }, (_, i) => plainLine("tool", i));
+    for (const line of toolLines) tagContent(ctx, line, "tool");
+    expect(ctx.dataLineage?.size).toBe(201);
+    const summaryLines = Array.from({ length: 70 }, (_, i) => plainLine("summary", i));
+    const summaryText = summaryLines.join("\n");
+    const { adapter } = makeStubAdapter(() => streamWithText(summaryText));
+    const result = await autoCompact([{ role: "user", content: "history" }], adapter, "m", {
+      runContext: ctx,
+    });
+    // The summary is benign, so it is kept and tagged.
+    expect(result[1]).toEqual({ role: "assistant", content: summaryText });
+    const lineage = ctx.dataLineage;
+    expect(lineage?.get(memoryLine)).toBe("memory");
+    for (const line of toolLines) expect(lineage?.get(line)).toBe("tool");
+    expect(lineage?.size ?? 0).toBeLessThanOrEqual(256);
+    // The summary's own pieces fill the room that was left, blob first.
+    expect(lineage?.get(summaryText)).toBe("compaction");
+    expect(lineage?.get(summaryLines[0] ?? "")).toBe("compaction");
+    expect(lineage?.size).toBe(256);
+  });
+
+  test("a lineage already at the cap gains nothing from a kept summary and keeps every entry", async () => {
+    const ctx = createRunContext();
+    const held = Array.from({ length: 256 }, (_, i) => plainLine("held", i));
+    held.forEach((line, i) => tagContent(ctx, line, i === 0 ? "memory" : "tool"));
+    const summaryText = Array.from({ length: 5 }, (_, n) => plainLine("summary", n)).join("\n");
+    const { adapter } = makeStubAdapter(() => streamWithText(summaryText));
+    await autoCompact([{ role: "user", content: "history" }], adapter, "m", { runContext: ctx });
+    expect(ctx.dataLineage?.size).toBe(256);
+    expect(ctx.dataLineage?.has(summaryText)).toBe(false);
+    expect(ctx.dataLineage?.get(held[0] ?? "")).toBe("memory");
+    for (const line of held) expect(ctx.dataLineage?.has(line)).toBe(true);
+  });
+
+  test("a run context with no lineage gains one holding the kept summary", async () => {
+    const ctx = createRunContext();
+    expect(ctx.dataLineage).toBeUndefined();
+    const { adapter } = makeStubAdapter(() => streamWithText(summary));
+    await autoCompact([{ role: "user", content: "history" }], adapter, "m", { runContext: ctx });
+    expect(ctx.dataLineage?.get(summary)).toBe("compaction");
+  });
 });
 
 describe("autoCompact — a ledger anchor whose entries are labelled", () => {

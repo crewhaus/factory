@@ -89,6 +89,7 @@ const NO_SCOPING_ARGUMENT: Readonly<Record<string, string>> = {
   UserPresence: "reads this machine's idle time",
   VatIdValidate: "asks the fixed VIES service",
   WindowList: "lists this machine's windows",
+  WorkPropose: "writes a proposal into this harness's own work list; nothing selects a place",
 };
 
 describe("every non-read-only or external builtin declares operativeArgs", () => {

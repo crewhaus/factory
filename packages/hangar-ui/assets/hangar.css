@@ -923,6 +923,26 @@ button.tab {
   margin: 2px 0 10px;
 }
 
+/* Work items: a long title or a URL wraps instead of widening the page, a long choice
+   never widens its select past the page, and each scope choice keeps its radio beside
+   its own words. */
+.work-row,
+.work-group li,
+.work-text {
+  overflow-wrap: anywhere;
+}
+.work-action select {
+  max-width: 100%;
+}
+.work-scope label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  margin-right: 12px;
+  white-space: nowrap;
+}
+
 /* overview grid */
 .ov-grid {
   display: grid;

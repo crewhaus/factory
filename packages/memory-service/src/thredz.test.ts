@@ -16,6 +16,7 @@ import { ToolCatalog } from "@crewhaus/tool-catalog";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { THREDZ_WIKI_TOOL_NAMES } from "@crewhaus/tool-wiki";
 import {
+  BACKEND_MARKERS_FILE,
   THREDZ_ALIAS_TOOL_NAMES,
   THREDZ_GOAL_MAP_FILE,
   type ThredzCallResult,
@@ -26,6 +27,7 @@ import {
   extractThredzGoalId,
   memoryFragmentFromIr,
   parseThredzRecallLines,
+  thredzTiers,
   wireContinuity,
   wireMemory,
   wireWiki,
@@ -892,5 +894,102 @@ describe("goal mirror × require rechecks frozen proofs", () => {
         ".lock",
       ].map((n) => join(spec, n)),
     );
+  });
+});
+
+describe("a declared Thredz backend that falls back is recorded", () => {
+  const markersOf = (): Array<Record<string, unknown>> => {
+    const file = join(tmp, BACKEND_MARKERS_FILE);
+    if (!existsSync(file)) return [];
+    return readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as Record<string, unknown>);
+  };
+
+  test("no connection: one marker per tier the fragment routes there, 0600, ids and closed codes only", async () => {
+    const { deps: d, logs } = deps();
+    await wireMemory(
+      {
+        specName: "fallback-spec",
+        memory: { backend: "thredz", wiki: {} },
+        continuity: {},
+        thredz: { goals: true },
+      },
+      d,
+    );
+    const markers = markersOf();
+    expect(markers.map((m) => m["tier"])).toEqual(["wiki", "goals"]);
+    for (const m of markers) {
+      expect(m).toEqual({
+        v: 1,
+        at: expect.any(String),
+        pid: process.pid,
+        spec: "fallback-spec",
+        tier: m["tier"],
+        declared: "thredz",
+        effective: "local",
+        cause: "unavailable",
+      });
+    }
+    expect(statSync(join(tmp, BACKEND_MARKERS_FILE)).mode & 0o777).toBe(0o600);
+    // The degrade line stays.
+    expect(logs.join("")).toContain("[thredz] unavailable");
+  });
+
+  test("a wiki turned off writes no wiki marker; a declared learning block adds one for learning", async () => {
+    const { deps: d } = deps();
+    await wireMemory(
+      {
+        specName: "fallback-spec",
+        memory: { wiki: { enabled: false } },
+        thredz: { goals: false },
+        learning: {},
+      },
+      d,
+    );
+    expect(markersOf().map((m) => m["tier"])).toEqual(["gaps"]);
+    expect(thredzTiers({ specName: "s", thredz: {}, continuity: { scope: "session" } })).toEqual([
+      "wiki",
+    ]);
+  });
+
+  test("a live connection writes none", async () => {
+    const { client } = fakeClient();
+    const { deps: d } = deps({ thredz: { client } });
+    await wireMemory(
+      {
+        specName: "live-spec",
+        memory: { backend: "thredz", wiki: {} },
+        continuity: {},
+        thredz: { goals: true },
+      },
+      d,
+    );
+    expect(markersOf()).toEqual([]);
+  });
+});
+
+describe("the continuity seam names what its tail rendered", () => {
+  test("tailRefs lists the focus, the active plan and each open goal of the last render, with spec and partition", async () => {
+    const { deps: d } = deps();
+    const wired = wireContinuity({ specName: "tail-spec", continuity: {} }, d);
+    if (wired === null) throw new Error("continuity was not wired");
+    const seam = wired.continuity;
+    expect(await seam.tailRefs?.()).toEqual([]);
+    const plan = await wired.store.createPlan({ title: "Ship", steps: ["draft", "send"] });
+    await wired.store.setActivePlan(plan.id);
+    await wired.store.writeFocus("ship the report");
+    const goal = await wired.store.writeGoal({ title: "Report sent" });
+    const text = await seam.loadPlan();
+    expect(text).toContain("ship the report");
+    const where = { backend: "local", spec: "tail-spec", partition: "-" };
+    expect(await seam.tailRefs?.()).toEqual([
+      { store: "focus", ...where, localId: "focus" },
+      { store: "plan", ...where, localId: plan.id },
+      { store: "goal", ...where, localId: goal.id },
+    ]);
+    expect(plan.id).toMatch(/^plan-\d{4}$/);
+    expect(goal.id).toMatch(/^goal-\d{4}$/);
   });
 });

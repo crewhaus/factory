@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../boundary-classifier" },
+    { "path": "../continuity-store" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
+    { "path": "../run-context" },
+    { "path": "../tenancy" },
+    { "path": "../tool-builder" },
+    { "path": "../tool-catalog" },
+    { "path": "../tool-categories" },
+    { "path": "../tool-safety" }
+  ],
+  "include": ["src/**/*"]
+}

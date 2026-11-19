@@ -66,6 +66,9 @@ const GATE_RECORDS = [
   join("scope-audit", "baseline.json"),
   join("security-corpus", "corpus.json"),
   join("slo", "intake.json"),
+  join("watchme", "synthesized"),
+  "feedback",
+  "fewshot",
 ].map((name) => join(".crewhaus", name));
 /** The idempotency store's default directory, always a root. */
 const IDEMPOTENCY = [join(".crewhaus", "idempotency")];
@@ -1458,5 +1461,54 @@ describe("the delegation rules and their application log", () => {
     expect(
       evaluateWithReason(write(outside), "auto", allowWrite, { protectedRoots: roots }).decision,
     ).toBe("allow");
+  });
+});
+
+describe("the specs watchme synthesizes for a person to adopt", () => {
+  const write = (path: string): ToolCallContext => ({
+    toolName: "Write",
+    input: { path },
+    operativeValues: [{ kind: "path", canonical: [path] }],
+    readOnly: false,
+    destructive: true,
+  });
+  const allowWrite: RuleSet = {
+    ...emptyRuleSet,
+    flag: [{ type: "alwaysAllow", pattern: "Write", source: "flag" }],
+  };
+
+  test("are a root, and an agent's write there is refused with the floor's reason", () => {
+    const cwd = tempDir("crewhaus-watchme-floor-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    const dir = join(".crewhaus", "watchme", "synthesized");
+    expect(roots).toContain(dir);
+    expect(roots).toContain(join(cwd, dir));
+    const verdict = evaluateWithReason(write(join(cwd, dir, "mimic.yaml")), "auto", allowWrite, {
+      protectedRoots: roots,
+    });
+    expect(verdict.decision).toBe("deny");
+    expect(verdict.reason).toContain("no rule can allow that");
+    // A neighbour outside the root is left to the rules.
+    const beside = join(cwd, ".crewhaus", "watchme", "notes.md");
+    expect(
+      evaluateWithReason(write(beside), "auto", allowWrite, { protectedRoots: roots }).decision,
+    ).toBe("allow");
+  });
+
+  test("the recorded ratings and the few-shot pools are roots, and an agent's write there is refused", () => {
+    const cwd = tempDir("crewhaus-feedback-floor-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    for (const [dir, file] of [
+      [join(".crewhaus", "feedback"), "ui.jsonl"],
+      [join(".crewhaus", "fewshot"), "bot.jsonl"],
+    ] as const) {
+      expect(roots).toContain(dir);
+      expect(roots).toContain(join(cwd, dir));
+      const verdict = evaluateWithReason(write(join(cwd, dir, file)), "auto", allowWrite, {
+        protectedRoots: roots,
+      });
+      expect(verdict.decision).toBe("deny");
+      expect(verdict.reason).toContain("no rule can allow that");
+    }
   });
 });

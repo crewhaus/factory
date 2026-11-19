@@ -183,9 +183,9 @@ export const BUDGET_CAPABILITIES: readonly CapabilityProvider[] = BUDGET_CAPABIL
   }),
 );
 
-export const HOME_RUNTIME: HomeAreaRuntime = {
-  area: "runtime",
+/** The budget half of the runtime area's Home entry; `./work.ts` composes the area's slot. */
+export const BUDGET_HOME = {
   sweeps: [BUDGET_SWEEP],
   handlers: BUDGET_HANDLERS,
   capabilityProviders: BUDGET_CAPABILITIES,
-};
+} as const satisfies Omit<HomeAreaRuntime, "area">;

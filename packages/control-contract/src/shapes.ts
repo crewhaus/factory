@@ -1,3 +1,4 @@
+import type { WorkCreateSpec } from "./areas/runtime-work.js";
 /**
  * The wire shapes of `crewhaus.hangar.v1` that have no other home. Types only.
  * `./schemas` holds a zod schema for each, and `schemas/type-checks.ts` fails the
@@ -96,7 +97,8 @@ export type RunCreateRequest = {
   readonly subject?: string;
   /** Defaults to `reject`. */
   readonly admission?: "reject" | "queue";
-  readonly work?: string;
+  /** A work item of this harness (`<hrn>/work/<wi>` or `wi_…`) the run serves, or one to create. */
+  readonly work?: string | WorkCreateSpec;
 };
 
 export type DecisionResolveRequest = {

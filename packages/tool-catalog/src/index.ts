@@ -51,7 +51,35 @@ export interface ToolExecuteContext {
    * superRefine already rejected sandbox-override keys per profile.
    */
   readonly toolConfig?: unknown;
+  /**
+   * Report the knowledge items this call returned to the model: fact ids,
+   * wiki slugs and versions, document fingerprints. The runtime records them
+   * (a `knowledge_read` line on the call, and a content-free usage line per
+   * item) after the call's output passed its post-tool check. Fire-and-forget:
+   * a tool calls it once or more and never waits on it. Ids only, never text:
+   * a ref whose id does not fit the run-record grammar is dropped by the
+   * runtime. Absent on bare unit calls and wherever nothing records, so a
+   * tool that reads it calls it only when present.
+   */
+  readonly recordReads?: (refs: ReadonlyArray<ToolReadRef>) => void;
 }
+
+/**
+ * One knowledge item a tool returned to the model, by reference: the store it
+ * lives in, the backend that served it, the spec and partition it belongs to,
+ * its id there and the version that was read. `withheld` marks an item the
+ * tool itself redacted before the model saw it. Structurally the run record's
+ * knowledge ref (`@crewhaus/event-log`), plus `withheld`.
+ */
+export type ToolReadRef = {
+  readonly store: "fact" | "wiki" | "session" | "plan" | "goal" | "focus" | "document";
+  readonly backend: "local" | "thredz";
+  readonly spec?: string;
+  readonly partition?: string;
+  readonly localId: string;
+  readonly version?: number | string;
+  readonly withheld?: true;
+};
 
 /** 0.6.0 §4.4 — see `ToolExecuteContext.model`. */
 export type ToolExecuteModel = {

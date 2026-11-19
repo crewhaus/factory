@@ -45,6 +45,7 @@ const RUN = mintRunId();
 
 /** An attention item's id as the area derives it, from a digest's bytes. */
 const ATT = attIdFromDigest(new Uint8Array(32).map((_, i) => (i * 37 + 11) % 256));
+const WORK = { wi: mintId("wi"), belowWi: mintId("wi"), workSource: "continuity-goal:goal-0001" };
 
 const SAMPLES = [
   {
@@ -67,6 +68,9 @@ const SAMPLES = [
     delegationAction: "merge",
     run: RUN,
     att: ATT,
+    ...WORK,
+    declineReason: "not-now",
+    correctionScope: "item",
     usd: "50",
     budgetReason: "planned-work",
   },
@@ -90,6 +94,9 @@ const SAMPLES = [
     delegationAction: "rollout",
     run: RUN,
     att: ATT,
+    ...WORK,
+    declineReason: "needs-evidence",
+    correctionScope: "all",
     usd: "12.5",
     budgetReason: "other",
   },
@@ -223,6 +230,11 @@ test("the placeholders, pinned, with empty flags", () => {
     "{delegationAction}",
     "{run}",
     "{att}",
+    "{wi}",
+    "{belowWi}",
+    "{declineReason}",
+    "{correctionScope}",
+    "{workSource}",
     "{usd}",
     "{budgetReason}",
   ]);
@@ -384,6 +396,60 @@ describe("a deferral's twin", () => {
       for (const [other, otherId] of Object.entries(ACCESS)) {
         if (other !== name) expect((grammar[`{${name}}`] as RegExp).test(otherId)).toBe(false);
       }
+    }
+  });
+});
+
+describe("the work placeholders", () => {
+  const grammar = TWIN_PLACEHOLDERS as Readonly<Record<string, RegExp>>;
+  const decline: CliTwin = {
+    argv: ["work", "decline", "{wi}", "--reason", "{declineReason}", "--harness", "{hrn}"],
+  };
+  const rank: CliTwin = {
+    argv: ["work", "rank", "{wi}", "--above", "{belowWi}", "--scope", "{correctionScope}"],
+  };
+  const adopt: CliTwin = { argv: ["work", "adopt", "--from", "{workSource}"] };
+
+  test("{wi} and {belowWi} take a work item's id, and nothing else", () => {
+    for (const token of ["{wi}", "{belowWi}"]) {
+      expect(grammar[token]?.test(mintId("wi"))).toBe(true);
+      expect(grammar[token]?.test(mintId("cmd"))).toBe(false);
+      expect(grammar[token]?.test(`${HRN}/work/${mintId("wi")}`)).toBe(false);
+    }
+  });
+
+  test("{declineReason} and {correctionScope} take their closed lists", () => {
+    const wi = mintId("wi");
+    for (const reason of ["out-of-scope", "duplicate", "not-now", "wont-fix", "needs-evidence"]) {
+      const rendered = renderTwin(decline, { wi, declineReason: reason, hrn: HRN });
+      expect("argv" in rendered && parseTwin(decline, rendered.argv)?.params).toEqual({
+        wi,
+        declineReason: reason,
+        hrn: HRN,
+      });
+    }
+    expect(renderTwin(decline, { wi, declineReason: "because", hrn: HRN })).toEqual({
+      invalid: ["declineReason"],
+    });
+    for (const scope of ["item", "similar", "all"]) {
+      const params = { wi, belowWi: mintId("wi"), correctionScope: scope };
+      const rendered = renderTwin(rank, params);
+      expect("argv" in rendered && parseTwin(rank, rendered.argv)?.params).toEqual(params);
+    }
+    expect(renderTwin(rank, { wi, belowWi: wi, correctionScope: "everything" })).toEqual({
+      invalid: ["correctionScope"],
+    });
+  });
+
+  test("{workSource} is a continuity goal only: a Thredz task or an issue renders no twin", () => {
+    const rendered = renderTwin(adopt, { workSource: "continuity-goal:goal-0042" });
+    expect(rendered).toEqual({ argv: ["work", "adopt", "--from", "continuity-goal:goal-0042"] });
+    expect(parseTwin(adopt, ["work", "adopt", "--from", "continuity-goal:goal-0042"])).toEqual({
+      params: { workSource: "continuity-goal:goal-0042" },
+    });
+    for (const source of ["thredz-task:t1", "github-issue:acme/app#12", "continuity-goal:x"]) {
+      expect(renderTwin(adopt, { workSource: source })).toEqual({ invalid: ["workSource"] });
+      expect(parseTwin(adopt, ["work", "adopt", "--from", source])).toBeNull();
     }
   });
 });

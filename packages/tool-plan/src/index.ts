@@ -77,10 +77,14 @@
  * that is only whitespace (refused as GoalWrite's and PlanUpdate's always
  * were), are the input the default mode now refuses that it used to accept.
  *
- * Pillar 3: plan/focus/ledger content is user-authored working state
- * (origin "user" semantics, like tool-memory writes) — recalled wiki/fact
- * content is what gets the new `memory` TrustOrigin, not this. All tools are
- * `scope: "internal"` (process-local files only).
+ * Pillar 3: plan, focus and goal content is model-authored working state,
+ * written through these tools from whatever the run had read. When the
+ * runtime re-reads it as the `<current_plan>` tail, it screens the rendered
+ * text at the `memory` TrustOrigin by line, by adjacent pair and as a whole
+ * (what the classifier redacts reaches the model as its notice), the same
+ * tier as recalled wiki and fact content. It is not tagged into the run's lineage, so a step the
+ * agent mirrors to an outside tracker is not held back as recalled text. All
+ * tools are `scope: "internal"` (process-local files only).
  */
 import {
   type ContinuityScope,

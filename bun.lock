@@ -214,6 +214,7 @@
         "@crewhaus/tool-verify": "workspace:*",
         "@crewhaus/tool-vision-grounding": "workspace:*",
         "@crewhaus/tool-web": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
         "@crewhaus/trace-event-bus": "workspace:*",
         "@crewhaus/vector-store": "workspace:*",
         "@crewhaus/watchme-store": "workspace:*",
@@ -717,8 +718,10 @@
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
         "@crewhaus/tool-registry-manifest": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
       },
       "devDependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
@@ -851,6 +854,7 @@
       "name": "@crewhaus/dream-engine",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/durable-execution": "workspace:*",
@@ -1298,6 +1302,7 @@
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
         "axe-core": "4.14.0",
         "playwright": "1.59.1",
@@ -1340,6 +1345,7 @@
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
         "@crewhaus/watchme-store": "workspace:*",
         "@crewhaus/wiki-store": "workspace:*",
       },
@@ -1350,6 +1356,7 @@
         "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/quality-service": "workspace:*",
         "@crewhaus/runtime-core": "workspace:*",
+        "service-fakes": "workspace:*",
       },
     },
     "packages/hangar-ui": {
@@ -3422,6 +3429,7 @@
       "name": "@crewhaus/tool-memory",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
@@ -3996,6 +4004,23 @@
       },
       "devDependencies": {
         "@crewhaus/embedder": "workspace:*",
+      },
+    },
+    "packages/tool-work": {
+      "name": "@crewhaus/tool-work",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
+        "@crewhaus/tool-builder": "workspace:*",
+        "@crewhaus/tool-catalog": "workspace:*",
+        "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+        "zod": "^3.23.8",
       },
     },
     "packages/trace-event-bus": {
@@ -4744,6 +4769,8 @@
     "@crewhaus/tool-web": ["@crewhaus/tool-web@workspace:packages/tool-web"],
 
     "@crewhaus/tool-wiki": ["@crewhaus/tool-wiki@workspace:packages/tool-wiki"],
+
+    "@crewhaus/tool-work": ["@crewhaus/tool-work@workspace:packages/tool-work"],
 
     "@crewhaus/trace-event-bus": ["@crewhaus/trace-event-bus@workspace:packages/trace-event-bus"],
 

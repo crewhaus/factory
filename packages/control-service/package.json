@@ -26,9 +26,11 @@
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*",
-    "@crewhaus/tool-registry-manifest": "workspace:*"
+    "@crewhaus/tool-registry-manifest": "workspace:*",
+    "@crewhaus/tool-work": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",

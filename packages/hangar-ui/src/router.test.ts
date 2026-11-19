@@ -182,9 +182,11 @@ describe("ROUTE_TEMPLATES", () => {
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
     // The device sign-in page is a fleet address of its own.
     expect(fleetTemplates.length).toBe(21);
-    // Setup › Delegations is the twenty-eighth.
-    expect(harnessTemplates.length).toBe(28);
+    // Setup › Delegations is the twenty-eighth; Work › Work items and an item's page follow.
+    expect(harnessTemplates.length).toBe(30);
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/setup/delegations");
+    expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items");
+    expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items/:wi");
     expect(new Set(ROUTE_TEMPLATES).size).toBe(ROUTE_TEMPLATES.length);
     expect(Object.isFrozen(ROUTE_TEMPLATES)).toBe(true);
     for (const t of [
@@ -209,7 +211,13 @@ describe("ROUTE_TEMPLATES", () => {
   });
 
   test("each one, filled in, parses to a screen whose template it is", () => {
-    const params = { id: ID, run: "run_1", session: "sess_1", slug: "notes" };
+    const params = {
+      id: ID,
+      run: "run_1",
+      session: "sess_1",
+      slug: "notes",
+      wi: "wi_01m76e6f05hp514w9j4v3qymka",
+    };
     for (const template of ROUTE_TEMPLATES) {
       const route = parseRoute(routeFor(template, params));
       expect(`${template}:${route.view}`).not.toBe(`${template}:notfound`);

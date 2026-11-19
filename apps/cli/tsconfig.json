@@ -90,6 +90,7 @@
     { "path": "../../packages/trace-event-bus" },
     { "path": "../../packages/tool-bash" },
     { "path": "../../packages/tool-builder" },
+    { "path": "../../packages/tool-work" },
     { "path": "../../packages/tool-proof" },
     { "path": "../../packages/tool-safety" },
     { "path": "../../packages/provability" },

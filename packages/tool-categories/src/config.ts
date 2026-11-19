@@ -601,6 +601,13 @@ export function toolConfigProblems(init: ToolConfigInit): ReadonlyArray<ToolConf
   }
   const rec = block as Record<string, unknown>;
   const out: ToolConfigNotice[] = [];
+  const closed = checks.closed;
+  if (closed !== undefined) {
+    for (const key of Object.keys(rec)) {
+      if (closed.keys.includes(key)) continue;
+      out.push({ path: pathJoin(init.where, key), message: `is not a setting: ${closed.fix}.` });
+    }
+  }
   for (const key of checks.refused?.keys ?? []) {
     if (Object.hasOwn(rec, key)) {
       out.push({

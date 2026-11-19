@@ -391,6 +391,7 @@ const TOKEN_PARAMS = {
   ":session": "session",
   ":slug": "slug",
   ":sample": "sample",
+  ":wi": "wi",
 };
 
 /** A template filled in: `routeFor("#/h/:id/work/runs/:run", { id, run })`. Throws on a missing value. */

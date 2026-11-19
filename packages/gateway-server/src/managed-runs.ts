@@ -70,13 +70,14 @@ import {
 import { hostname } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { AuditLog } from "@crewhaus/audit-log";
-import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
+import { boundaryRuleIds } from "@crewhaus/boundary-classifier";
 import {
   CANONICAL_RUN_ID_RE,
   EXECUTION_RUN_ID_RE,
   SESSION_ID_RE,
   type Trigger,
   canonicalJson,
+  formatResumeScope,
   isId,
   isStoredActor,
   parseResumeScope,
@@ -128,6 +129,7 @@ import {
 } from "./coded";
 import { estimateRunUsage } from "./estimate";
 import type { ResolveRunEvents, RunHandler, RunInputVerdict, UsageDelta } from "./index";
+import { classifyManagedInput } from "./managed-classify";
 
 export {
   GatewayCodedError,
@@ -138,6 +140,11 @@ export {
 
 /** What started a run this module records. */
 const API_TRIGGER: Trigger = Object.freeze({ kind: "api" });
+
+/** What started a run that serves a work item. */
+function workTrigger(workItem: string): Trigger {
+  return { kind: "api", workItem };
+}
 
 /** How many run buses `runs.subscribe` can resolve; the oldest goes past it. */
 export const RUN_BUS_CAP = 256;
@@ -197,18 +204,6 @@ export type ManagedControl = Pick<ControlPlane, "onClaim" | "onActiveRuns"> &
   Partial<Pick<ControlPlane, "clientRunIds">> & {
     readonly counters: { turns: number };
   };
-
-type Classify = typeof classifyBoundary;
-
-let classify: Classify = classifyBoundary;
-
-/**
- * Test seam: count or script the classifier a run's input meets, a request's and a
- * queued run's alike. `undefined` restores it.
- */
-export function _setManagedClassifierForTest(next: Classify | undefined): void {
-  classify = next ?? classifyBoundary;
-}
 
 /** A method the daemon serves beyond the runs, such as `feedback.submit`. */
 export type ManagedMethod = (args: {
@@ -467,6 +462,12 @@ export type QueueManagedRunOptions = {
   readonly subject?: string;
   /** The deployment (`dep_…`) whose daemon may claim it. */
   readonly deployment?: string;
+  /**
+   * The work item (`wi_…`) the run serves: on its `queued` row and its trigger, and the
+   * run resumes as `work:<wi>`, so a decision granted for the item reaches the run that
+   * picks it up again.
+   */
+  readonly workItem?: string;
   readonly now?: () => number;
   readonly env?: Readonly<Record<string, string | undefined>>;
 };
@@ -514,6 +515,9 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
   if (opts.byCredential !== undefined && !isId("crd", opts.byCredential)) {
     return { ok: false, reason: "byCredential must be a credential id (crd_…)" };
   }
+  if (opts.workItem !== undefined && !isId("wi", opts.workItem)) {
+    return { ok: false, reason: "workItem must be a work item id (wi_…)" };
+  }
   const now = opts.now ?? Date.now;
   const record: QueuedInput = {
     v: 1,
@@ -547,7 +551,8 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
     id: runId,
     state: "queued",
     at: new Date(now()).toISOString(),
-    trigger: API_TRIGGER,
+    trigger: opts.workItem !== undefined ? workTrigger(opts.workItem) : API_TRIGGER,
+    ...(opts.workItem !== undefined ? { workItem: opts.workItem } : {}),
     tenant: opts.tenant,
     by: opts.by,
     ...(opts.byCredential !== undefined ? { byCredential: opts.byCredential } : {}),
@@ -624,15 +629,20 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
   function startRows(
     runId: string,
     tenantId: string,
-    fields: { readonly session: string; readonly resumeScope: string | undefined },
+    fields: {
+      readonly session: string;
+      readonly resumeScope: string | undefined;
+      readonly workItem?: string;
+    },
   ): RunRows {
     const running = append(ledger, {
       id: runId,
       state: "running",
       at: stamp(),
-      trigger: API_TRIGGER,
+      trigger: fields.workItem !== undefined ? workTrigger(fields.workItem) : API_TRIGGER,
       session: fields.session,
       ...(fields.resumeScope !== undefined ? { resumeScope: fields.resumeScope } : {}),
+      ...(fields.workItem !== undefined ? { workItem: fields.workItem } : {}),
       tenant: tenantId,
       ...executionField,
     });
@@ -765,6 +775,8 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     readonly isResume: boolean;
     readonly resumeScope: string | undefined;
     readonly subject: string | undefined;
+    /** The work item the run serves, when it was queued for one. */
+    readonly workItem?: string;
     readonly rows: RunRows;
     readonly run: LiveRun;
     readonly log: AuditLog;
@@ -776,12 +788,17 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
    */
   function runTurn(plan: TurnPlan): Promise<ManagedRunResult> {
     const scope: RunScope = {
-      trigger: API_TRIGGER,
+      trigger: plan.workItem !== undefined ? workTrigger(plan.workItem) : API_TRIGGER,
       ...(plan.resumeScope !== undefined ? { resumeScope: plan.resumeScope } : {}),
       ...(plan.subject !== undefined ? { subject: plan.subject } : {}),
+      ...(plan.workItem !== undefined ? { workItem: plan.workItem } : {}),
     };
     return runWithScope(scope, async () => {
-      const runContext = createRunContext({ runId: plan.runId, sessionId: plan.sessionId });
+      const runContext = createRunContext({
+        runId: plan.runId,
+        sessionId: plan.sessionId,
+        ...(plan.workItem !== undefined ? { workItem: plan.workItem } : {}),
+      });
       registerBus(plan.runId, plan.tenant.id, runContext.eventBus);
       plan.run.ctx = runContext;
       if (plan.run.cancelled) cancelRun(plan.runId);
@@ -851,7 +868,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     if (typeof input !== "string") {
       throw new GatewayCodedError(ErrorCode.BadRequest, "params.input must be a string");
     }
-    const boundary = await classify(input, { origin: "api" });
+    const boundary = await classifyManagedInput(input, { origin: "api" });
     const rules = boundaryRuleIds(boundary.verdict);
     const verdict: RunInputVerdict = {
       action: boundary.action,
@@ -1085,7 +1102,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
   }
 
   /** Run one queued run whose claim this process won. Never rejects. */
-  async function runQueued(runId: string, tenantId: string): Promise<void> {
+  async function runQueued(runId: string, tenantId: string, workItem?: string): Promise<void> {
     const run: LiveRun = { tenantId, cancelled: false };
     live.set(runId, run);
     try {
@@ -1094,8 +1111,16 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       const input = readQueuedInput(harnessDir, runId, tenantId);
       forgetInput(runId);
       const sessionId = input?.sessionId ?? `sess_${randomBytes(8).toString("hex")}`;
-      const resumeScope = sessionScope(sessionId);
-      const rows = startRows(runId, tenantId, { session: sessionId, resumeScope });
+      // A run for a work item resumes as the item, so a grant decided for it carries over.
+      const resumeScope =
+        workItem !== undefined
+          ? formatResumeScope({ kind: "work", id: workItem })
+          : sessionScope(sessionId);
+      const rows = startRows(runId, tenantId, {
+        session: sessionId,
+        resumeScope,
+        ...(workItem !== undefined ? { workItem } : {}),
+      });
       const subject = input?.subject;
       let tenant: Tenant;
       try {
@@ -1125,7 +1150,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         }
         // A queued input enters here, never through a request: classified at
         // "api" before anything runs, and kept text tags the run's context.
-        const boundary = await classify(input.input, { origin: "api" });
+        const boundary = await classifyManagedInput(input.input, { origin: "api" });
         if (boundary.action === "redact") {
           await rows.end({ state: "failed", failureClass: "input_blocked" }, subject);
           return;
@@ -1156,6 +1181,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
               isResume: input.sessionId !== undefined,
               resumeScope,
               subject,
+              ...(workItem !== undefined ? { workItem } : {}),
               rows,
               run,
               log,
@@ -1252,7 +1278,8 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         if (claimed.code !== "exists") warnOnce(claimed.code);
         continue;
       }
-      runs.push(runQueued(id, tenantId));
+      const workItem = object.record["workItem"];
+      runs.push(runQueued(id, tenantId, isId("wi", workItem) ? (workItem as string) : undefined));
     }
     await Promise.all(runs);
   }

@@ -7,13 +7,19 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
  * the network. End-to-end retrieval is exercised against the real
  * `@crewhaus/tool-retrieve` engine, not a hand-built fixture.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
 import { ConfigError } from "@crewhaus/errors";
 import type { IrKnowledge } from "@crewhaus/ir";
-import { _resetRetrieveConfig, getRetrieveConfig } from "@crewhaus/tool-retrieve";
+import {
+  CORPUS_MANIFEST_FILE,
+  type CorpusManifest,
+  _resetRetrieveConfig,
+  getRetrieveConfig,
+  knowledgeSourceFingerprint,
+} from "@crewhaus/tool-retrieve";
 import {
   DEFAULT_KNOWLEDGE_EMBEDDER_MODEL,
   ingestKnowledge,
@@ -216,5 +222,85 @@ describe("ingestKnowledge", () => {
     expect(getRetrieveConfig()).toBeDefined();
     const hits = (await tool.execute({ query: "anything" })) as string;
     expect(hits).toBe("no hits");
+  });
+});
+
+describe("ingestKnowledge writes the corpus manifest", () => {
+  const manifestOf = (cwd: string): CorpusManifest =>
+    JSON.parse(readFileSync(join(cwd, CORPUS_MANIFEST_FILE), "utf-8")) as CorpusManifest;
+
+  test("what it indexed, by label, fingerprint, parts and hash, at 0600 and without text", async () => {
+    const text = "Cats are small domesticated feline mammals.";
+    writeFileSync(join(dir, "cats.md"), text);
+    await ingestKnowledge(
+      knowledge({
+        sources: [
+          { kind: "path", path: "cats.md" },
+          { kind: "glob", glob: "*.nomatch" },
+        ],
+      }),
+      { cwd: dir, embedder: mockEmbedder },
+    );
+    const file = join(dir, CORPUS_MANIFEST_FILE);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const manifest = manifestOf(dir);
+    expect(manifest).toMatchObject({
+      v: 1,
+      embedderModel: mockEmbedder.model,
+      vectorBackend: "in-memory",
+    });
+    expect(manifest.sources).toEqual([
+      {
+        label: "cats.md",
+        kind: "path",
+        status: "included",
+        docs: [
+          {
+            source: knowledgeSourceFingerprint("cats.md"),
+            parts: 1,
+            contentHash16: expect.stringMatching(/^[0-9a-f]{16}$/),
+          },
+        ],
+      },
+      { label: "*.nomatch", kind: "glob", status: "empty", docs: [] },
+    ]);
+    expect(readFileSync(file, "utf-8")).not.toContain("feline");
+  });
+
+  test("a failing source is recorded with its reason, the rest not-reached, and boot still fails", async () => {
+    writeFileSync(join(dir, "cats.md"), "Cats are small domesticated feline mammals.");
+    await expect(
+      ingestKnowledge(
+        knowledge({
+          sources: [
+            { kind: "path", path: "cats.md" },
+            { kind: "url", url: "https://docs.example.com/gone.md" },
+            { kind: "path", path: "missing.md" },
+          ],
+        }),
+        {
+          cwd: dir,
+          embedder: mockEmbedder,
+          fetchImpl: (async () => new Response("", { status: 410 })) as unknown as typeof fetch,
+        },
+      ),
+    ).rejects.toThrow(/HTTP 410/);
+    expect(manifestOf(dir).sources.map((s) => [s.kind, s.status, s.reason])).toEqual([
+      ["path", "included", undefined],
+      ["url", "failed", "http-410"],
+      ["path", "failed", "not-reached"],
+    ]);
+  });
+
+  test("a missing path is recorded not-found", async () => {
+    await expect(
+      ingestKnowledge(knowledge({ sources: [{ kind: "path", path: "nope.md" }] }), {
+        cwd: dir,
+        embedder: mockEmbedder,
+      }),
+    ).rejects.toBeInstanceOf(ConfigError);
+    expect(manifestOf(dir).sources).toEqual([
+      { label: "nope.md", kind: "path", status: "failed", reason: "not-found", docs: [] },
+    ]);
   });
 });

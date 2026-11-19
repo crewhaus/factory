@@ -129,7 +129,11 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/routing/freeze.json`, the scope-audit baseline
   `.crewhaus/scope-audit/baseline.json`, the security corpus
   `.crewhaus/security-corpus/corpus.json` and the SLO intake gate
-  `.crewhaus/slo/intake.json`, exactly each of those files; the
+  `.crewhaus/slo/intake.json`, exactly each of those files; the specs
+  `crewhaus watchme synthesize` writes for a person to adopt,
+  `.crewhaus/watchme/synthesized`; the ratings the web UI, the gateway and the
+  CLI record, `.crewhaus/feedback`, and the few-shot pools
+  `crewhaus fewshot harvest` writes, `.crewhaus/fewshot`; the
   durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
@@ -822,6 +826,56 @@ these on: they reach every harness that uses what each one names.
   `--emit-as cf-worker` warns for `cf_worker.public_chat` on cli, workflow and
   graph specs, which only a Cloudflare Worker build reads. Removing the setting
   changes nothing the harness does.
+
+- **Recall shows each memory's id, and Remember records the session that
+  saved it.** Each Recall result reads `• (<id> · <score>) <text>`, so an
+  answer can name the memory it used and `crewhaus memory show <id>` opens it.
+  Remember stamps `provenance.sessionId` from the run that called it, never
+  from what the model passes. If an eval grades Recall's exact output,
+  rebaseline it.
+
+- **Runs record which knowledge they used.** A tool call that returns stored
+  knowledge (Recall's facts, the wiki read tools' articles, Retrieve's
+  documents) adds a `knowledge_read` line to the session log: the items' ids
+  and versions and what the output check did with them, no text. Auto-recall,
+  the plan tail and those calls also add lines to
+  `.crewhaus/run/knowledge/usage/`, one per item the first time a run uses it
+  each way: the item as a keyed digest under the harness's digest key, its
+  store, version and status, no text. `CREWHAUS_RUN_STAMPS=0` turns both off.
+
+- **A harness with `knowledge:` writes `.crewhaus/run/knowledge/corpus.json`
+  at boot.** It lists each declared source by its label, whether it was
+  included, empty or failed and why, and each document by a fingerprint, its
+  part count and a hash of its text. No document text. A failed write is one
+  log line, and boot goes on.
+
+- **A declared Thredz backend that falls back is recorded.** When `thredz:` or
+  `memory.backend: thredz` is declared and no connection comes up, boot adds
+  one line per part Thredz would have served (the wiki, the goal mirror,
+  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, beside the
+  warning it prints.
+
+- **Text the runtime re-reads from earlier work is screened as remembered
+  memory.** The plan, focus and goals in the `<current_plan>` block, a
+  `LESSONS.md` that `crewhaus lessons update` wrote and the per-user
+  preference files are checked with the screen recalled memories pass, line
+  by line, two adjacent lines at a time and as a whole. What it withholds
+  reaches the model as a notice. The findings
+  the dream pass starts from are checked the same way; a withheld one is left
+  out and counted. `crewhaus optimize --few-shot` checks each example's input
+  and output, leaves out one the screen withholds, prints the ids it injects,
+  and skips a pool line whose id is not the one its provenance names.
+  `AGENTS.md`, `CLAUDE.md` and the other project memory files an operator
+  writes are read as the operator's own.
+
+- **`crewhaus lessons update` shows what it will write, and asks for `--yes`
+  when anything came from somewhere other than your own ratings.** It prints
+  every new lesson and preference note as it will be written. When one of
+  them came from a record in `.crewhaus/feedback/` or from a failure a session
+  recorded, rather than from your own `crewhaus rate` or `crewhaus feedback`,
+  it writes nothing and stops with an error that names
+  `crewhaus lessons update --yes`. A candidate the memory screen withholds is
+  left out and counted. A script that runs it unattended adds `--yes`.
 
 - **The permission rule-order check does a bounded amount of work.**
   `crewhaus lint`, `crewhaus compile` and the compiler worker's `POST /compile`

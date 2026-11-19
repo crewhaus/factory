@@ -132,6 +132,10 @@ export const TOOL_KEYWORDS: Readonly<Record<string, ReadonlyArray<string>>> = Ob
     "cancel the command",
   ],
   todoWrite: ["todo", "task list", "track tasks", "checklist"],
+  workList: ["work items", "list work", "backlog", "what to do next"],
+  workGet: ["work item", "read work", "acceptance criteria"],
+  workPropose: ["propose work", "suggest work", "proposal", "feature request"],
+  workUpdate: ["update work", "close work", "link run", "deliver"],
   proofCheckers: [
     "proof checker",
     "which checkers",

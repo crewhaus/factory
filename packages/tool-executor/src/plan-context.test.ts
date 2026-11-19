@@ -58,3 +58,36 @@ describe("executeTool — plan context threading", () => {
     expect("toolConfig" in (seen[0] as object)).toBe(false);
   });
 });
+
+describe("executeTool — the knowledge-read collector", () => {
+  test("recordReads reaches the tool's context when given, and the tool's reports reach it", async () => {
+    const reported: unknown[] = [];
+    const recordReads = (refs: ReadonlyArray<unknown>): void => {
+      reported.push(...refs);
+    };
+    const seen: ToolExecuteContext[] = [];
+    const { tool } = recorder();
+    const reporting: RegisteredTool = {
+      ...tool,
+      execute: async (_input, ctx) => {
+        if (ctx !== undefined) seen.push(ctx);
+        ctx?.recordReads?.([{ store: "fact", backend: "local", localId: "mem_0123456789abcdef" }]);
+        return "ok";
+      },
+    };
+    await executeTool(reporting, {}, { toolUseId: "t3", recordReads });
+    expect(seen[0]?.recordReads).toBe(recordReads);
+    expect(reported).toEqual([
+      { store: "fact", backend: "local", localId: "mem_0123456789abcdef" },
+    ]);
+  });
+
+  test("absent → the tool gets exactly the context a call without it gets", async () => {
+    const a = recorder();
+    const signal = new AbortController().signal;
+    await executeTool(a.tool, {}, { toolUseId: "t4", signal });
+    expect("recordReads" in (a.seen[0] as object)).toBe(false);
+    expect(Object.keys(a.seen[0] as object).sort()).toEqual(["signal"]);
+    expect(a.seen[0]).toEqual({ signal });
+  });
+});

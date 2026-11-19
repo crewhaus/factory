@@ -29,6 +29,7 @@ export const CAPTURE_TOKENS = Object.freeze({
   sampleId: ":sample",
   sessionId: ":session",
   wikiSlug: ":slug",
+  workItem: ":wi",
 });
 
 /** A section by id, or null. */
