@@ -32,6 +32,10 @@ import {
   parseSpec,
 } from "../packages/compiler/src/index";
 import { Spec } from "../packages/spec/src/index";
+import { preparePermissionSubject } from "../packages/tool-executor/src/index";
+import { TOOL_FLAGS } from "../packages/tool-registry-manifest/src/flags";
+import { decideWorkerToolCall } from "../packages/worker-runtime/src/permissions";
+import { EDGE_SAFE_TOOLS } from "../packages/worker-runtime/src/tool-policy";
 
 const WILDCARD_SEGMENT = "*";
 type Shape = (typeof CF_WORKER_EMIT_TARGETS)[number];
@@ -603,5 +607,83 @@ tools: [webFetch, webSearch]
       compared += 1;
     }
     expect(compared).toBe(5);
+  }, 20_000); // the CLI's loader imports every builtin tool package the cli shape carries
+});
+
+// The edge gate reads `alwaysDeny T(**)` and `alwaysAsk T(**)` as covering
+// every call of an edge tool that declares operative fields. That holds while
+// each such tool requires every operative field, refuses an empty one, and is
+// never allowed under a `T(**)` deny or ask, whatever value a call carries.
+describe("every edge tool with operative fields carries a value on every call", () => {
+  /** A valid input for each edge tool that declares operative fields. */
+  const SAMPLES: Readonly<Record<string, Record<string, unknown>>> = {
+    fetch: { url: "https://example.com/a" },
+    webFetch: { url: "https://example.com/a" },
+    webSearch: { query: "q" },
+  };
+  /** Values each operative field is probed with, beside the sample's own. */
+  const PROBES = [" ", "*", "/", "x".repeat(5000), "https://evil.example.net/x?y=1#z"];
+
+  test("each operative field is required and non-empty, and a T(**) deny or ask decides every call", async () => {
+    const live = await loadBuiltinTools(CLI_RUNTIME_TOOL_KEYS);
+    let checked = 0;
+    for (const key of [...EDGE_SAFE_TOOLS].sort()) {
+      const manifest = TOOL_FLAGS[key];
+      expect(manifest, key).toBeDefined();
+      const declared = (manifest?.operativeArgs ?? []).map((a) => a.field);
+      if (declared.length === 0) continue;
+      const tool = live[key];
+      if (tool === undefined) throw new Error(`no live tool for the edge tool ${key}`);
+      expect(
+        (tool.operativeArgs ?? []).map((a) => a.field),
+        key,
+      ).toEqual(declared);
+      const sample = SAMPLES[key];
+      if (sample === undefined) throw new Error(`no valid sample input for the edge tool ${key}`);
+      expect(preparePermissionSubject(tool, sample).ok, key).toBe(true);
+      const accepted: unknown[] = [sample];
+      for (const field of declared) {
+        const { [field]: _dropped, ...without } = sample;
+        expect(preparePermissionSubject(tool, without).ok, `${key} without ${field}`).toBe(false);
+        expect(
+          preparePermissionSubject(tool, { ...sample, [field]: "" }).ok,
+          `${key} ${field}: ""`,
+        ).toBe(false);
+        for (const value of PROBES) {
+          const input = { ...sample, [field]: value };
+          if (preparePermissionSubject(tool, input).ok) accepted.push(input);
+        }
+      }
+      for (const guard of ["alwaysDeny", "alwaysAsk"] as const) {
+        const permissions = {
+          rules: [
+            { type: "alwaysAllow" as const, pattern: tool.name },
+            { type: guard, pattern: `${tool.name}(**)` },
+          ],
+        };
+        for (const input of accepted) {
+          const subject = preparePermissionSubject(tool, input);
+          if (!subject.ok) throw new Error(`${key}: an accepted probe was refused`);
+          const verdict = decideWorkerToolCall(
+            {
+              toolName: tool.name,
+              input: subject.input,
+              ...(subject.operativeValues !== undefined
+                ? { operativeValues: subject.operativeValues }
+                : {}),
+              readOnly: tool.readOnly ?? false,
+              requiresSandbox: tool.requiresSandbox ?? false,
+              requireJustification: tool.requireJustification ?? false,
+            },
+            permissions,
+          );
+          expect(
+            `${key} ${guard} ${JSON.stringify(input).slice(0, 80)}: ${verdict.decision}`,
+          ).not.toEndWith(": allow");
+        }
+      }
+      checked += 1;
+    }
+    expect(checked).toBeGreaterThanOrEqual(3);
   }, 20_000); // the CLI's loader imports every builtin tool package the cli shape carries
 });

@@ -180,6 +180,7 @@ import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 import { lowerDelegation } from "./lower/delegation";
 import { lowerPlugins } from "./lower/plugins";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
+import { PERMISSION_RULE_NOTES } from "./permission-rules";
 import { toolConfigWidenings } from "./tool-config-widening";
 
 /**
@@ -415,6 +416,9 @@ export function localBuildUnreadWarnings(spec: Spec): CompileWarning[] {
  * itself on every compile; a library caller that asks for the passes (the
  * compiler worker's `POST /compile`) is the one whose bundles changed, so it
  * is told here.
+ *
+ * The check does a bounded amount of work; where it stops, one
+ * `permission-rule-note` (`order-not-checked`) names the rule and list.
  */
 function ruleOrderWarnings(spec: Spec): CompileWarning[] {
   // Not every shape carries `permissions:`; read the mode where one does.
@@ -423,7 +427,7 @@ function ruleOrderWarnings(spec: Spec): CompileWarning[] {
     specPermissionRuleLists(spec),
     mode !== undefined ? { mode } : {},
   ).map((p) => ({
-    code: p.code === "shadowed-outside-plan" ? "permission-rule-note" : "permission-rule",
+    code: PERMISSION_RULE_NOTES.has(p.code) ? "permission-rule-note" : "permission-rule",
     path: p.list,
     message: p.message,
   }));

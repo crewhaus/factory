@@ -302,7 +302,37 @@ permissions:
     expect(await compileAs(keyRule, "local")).toEqual([]);
   });
 
-  test("POST /compile emitAs:cf-worker refuses a gated setting before it reads the rules", async () => {
+  test("POST /compile emitAs:cf-worker returns its warnings in the CLI edge path's order, the permission-rule findings last", async () => {
+    const yaml = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch]
+permissions:
+  rules:
+    - { type: alwaysDeny, pattern: webFetch }
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { warnings?: Array<{ code: string; path: string; message: string }> };
+    };
+    expect((body.bundle.warnings ?? []).map((w) => [w.code, w.path])).toEqual([
+      ["edge-tool-needs-allow", "tools"],
+      ["permission-rule", "permissions.rules"],
+    ]);
+  });
+
+  test("POST /compile emitAs:cf-worker: a refused setting answers 400 COMPILE even when the rules have findings", async () => {
     const yaml = `
 name: edge
 target: cli
