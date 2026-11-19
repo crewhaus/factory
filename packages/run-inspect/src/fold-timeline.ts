@@ -4,7 +4,8 @@ import type { SessionLine } from "./lines";
  * span, key events or everything recorded. A tool call and its result are one entry;
  * each check sits on the call it judged; an approval's later outcome from the decision
  * log is an entry of its own. Titles are fixed templates; content is only ever in
- * `detail`.
+ * `detail`, and it is whole: a reader masks it first and only then cuts it short, so a
+ * cut never leaves part of a secret the masker would have matched whole.
  */
 import type { LoadedRun } from "./load";
 import {
@@ -89,10 +90,6 @@ function placeOf(index: RunIndex, line: SessionLine): { span?: string; parent?: 
   return { span, ...(parent !== undefined ? { parent } : {}) };
 }
 
-function capped(text: string, max = 2000): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
 /** One line's entry, or `undefined` for a line another entry carries. */
 function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
   const p = payloadOf(line);
@@ -172,7 +169,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
           entryKind: "note",
           kind: "note",
           title: "A note the runtime added",
-          ...(text !== undefined ? { detail: capped(text) } : {}),
+          ...(text !== undefined ? { detail: text } : {}),
           sensitivity: "restricted",
         };
       }
@@ -182,7 +179,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "message",
         kind: "message",
         title: "Message",
-        ...(text !== undefined ? { detail: capped(text) } : {}),
+        ...(text !== undefined ? { detail: text } : {}),
         sensitivity: "restricted",
         ...(turn !== undefined ? { turn } : {}),
       };
@@ -195,7 +192,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "answer",
         kind: "answer",
         title: "Answer",
-        detail: capped(text),
+        detail: text,
         sensitivity: "restricted",
         ...(turn !== undefined ? { turn } : {}),
       };
@@ -212,7 +209,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "tool",
         kind: "tool",
         title: `Used ${tool.name}${failed ? ": failed" : spanInfo?.status !== undefined && spanInfo.status !== "ok" ? `: ${spanInfo.status}` : ""}`,
-        ...(resultText !== undefined ? { detail: capped(resultText) } : {}),
+        ...(resultText !== undefined ? { detail: resultText } : {}),
         refs: [
           line.id,
           ...(tool.ran !== undefined ? [tool.ran.id] : []),
@@ -233,7 +230,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         kind: "check",
         outcome,
         title: `${GATE_WORDS[gate] ?? "Check"}: ${outcome}`,
-        ...(reason !== undefined ? { detail: capped(reason) } : {}),
+        ...(reason !== undefined ? { detail: reason } : {}),
         sensitivity: "internal",
       };
     }
@@ -298,7 +295,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "run-failed",
         kind: "run-failed",
         title: `Run failed: ${code(p["class"])}`,
-        ...(str(p["message"]) !== undefined ? { detail: capped(str(p["message"]) as string) } : {}),
+        ...(str(p["message"]) !== undefined ? { detail: str(p["message"]) as string } : {}),
         sensitivity: "restricted",
       };
     case "error":
@@ -307,7 +304,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "error",
         kind: "error",
         title: "An error was recorded",
-        ...(str(p["message"]) !== undefined ? { detail: capped(str(p["message"]) as string) } : {}),
+        ...(str(p["message"]) !== undefined ? { detail: str(p["message"]) as string } : {}),
         sensitivity: "restricted",
       };
     case "sub_agent_start":

@@ -8,7 +8,8 @@
  *
  * Everything printed is masked first, as `crewhaus daemon logs` masks: the harness's own
  * env values are scrubbed, credential-shaped tokens are masked, and a value under a
- * credential's key name is replaced. Text output then has its terminal control
+ * credential's key name is replaced. Only then is long content cut short, so a cut never
+ * leaves part of a secret unmasked. Text output then has its terminal control
  * characters removed, and `--json` escapes the ones JSON leaves raw, so a tool's output
  * cannot drive the terminal it is read in.
  */
@@ -82,6 +83,28 @@ export function maskedView(view: unknown, harnessDir: string): unknown {
     return underKey && value !== null && value !== undefined ? REDACTED_VALUE : value;
   };
   return walk(scrubbed, false);
+}
+
+/** The longest piece of content a view prints, in characters. */
+export const SHOWN_MAX = 4000;
+
+/**
+ * A view as it is printed: masked whole first, then every string cut to `SHOWN_MAX`.
+ * The folds return content whole so the cut never comes before the mask: a secret
+ * that crossed the cut would leave a fragment no masker matches.
+ */
+export function shownView(view: unknown, harnessDir: string): unknown {
+  const cut = (value: unknown): unknown => {
+    if (typeof value === "string") {
+      return value.length > SHOWN_MAX ? `${value.slice(0, SHOWN_MAX)}…` : value;
+    }
+    if (Array.isArray(value)) return value.map(cut);
+    if (typeof value === "object" && value !== null) {
+      return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cut(item)]));
+    }
+    return value;
+  };
+  return cut(maskedView(view, harnessDir));
 }
 
 /** JSON text with DEL and the C1 controls escaped too: `JSON.stringify` leaves them raw. */
@@ -428,7 +451,7 @@ export async function runRunsInspect(args: InspectArgs, deps: RunsDeps): Promise
       return [...summaryLines(both.summary, harnessFlag), "", ...timelineLines(both.timeline, ref)];
     };
   }
-  const masked = maskedView(view, harness.dir);
+  const masked = shownView(view, harness.dir);
   if (args.json) return { lines: [jsonSafe(masked)], exitCode: 0 };
   return { lines: render(masked).map(terminalSafe), exitCode: 0 };
 }

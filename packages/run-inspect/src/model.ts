@@ -270,7 +270,10 @@ export type EntryGroup =
   | "gaps"
   | "other";
 
-/** One line of a timeline. `title` is a fixed template; `detail` holds content. */
+/**
+ * One line of a timeline. `title` is a fixed template; `detail` holds content, whole:
+ * mask it before cutting it short.
+ */
 export type TimelineEntry = {
   /** `s:<byte offset>` for a session-log line, `d:<segment>:<offset>` for a decision-log line. */
   readonly id: string;
@@ -387,7 +390,10 @@ export type WhyRecord = {
   readonly did: Provenance<{
     readonly what: string;
     readonly tool?: string;
-    /** The input the call ran: the object, or its JSON cut short when it is long. Content. */
+    /**
+     * The input the call ran, whole and as recorded (an object stays an object, so a
+     * key-name masker still sees its keys). Content: mask it before cutting it short.
+     */
     readonly input?: unknown;
     /** The text the model wrote before the call or answer. Content. */
     readonly reasonGiven?: string;

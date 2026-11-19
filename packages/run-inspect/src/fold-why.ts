@@ -42,18 +42,6 @@ import {
 /** `tool:<span>`, `answer:<span>`, `model:<span>` or `turn:<span>`. */
 export const WHY_ACTION_RE = /^(tool|answer|model|turn):([0-9a-f]{16})$/;
 
-const INPUT_MAX = 4000;
-
-function capped(text: string, max = INPUT_MAX): string {
-  return text.length > max ? `${text.slice(0, max)}…` : text;
-}
-
-/** A tool input as it is shown: whole, or its JSON cut short when it is long. */
-function inputView(input: unknown): unknown {
-  const json = JSON.stringify(input) ?? "";
-  return json.length > INPUT_MAX ? capped(json) : input;
-}
-
 function checkOf(index: RunIndex, verdict: VerdictInfo): CheckView {
   const p = verdict.payload;
   const refs = rec(p["refs"]);
@@ -331,7 +319,7 @@ export function whyOf(index: RunIndex, action: string): WhyRecord | InspectRefus
       {
         what: `Called ${tool?.name ?? "a tool"}${tool?.ran !== undefined ? " with the approved input" : ""}`,
         ...(tool !== undefined ? { tool: tool.name } : {}),
-        ...(input !== undefined ? { input: inputView(input) } : {}),
+        ...(input !== undefined ? { input } : {}),
         ...(reasonGiven !== undefined ? { reasonGiven } : {}),
         note: WHY_NOTE,
       },

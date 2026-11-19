@@ -184,6 +184,61 @@ describe("an approval's later outcome", () => {
     expect(check?.later).toEqual([]);
   });
 
+  test("a deny on a parked verdict reads 'denied', never 'granted'", () => {
+    const b = new LogBuilder();
+    const run = runId(1);
+    const tool = runWithCall(b, run, 0x100, [{ outcome: "parked", approval: apprId(1) }]);
+    const { dir } = harnessWith({
+      log: b.text(),
+      decisions: [
+        decisionLine("park", apprId(1), { runId: run }),
+        decisionLine("decide", apprId(1), {
+          runId: run,
+          choice: "deny",
+          by: "local:#0123abcd",
+          surface: "cli",
+        }),
+      ],
+    });
+    const loaded = load(dir, SESSION);
+    const [check] = checksOf(loaded, tool);
+    expect(check?.later).toMatchObject([{ outcome: "denied", by: "local:#0123abcd" }]);
+    expect(check?.later).toHaveLength(1);
+    const titles = timeline(loaded).entries.map((e) => e.title);
+    expect(titles).toContain("Approval denied");
+    expect(titles).not.toContain("Approval granted");
+  });
+
+  test("of an expire line and a later supersede line for one approval, only the newest shows", () => {
+    const b = new LogBuilder();
+    const run = runId(1);
+    const tool = runWithCall(b, run, 0x100, [{ outcome: "parked", approval: apprId(1) }]);
+    const { dir } = harnessWith({
+      log: b.text(),
+      decisions: [
+        decisionLine("park", apprId(1), { runId: run }),
+        decisionLine("expire", apprId(1), {
+          runId: run,
+          at: "2026-11-14T12:00:01.000Z",
+          reason: "ttl",
+        }),
+        decisionLine("supersede", apprId(1), {
+          runId: run,
+          at: "2026-11-14T12:00:02.000Z",
+          reason: "moved",
+        }),
+      ],
+    });
+    const loaded = load(dir, SESSION);
+    const [check] = checksOf(loaded, tool);
+    expect(check?.later.map((l) => [l.outcome, l.at])).toEqual([
+      ["superseded", "2026-11-14T12:00:02.000Z"],
+    ]);
+    const titles = timeline(loaded).entries.map((e) => e.title);
+    expect(titles).toContain("Approval superseded");
+    expect(titles).not.toContain("Approval expired");
+  });
+
   test("a grant on a parked verdict of the same run shows who granted it and where", () => {
     const b = new LogBuilder();
     const run = runId(1);

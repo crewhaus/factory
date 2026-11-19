@@ -74,6 +74,19 @@ describe("operator wake", () => {
     expect(summary.asked.value).toBe("please read the notes");
   });
 
+  test("of two markers on the lane before one stamp, the last one names the wake", () => {
+    const b = new LogBuilder();
+    marker(b, "first poke", "alice");
+    marker(b, "second poke", "max");
+    const run = runId(1);
+    simpleRun(b, run, 0x100, { trigger: HEARTBEAT });
+    const loaded = fromText(b.text(), run);
+    const summary = foldSummary(loaded);
+    expect(summary.wake?.value).toMatchObject({ reason: "second poke", by: "max" });
+    expect(JSON.stringify(summary)).not.toContain("first poke");
+    expect(JSON.stringify(summary)).not.toContain("alice");
+  });
+
   test("the same stamp with no marker reads 'reason not recorded', and does not fail", () => {
     const b = new LogBuilder();
     const run = runId(1);
