@@ -1651,6 +1651,19 @@ describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () 
     const without = compile(MINIMAL_SPEC).files[0]?.content;
     expect(withPasses).toBe(without);
   });
+
+  test("the rule-order check compares a bounded number of rule pairs and names the list where it stopped", () => {
+    // 500 allow/deny pairs that shadow nothing: past the bound, one note.
+    const yaml = `${MINIMAL_SPEC}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+    const warnings = compile(yaml, { applyIrPasses: true }).warnings;
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    expect(warnings[0]?.message.startsWith('rule "alwaysDeny Read" in permissions.rules')).toBe(
+      true,
+    );
+    expect(compile(yaml).warnings).toEqual([]);
+  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
 });
 
 describe("lower — CLI banner + TUI block (Phase 3 §3.3 / Phase 2 M2.2)", () => {
