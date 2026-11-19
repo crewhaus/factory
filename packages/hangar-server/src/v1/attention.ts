@@ -40,6 +40,7 @@ import { writeIndexRecord } from "@crewhaus/control-records";
 import { type Projection, readModel } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { harnessEnvFacts } from "@crewhaus/harness-supervisor";
+import { PEOPLE_SENSITIVITY } from "../access";
 import type { Sweep } from "../scheduler-host";
 import type { HomePorts } from "../sweeps";
 import type { HomeAreaRuntime } from "./areas";
@@ -183,7 +184,8 @@ function idOfRef(raw: string): string | undefined {
 
 /**
  * One item, found among the harnesses the caller may read only, in any state. An unknown
- * ref and one about a harness the caller may not read answer the same 404.
+ * ref, one about a harness the caller may not read, and an item about people the caller
+ * may not see (the list withholds it) answer the same 404.
  */
 function findItem(ctx: V1Context, raw: string): { item: AttentionItem; dir?: string } {
   const id = idOfRef(raw);
@@ -194,6 +196,12 @@ function findItem(ctx: V1Context, raw: string): { item: AttentionItem; dir?: str
   const ref = attentionRef(id);
   const item = inbox.all.find((candidate) => candidate.ref === ref);
   if (item === undefined) throw MISSING();
+  if (
+    item.sensitivity === PEOPLE_SENSITIVITY &&
+    !ctx.access.peopleAllowed(item as unknown as Readonly<Record<string, unknown>>)
+  ) {
+    throw MISSING();
+  }
   const dir =
     item.harness === undefined
       ? undefined

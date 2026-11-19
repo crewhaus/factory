@@ -15,6 +15,7 @@ import { join } from "node:path";
 import {
   advisorSnapshotRecord,
   advisorSnapshotRel,
+  approvalItemRef,
   readAdvisorSnapshot,
 } from "@crewhaus/attention";
 import { mintRunId } from "@crewhaus/control-contract";
@@ -261,6 +262,29 @@ describe("attention.list", () => {
     expect(JSON.stringify(itemsOf(res.body))).not.toContain("appr_00000000000000a5");
     expect(JSON.stringify(itemsOf(res.body))).not.toContain("PeopleLookup");
     expect(res.body["hidden"]).toEqual(["people"]);
+  });
+
+  test("an item about people answers the unknown ref's 404 to get and refs, and search lists nothing for it", async () => {
+    const ref = approvalItemRef(a.id, { id: "appr_00000000000000a5", kind: "tool" });
+    const unknown = await home.call(
+      "GET",
+      `/api/v1/attention/home/attention/att_${"0".repeat(26)}`,
+    );
+    const got = await home.call("GET", `/api/v1/attention/${ref}`);
+    expect(got.status).toBe(404);
+    expect(got.body).toEqual(unknown.body);
+    expect(JSON.stringify(got.body)).not.toContain("PeopleLookup");
+    const resolved = await home.call("GET", `/api/v1/refs/${ref}`);
+    const unknownRef = await home.call("GET", `/api/v1/refs/home/attention/att_${"0".repeat(26)}`);
+    expect(resolved.status).toBe(404);
+    expect(resolved.body).toEqual(unknownRef.body);
+    // The other request of the same harness still opens: the 404 is the people exit's.
+    const other = approvalItemRef(a.id, { id: "appr_00000000000000a1", kind: "tool" });
+    expect((await home.call("GET", `/api/v1/attention/${other}`)).status).toBe(200);
+    const search = await home.call("GET", "/api/search?q=People");
+    expect(search.status).toBe(200);
+    expect(JSON.stringify(search.body)).not.toContain(ref.slice(ref.lastIndexOf("/") + 1));
+    expect(JSON.stringify(search.body)).not.toContain("PeopleLookup");
   });
 });
 

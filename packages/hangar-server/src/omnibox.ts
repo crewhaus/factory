@@ -478,6 +478,8 @@ export function buildHarnessEntries(
   );
   for (const { item } of asked.items) {
     if (item.source.kind !== "approval") continue;
+    // A request about people is withheld from search: the index is shared by every caller.
+    if (item.sensitivity === "people") continue;
     const settled = item.resolution === undefined ? undefined : Date.parse(item.resolution.at);
     const recent = settled !== undefined && nowMs - settled <= APPROVAL_TTL_MS;
     if (item.state !== "open" && !recent) continue;
