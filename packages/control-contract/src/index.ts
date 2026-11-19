@@ -326,6 +326,7 @@ export {
   type ChangeAdoptionSubject,
   type DecisionRecordView,
   type DecisionSensitivity,
+  type RunStarter,
   type StandingRuleTerms,
   type DecisionSupersedes,
   type EffectiveDecisionState,
@@ -345,6 +346,7 @@ export {
   classAllows,
   effectiveDecisionState,
   memberMayDecide,
+  starterOf,
   verifyDecision,
 } from "./decisions.js";
 export {

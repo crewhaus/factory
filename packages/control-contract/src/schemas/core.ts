@@ -382,6 +382,7 @@ export const decisionBinding = z
     resumeScope,
     sessionId: z.string(),
     workItem: workItemId.optional(),
+    starter: z.enum(["person", "service", "system"]).optional(),
     deploymentId: deploymentId.optional(),
     specHash: z.string().optional(),
     placesDigest: z.string(),

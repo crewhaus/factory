@@ -43,6 +43,7 @@ import {
   OPERATOR_SUPERSEDE_REASONS,
   RECEIPT_VIA,
   type ReceiptVia,
+  type RunStarter,
   type SupersedeReason,
   type VerifyReason,
   effectiveDecisionState,
@@ -504,6 +505,7 @@ async function locked<T>(rootDir: string, fn: (touch: Touch) => Promise<T>): Pro
 /** What a spend that retired a grant knows now, so the request asked in its place is bound to it. */
 type Rebind = {
   readonly runId: string;
+  readonly starter?: RunStarter;
   readonly deploymentId?: string;
   readonly specHash?: string;
   readonly resourceRevision?: string;
@@ -522,6 +524,7 @@ function reboundBinding(record: PendingApproval, rebind: Rebind): ApprovalToPers
     resumeScope,
     sessionId,
     ...(typeof workItem === "string" ? { workItem } : {}),
+    ...(rebind.starter !== undefined ? { starter: rebind.starter } : {}),
     ...(rebind.deploymentId !== undefined ? { deploymentId: rebind.deploymentId } : {}),
     ...(rebind.specHash !== undefined ? { specHash: rebind.specHash } : {}),
     ...(bound ? { resourceRevision: rebind.resourceRevision } : {}),
@@ -978,6 +981,7 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
             runId: request.runId,
             resumeScope: request.resumeScope,
             ...(request.continues !== undefined ? { continues: request.continues } : {}),
+            ...(request.starter !== undefined ? { starter: request.starter } : {}),
             ...(request.deploymentId !== undefined ? { deploymentId: request.deploymentId } : {}),
             ...(request.specHash !== undefined ? { specHash: request.specHash } : {}),
             ...(request.resourceRevision !== undefined
@@ -1021,6 +1025,7 @@ export function createApprovalWriter(ctx: ApprovalWriterContext): ApprovalWriter
             touch,
             freshRequest(superseded, claim.supersededBy, at, {
               runId: request.runId,
+              ...(request.starter !== undefined ? { starter: request.starter } : {}),
               ...(request.deploymentId !== undefined ? { deploymentId: request.deploymentId } : {}),
               ...(request.specHash !== undefined ? { specHash: request.specHash } : {}),
               ...(request.resourceRevision !== undefined

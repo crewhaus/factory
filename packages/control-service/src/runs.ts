@@ -610,8 +610,13 @@ const jobRunAdapter: RunAdapter = {
           id: req.runId,
           state: "queued",
           at: new Date(now()).toISOString(),
-          trigger:
-            item.wi !== undefined ? { kind: "api" as const, workItem: item.wi } : API_TRIGGER,
+          // The door it came through: a work item's grant is spent by a run a person
+          // started, never by one a service queued.
+          trigger: {
+            kind: "api" as const,
+            ...(item.wi !== undefined ? { workItem: item.wi } : {}),
+            via: receipt.via,
+          },
           ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
@@ -1162,6 +1167,7 @@ const managedRunAdapter: RunAdapter = {
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
+          via: receipt.via,
           ...(req.subject !== undefined ? { subject: req.subject } : {}),
           ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           ...(req.home.now !== undefined ? { now: req.home.now } : {}),

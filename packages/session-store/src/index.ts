@@ -38,6 +38,7 @@ import {
   type DecisionClass,
   SESSION_ID_RE as ID_REGEX,
   type ReceiptVia,
+  type RunStarter,
   type SupersedeReason,
   type VerifyApprovers,
   type VerifyReason,
@@ -932,6 +933,8 @@ export type ConsumeRequest = {
   readonly resumeScope: string;
   /** The parked run this one continues, when it is a continuation. */
   readonly continues?: string;
+  /** Who started the spending run: what a work item's grant is read against. */
+  readonly starter?: RunStarter;
   readonly deploymentId?: string;
   readonly specHash?: string;
   /** The version of the resource the tool reports now; absent when it reports none. */

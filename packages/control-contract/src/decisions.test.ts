@@ -19,6 +19,7 @@ import {
   memberMayDecide,
   mintId,
   mintRunId,
+  starterOf,
   verifyDecision,
 } from "./index.js";
 
@@ -301,8 +302,8 @@ describe("verifyDecision, one reason at a time", () => {
     const noRun = { ...RUN_BOUND, binding: { ...RUN_BOUND.binding, runId: "" } } as never;
     expect(verify({ decision: noRun, consumer })).toEqual(refused("run-mismatch"));
   });
-  test("under a session, a job, a lane or a work item the scope is the binding: a new run passes", () => {
-    for (const scope of [SCOPE, "job:nightly-1", "lane:heartbeat", `work:${mintId("wi")}`]) {
+  test("under a session, a job or a lane the scope is the binding: a new run passes", () => {
+    for (const scope of [SCOPE, "job:nightly-1", "lane:heartbeat"]) {
       const decision = {
         ...GRANT,
         binding: { ...(GRANT.binding as object), resumeScope: scope },
@@ -314,6 +315,36 @@ describe("verifyDecision, one reason at a time", () => {
         refused("scope-mismatch"),
       );
     }
+  });
+  test("under a work item: the run that asked, its continuation or a run a person started", () => {
+    const scope = `work:${mintId("wi")}`;
+    const decision = {
+      ...GRANT,
+      binding: { ...(GRANT.binding as object), resumeScope: scope, starter: "person" },
+    } as DecisionRecordView;
+    const consumer = { ...CONSUMER, resumeScope: scope };
+    const fresh = { ...consumer, runId: "run_ffffffff" };
+    const table: readonly [string, VerifyConsumer, ReturnType<typeof verify>][] = [
+      ["the same run", consumer, { ok: true }],
+      ["its continuation", { ...fresh, continues: "run_abcd1234" }, { ok: true }],
+      ["a new run a person started", { ...fresh, starter: "person" }, { ok: true }],
+      ["a new run a service queued", { ...fresh, starter: "service" }, refused("run-mismatch")],
+      ["a new run the system started", { ...fresh, starter: "system" }, refused("run-mismatch")],
+      ["a new run whose trigger names no door", fresh, refused("run-mismatch")],
+    ];
+    for (const [, who, answer] of table) {
+      expect(verify({ decision, consumer: who })).toEqual(answer);
+    }
+    // The scope still binds a person's run: another scope is refused.
+    expect(
+      verify({ decision, consumer: { ...fresh, starter: "person", resumeScope: "job:other" } }),
+    ).toEqual(refused("scope-mismatch"));
+  });
+  test("a door names its starter", () => {
+    expect(["home", "cli", "slack"].map(starterOf)).toEqual(["person", "person", "person"]);
+    expect(starterOf("sdk")).toBe("service");
+    expect(["github", "resident", "system"].map(starterOf)).toEqual(["system", "system", "system"]);
+    expect([undefined, "", "pager"].map(starterOf)).toEqual([undefined, undefined, undefined]);
   });
   test("revision-changed, and it alone says supersede", () => {
     const deployment = verify({ consumer: { ...CONSUMER, deploymentId: "dep_b" } });
