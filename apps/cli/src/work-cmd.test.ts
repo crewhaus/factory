@@ -65,6 +65,8 @@ function world(spec = "tools: [read, workList, workGet, workPropose, workUpdate]
   return { harness, run, starts };
 }
 
+const PERSON_ACTOR = { by: mintId("prn"), via: "cli", role: "person" } as const;
+
 const idOf = (lines: readonly string[]) => /\b(wi_[0-9a-z]{26})\b/.exec(lines[0] ?? "")?.[1] ?? "";
 
 describe("crewhaus work", () => {
@@ -185,5 +187,58 @@ describe("crewhaus work", () => {
     const start = await w.run(["start", proposed.item.id]);
     expect(start.exitCode).toBe(EXIT_FOR_ERROR.unsupported);
     expect(start.lines[0]).toContain("Turn on the Work tools");
+  });
+});
+
+type WorkPage = {
+  actionsFor(
+    item: Record<string, unknown>,
+    can: Record<string, boolean>,
+    hrn: string,
+  ): ReadonlyArray<{ readonly id: string; readonly twin: string }>;
+  declineTwin(wi: string, reason: string, hrn: string): string;
+  rankTwin(wi: string, above: string, scope: string, hrn: string): string;
+};
+
+/** A twin as argv for `runWorkCommand`: no `crewhaus work`, no `--harness` (the world adds it). */
+function argvOf(twin: string, fill: Readonly<Record<string, string>> = {}): string[] {
+  const words = twin.split(" ").map((w) => fill[w] ?? w);
+  expect(words.slice(0, 2)).toEqual(["crewhaus", "work"]);
+  const at = words.indexOf("--harness");
+  expect(at).toBeGreaterThan(-1);
+  return [...words.slice(2, at), ...words.slice(at + 2)];
+}
+
+describe("the Work page's twins, run", () => {
+  test("Add note, Decline and Move above… do what the page does", async () => {
+    const url = new URL("../../../packages/hangar-ui/assets/js/views/work.js", import.meta.url)
+      .href;
+    const page = (await import(url)) as WorkPage;
+    const w = world();
+    const store = openWorkStore(w.harness);
+    const a = await store.create({ title: "Fix the date parser", kind: "fix" }, PERSON_ACTOR);
+    if (!a.ok) throw new Error(a.message);
+    const b = await store.create({ title: "Update the parser", kind: "fix" }, PERSON_ACTOR);
+    if (!b.ok) throw new Error(b.message);
+    const can = { "h.run.submit": true, "h.control": true };
+    const edit = page.actionsFor(a.item, can, HRN).find((x) => x.id === "edit")?.twin ?? "";
+    const noted = await w.run(argvOf(edit, { "<text>": "Seen twice." }));
+    expect(`${noted.exitCode} ${noted.lines.join(" ")}`).toStartWith("0");
+    const read = store.get(a.item.id);
+    expect("ok" in read ? undefined : read.item.rev).toBe(2);
+
+    const ranked = await w.run(argvOf(page.rankTwin(b.item.id, a.item.id, "item", HRN)));
+    expect(ranked.exitCode).toBe(0);
+
+    const proposed = await store.propose(
+      { title: "Add CSV export", kind: "fix", basis: "speculative" },
+      { by: "sys:runtime", via: "tool", role: "harness" },
+    );
+    if (!proposed.ok) throw new Error(proposed.message);
+    const declined = await w.run(argvOf(page.declineTwin(proposed.item.id, "not-now", HRN)));
+    expect(declined.exitCode).toBe(0);
+    expect(store.get(proposed.item.id)).toMatchObject({
+      item: { state: "closed", outcome: "declined" },
+    });
   });
 });

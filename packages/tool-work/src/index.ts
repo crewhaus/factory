@@ -15,7 +15,14 @@
  * decline or cancel, never rewrite an accepted item, and never claim an operator's or an
  * API caller's source: the store refuses each (`WORK_ACTOR_RULES`). Only the owner's
  * policy (`tool_config.work.accept`, through {@link registerWorkConfig}) lets the runtime
- * accept a proposal of a listed kind, and never a feature with nothing observed.
+ * accept a proposal of a listed kind, and never a feature or a speculative proposal with
+ * nothing observed.
+ *
+ * ## One work list per harness, never per tenant
+ *
+ * The store lives in the harness directory, so only the harness itself and Home's own runs
+ * (tenant {@link WORK_HOME_TENANT}) reach it. Inside any other tenant's context, a managed
+ * daemon's client, all four tools refuse before they open the store.
  *
  * ## Pillar 3: text read back at the origin it came through
  *
@@ -43,6 +50,7 @@ import {
   parseRef,
 } from "@crewhaus/control-contract";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
+import { currentTenantContext } from "@crewhaus/tenancy";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
@@ -80,6 +88,20 @@ export function getWorkConfig(): WorkConfig {
 
 export class WorkToolError extends Error {
   override readonly name = "WorkToolError";
+}
+
+/**
+ * The tenant Home's own runs serve on a managed daemon (the gateway's `HOME_RUN_TENANT`;
+ * a control-service test pins the two equal). The only tenant whose runs reach the store.
+ */
+export const WORK_HOME_TENANT = "home";
+
+/** Refuse inside any tenant context but Home's own: the store is the harness's, not a tenant's. */
+function assertHarnessTenant(): void {
+  const ctx = currentTenantContext();
+  if (ctx !== undefined && ctx.tenant.id !== WORK_HOME_TENANT) {
+    throw new WorkToolError("Work items are not available to a managed tenant's runs.");
+  }
 }
 
 type Classify = (text: string, opts: { readonly origin: TrustOrigin }) => Promise<BoundaryResult>;
@@ -340,6 +362,7 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
   const classify: Classify = deps.classify ?? ((text, opts) => classifyBoundary(text, opts));
   const config = deps.config ?? getWorkConfig;
   const storeOf = (): { readonly store: WorkStore; readonly dir: string } => {
+    assertHarnessTenant();
     const dir = deps.harnessDir ?? process.cwd();
     return { store: openWorkStore(dir, deps.now !== undefined ? { now: deps.now } : {}), dir };
   };
@@ -560,8 +583,15 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
         input.edit !== undefined;
       if (!wants)
         throw new WorkToolError("Say what to change: note, link, deliver, edit or close.");
-      // A run started for this item links on its first update.
-      const linkRun = input.link === true || rc?.workItem === wi;
+      // A run started for this item links on its first update, while the item is not
+      // closed: after a close the run still records a note or a delivery. Only an
+      // explicit link is refused on a closed item.
+      let implicit = false;
+      if (input.link !== true && rc?.workItem === wi) {
+        const read = store.get(wi);
+        implicit = !("ok" in read) && read.item.state !== "closed";
+      }
+      const linkRun = input.link === true || implicit;
       if (linkRun) {
         if (actor.run === undefined) {
           if (input.link === true)

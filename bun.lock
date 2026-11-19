@@ -4010,6 +4010,7 @@
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",

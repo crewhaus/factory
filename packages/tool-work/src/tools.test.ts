@@ -5,8 +5,10 @@ import { join } from "node:path";
 import type { BoundaryResult, TrustOrigin } from "@crewhaus/boundary-classifier";
 import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { createRunContext } from "@crewhaus/run-context";
+import { buildTenant, withTenant } from "@crewhaus/tenancy";
 import * as main from "./index";
 import {
+  WORK_HOME_TENANT,
   WorkConfigError,
   createWorkTools,
   getWorkConfig,
@@ -211,6 +213,91 @@ describe("writes through the tools", () => {
     const read = store.get(a.work);
     if ("ok" in read) throw new Error(read.message);
     expect(read.item.runs).toEqual([rc.runId]);
+  });
+
+  test("a run started for an item closes it, then records its delivery and a note in later calls", async () => {
+    const dir = harness();
+    const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });
+    const store = openWorkStore(dir);
+    const created = await store.create({ title: "Fix the CSV import", kind: "fix" }, PERSON);
+    if (!created.ok) throw new Error(created.message);
+    const wi = created.item.id;
+    const rc = rcFor(wi);
+    await tools.workUpdate.execute(
+      { work: wi, close: { outcome: "done", reasonCode: "fixed" } },
+      { runContext: rc },
+    );
+    const delivered = JSON.parse(
+      String(
+        await tools.workUpdate.execute(
+          { work: wi, deliver: { kind: "report", ref: "reports/csv.md" } },
+          { runContext: rc },
+        ),
+      ),
+    );
+    expect(delivered).toEqual({ work: wi, state: "closed" });
+    await tools.workUpdate.execute({ work: wi, note: "Shipped." }, { runContext: rc });
+    const read = store.get(wi);
+    if ("ok" in read) throw new Error(read.message);
+    expect(read.item.runs).toEqual([rc.runId]);
+    expect(read.item.history.map((line) => line.event)).toEqual([
+      "opened",
+      "linked",
+      "closed",
+      "delivered",
+      "updated",
+    ]);
+    // An explicit link is still refused on a closed item, for a run it never linked.
+    await expect(
+      tools.workUpdate.execute({ work: wi, link: true }, { runContext: rcFor(wi) }),
+    ).rejects.toThrow("closed");
+  });
+
+  test("a managed tenant's run neither reads nor changes the work list; Home's own runs do", async () => {
+    const dir = harness();
+    const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });
+    const store = openWorkStore(dir);
+    const created = await store.create(
+      { title: "Refund the customer", kind: "fix", goal: "PRIVATE-GOAL" },
+      PERSON,
+    );
+    if (!created.ok) throw new Error(created.message);
+    const wi = created.item.id;
+    const tenantsRoot = mkdtempSync(join(tmpdir(), "tool-work-tenants-"));
+    dirs.push(tenantsRoot);
+    const tenantB = buildTenant("tenant-b", { tenantsRoot });
+    const refusal = "Work items are not available to a managed tenant's runs.";
+    const asB = <T>(fn: () => Promise<T>) => withTenant(tenantB, fn) as Promise<T>;
+    await expect(
+      asB(() => tools.workList.execute({ state: "all" }, { runContext: rcFor() })),
+    ).rejects.toThrow(refusal);
+    await expect(
+      asB(() => tools.workGet.execute({ work: wi }, { runContext: rcFor() })),
+    ).rejects.toThrow(refusal);
+    await expect(
+      asB(() => tools.workUpdate.execute({ work: wi, note: "From B." }, { runContext: rcFor(wi) })),
+    ).rejects.toThrow(refusal);
+    await expect(
+      asB(() =>
+        tools.workPropose.execute(
+          { title: "B's idea", kind: "fix", basis: "speculative" },
+          { runContext: rcFor() },
+        ),
+      ),
+    ).rejects.toThrow(refusal);
+    const read = store.get(wi);
+    if ("ok" in read) throw new Error(read.message);
+    expect(read.item.rev).toBe(1);
+    expect(read.item.runs).toEqual([]);
+    expect(store.list().items).toHaveLength(1);
+    // Home's own runs serve the harness's list.
+    const home = buildTenant(WORK_HOME_TENANT, { tenantsRoot });
+    const listed = String(
+      await withTenant(home, () =>
+        tools.workList.execute({ state: "all" }, { runContext: rcFor() }),
+      ),
+    );
+    expect(listed).toContain(wi);
   });
 
   test("the harness cannot claim an operator source, and cannot close without a reason", async () => {

@@ -1000,3 +1000,53 @@ describe("every write has an equivalent or a note", () => {
     expect(coverage(table, { a: "x", gone: "y" })).toEqual({ uncovered: ["b"], stray: ["gone"] });
   });
 });
+
+type WorkPage = {
+  actionsFor(
+    item: Record<string, unknown>,
+    can: Record<string, boolean>,
+    hrn: string,
+  ): ReadonlyArray<{ readonly id: string; readonly twin: string }>;
+  rankControlModel(
+    item: Record<string, unknown>,
+    candidates: ReadonlyArray<Record<string, unknown>>,
+    hrn: string,
+  ): { readonly twin: string | null };
+  declineTwin(wi: string, reason: string, hrn: string): string;
+  rankTwin(wi: string, above: string, scope: string, hrn: string): string;
+};
+
+describe("the Work page's twins, by import", () => {
+  test("each one the page shows, for every state and every choice, is a command the CLI takes", async () => {
+    const url = new URL("../../../packages/hangar-ui/assets/js/views/work.js", import.meta.url)
+      .href;
+    const page = (await import(url)) as WorkPage;
+    const hrn = "hrn_0123456789abcdef";
+    const wi = mintId("wi");
+    const other = mintId("wi");
+    const can = { "h.run.submit": true, "h.control": true };
+    let checked = 0;
+    for (const state of ["proposed", "open", "closed"]) {
+      for (const action of page.actionsFor({ id: wi, state, rev: 4 }, can, hrn)) {
+        expectRunnable(`work ${state} ${action.id}`, action.twin);
+        checked++;
+      }
+    }
+    for (const reason of ["out-of-scope", "duplicate", "not-now", "wont-fix", "needs-evidence"]) {
+      expectRunnable(`decline ${reason}`, page.declineTwin(wi, reason, hrn));
+      checked++;
+    }
+    for (const scope of ["item", "similar", "all"]) {
+      expectRunnable(`rank ${scope}`, page.rankTwin(wi, other, scope, hrn));
+      checked++;
+    }
+    const rank = page.rankControlModel(
+      { id: wi, state: "open" },
+      [{ id: other, state: "open", title: "Other" }],
+      hrn,
+    ).twin;
+    expectRunnable("rank, as the page starts", rank ?? "");
+    // proposed: accept, decline, edit; open: start, cancel, edit; closed: reopen.
+    expect(checked).toBe(7 + 5 + 3);
+  });
+});

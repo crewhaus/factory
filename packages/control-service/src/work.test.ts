@@ -12,9 +12,11 @@ import { join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
 import { type CommandReceipt, mintId, mintRunId } from "@crewhaus/control-contract";
 import { controlPaths, foldStates, runsLedger } from "@crewhaus/control-records";
+import { HOME_RUN_TENANT } from "@crewhaus/gateway-server";
 import { type ApiRunInput, openApiRoot } from "@crewhaus/harness-supervisor";
 import { createRunContext } from "@crewhaus/run-context";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { WORK_HOME_TENANT } from "@crewhaus/tool-work";
 import { openWorkStore, workLedger } from "@crewhaus/tool-work/work-items";
 // runtime-core's package entry exports no test seam; this is the module the loop loads.
 import { _resetRunLedgerForTest } from "../../runtime-core/src/run-ledger";
@@ -120,6 +122,10 @@ async function opened(r: Rig, title = "Fix the date parser"): Promise<string> {
   if (id === undefined) throw new Error("not created");
   return id;
 }
+
+test("the Work tools' own tenant is the one Home's runs serve", () => {
+  expect(WORK_HOME_TENANT).toBe(HOME_RUN_TENANT);
+});
 
 describe("each work command writes one receipt and one line naming it", () => {
   test("create, update, accept, decline, reopen, rank and adopt", async () => {

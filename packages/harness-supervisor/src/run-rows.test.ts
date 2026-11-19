@@ -25,7 +25,7 @@ import {
   readPage,
 } from "@crewhaus/control-records";
 import type { ProcessOps, SpawnRequest } from "./process-ops";
-import { RUN_LEDGER_DIR, openApiRoot, runLedgerFor } from "./run-rows";
+import { RUN_LEDGER_DIR, closeExecution, openApiRoot, runLedgerFor } from "./run-rows";
 import { writeRunfile } from "./runfiles";
 import { buildSpawnPlan } from "./spawn-contracts";
 import { type HarnessSupervisor, type StartResult, createHarnessSupervisor } from "./supervisor";
@@ -614,14 +614,23 @@ describe("an API root for a work item", () => {
       execution,
       workItem,
     });
-    // Parked, then resumed: the resume's preparing row carries it too.
-    plant(dir, { id: runId, state: "running", trigger: { kind: "api", workItem }, workItem });
-    plant(dir, {
-      id: runId,
-      state: "waiting-for-approval",
-      trigger: { kind: "api", workItem },
-      workItem,
-    });
+    // Parked, then resumed, through the rows the real writers produce: the runtime's root
+    // `running` row (trigger and execution only), then the supervisor's park through
+    // closeExecution. Neither carries a top-level workItem; the resume's preparing row
+    // still names the item.
+    plant(dir, { id: runId, state: "running", trigger: { kind: "api", workItem }, execution });
+    expect(
+      await closeExecution(dir, {
+        execution,
+        root: { id: runId, ending: { state: "waiting-for-approval" } },
+        now: () => Date.parse(AT),
+      }),
+    ).toEqual({ ok: true });
+    const parked = rowsAt(dir)
+      .filter((row) => row["id"] === runId)
+      .at(-1);
+    expect(parked?.["state"]).toBe("waiting-for-approval");
+    expect(parked && "workItem" in parked).toBe(false);
     const again = `run_${"b".repeat(16)}`;
     expect(await openApiRoot(dir, { id: runId, execution: again, at: AT, holder: HOLDER })).toEqual(
       { ok: true },

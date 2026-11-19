@@ -104,7 +104,11 @@ export async function openApiRoot(
     const fold = foldStates(ledger);
     if (!fold.ok) return { ok: false as const, reason: fold.reason };
     const current = fold.objects.get(run.id);
-    const workItem = current?.record["workItem"];
+    // The newest row may be one that carries only the trigger (the root's `running` row,
+    // or the supervisor's own `waiting-for-approval` row at a park): the trigger names the
+    // item too, so a resume reads it from there.
+    const trigger = current?.record["trigger"] as { readonly workItem?: unknown } | undefined;
+    const workItem = current?.record["workItem"] ?? trigger?.workItem;
     const row = {
       id: run.id,
       state: "preparing",

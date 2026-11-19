@@ -211,6 +211,31 @@ describe("content revisions", () => {
     expect(store.revision(wi, 3)?.goal).toBe("Dates and times parse.");
   });
 
+  test("a revision file no line names (a writer that stopped before its line) never blocks the item", async () => {
+    const dir = harness();
+    const store = openWorkStore(dir);
+    const wi = ok(await store.create(FIX, PERSON)).item.id;
+    // Revision 2 on disk, but no log line names it.
+    const orphan = join(dir, revisionRelOf(dir, wi, 2));
+    writeFileSync(orphan, `${JSON.stringify({ v: 1, wi, rev: 2, title: "Left behind" })}\n`, {
+      mode: 0o600,
+    });
+    const noted = ok(await store.update(wi, { expect: 1, note: "Seen again today." }, PERSON));
+    expect(noted.item.rev).toBe(2);
+    expect(store.revision(wi, 2)?.title).toBe(FIX.title);
+    // And again for a delivery, whose revision is above the folded one.
+    const next = join(dir, revisionRelOf(dir, wi, 3));
+    writeFileSync(next, `${JSON.stringify({ v: 1, wi, rev: 3, title: "Left behind" })}\n`, {
+      mode: 0o600,
+    });
+    const delivered = ok(
+      await store.deliver(wi, { kind: "report", ref: "reports/csv.md" }, HARNESS),
+    );
+    expect(delivered.item.rev).toBe(3);
+    expect(store.revision(wi, 3)?.title).toBe(FIX.title);
+    expect(statSync(next).mode & 0o777).toBe(0o600);
+  });
+
   test("each field keeps the origin it was written through", async () => {
     const dir = harness();
     const store = openWorkStore(dir);
@@ -449,6 +474,31 @@ describe("the owner's accept policy", () => {
           basis: "speculative",
           assessment: { ...HYPOTHESIS, evidence: [...HYPOTHESIS.evidence, ...OBSERVED.evidence] },
         },
+        HARNESS,
+        { policy },
+      ),
+    );
+    expect(seen.item.state).toBe("open");
+  });
+});
+
+describe("the owner's accept policy, by basis", () => {
+  test("a speculative proposal of any listed kind stays proposed without observed evidence", async () => {
+    const dir = harness();
+    const store = openWorkStore(dir);
+    const policy = { accept: ["fix" as const] };
+    const guess = ok(
+      await store.propose(
+        { title: "Add a brand new billing dashboard", kind: "fix", basis: "speculative" },
+        HARNESS,
+        { policy },
+      ),
+    );
+    expect(guess.item.state).toBe("proposed");
+    expect(guess.item.history.map((line) => line.event)).toEqual(["opened"]);
+    const seen = ok(
+      await store.propose(
+        { title: "Fix the CSV import", kind: "fix", basis: "speculative", assessment: OBSERVED },
         HARNESS,
         { policy },
       ),

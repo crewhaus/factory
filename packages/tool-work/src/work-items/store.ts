@@ -372,17 +372,21 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
     }
   }
 
-  /** Write one revision, exclusively, `0600`; never over an existing one. */
-  function writeRevision(revision: WorkRevision): WorkRefusal | undefined {
+  /**
+   * Write one revision, exclusively, `0600`; never over an existing one. `named` is the
+   * newest revision a log line names, given only under the ledger's lock: a file above it
+   * is one no line names (a writer that stopped between its revision and its line), so it
+   * is removed and written again instead of blocking every later edit of the item.
+   */
+  function writeRevision(revision: WorkRevision, named?: number): WorkRefusal | undefined {
     const dir = ensureDirContained(harnessDir, itemDirOf(harnessDir, revision.wi), { mode: 0o700 });
     if (!dir.ok) return refusal("unavailable", "store_unwritable", dir.reason);
-    const created = createExclusive(
-      harnessDir,
-      revisionRelOf(harnessDir, revision.wi, revision.rev),
-      {
-        mode: 0o600,
-      },
-    );
+    const rel = revisionRelOf(harnessDir, revision.wi, revision.rev);
+    let created = createExclusive(harnessDir, rel, { mode: 0o600 });
+    if (!created.ok && created.code === "exists" && named !== undefined && revision.rev > named) {
+      removeRevision(revision.wi, revision.rev);
+      created = createExclusive(harnessDir, rel, { mode: 0o600 });
+    }
     if (!created.ok) {
       return created.code === "exists"
         ? refusal("conflict", "revision_exists", "That revision was written already.", {
@@ -398,6 +402,19 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
       closeSync(created.fd);
     }
     return undefined;
+  }
+
+  /** Remove one revision file no log line names: contained, never followed out. */
+  function removeRevision(wi: string, rev: number): void {
+    const at = resolveContained(harnessDir, revisionRelOf(harnessDir, wi, rev), {
+      followLeaf: false,
+    });
+    if (!at.ok) return;
+    const root = resolveContained(harnessDir, ".");
+    if (!root.ok) return;
+    const rel = relative(root.real, at.real);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) return;
+    rmSync(at.real, { force: true });
   }
 
   /** Remove an item directory this call created and nothing names: contained, never followed out. */
@@ -555,11 +572,17 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
       if ("ok" in decided) return decided;
       if (decided.line === undefined) return { ok: true, item, wrote: false };
       if (decided.revision !== undefined) {
-        const problem = writeRevision(decided.revision);
+        const problem = writeRevision(decided.revision, item.rev);
         if (problem !== undefined) return problem;
       }
       const written = lockedAppend(decided.line as unknown as LedgerRecord);
-      if (!written.ok) return refusal("unavailable", "store_unwritable", written.reason);
+      if (!written.ok) {
+        // No line names the revision this call wrote: remove it, so the next edit can.
+        if (decided.revision !== undefined) {
+          removeRevision(decided.revision.wi, decided.revision.rev);
+        }
+        return refusal("unavailable", "store_unwritable", written.reason);
+      }
       const after = foldWork(harnessDir);
       const folded = after.ok ? after.items.get(wi) : undefined;
       return { ok: true, item: folded ?? item, wrote: true };
@@ -735,12 +758,11 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
             })();
       if (!written.ok || !written.wrote) return written;
       // The owner's accept policy: a listed kind is accepted by the runtime, except a
-      // feature with no observed evidence, which waits for a person.
+      // feature or a speculative proposal of any kind with no observed evidence, which
+      // waits for a person.
       const accept = opts.policy?.accept ?? [];
-      if (
-        accept.includes(input.kind) &&
-        (input.kind !== "feature" || hasObservedEvidence(assessment))
-      ) {
+      const needsObserved = input.kind === "feature" || input.basis === "speculative";
+      if (accept.includes(input.kind) && (!needsObserved || hasObservedEvidence(assessment))) {
         const accepted = await store.transition(
           written.item.id,
           "open",
@@ -1009,12 +1031,13 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
         });
       }
       return locked(wi, (item) => {
+        // Already linked writes nothing, closed or not.
+        if (item.runs.includes(run)) return {};
         if (item.state === "closed") {
           return refusal("conflict", "closed", "This item is closed; reopen it to link a run.", {
             current: item.state,
           });
         }
-        if (item.runs.includes(run)) return {};
         return { line: line({ id: wi, state: item.state, event: "linked", run }, actor) };
       });
     },

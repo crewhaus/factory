@@ -18,7 +18,7 @@
 
 import { clear, el, statusBadge } from "../dom.js";
 import { hrefHarness } from "../router.js";
-import { emptyFor, emptyModel } from "../ui/empty.js";
+import { emptyFor } from "../ui/empty.js";
 import { announce } from "../ui/live.js";
 import { call, createAction } from "../v1.js";
 
@@ -126,13 +126,17 @@ export const KIND_CHOICES = Object.freeze([
 const WI_RE = /^wi_[0-9a-hjkmnp-tv-z]{26}$/;
 const GOAL_RE = /^goal-\d{4}$/;
 
-/** The wire's empty reason, as the screen's own cause. */
-export function causeOf(reason) {
+/**
+ * The wire's empty reason, as the screen's own cause. Unreachable Thredz is a service that
+ * did not answer (try again); anything else unreachable is a read that failed (goals, or
+ * the harness's own folder), which trying again does not fix.
+ */
+export function causeOf(reason, group = "fromThredz") {
   switch (reason) {
     case "no-access":
       return "no-access";
     case "unreachable":
-      return "connection-failed";
+      return group === "fromThredz" ? "connection-failed" : "unreachable";
     case "unsupported":
       return "unsupported";
     case "filtered":
@@ -259,17 +263,19 @@ export function feedModel(feed, hrn) {
     if (empty === undefined) continue;
     const useful = empty.reason !== "no-data" || (group.id === "upNext" && nothing);
     if (!useful) continue;
+    const cause = causeOf(empty.reason, group.id);
+    // What `emptyFor` takes, not what it draws: it builds the words once, from these.
     groups.push({
       id: group.id,
       heading: group.heading,
       parts: [],
-      empty: emptyModel({
-        cause: causeOf(empty.reason),
+      empty: {
+        cause,
         subject: group.id === "fromThredz" ? "Thredz" : group.heading.toLowerCase(),
-        detail: typeof empty.remedy === "string" ? empty.remedy : undefined,
+        ...(typeof empty.remedy === "string" ? { detail: empty.remedy } : {}),
         ...(typeof empty.verb === "string" ? { verb: empty.verb } : {}),
-        ...(empty.reason === "unreachable" ? { action: "Try again" } : {}),
-      }),
+        ...(cause === "connection-failed" ? { action: "Try again", retry: true } : {}),
+      },
       truncated: false,
     });
   }
@@ -371,22 +377,39 @@ function historyLine(h) {
     .replace("T", " ")} · ${what}${outcome} ${where}`.trim();
 }
 
+/** "Add note"'s twin: the revision the page shows, and the note as the one placeholder. */
+export function editTwin(wi, rev, hrn) {
+  return `crewhaus work edit ${wi} --expect ${rev} --note <text> --harness ${hrn}`;
+}
+
+/** Decline's twin, with the reason the person picked. */
+export function declineTwin(wi, reason, hrn) {
+  return `crewhaus work decline ${wi} --reason ${reason} --harness ${hrn}`;
+}
+
+/** "Move above…"'s twin, with the item and the scope the person picked. */
+export function rankTwin(wi, above, scope, hrn) {
+  return `crewhaus work rank ${wi} --above ${above} --scope ${scope} --harness ${hrn}`;
+}
+
 /**
  * The actions an item's state allows, for a caller who may take them (`can` is `me.get`'s
- * answer). Each names its operation and its exact CLI twin. Home decides again.
+ * answer). Each names its operation and its exact CLI twin, for the choices the page starts
+ * with; the page renders it again as the person changes them. Home decides again.
  */
 export function actionsFor(item, can, hrn) {
   const submit = can?.["h.run.submit"] === true;
   const control = can?.["h.control"] === true;
   const wi = String(item?.id ?? "");
+  const rev = Number.isSafeInteger(item?.rev) ? item.rev : 1;
   // Each twin spelled whole, so it reads as the command it is.
   const twins = {
     accept: `crewhaus work accept ${wi} --harness ${hrn}`,
-    decline: `crewhaus work decline ${wi} --reason <code> --harness ${hrn}`,
+    decline: declineTwin(wi, DECLINE_CHOICES[0].value, hrn),
     start: `crewhaus work start ${wi} --harness ${hrn}`,
     cancel: `crewhaus work cancel ${wi} --harness ${hrn}`,
     reopen: `crewhaus work reopen ${wi} --harness ${hrn}`,
-    edit: `crewhaus work edit ${wi} --expect <rev> --harness ${hrn}`,
+    edit: editTwin(wi, rev, hrn),
   };
   const twin = (verb) => twins[verb];
   const out = [];
@@ -437,18 +460,30 @@ export function actionsFor(item, can, hrn) {
   return out;
 }
 
+/** The longest title a "Move above…" choice shows; the whole title is the option's tooltip. */
+export const RANK_LABEL_MAX = 80;
+
 /** "Move above…": the items it can be moved above (same state, not itself), and the scopes. */
 export function rankControlModel(item, candidates, hrn) {
   const wi = String(item?.id ?? "");
   const options = (Array.isArray(candidates) ? candidates : [])
     .filter((c) => c?.id !== wi && c?.state === item?.state && item?.state !== "closed")
-    .map((c) => ({ value: String(c.id), label: String(c.title ?? c.id) }));
+    .map((c) => {
+      const title = String(c.title ?? c.id);
+      const chars = [...title];
+      return {
+        value: String(c.id),
+        label:
+          chars.length > RANK_LABEL_MAX ? `${chars.slice(0, RANK_LABEL_MAX - 1).join("")}…` : title,
+        title,
+      };
+    });
   return {
     available: options.length > 0,
     label: "Move above…",
     options,
     scopes: SCOPE_CHOICES,
-    twin: `crewhaus work rank ${wi} --above <wi> --scope item|similar|all --harness ${hrn}`,
+    twin: options.length > 0 ? rankTwin(wi, options[0].value, SCOPE_CHOICES[0].value, hrn) : null,
   };
 }
 
@@ -478,18 +513,35 @@ function select(id, choices) {
   return el(
     "select",
     { id, class: "input" },
-    choices.map((c) => el("option", { value: c.value, text: c.label })),
+    choices.map((c) =>
+      el("option", {
+        value: c.value,
+        text: c.label,
+        ...(typeof c.title === "string" && c.title !== c.label ? { title: c.title } : {}),
+      }),
+    ),
   );
 }
 
-function drawGroups(host, model) {
+/** Set a twin line's command to what the controls beside it now say. */
+function retwin(line, command) {
+  const code = line?.querySelector(".twin-cmd");
+  if (code) code.textContent = command;
+}
+
+function drawGroups(host, model, refresh) {
   clear(host);
   if (model.hidden) host.appendChild(el("p", { class: "muted", text: WORK_COPY.noContent }));
   for (const group of model.groups) {
     const section = el("section", { class: "work-group", "aria-labelledby": `work-${group.id}` }, [
       el("h3", { id: `work-${group.id}`, text: group.heading }),
     ]);
-    if (group.empty !== null) section.appendChild(emptyFor(group.empty));
+    if (group.empty !== null) {
+      const { retry, ...empty } = group.empty;
+      section.appendChild(
+        emptyFor(retry === true && refresh !== undefined ? { ...empty, onAction: refresh } : empty),
+      );
+    }
     for (const part of group.parts) {
       if (part.heading !== null) section.appendChild(el("h4", { text: part.heading }));
       section.appendChild(
@@ -626,10 +678,12 @@ export async function renderWork(root, ctx) {
   root.appendChild(heading);
   root.appendChild(groups);
   const can = await canOf();
-  const refresh = async () => {
+  const refresh = async (retried = false) => {
     const feed = await call("work.feed", { params: { h: ctx.id } });
-    // Never redraw under the reader's focus: the next refresh catches up.
-    if (groups.contains(document.activeElement) && groups.childElementCount > 0) return;
+    // Never redraw under the reader's focus: the next refresh catches up. "Try again" is
+    // the reader asking for the redraw, so it redraws and puts focus back on the heading.
+    if (!retried && groups.contains(document.activeElement) && groups.childElementCount > 0) return;
+    if (retried) heading.focus();
     if (!feed.ok) {
       clear(groups);
       groups.appendChild(
@@ -641,20 +695,23 @@ export async function renderWork(root, ctx) {
       );
       return;
     }
-    drawGroups(groups, feedModel(feed.body, ctx.id));
+    drawGroups(groups, feedModel(feed.body, ctx.id), () => refresh(true));
   };
   await refresh();
-  if (can["h.run.submit"] === true) root.appendChild(addForm(ctx, refresh));
+  if (can["h.run.submit"] === true) root.appendChild(addForm(ctx, () => refresh()));
   return undefined;
 }
 
 export async function renderWorkItem(root, ctx, wi) {
   currentHarness = ctx.id;
   clear(root);
-  const back = el("a", { href: hrefHarness(ctx.id, "work", "items"), text: WORK_COPY.back });
+  // In the crumb line the run and session pages use, never a bare inline link.
+  const back = el("div", { class: "crumb-line" }, [
+    el("a", { href: hrefHarness(ctx.id, "work", "items"), text: WORK_COPY.back }),
+  ]);
   if (!WI_RE.test(wi)) {
-    root.appendChild(el("p", { text: "There is no such work item." }));
     root.appendChild(back);
+    root.appendChild(el("p", { text: "There is no such work item." }));
     return undefined;
   }
   const [detail, can, list] = await Promise.all([
@@ -663,13 +720,13 @@ export async function renderWorkItem(root, ctx, wi) {
     call("work.list", { params: { h: ctx.id } }),
   ]);
   if (!detail.ok) {
+    root.appendChild(back);
     root.appendChild(el("h2", { text: WORK_COPY.title }));
     root.appendChild(el("p", { text: errorText(detail) }));
-    root.appendChild(back);
     return undefined;
   }
   const model = itemModel(detail.body);
-  const heading = el("h2", { tabindex: "-1", text: model.title });
+  const heading = el("h2", { tabindex: "-1", class: "work-text", text: model.title });
   root.appendChild(back);
   root.appendChild(heading);
   root.appendChild(
@@ -680,7 +737,10 @@ export async function renderWorkItem(root, ctx, wi) {
   );
   if (model.hidden) root.appendChild(el("p", { class: "muted", text: WORK_COPY.noContent }));
   const block = (title, children) =>
-    el("section", { "aria-label": title }, [el("h3", { text: title }), ...children]);
+    el("section", { class: "work-text", "aria-label": title }, [
+      el("h3", { text: title }),
+      ...children,
+    ]);
   if (model.goal !== null)
     root.appendChild(block("What's asked", [el("p", { class: "prewrap", text: model.goal })]));
   if (model.acceptance.length > 0) {
@@ -800,6 +860,7 @@ export async function renderWorkItem(root, ctx, wi) {
         if (done.ok) drafts.delete(`${wi}:decline-note`);
         await after(done, WORK_COPY.declined);
       });
+      reason.addEventListener("change", () => retwin(row, declineTwin(wi, reason.value, ctx.id)));
       row.append(
         el("label", { for: `work-decline-${wi}`, text: "Reason" }),
         " ",
@@ -858,7 +919,7 @@ export async function renderWorkItem(root, ctx, wi) {
   const rank = rankControlModel(detail.body.item, list.ok ? list.body?.items : [], ctx.id);
   if (rank.available && can["h.run.submit"] === true) {
     const above = select(`work-rank-above-${wi}`, rank.options);
-    const scopes = el("fieldset", {}, [
+    const scopes = el("fieldset", { class: "work-scope" }, [
       el("legend", { text: "How far it reaches" }),
       ...rank.scopes.map((s, i) =>
         el("label", {}, [
@@ -868,14 +929,15 @@ export async function renderWorkItem(root, ctx, wi) {
             value: s.value,
             ...(i === 0 ? { checked: true } : {}),
           }),
-          ` ${s.label} `,
+          s.label,
         ]),
       ),
     ]);
     const button = el("button", { class: "btn", type: "button", text: "Move" });
+    const scopeOf = () =>
+      root.querySelector(`input[name="work-rank-scope-${wi}"]:checked`)?.value ?? "item";
     button.addEventListener("click", async () => {
-      const scope =
-        root.querySelector(`input[name="work-rank-scope-${wi}"]:checked`)?.value ?? "item";
+      const scope = scopeOf();
       button.disabled = true;
       const done = await createAction("work.rank", { params: { ref: `${ctx.id}/work/${wi}` } }).run(
         {
@@ -885,17 +947,19 @@ export async function renderWorkItem(root, ctx, wi) {
       button.disabled = false;
       await after(done, WORK_COPY.moved);
     });
-    actions.appendChild(
-      el("div", { class: "work-action" }, [
-        el("label", { for: `work-rank-above-${wi}`, text: rank.label }),
-        " ",
-        above,
-        scopes,
-        button,
-        " ",
-        twinLine(rank.twin),
-      ]),
-    );
+    const rankRow = el("div", { class: "work-action" }, [
+      el("label", { for: `work-rank-above-${wi}`, text: rank.label }),
+      " ",
+      above,
+      scopes,
+      button,
+      " ",
+      twinLine(rank.twin),
+    ]);
+    const rerank = () => retwin(rankRow, rankTwin(wi, above.value, scopeOf(), ctx.id));
+    above.addEventListener("change", rerank);
+    scopes.addEventListener("change", rerank);
+    actions.appendChild(rankRow);
   }
   root.appendChild(actions);
   root.appendChild(status);

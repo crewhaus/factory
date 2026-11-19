@@ -27,6 +27,9 @@ the origin each field was written through (`api`, `memory`, `mcp`), and then the
 one origin side by side. They set `classifyOutput: false`, so the same text is not classified
 again as a tool result.
 
+The work list belongs to the harness and to Home's own runs: inside a managed tenant's run,
+the four tools refuse before they open the store.
+
 ## `tool_config.work`
 
 ```yaml
@@ -37,7 +40,8 @@ tool_config:
       weights: { evidence: 3, cost: 2, fit: 1 }   # each 0 to 10
 ```
 
-`accept` never accepts a feature with nothing observed: it waits for a person. Without
+`accept` never accepts a feature, or a proposal of any kind whose basis is speculative, with
+nothing observed: it waits for a person. Without
 `ranking.weights`, items rank by priority, then age. Every leaf under `tool_config` is out of
 the optimizer's reach.
 

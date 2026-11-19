@@ -1,6 +1,7 @@
 /**
  * `tool_config.work`, checked: `accept` lists the kinds the runtime may accept on its own
- * (a feature still waits for a person unless something was observed), and
+ * (a feature, or a speculative proposal of any kind, still waits for a person unless
+ * something was observed), and
  * `ranking.weights` gives each ranking dimension a weight from 0 to 10. Anything else is
  * refused with a message that names the key. Pure.
  */

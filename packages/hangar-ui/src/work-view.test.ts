@@ -15,19 +15,25 @@ import * as router from "../assets/js/router.js";
 import { CAPTURE_TOKENS } from "../assets/js/sections/index.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { WORK } from "../assets/js/sections/work.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { emptyModel } from "../assets/js/ui/empty.js";
 import {
   BASIS_HEADINGS,
   DECLINE_CHOICES,
   EVIDENCE_WORDS,
   GROUPS,
+  RANK_LABEL_MAX,
   SCOPE_CHOICES,
   STATUS_TONES,
   WORK_COPY,
   actionsFor,
   causeOf,
+  declineTwin,
+  editTwin,
   feedModel,
   itemModel,
   rankControlModel,
+  rankTwin,
   // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 } from "../assets/js/views/work.js";
 
@@ -202,7 +208,11 @@ describe("the feed", () => {
     });
     expect(shown["proposed"]).toMatchObject({ cause: "unsupported" });
     expect(shown["goals"]).toMatchObject({ cause: "no-access" });
-    expect(shown["fromThredz"]).toMatchObject({ cause: "connection-failed", action: "Try again" });
+    expect(shown["fromThredz"]).toMatchObject({
+      cause: "connection-failed",
+      action: "Try again",
+      retry: true,
+    });
     expect(shown["delivered"]).toMatchObject({ cause: "filtered" });
     for (const [wire, ui] of [
       ["no-data", "no-data"],
@@ -213,6 +223,8 @@ describe("the feed", () => {
     ]) {
       expect(causeOf(wire)).toBe(ui);
     }
+    // A read that failed is not a service that did not answer.
+    expect(causeOf("unreachable", "goals")).toBe("unreachable");
     // Thredz not connected names the command that connects it.
     const thredz = feedModel(
       {
@@ -230,6 +242,32 @@ describe("the feed", () => {
       cause: "unsupported",
       verb: "crewhaus services setup",
     });
+  });
+
+  test('the drawn words name their subject: Thredz, or goals, never "it"', () => {
+    const model = feedModel(
+      {
+        sections: {
+          fromThredz: empty("unsupported", "Connect Thredz to see its tasks here."),
+          goals: empty("unreachable", "The harness's goals could not be read."),
+        },
+      },
+      HRN,
+    );
+    const drawn = Object.fromEntries(
+      model.groups.map((g: { id: string; empty: Record<string, unknown> }) => [
+        g.id,
+        emptyModel(g.empty),
+      ]),
+    );
+    expect(drawn["fromThredz"].message).toBe("Not available for this harness: Thredz.");
+    expect(drawn["goals"]).toMatchObject({ cause: "unreachable", action: null });
+    expect(drawn["goals"].message).toBe("Couldn't read goals.");
+    const down = feedModel({ sections: { fromThredz: empty("unreachable", "Try later.") } }, HRN);
+    expect(emptyModel(down.groups[0].empty).message).toBe("Can't reach Thredz right now.");
+    for (const g of [...model.groups, ...down.groups]) {
+      expect(emptyModel(g.empty).message).not.toContain(" it");
+    }
   });
 
   test("a status word and a mark for every status the server sends", () => {
@@ -313,7 +351,21 @@ describe("the item page", () => {
       ]),
     );
     expect(twins["accept"]).toBe(`crewhaus work accept ${WI} --harness ${HRN}`);
-    expect(twins["decline"]).toBe(`crewhaus work decline ${WI} --reason <code> --harness ${HRN}`);
+    expect(twins["decline"]).toBe(
+      `crewhaus work decline ${WI} --reason out-of-scope --harness ${HRN}`,
+    );
+    expect(twins["edit"]).toBe(
+      `crewhaus work edit ${WI} --expect 1 --note <text> --harness ${HRN}`,
+    );
+    // The twins follow the page: the revision it shows, and what the person picks.
+    const at3 = actionsFor(item({ state: "open", rev: 3 }), all, HRN).find(
+      (a: { id: string }) => a.id === "edit",
+    );
+    expect(at3.twin).toBe(editTwin(WI, 3, HRN));
+    expect(at3.twin).toContain("--expect 3 --note <text>");
+    expect(declineTwin(WI, "not-now", HRN)).toBe(
+      `crewhaus work decline ${WI} --reason not-now --harness ${HRN}`,
+    );
     expect(DECLINE_CHOICES.map((c: { value: string }) => c.value)).toEqual([
       "out-of-scope",
       "duplicate",
@@ -335,15 +387,26 @@ describe("the item page", () => {
       HRN,
     );
     expect(model).toMatchObject({ available: true, label: "Move above…" });
-    expect(model.options).toEqual([{ value: OTHER, label: "Update the parser" }]);
+    expect(model.options).toEqual([
+      { value: OTHER, label: "Update the parser", title: "Update the parser" },
+    ]);
     expect(SCOPE_CHOICES.map((s: { value: string }) => s.value)).toEqual([
       "item",
       "similar",
       "all",
     ]);
     expect(model.twin).toBe(
-      `crewhaus work rank ${WI} --above <wi> --scope item|similar|all --harness ${HRN}`,
+      `crewhaus work rank ${WI} --above ${OTHER} --scope item --harness ${HRN}`,
     );
+    expect(rankTwin(WI, OTHER, "all", HRN)).toBe(
+      `crewhaus work rank ${WI} --above ${OTHER} --scope all --harness ${HRN}`,
+    );
+    // A long title is cut in the choice, whole in its tooltip.
+    const long = `${"Make the import keep every column ".repeat(6)}https://example.com/a/b`;
+    const cut = rankControlModel(item(), [item({ id: OTHER, title: long })], HRN).options[0];
+    expect([...cut.label].length).toBe(RANK_LABEL_MAX);
+    expect(cut.label.endsWith("…")).toBe(true);
+    expect(cut.title).toBe(long);
     expect(
       rankControlModel(item({ state: "closed" }), [item({ id: OTHER, state: "closed" })], HRN)
         .available,

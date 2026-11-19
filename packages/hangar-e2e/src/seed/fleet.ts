@@ -78,11 +78,13 @@ export type SeededHarness = {
   readonly approvalIds: readonly string[];
   /** The rich seed's open review item id, or null. */
   readonly reviewId: string | null;
-  /** A work item's id, deterministic; the rich seed writes it as a proposal through the work store. */
+  /** A work item's id, deterministic; every seed writes it as a proposal through the work store. */
   readonly workItem: string;
 };
 
 const DAY_MS = 86_400_000;
+/** The longest title a work item takes. */
+const WORK_TITLE_MAX = 200;
 
 /** The rich seed's records for one harness, as `makeFixtureHarness` options. */
 function richRecords(
@@ -343,24 +345,37 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       throw new Error(`the memory store did not read back the seeded entry for ${specName}`);
     }
 
-    // A proposal with its case, so the Work view and an item page have something to show.
-    const workItem = mintId("wi", {
-      now: opts.now,
-      random: (bytes) =>
-        bytes.set(
-          createHash("sha256")
-            .update(`${opts.seed}:${target}:work`)
-            .digest()
-            .subarray(0, bytes.length),
-        ),
-    });
-    if (rich !== null) {
+    // Two proposals with their case, in every harness, so the Work view always has a row
+    // that links to an item page, and the item page has another item to move it above.
+    // The second's title is as long as a title may be and carries an unbroken URL, so the
+    // narrow-screen sweep sees what a long title does to the feed and to "Move above…".
+    const workIdOf = (label: string): string =>
+      mintId("wi", {
+        now: opts.now,
+        random: (bytes) =>
+          bytes.set(
+            createHash("sha256")
+              .update(`${opts.seed}:${target}:${label}`)
+              .digest()
+              .subarray(0, bytes.length),
+          ),
+      });
+    const workItem = workIdOf("work");
+    const longTitle =
+      `Keep every column's type in the weekly partner import, as reported at https://example.com/${"reports/weekly-partner-import/".repeat(6)}`.slice(
+        0,
+        WORK_TITLE_MAX,
+      );
+    for (const [id, title] of [
+      [workItem, untrusted("Keep imported dates as dates")],
+      [workIdOf("work-long"), longTitle],
+    ] as const) {
       const proposed = await openWorkStore(harnessDir, {
         now: () => opts.now,
-        mintId: () => workItem,
+        mintId: () => id,
       }).propose(
         {
-          title: untrusted("Keep imported dates as dates"),
+          title,
           kind: "fix",
           basis: "user-pain",
           assessment: {
