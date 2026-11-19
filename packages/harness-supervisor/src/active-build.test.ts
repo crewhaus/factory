@@ -30,7 +30,12 @@ import {
   loadEnvChain,
   resolveBundle,
 } from "./spawn-contracts";
-import { type AdmitAnswer, type SupervisorOptions, createHarnessSupervisor } from "./supervisor";
+import {
+  type AdmitAnswer,
+  INTAKE_PAUSE_IGNORED_ENV,
+  type SupervisorOptions,
+  createHarnessSupervisor,
+} from "./supervisor";
 import { activateBuildForTest, createFakeClock, createFakeProcessOps } from "./testkit";
 
 const roots: string[] = [];
@@ -60,6 +65,7 @@ function supervise(
     prepare?: () => PrepareRunner;
     processEnv?: Record<string, string>;
     maxRestarts?: number;
+    pauseIgnored?: boolean;
   } = {},
 ) {
   const clock = createFakeClock();
@@ -76,6 +82,7 @@ function supervise(
         target: "channel",
         processEnv: options.processEnv ?? {},
         ports: { port: 3000, controlPort: 3001 },
+        ...(options.pauseIgnored !== undefined ? { pauseIgnored: options.pauseIgnored } : {}),
       }),
     managerVersion: "0.9.0-test",
     newRunId: () => `run_${String(++seq).padStart(16, "0")}`,
@@ -405,6 +412,26 @@ describe("the spawn carries the active deployment", () => {
     expect(env["CREWHAUS_DEPLOYMENT_ID"]).toBeUndefined();
     expect(env["CREWHAUS_SPEC_HASH"]).toBeUndefined();
     expect(readRunfile(dir)?.deployment).toBeUndefined();
+  });
+});
+
+describe("the spawn says --ignore-pause only when the start did", () => {
+  test("an inherited or .env value never reaches the child; the start option sets it", async () => {
+    const dir = harness("channel", "CREWHAUS_INTAKE_PAUSE_IGNORED=1\n");
+    const inherited = supervise(dir, { processEnv: { CREWHAUS_INTAKE_PAUSE_IGNORED: "1" } });
+    expect((await inherited.supervisor.start()).ok).toBe(true);
+    const env = inherited.ops.last()?.request.env ?? {};
+    expect(env[INTAKE_PAUSE_IGNORED_ENV]).toBeUndefined();
+    inherited.supervisor.close();
+
+    const dir2 = harness("channel");
+    const ignored = supervise(dir2, {
+      processEnv: { CREWHAUS_INTAKE_PAUSE_IGNORED: "0" },
+      pauseIgnored: true,
+    });
+    expect((await ignored.supervisor.start()).ok).toBe(true);
+    expect(ignored.ops.last()?.request.env?.[INTAKE_PAUSE_IGNORED_ENV]).toBe("1");
+    ignored.supervisor.close();
   });
 });
 

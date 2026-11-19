@@ -35,6 +35,7 @@
     { "path": "./packages/tool-image" },
     { "path": "./packages/tool-codegraph" },
     { "path": "./packages/tool-consult" },
+    { "path": "./packages/tool-work" },
     { "path": "./packages/tool-capability" },
     { "path": "./packages/tool-table" },
     { "path": "./packages/tool-changeset" },

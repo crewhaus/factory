@@ -8,9 +8,11 @@ import {
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import { budgetPeriodBlock } from "./blocks/budget-period";
 import { delegationBlock } from "./blocks/delegation";
 import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
 import { intentBlock } from "./blocks/intent";
+import { modelPriceBlock } from "./blocks/model-price";
 import { pluginsBlock } from "./blocks/plugins";
 import { scheduleBlockFrom } from "./blocks/schedule";
 
@@ -748,6 +750,7 @@ const budgetBlock = z
       .describe(
         "fraction of usd the auxiliary model calls (judge, compaction, guide, …) may spend; default 0.3",
       ),
+    period: budgetPeriodBlock,
   })
   .strict()
   .optional();
@@ -1367,6 +1370,7 @@ const modelProfileSchema = z
       .min(1)
       .describe("model-router grammar string, or cheapest | strongest (never a $ref)"),
     ...modelProfileFields,
+    price: modelPriceBlock,
   })
   .strict()
   .superRefine(refineTemperatureThinking)

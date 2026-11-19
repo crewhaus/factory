@@ -170,6 +170,10 @@ describe("cardFor", () => {
   test("an unpriced cost is unknown, never $0", () => {
     expect(fmtMicros(undefined)).toBe("cost unknown");
     expect(cardFor({ kind: "cost_accrual" }).meta).toBe("cost unknown");
+    expect(cardFor({ kind: "budget_unpriced", modelId: "m-1" })).toMatchObject({
+      title: "The cost of m-1 is unknown",
+      severity: "notice",
+    });
     expect(fmtMicros(1_500_000)).toBe("$1.50");
   });
 });

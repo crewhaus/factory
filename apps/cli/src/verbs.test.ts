@@ -125,6 +125,7 @@ describe("the inventory is the dispatch", () => {
     expect(families.sort()).toEqual([
       "access",
       "api",
+      "budget",
       "changes",
       "commands",
       "criteria",
@@ -137,6 +138,7 @@ describe("the inventory is the dispatch", () => {
       "logout",
       "people",
       "runs",
+      "work",
     ]);
     expect(LEGACY_VERBS.length, "a new verb is a `<verb>-cmd.ts` module exporting CLI_FAMILY").toBe(
       LEGACY_COUNT,
@@ -257,9 +259,10 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect` (#518).
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6));
-  }, 30_000); // fourteen modules' imports and a hundred and eighty calls; slow on a loaded runner
+    // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect`
+    // (#518); `work` came with its eleven (#516); budget is show, history and extend.
+    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6 + 11 + 3));
+  }, 30_000); // sixteen modules' imports and two hundred and twelve calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

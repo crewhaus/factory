@@ -86,6 +86,26 @@ export {
 } from "./areas";
 export { DELEGATION_RUNTIME } from "./areas/delegation";
 export {
+  RUNTIME_RUNTIME,
+  WORK_EXECUTORS,
+  WORK_RECONCILERS,
+  WORK_UNSUPERVISED,
+} from "./areas/runtime";
+export {
+  ISSUE_ADOPTION_NOT_SERVED,
+  THREDZ_ADOPTION_NEEDS_HOME,
+  type WorkCaller,
+  type WorkCommandRefusal,
+  type WorkCommandValue,
+  type WorkCommands,
+  type WorkHead,
+  type WorkPlan,
+  type WorkSourcePorts,
+  workActorFor,
+  workCommands,
+  workRefOf,
+} from "./work";
+export {
   type ActiveCeiling,
   APPLY_NOTE,
   type ApplySummary,
@@ -192,6 +212,12 @@ export {
   reconcileOperatorControl,
   recordDesired,
 } from "./operator-controls";
+export {
+  type BudgetExtendAnswer,
+  type BudgetExtendInput,
+  applyBudgetExtend,
+  budgetTopupWritten,
+} from "./budget";
 export { type ObjectPage, type ObjectPageOptions, pageObjects } from "./pages";
 export type { ReconcileCounts } from "./reconcile";
 export { type RecoverCounts, type RecoverScope, isJobReceipt } from "./recover";

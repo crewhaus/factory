@@ -79,6 +79,8 @@ export const GATE_EXPECTS: Readonly<Record<string, string>> = {
   "#/h/:id/work/schedule": ".tab-body .lane-card",
   "#/h/:id/work/sessions": "table.fleet tbody tr",
   "#/h/:id/work/sessions/:session": ".transcript > *",
+  "#/h/:id/work/items": "#view .work-groups .work-row",
+  "#/h/:id/work/items/:wi": "#view .work-action .twin-cmd",
   "#/h/:id/quality": ".section-index a",
   "#/h/:id/quality/results": "table.fleet tbody tr",
   "#/h/:id/quality/datasets": "#view .tab-body form.row-editor",

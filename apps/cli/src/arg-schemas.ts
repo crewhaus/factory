@@ -1184,6 +1184,9 @@ export const LESSONS_SCHEMA: ParseArgsSchema = {
     { name: "help", short: "h" },
     // retire — why the lesson is retired, kept in .crewhaus/lessons/retired.jsonl.
     { name: "reason", takesValue: true },
+    // update — write lessons and preference notes mined from anything other
+    // than the operator's own `crewhaus rate` ratings.
+    { name: "yes", takesValue: false },
   ],
 };
 

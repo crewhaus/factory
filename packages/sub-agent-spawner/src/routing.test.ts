@@ -27,6 +27,8 @@ import type {
   SpawnSubAgentOptions,
   SubAgentDefinition,
 } from "@crewhaus/agent-context-isolation";
+import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
+import { createSpendMeter } from "@crewhaus/cost-tracker/spend";
 import { isRunFailedError } from "@crewhaus/errors";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { emptyRuleSet } from "@crewhaus/permission-engine";
@@ -39,6 +41,7 @@ import type {
   SubAgentEndEvent,
   SubAgentStartEvent,
   TraceEvent,
+  TraceEventBus,
 } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { resolveChildLoopPlan, spawnSubAgent } from "./index.js";
@@ -341,6 +344,28 @@ describe("resolveChildLoopPlan (§7.7)", () => {
     const uncapped = { ...parent, routing: SERVED_FAST } as unknown as ParentRunHandle;
     expect(resolveChildLoopPlan(uncapped, def, undefined).loopOptions.budget).toBeUndefined();
   });
+
+  test("the child spends from the parent's meter: a nested meter at its share, the parent's own otherwise", async () => {
+    const meter = createSpendMeter({ capMicros: 1_000_000, pricing: DEFAULT_PRICING });
+    const withSpend = { ...parent, spend: meter, pricing: DEFAULT_PRICING } as ParentRunHandle;
+    // No share: the parent's meter itself.
+    const plain = resolveChildLoopPlan(withSpend, HELPER, undefined);
+    expect(plain.loopOptions.spendMeter).toBe(meter);
+    expect(plain.loopOptions.pricing).toBe(DEFAULT_PRICING);
+    // A share: a nested meter capped at it, whose spend lands on the parent.
+    const shared = resolveChildLoopPlan(withSpend, { ...HELPER, budgetShare: 0.25 }, undefined);
+    const child = shared.loopOptions.spendMeter;
+    if (child === undefined || child === meter) throw new Error("expected a nested meter");
+    expect(child.snapshot().capMicros).toBe(250_000);
+    await child.reserve("rsv_1", 10);
+    expect(meter.snapshot().reservedMicros).toBe(10);
+    // An unbudgeted parent hands no meter on, but still its prices.
+    const priced = { ...parent, pricing: DEFAULT_PRICING } as ParentRunHandle;
+    expect("spendMeter" in resolveChildLoopPlan(priced, HELPER, undefined).loopOptions).toBe(false);
+    expect(resolveChildLoopPlan(priced, HELPER, undefined).loopOptions.pricing).toBe(
+      DEFAULT_PRICING,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -513,6 +538,49 @@ describe("spawnSubAgent — child spend re-published on the parent bus (§7.6 / 
     }
   });
 
+  test("a child with priced and unpriced calls rolls up its unknown calls, not only an all-unpriced child", async () => {
+    const root = newTempRoot();
+    try {
+      const { parent, parentLog, events } = await makeParent(root);
+      // A side call inside the child (as a hybrid guide's is) on a model with no price.
+      const sideCall = buildTool({
+        name: "side",
+        description: "a side call",
+        inputSchema: z.object({}),
+        readOnly: true,
+        execute: async (_input, ctx) => {
+          const bridge = ctx.bridge as { runContext?: { eventBus: TraceEventBus } } | undefined;
+          const bus = ctx.runContext?.eventBus ?? bridge?.runContext?.eventBus;
+          if (bus === undefined) throw new Error("no child bus");
+          bus.publish({
+            ...bus.envelope(),
+            kind: "model_response",
+            model: "totally-unknown-model",
+            provider: "openai",
+            stopReason: "end_turn",
+            usage: { input: 40, output: 4 },
+            durationMs: 1,
+          });
+          return "ok";
+        },
+      });
+      const client = scripted([{ tool: "side", input: {} }, { text: "done" }], {
+        input: 10_000,
+        output: 1_000,
+      });
+      await spawn(parent, { ...HELPER, model: FAST }, client, { childTools: [sideCall] });
+      const accruals = events.filter((e): e is CostAccrualEvent => e.kind === "cost_accrual");
+      expect(accruals).toHaveLength(1);
+      expect(accruals[0]?.costUsdMicros).toBeGreaterThan(0);
+      expect(accruals[0]?.unpricedCalls).toBe(1);
+      // Not every call was unpriced, so the all-unpriced flag stays off.
+      expect(accruals[0]?.unpriced).toBeUndefined();
+      await parentLog.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("a child that made no model call publishes no roll-up; an unpriced model publishes a $0 roll-up flagged unpriced", async () => {
     const root = newTempRoot();
     try {
@@ -523,6 +591,7 @@ describe("spawnSubAgent — child spend re-published on the parent bus (§7.6 / 
       expect(accruals).toHaveLength(1);
       expect(accruals[0]?.costUsdMicros).toBe(0);
       expect(accruals[0]?.unpriced).toBe(true);
+      expect(accruals[0]?.unpricedCalls).toBe(1);
       expect(accruals[0]?.inputTokens).toBe(500);
       await parentLog.close();
     } finally {

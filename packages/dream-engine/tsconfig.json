@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../boundary-classifier" },
     { "path": "../continuity-store" },
     { "path": "../cost-tracker" },
     { "path": "../durable-execution" },

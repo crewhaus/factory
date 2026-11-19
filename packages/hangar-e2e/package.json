@@ -17,6 +17,7 @@
     "@crewhaus/harness-registry": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/tool-work": "workspace:*",
     "@crewhaus/wiki-store": "workspace:*",
     "axe-core": "4.14.0",
     "playwright": "1.59.1",

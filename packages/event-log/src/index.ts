@@ -297,7 +297,16 @@ export type EventKind =
   // unaffected, and readers that predate them skip them. Payloads:
   // `SpanClosedPayload`, `VerdictPayload` below.
   | "span_closed"
-  | "verdict";
+  | "verdict"
+  // Which knowledge items a tool call returned to the model
+  // (`knowledge_read`, one per call that reported any, on the call's span,
+  // after its post-tool check): fact ids, wiki slugs and versions, document
+  // fingerprints, and what the check did with the output. Ids, never text.
+  // Written by runtime-core unless `CREWHAUS_RUN_STAMPS=0`.
+  // Non-conversational: `replayMessageHistory` ignores it, `--resume` is
+  // unaffected, and readers that predate it skip it. Payload:
+  // `KnowledgeReadPayload` below.
+  | "knowledge_read";
 
 /**
  * Payload for the `wiki_write` event kind (0.3.0 design §9): which article
@@ -627,6 +636,12 @@ export type RunStampPayload = {
     readonly watchme: boolean;
     readonly runLedger: boolean;
   };
+  /**
+   * How the run got past a closed intake. Present only when an operator's
+   * `--ignore-pause` let it start while the harness was paused; a run
+   * admitted by an open intake carries no `intake` key. Recording only.
+   */
+  readonly intake?: { readonly pauseIgnored: true };
 };
 
 /** One system region of a model request, in request order. */
@@ -645,12 +660,21 @@ export type ContextBlockKind =
 /** What became of one recalled item before it reached the model. */
 export type RecalledItemStatus = "included" | "warned" | "redacted" | "split-redacted";
 
-/** Where a recalled item lives: its store, backend, id there and version. */
+/**
+ * Where a recalled item lives: its store, backend, id there and version.
+ * `spec` names the spec whose store holds it (`[A-Za-z0-9_.-]{1,128}`);
+ * `partition` the part of that store it sits in: `-` for the spec's own,
+ * `s.sess_<16 hex>` for a session's, `t.<tenant>` for a tenant's. A string
+ * `version` is 8-16 lowercase hex (a content revision); a number is the
+ * store's own version counter.
+ */
 export type RecalledItemRef = {
-  readonly store: "fact" | "wiki" | "session";
+  readonly store: "fact" | "wiki" | "session" | "plan" | "goal" | "focus" | "document";
   readonly backend: "local" | "thredz";
+  readonly spec?: string;
+  readonly partition?: string;
   readonly localId: string;
-  readonly version?: number;
+  readonly version?: number | string;
 };
 
 export type ContextManifestBlock = {
@@ -660,6 +684,11 @@ export type ContextManifestBlock = {
   readonly fingerprint: string;
   /** Whether the block carries a cache marker in the request. */
   readonly cached: boolean;
+  /**
+   * A `plan` block's knowledge items, by reference: the focus, the active
+   * plan and each open goal it rendered. Written only when there are any.
+   */
+  readonly refs?: readonly RecalledItemRef[];
 };
 
 /** A project memory file: its name at the working directory, or `outside` for one loaded from elsewhere. */
@@ -871,4 +900,25 @@ export type VerdictPayload = {
     /** The audit record written beside the verdict. */
     readonly audit?: { readonly kind: string };
   };
+};
+
+/** One knowledge item a tool call returned, by reference: a {@link RecalledItemRef}. */
+export type KnowledgeReadRef = RecalledItemRef;
+
+/** What the call's post-tool check did with the output that carried the items. */
+export type KnowledgeReadStatus = "included" | "warned" | "redacted";
+
+/**
+ * Payload of a `knowledge_read` line: the knowledge items one tool call
+ * returned to the model, by reference, on the call's span. At most 64 refs;
+ * `more` counts the ones past the cap. Ids and versions only, never text.
+ */
+export type KnowledgeReadPayload = {
+  readonly v: 1;
+  readonly run: string;
+  readonly toolUseId: string;
+  readonly tool: string;
+  readonly refs: readonly KnowledgeReadRef[];
+  readonly more?: number;
+  readonly status: KnowledgeReadStatus;
 };

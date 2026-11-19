@@ -764,8 +764,14 @@ describe("structured recall items beside the lines", () => {
     expect(lines.length).toBe(2);
     expect(items.map((i) => i.text)).toEqual(lines);
     const hits = (await wired.stores.memory?.recall("deploy", 5)) ?? [];
+    // The spec names the store, as Recall's own report does.
     expect(items.map((i) => i.ref)).toEqual(
-      hits.map((h) => ({ store: "fact", backend: "local", localId: h.entry.id })),
+      hits.map((h) => ({
+        store: "fact",
+        backend: "local",
+        spec: "items-fact",
+        localId: h.entry.id,
+      })),
     );
     expect(items.map((i) => i.score)).toEqual(hits.map((h) => h.score));
   });
@@ -794,6 +800,7 @@ describe("structured recall items beside the lines", () => {
     expect(items[1]?.ref).toEqual({
       store: "wiki",
       backend: "local",
+      spec: "items-wiki",
       localId: "csv-delimiters",
       version: wikiHit?.ref.version as number,
     });

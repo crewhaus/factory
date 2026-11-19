@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ConfigError } from "@crewhaus/errors";
-import { OPENAI_COMPAT_HOSTS, parseModelString } from "./parse.js";
+import { BEDROCK_GEO_PREFIX, OPENAI_COMPAT_HOSTS, parseModelString } from "./parse.js";
 
 describe("parseModelString", () => {
   describe("anthropic (no prefix)", () => {
@@ -325,5 +325,55 @@ describe("parseModelString", () => {
     test("non-claude unprefixed", () => {
       expect(() => parseModelString("gpt-4o-mini")).toThrow(ConfigError);
     });
+  });
+});
+
+/**
+ * cost-tracker keys a declared price (`models.<name>.price`) by a twin of this
+ * parse (`declaredPricingKey`, which may not import the router). Its
+ * `unknown-cost.test.ts` holds these vectors too: a change here that is not
+ * made there fails one of the two.
+ */
+describe("the declared-price twin in cost-tracker", () => {
+  const VECTORS: ReadonlyArray<
+    readonly [string, { readonly provider: string; readonly modelId: string } | undefined]
+  > = [
+    ["claude-opus-4-7", { provider: "anthropic", modelId: "claude-opus-4-7" }],
+    ["local/qwen3-coder@http://127.0.0.1:11434/v1", { provider: "openai", modelId: "qwen3-coder" }],
+    ["local/llama3.2", { provider: "openai", modelId: "llama3.2" }],
+    ["openai/gpt-5", { provider: "openai", modelId: "gpt-5" }],
+    ["gemini/gemini-2.5-pro", { provider: "gemini", modelId: "gemini-2.5-pro" }],
+    [
+      "bedrock/us.anthropic.claude-sonnet-4-5-v1:0",
+      { provider: "bedrock", modelId: "anthropic.claude-sonnet-4-5-v1:0" },
+    ],
+    ["bedrock/meta.llama3-70b", { provider: "bedrock", modelId: "meta.llama3-70b" }],
+    ["groq/llama-3.3-70b", { provider: "openai", modelId: "llama-3.3-70b" }],
+    ["azure/my-deployment", { provider: "openai", modelId: "my-deployment" }],
+    ["vertex/claude-sonnet-4-5", { provider: "anthropic", modelId: "claude-sonnet-4-5" }],
+    ["vertex/gemini-2.5-flash", { provider: "gemini", modelId: "gemini-2.5-flash" }],
+    ["gpt-5", undefined],
+    ["local/", undefined],
+    ["local/m@", undefined],
+    ["vertex/llama", undefined],
+  ];
+
+  test("parseModelString gives the provider and the geo-free wire id the twin prices under", () => {
+    for (const [modelString, expected] of VECTORS) {
+      let got: { provider: string; modelId: string } | undefined;
+      try {
+        const parsed = parseModelString(modelString);
+        got = {
+          provider: parsed.providerId,
+          modelId:
+            parsed.providerId === "bedrock"
+              ? parsed.modelId.replace(BEDROCK_GEO_PREFIX, "")
+              : parsed.modelId,
+        };
+      } catch {
+        got = undefined;
+      }
+      expect(got).toEqual(expected);
+    }
   });
 });

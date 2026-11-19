@@ -908,7 +908,7 @@ describe("rows, pinned", () => {
     ]);
     expect(declared).toEqual([
       ["controls.retire", "confirmName,nonce"],
-      ["runs.create", "input,subject"],
+      ["runs.create", "input,subject,work"],
       ["decisions.resolve", "expect,note"],
       ["rules.create", "tool,pattern,reason"],
       ["access.scopedTokens.mint", "subject"],
@@ -922,9 +922,11 @@ describe("rows, pinned", () => {
       origin: "api",
       at: "run-entry",
     });
+    // A work item created with the run is stored at api and classified when a tool reads it.
+    expect(coreRow("runs.create").modelBound?.["work"]).toEqual({ origin: "api", at: "write" });
     for (const op of CORE) {
       for (const [field, decl] of Object.entries(op.modelBound ?? {})) {
-        if (op.id === "runs.create" && field === "input") continue;
+        if (op.id === "runs.create" && (field === "input" || field === "work")) continue;
         expect(`${op.id}.${field}: ${"none" in decl ? decl.none : "bound"}`).toBe(
           `${op.id}.${field}: true`,
         );

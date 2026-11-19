@@ -470,6 +470,31 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
     flags: ["harness"],
     pins: [{ file: "delegations-cmd.ts", text: 'requireValue(sub, args, "harness")' }],
   },
+  "work decline": {
+    positionals: { min: 1, max: 1 },
+    flags: ["reason"],
+    pins: [
+      { file: "work-cmd.ts", text: "itemIdOf(verb, args)" },
+      { file: "work-cmd.ts", text: 'requireValue(verb, args, "reason")' },
+    ],
+  },
+  "work rank": {
+    positionals: { min: 1, max: 1 },
+    flags: ["above", "scope"],
+    pins: [
+      { file: "work-cmd.ts", text: "itemIdOf(verb, args)" },
+      { file: "work-cmd.ts", text: 'requireValue(verb, args, "above")' },
+      { file: "work-cmd.ts", text: 'requireValue(verb, args, "scope")' },
+    ],
+  },
+  "work adopt": {
+    positionals: { max: 0 },
+    flags: ["from"],
+    pins: [
+      { file: "work-cmd.ts", text: '"work adopt: unexpected argument"' },
+      { file: "work-cmd.ts", text: 'requireValue(verb, args, "from")' },
+    ],
+  },
   "changes show": changesNeedsOne("show"),
   "changes check": changesNeedsOne("check"),
   "changes withdraw": changesNeedsOne("withdraw"),

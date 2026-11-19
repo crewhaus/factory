@@ -780,6 +780,63 @@
       ]
     },
     {
+      "verb": "budget",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "history": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "extend": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "usd",
+              "takesValue": true
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
       "verb": "build-image",
       "kind": "legacy",
       "since": "0.8.0",
@@ -6388,6 +6445,10 @@
             {
               "name": "reason",
               "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
             }
           ]
         },
@@ -6414,6 +6475,10 @@
             {
               "name": "reason",
               "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
             }
           ]
         }
@@ -6440,6 +6505,10 @@
         {
           "name": "reason",
           "takesValue": true
+        },
+        {
+          "name": "yes",
+          "takesValue": false
         }
       ]
     },
@@ -12442,6 +12511,223 @@
           "takesValue": true
         }
       ]
+    },
+    {
+      "verb": "work",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "state",
+              "takesValue": true
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "add": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "title",
+              "takesValue": true
+            },
+            {
+              "name": "goal-file",
+              "takesValue": true
+            },
+            {
+              "name": "kind",
+              "takesValue": true
+            },
+            {
+              "name": "parent",
+              "takesValue": true
+            },
+            {
+              "name": "priority",
+              "takesValue": true
+            },
+            {
+              "name": "start",
+              "takesValue": false
+            }
+          ]
+        },
+        "edit": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "title",
+              "takesValue": true
+            },
+            {
+              "name": "goal-file",
+              "takesValue": true
+            },
+            {
+              "name": "kind",
+              "takesValue": true
+            },
+            {
+              "name": "parent",
+              "takesValue": true
+            },
+            {
+              "name": "priority",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "note",
+              "takesValue": true
+            }
+          ]
+        },
+        "accept": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "decline": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "note",
+              "takesValue": true
+            }
+          ]
+        },
+        "cancel": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "reopen": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "start": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "adopt": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "from",
+              "takesValue": true
+            }
+          ]
+        },
+        "rank": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "above",
+              "takesValue": true
+            },
+            {
+              "name": "scope",
+              "takesValue": true
+            }
+          ]
+        }
+      },
+      "flags": null
     }
   ]
 }

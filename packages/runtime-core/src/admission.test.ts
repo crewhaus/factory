@@ -696,4 +696,55 @@ describe("loopAdmission, the pure decision", () => {
     expect(loopAdmission({ ...base, verdict: () => CLOSED })).toEqual({ admit: true });
     expect(grantReads).toBe(1);
   });
+
+  test("paused and out of budget, with a waiting grant: refused with the budget report, and the grant is kept", () => {
+    const takes: boolean[] = [];
+    const both: IntakeVerdict = {
+      ...CLOSED,
+      reasons: [
+        { kind: "operator", state: "paused" },
+        { kind: "budget", periodId: "month-2026-11-01", renewsAt: "2026-12-01T00:00:00.000Z" },
+      ],
+    };
+    const decision = loopAdmission({
+      served: true,
+      continuing: false,
+      sessionTarget: "managed",
+      verdict: () => both,
+      grantWaiting: (take) => {
+        takes.push(take);
+        return true;
+      },
+    });
+    expect(decision).toEqual({
+      admit: false,
+      code: "budget_exceeded",
+      report: {
+        class: "crewhaus_budget",
+        title: "its budget for this period is used up",
+        detail: "Its budget for this period is used up; this message was not processed.",
+        exitCode: EXIT_CODES.crewhaus_budget,
+      },
+    });
+    // It looked, and did not spend the grant.
+    expect(takes).toEqual([false]);
+    // A budget-only verdict refuses every loop with its own report.
+    const budgetOnly: IntakeVerdict = {
+      state: "closed",
+      reasons: [both.reasons[1] as never],
+      notice: "Its budget for this period is used up; this message was not processed.",
+      code: "budget_exceeded",
+      exitName: "crewhaus_budget",
+      retryAfter: 60,
+    };
+    expect(
+      loopAdmission({
+        served: true,
+        continuing: false,
+        sessionTarget: "channel",
+        verdict: () => budgetOnly,
+        grantWaiting: () => true,
+      }),
+    ).toEqual({ admit: false, code: "budget_exceeded", reply: budgetOnly.notice as string });
+  });
 });

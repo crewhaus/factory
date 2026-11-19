@@ -387,6 +387,25 @@ export function screenStates(harness: RouteHarness): readonly ScreenState[] {
       },
     },
     {
+      template: "#/h/:id/work/items",
+      state: "add work typed",
+      route: h("#/h/:id/work/items"),
+      open: async (page) => {
+        await page.locator("#work-add-title").fill("Check the weekly report");
+        await waitFor(page, "form.work-add .twin-cmd", "the add form and its command");
+      },
+    },
+    {
+      template: "#/h/:id/work/items/:wi",
+      state: "decline reason chosen",
+      route: h("#/h/:id/work/items/:wi"),
+      open: async (page) => {
+        await page.locator('select[id^="work-decline-"]').first().selectOption("needs-evidence");
+        await page.locator('input[id^="work-decline-note-"]').first().fill("Show the reports.");
+        await waitFor(page, ".work-action .twin-cmd", "the decline form and its command");
+      },
+    },
+    {
       template: HARNESSES_ROUTE,
       state: "tooltip open",
       route: HARNESSES_ROUTE,

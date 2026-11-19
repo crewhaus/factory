@@ -47,6 +47,8 @@ export const RUN_OPERATIONS = [
     modelBound: {
       input: { origin: "api", at: "run-entry" },
       subject: NOT_MODEL_BOUND.subject,
+      // A work item created with the run: its text is classified at api when a tool reads it.
+      work: { origin: "api", at: "write" },
     },
   },
   {

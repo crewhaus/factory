@@ -142,9 +142,13 @@ export function checkMachine(name: string, machine: MachineDef): string[] {
     if (!reachable.has(state)) problems.push(`${name}: orphan ${state}`);
     if (machine.terminal.includes(state)) continue;
     const onward = reachableFrom(machine, [state]);
-    if (!machine.terminal.some((end) => onward.has(end))) {
-      problems.push(`${name}: dead end ${state}`);
-    }
+    // A lifecycle with no end (an item closes and reopens) must still never strand a
+    // state: each one reaches another state.
+    const ends =
+      machine.terminal.length > 0
+        ? machine.terminal.some((end) => onward.has(end))
+        : [...onward].some((other) => other !== state);
+    if (!ends) problems.push(`${name}: dead end ${state}`);
   }
   return problems;
 }

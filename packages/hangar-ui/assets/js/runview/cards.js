@@ -213,6 +213,12 @@ const CARDS = {
     badge: str(e.modelId) ?? str(e.model) ?? undefined,
     meta: fmtMicros(e.costUsdMicros),
   }),
+  budget_unpriced: (e) => ({
+    severity: "notice",
+    title:
+      str(e.modelId) !== null ? `The cost of ${e.modelId} is unknown` : "A model's cost is unknown",
+    sub: "The run goes on. Declare the model's price to count it.",
+  }),
   circuit_state_changed: (e) => ({
     severity: e.toState === "open" ? "warn" : "notice",
     title:

@@ -304,7 +304,7 @@ describe("starting a run", () => {
     expect(JSON.stringify(caps.body)).toContain("crewhaus compile");
   });
 
-  test("paused and disabled are 503 before anything is written; work is 501", async () => {
+  test("paused and disabled are 503 before anything is written; an unknown work item is 404", async () => {
     const h = await cliHarness("paused-start");
     await home.call("POST", `/api/v1/harnesses/${h.id}/controls/pause`, { body: {} });
     const paused = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
@@ -323,7 +323,8 @@ describe("starting a run", () => {
     const work = await home.call("POST", `/api/v1/harnesses/${h.id}/runs`, {
       body: { input: "x", work: `${h.id}/work/wi_01m76e6f05hp514w9j4v3qymka` },
     });
-    expect(work.status).toBe(501);
+    expect(work.status).toBe(404);
+    expect(errorOf(work.body)["reason"]).toBe("work_unknown");
     expect(rowsOf(h.dir)).toEqual([]);
   });
 });

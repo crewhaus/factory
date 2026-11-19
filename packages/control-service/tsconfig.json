@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../continuity-store" },
     { "path": "../access-control" },
     { "path": "../control-contract" },
     { "path": "../control-records" },
@@ -21,7 +22,8 @@
     { "path": "../spec-patch" },
     { "path": "../tool-builder" },
     { "path": "../tool-executor" },
-    { "path": "../tool-registry-manifest" }
+    { "path": "../tool-registry-manifest" },
+    { "path": "../tool-work" }
   ],
   "include": ["src/**/*"]
 }

@@ -232,10 +232,11 @@ describe("every boot seam in a tool package has a delivery path", () => {
     // (C127), so its own code now assigns module state, not only its name.
     // registerChaincallConfig does the same for tool-chaincall, and 0.7.1 C052
     // added tool-proc's registerProcConfig (by code and by name), and the
-    // agents unit tool-objectstore's and tool-secure's registrars.
-    expect(seams.length).toBe(39);
-    expect(by("code").length).toBe(26);
-    expect(by("name").length).toBe(38);
+    // agents unit tool-objectstore's and tool-secure's registrars, and 0.9.0's
+    // tool-work registerWorkConfig (by code and by name).
+    expect(seams.length).toBe(40);
+    expect(by("code").length).toBe(27);
+    expect(by("name").length).toBe(39);
     expect(by("code")).toContain("setChainRpcResolver");
     expect(by("name")).toContain("registerChannelAdapter");
     expect(by("name")).toContain("bindEvmChains");

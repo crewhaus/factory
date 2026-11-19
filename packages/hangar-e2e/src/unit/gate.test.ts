@@ -45,6 +45,7 @@ const SEEDED = {
   runId: "run_0123456789abcdef",
   sessionIds: ["sess_0123456789abcdef"],
   wikiSlug: "getting-started",
+  workItem: "wi_01m76e6f05hp514w9j4v3qymka",
 };
 
 describe("gateVerdict", () => {

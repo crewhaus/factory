@@ -11,7 +11,8 @@ import { decodeBase32, encodeBase32 } from "./base32.js";
 import { canonicalJson } from "./canonical-json.js";
 import { deepFreeze } from "./util.js";
 
-export const CURSOR_MAX_LENGTH = 2048;
+/** Room for every source at its largest legal position, with a page's two each. */
+export const CURSOR_MAX_LENGTH = 4096;
 
 /** A closed list: a source id is never a path or a person. */
 export const CURSOR_SOURCES = deepFreeze([
@@ -23,6 +24,7 @@ export const CURSOR_SOURCES = deepFreeze([
   "deployments",
   "decisions",
   "approvals",
+  "work",
 ] as const);
 
 export type CursorSource = (typeof CURSOR_SOURCES)[number];

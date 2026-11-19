@@ -27,6 +27,14 @@
  * stance for a developer-trusted source. If a future deployment wants
  * strict policy on these files, pass `severity: "block"` via opts.
  *
+ * The files the runtime writes from earlier work and re-reads here — a
+ * marker-carrying `LESSONS.md` (`MARKER_GATED_FILES`) and the per-user
+ * preference files (`extraFiles`) — are mined from ratings, feedback and
+ * session logs, so they are screened as remembered memory instead: each line,
+ * each two adjacent lines and the file as a whole are classified at
+ * TrustOrigin `"memory"`, and what the classifier redacts is replaced by its
+ * notice ({@link screenRememberedLines}).
+ *
  * Size cap: 64 KB total across all matched files. Larger files load
  * the first N bytes plus a `[...truncated]` notice — the prompt cache
  * is more valuable than the tail of a large memory file.
@@ -35,6 +43,92 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
+
+/** Text screened as remembered memory, line by line and as a whole. */
+export type ScreenedLines = {
+  /**
+   * The text, each line the classifier redacts replaced by its notice; the
+   * notice alone when the text redacts as a whole after that.
+   */
+  readonly text: string;
+  /** How many lines were replaced or withheld. */
+  readonly redacted: number;
+  /** How many lines were kept with a suspicious verdict. */
+  readonly warned: number;
+  /** The detector rules behind the replaced and flagged lines, first seen first. */
+  readonly rules: readonly string[];
+};
+
+/**
+ * Screen text the runtime re-reads from earlier work as remembered memory,
+ * at TrustOrigin `"memory"`, in three passes:
+ *
+ * 1. Each line: a line the classifier redacts becomes its redaction notice.
+ * 2. Each two adjacent non-blank lines still kept, read together: when the
+ *    pair redacts, both lines become the pair's notice.
+ * 3. The kept lines as a whole: when they still redact, the whole text is
+ *    withheld and becomes that notice, every non-blank line counted.
+ *
+ * Every other line is kept as it is, with its line break. A classifier
+ * rejection rejects.
+ */
+export async function screenRememberedLines(text: string): Promise<ScreenedLines> {
+  const classify = (t: string) => classifyBoundary(t, { origin: "memory" });
+  const lines = text.split("\n");
+  const withheld = lines.map(() => false);
+  const rules = new Set<string>();
+  const note = (hits: ReadonlyArray<{ readonly rule: string }>): void => {
+    for (const hit of hits) rules.add(hit.rule);
+  };
+  let redacted = 0;
+  let warned = 0;
+  const withhold = (i: number, notice: string): void => {
+    lines[i] = notice;
+    withheld[i] = true;
+    redacted += 1;
+  };
+  for (const [i, line] of lines.entries()) {
+    if (line.trim() === "") continue;
+    const boundary = await classify(line);
+    if (boundary.action === "pass") continue;
+    note(boundary.verdict.hits);
+    if (boundary.action === "redact") withhold(i, boundary.redacted ?? "");
+    else warned += 1;
+  }
+  /** The kept non-blank lines, in order, and their text joined as one. */
+  const kept = (): { readonly at: number[]; readonly text: string } => {
+    const at = lines.flatMap((line, i) => (!withheld[i] && line.trim() !== "" ? [i] : []));
+    return { at, text: at.map((i) => lines[i]).join("\n") };
+  };
+  const before = kept();
+  if (before.at.length < 2) return { text: lines.join("\n"), redacted, warned, rules: [...rules] };
+  // Each two adjacent kept lines, read from the text as it stood after the
+  // line pass, so a pair is judged by its own two lines.
+  const original = before.at.map((i) => lines[i] ?? "");
+  for (let k = 0; k + 1 < before.at.length; k += 1) {
+    const boundary = await classify(`${original[k]}\n${original[k + 1]}`);
+    if (boundary.action !== "redact") continue;
+    note(boundary.verdict.hits);
+    for (const i of [before.at[k], before.at[k + 1]] as number[]) {
+      if (!withheld[i]) withhold(i, boundary.redacted ?? "");
+    }
+  }
+  const after = kept();
+  if (after.at.length > 0) {
+    const whole = await classify(after.text);
+    if (whole.action === "redact") {
+      note(whole.verdict.hits);
+      const nonBlank = lines.filter((line) => line.trim() !== "").length;
+      return {
+        text: whole.redacted ?? "",
+        redacted: nonBlank,
+        warned,
+        rules: [...rules],
+      };
+    }
+  }
+  return { text: lines.join("\n"), redacted, warned, rules: [...rules] };
+}
 
 export const CANONICAL_MEMORY_FILES = [
   "AGENTS.md",
@@ -164,9 +258,21 @@ export async function loadProjectMemory(
       } bytes omitted]`;
       truncated = true;
     }
-    // Pillar 3: classify with origin "user" — `pass` policy runs the
-    // classifier and emits trace events without modifying content.
-    await classifyBoundary(content, { origin: "user" }).catch(() => undefined);
+    if (requiredMarker !== undefined || m.outside === true) {
+      // Written by the runtime from earlier work (lessons, preferences):
+      // screened as remembered memory, by line, by adjacent pair and whole,
+      // before the model reads it. A classifier rejection leaves the file out
+      // of the prompt.
+      try {
+        content = (await screenRememberedLines(content)).text;
+      } catch {
+        continue;
+      }
+    } else {
+      // Pillar 3: classify with origin "user" — `pass` policy runs the
+      // classifier and emits trace events without modifying content.
+      await classifyBoundary(content, { origin: "user" }).catch(() => undefined);
+    }
     files.push({
       filename: m.filename,
       content,

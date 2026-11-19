@@ -165,6 +165,7 @@ import {
   refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
+import { budgetUsedRatio } from "./budget";
 import { bundleFreshness } from "./bundle-freshness";
 import {
   DEFAULT_HANGAR_PORT,
@@ -209,7 +210,6 @@ import {
   type HealthResult,
   cadenceToMs,
   computeHealth,
-  declaredBudgetUsd,
   dreamOverdue,
 } from "./health";
 import { allowedHosts, hostAllowed, misdirected } from "./host-allowlist";
@@ -327,6 +327,7 @@ import {
 } from "./spec-view";
 import { assetResponse } from "./static-cache";
 import type { HomePorts } from "./sweeps";
+import { readThredzTasks } from "./thredz";
 import {
   HOME_AREAS,
   type HomeAreaRuntime,
@@ -1384,12 +1385,6 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           }))
           .filter((d) => d.neverRan || (d.windows !== null && d.windows > 2))
           .map((d) => d.specName);
-        const budgetUsd = declaredBudgetUsd(yamlText);
-        // The CACHED rollup, not a fresh fold: this runs on every badge poll
-        // across the whole fleet, and re-reading every session log for a
-        // number the Library already caches would make the cheapest screen
-        // the most expensive request.
-        const spentUsd = cache.get(entry.id, dir, now()).costBreakdown.totalUsdMicros / 1_000_000;
         return {
           harnessId: entry.id,
           specName: view.specName,
@@ -1407,7 +1402,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
               exitCode: r.exitCode as number,
               endedAt: r.endedAt ?? null,
             })),
-          budgetUsedRatio: budgetUsd === null ? null : spentUsd / budgetUsd,
+          budgetUsedRatio: budgetUsedRatio(dir, yamlText, now()),
           credentialProbeFailed: view.envRefs.some((r) => !r.set),
         } satisfies HarnessSignal;
       });
@@ -3443,6 +3438,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         : { ok: false, detail: "a live daemon holds the runfile but was not adopted" };
     },
     streamSignal,
+    // The Work view's one read of a harness's Thredz tasks, under the harness's own session.
+    thredzTasks: async (entry) =>
+      readThredzTasks({
+        env: mergedSpawnEnv(env, entry.dir).env,
+        contain: (segments) => {
+          const found = harnessPathOf(entry.dir, hangarRoot, segments);
+          if (found.ok) return found.path;
+          throw new HttpError(400, "path escapes the harness directory");
+        },
+      }),
     accessNow: (caller) => requestAccessFor(caller, accessView(signIn.snapshot())),
     ...(opts.streamTimings !== undefined ? { streamTimings: opts.streamTimings } : {}),
   });

@@ -40,35 +40,34 @@
  * exceed", evaluated at gate time — is satisfied, and with the hook it is
  * satisfied unconditionally (both cost axes are bounded from above).
  *
- * PRICING MISS = $0: an unmapped model id (`resolvePricing` returns
- * undefined) is treated as zero micros — cannot price → do not block,
- * consistent with cost-tracker's own pricing-miss behaviour. Such a run
- * degrades to iterations-cap only.
+ * UNKNOWN COST: a model nothing can price (`resolvePricing` returns
+ * undefined) has an unknown cost, never $0. Its estimate is `undefined`, so
+ * the gate cannot bound the call and lets it through (an unknown cost never
+ * stops a run); its actual cost is counted as an unknown call
+ * (`SpendSummary.unpricedCalls`), and the summary's `totalUsd` reads
+ * `"$0.0012 + unknown"`. A declared price (`models.<name>.price`) makes it
+ * known.
+ *
+ * The estimate functions live in `@crewhaus/cost-tracker/spend` (the spend
+ * meter's own worst case) and are re-exported here under the same names.
  *
  * Catalog layer: F-eval (active optimisation). Brief: 279 (orchestrator).
  */
-import {
-  DEFAULT_PRICING,
-  type PricingTable,
-  computeCostMicros,
-  formatUsdMicros,
-  resolvePricing,
-} from "@crewhaus/cost-tracker";
+import { DEFAULT_PRICING, type PricingTable, formatUsdMicros } from "@crewhaus/cost-tracker";
+import { type CallUsage, actualCallMicros, estimateCallMicros } from "@crewhaus/cost-tracker/spend";
 import type { ProviderId } from "@crewhaus/trace-event-bus";
 
-/** Per-call token usage as surfaced by a `MutationProvider`. */
-export type CallUsage = {
-  readonly input: number;
-  readonly output: number;
-  readonly cacheRead?: number;
-};
+export { actualCallMicros, estimateCallMicros, type CallUsage };
 
 /** One iteration's recorded spend, for the per-iteration breakdown. */
 export type IterationSpend = {
   readonly iteration: number;
+  /** `0` as a placeholder when {@link unpriced}: the cost is unknown, not zero. */
   readonly costUsdMicros: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** Present when nothing could price this call. */
+  readonly unpriced?: true;
 };
 
 /** Why the run ended — mirrored onto `OptimizeSpecResult` for ergonomics. */
@@ -76,10 +75,15 @@ export type StoppedReason = "iterations-cap" | "budget-reached";
 
 /** The spend summary attached to every optimize result + persisted report. */
 export type SpendSummary = {
-  /** Running total in USD-micros (1 USD = 1_000_000 micros). */
+  /** Running total of the priced calls, in USD-micros (1 USD = 1_000_000 micros). */
   readonly totalUsdMicros: number;
-  /** `totalUsdMicros` formatted as `"$0.0000"` via `formatUsdMicros`. */
+  /**
+   * `totalUsdMicros` formatted as `"$0.0000"` via `formatUsdMicros`, with
+   * `" + unknown"` appended when {@link unpricedCalls} is present.
+   */
   readonly totalUsd: string;
+  /** Calls nothing could price; present only when > 0. */
+  readonly unpricedCalls?: number;
   /** Per-iteration cost breakdown, in iteration order. */
   readonly perIteration: ReadonlyArray<IterationSpend>;
   /** Which bound ended the run. */
@@ -89,54 +93,13 @@ export type SpendSummary = {
 const DEFAULT_META_OVERHEAD_CHARS = 800;
 
 /**
- * Worst-case USD-micros for the NEXT mutation call: `chars/4` input-token
- * estimate priced at input rate, plus the full `maxOutputTokens` ceiling
- * priced at output rate. Returns 0 when the model cannot be priced
- * (unknown id → do not block).
- *
- * `inputChars` is the estimated INPUT character count for the upcoming
- * call. When the provider exposes `estimateInputChars`, this is the exact
- * serialized system + user message length (so the dev-set failure block is
- * fully counted); otherwise it is the candidate prompt length. In both
- * cases `metaOverheadChars` is added as an extra safety margin, keeping
- * the estimate conservative-high.
- */
-export function estimateCallMicros(
-  inputChars: number,
-  metaOverheadChars: number,
-  maxOutputTokens: number,
-  provider: ProviderId,
-  modelId: string,
-  pricing: PricingTable = DEFAULT_PRICING,
-): number {
-  const row = resolvePricing(pricing, provider, modelId);
-  if (!row) return 0;
-  const estInput = Math.ceil((inputChars + metaOverheadChars) / 4);
-  return computeCostMicros(row, estInput, maxOutputTokens, 0);
-}
-
-/**
- * Actual USD-micros for a completed call given its returned `usage`.
- * Returns 0 when the model cannot be priced.
- */
-export function actualCallMicros(
-  usage: CallUsage,
-  provider: ProviderId,
-  modelId: string,
-  pricing: PricingTable = DEFAULT_PRICING,
-): number {
-  const row = resolvePricing(pricing, provider, modelId);
-  if (!row) return 0;
-  return computeCostMicros(row, usage.input, usage.output, usage.cacheRead ?? 0);
-}
-
-/**
  * Running-spend meter for one optimize run. The orchestrator checks
  * `wouldExceed()` BEFORE delegating to the mutator and `record()`s the
  * actual usage AFTER a call completes.
  */
 export class BudgetMeter {
   private spent = 0;
+  private unpriced = 0;
   private readonly per: IterationSpend[] = [];
 
   /**
@@ -165,7 +128,9 @@ export class BudgetMeter {
 
   /**
    * True ⇒ the caller MUST NOT issue the upcoming call (it would push the
-   * running total over budget). Always false when no budget is configured.
+   * running total over budget). Always false when no budget is configured,
+   * and when the model has no price (an unknown estimate cannot be bounded,
+   * and an unknown cost never stops a run).
    *
    * @param inputChars Estimated INPUT chars for the upcoming call. Pass the
    *   provider's exact serialized input length (system + user message) when
@@ -182,26 +147,48 @@ export class BudgetMeter {
       this.modelId,
       this.pricing,
     );
+    if (estimate === undefined) return false;
     return this.spent + estimate > this.budgetMicros;
   }
 
+  /** The worst case of the upcoming call; `undefined` when the model has no price. */
+  estimate(inputChars: number): number | undefined {
+    return estimateCallMicros(
+      inputChars,
+      this.metaOverheadChars,
+      this.maxOutputTokens,
+      this.provider,
+      this.modelId,
+      this.pricing,
+    );
+  }
+
   /** Fold a completed call's actual usage into the running total. */
-  record(iteration: number, usage: CallUsage): void {
+  /**
+   * Fold a completed call's actual usage into the running total. Returns its
+   * cost in USD-micros, or `undefined` when nothing could price it (counted
+   * as an unknown call, adding nothing to the total).
+   */
+  record(iteration: number, usage: CallUsage): number | undefined {
     const micros = actualCallMicros(usage, this.provider, this.modelId, this.pricing);
-    this.spent += micros;
+    if (micros === undefined) this.unpriced += 1;
+    else this.spent += micros;
     this.per.push({
       iteration,
-      costUsdMicros: micros,
+      costUsdMicros: micros ?? 0,
       inputTokens: usage.input,
       outputTokens: usage.output,
+      ...(micros === undefined ? { unpriced: true as const } : {}),
     });
+    return micros;
   }
 
   /** Build the final spend summary, stamped with why the run ended. */
   summary(stopped: StoppedReason): SpendSummary {
     return {
       totalUsdMicros: this.spent,
-      totalUsd: formatUsdMicros(this.spent),
+      totalUsd: `${formatUsdMicros(this.spent)}${this.unpriced > 0 ? " + unknown" : ""}`,
+      ...(this.unpriced > 0 ? { unpricedCalls: this.unpriced } : {}),
       perIteration: [...this.per],
       stopped,
     };

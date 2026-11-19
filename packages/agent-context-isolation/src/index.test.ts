@@ -3,6 +3,8 @@ import { getEventListeners } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
+import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
+import { createSpendMeter } from "@crewhaus/cost-tracker/spend";
 import { type EventLog, openEventLog } from "@crewhaus/event-log";
 import { type RuleSet, emptyRuleSet } from "@crewhaus/permission-engine";
 import { createRunContext } from "@crewhaus/run-context";
@@ -342,8 +344,13 @@ describe("projectParentHandle (0.6.0 §10.2)", () => {
         runState: createStore({}),
         parentSpanId: "0123456789abcdef",
         recordSpanClosed: async () => {},
+        spend: createSpendMeter({ capMicros: 1_000, pricing: DEFAULT_PRICING }),
+        pricing: DEFAULT_PRICING,
       };
       const handle = projectParentHandle(bridge);
+      // The parent's spend meter and pricing reach the child as the same objects.
+      expect(handle.spend).toBe(bridge.spend);
+      expect(handle.pricing).toBe(DEFAULT_PRICING);
       expect(handle.routing).toBe(routing);
       expect(handle.model).toBe(parent.model);
       expect(handle.maxTokens).toBe(parent.maxTokens);

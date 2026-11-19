@@ -713,6 +713,8 @@ agent:
       ["judge", "protected"],
       // Who may act without asking (#514).
       ["permissions", "delegation"],
+      // What a model costs (#514): budgets are measured with it.
+      ["models", "*", "price"],
       // Who approves an on-chain write.
       ["transaction_policy", "defaultWriteApproval"],
       // The candidate roster a person declared (#514).
@@ -1062,6 +1064,31 @@ describe("applySpecEdits — restrictToOptimizable (optimizer surface)", () => {
         restrictToOptimizable: true,
       }),
     ).toThrow(/is not a known target/);
+  });
+
+  test("a target named like an object property is not a known target", () => {
+    for (const target of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+      let thrown: unknown;
+      try {
+        applySpecEdits(`target: ${target}\nname: x\n`, [{ path: ["name"], value: "y" }], {
+          restrictToOptimizable: true,
+        });
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(SpecPatchError);
+      expect((thrown as Error).message).toMatch(/is not a known target/);
+    }
+  });
+});
+
+describe("isOptimizable — a target that is not a shape", () => {
+  test("a target that is not a shape is never optimizable", () => {
+    for (const target of ["constructor", "__proto__", "toString", "valueOf"]) {
+      expect(isOptimizable(target as Spec["target"], ["agent", "instructions"])).toBe(false);
+    }
+    // The real shape still answers true for the same path.
+    expect(isOptimizable("cli", ["agent", "instructions"])).toBe(true);
   });
 });
 

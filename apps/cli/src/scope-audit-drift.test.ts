@@ -372,12 +372,26 @@ describe("auditBoundarySite — anchored reply paths", () => {
     ]);
   });
 
-  test("the shipped sites hold against this tree: Consult, the guide reply path, and recalled memory are classified and tagged", () => {
+  test("the work tools' site fails without the classification, and its lineage row without the tag", () => {
+    const root = join(import.meta.dir, "..", "..", "..");
+    const site = BOUNDARY_SITES.find((s) => s.name === "tool-work");
+    if (site === undefined) throw new Error("site tool-work missing");
+    const source = readFileSync(join(root, site.path), "utf8");
+    const unclassified = source
+      .replaceAll("classifyBoundary", "screenNothing")
+      .replaceAll("@crewhaus/boundary-classifier", "./nothing");
+    expect(auditBoundarySite(site, unclassified).map((f) => f.pass)).toEqual([false, true]);
+    const untagged = source.replaceAll("tagContent", "tagNothing");
+    expect(auditBoundarySite(site, untagged).map((f) => f.pass)).toEqual([true, false]);
+  });
+
+  test("the shipped sites hold against this tree: Consult, the guide reply path, recalled memory and work text are classified and tagged", () => {
     const root = join(import.meta.dir, "..", "..", "..");
     for (const name of [
       "tool-consult",
       "runtime-core-guide-reply",
       "runtime-core-recalled-memory",
+      "tool-work",
     ]) {
       const site = BOUNDARY_SITES.find((s) => s.name === name);
       if (site === undefined) throw new Error(`site ${name} missing`);

@@ -463,6 +463,7 @@ import { openScoreboard } from "@crewhaus/routing-store";
 import { createRunContext, runWithScope } from "@crewhaus/run-context";
 import {
   type AgentIdentityFile,
+  INTAKE_PAUSE_IGNORED_ENV,
   type RunChatLoopOptions,
   resolveSessionRootDir,
   runChatLoop,
@@ -669,6 +670,7 @@ import {
 // argv switch on import). The block's exit-rating half lives in the RUNTIME
 // (@crewhaus/runtime-core's exit-rating module) so compiled bundles get it too.
 import { DISTILL_STATE_RELPATH, maybeAutoDistill } from "./autodistill";
+import { optimizeSpendLedger } from "./budget-cmd";
 // 0.7.1 — the oldest supported Bun and doctor's check of it, in a module the
 // floor guard (scripts/bun-floor.test.ts) can import.
 import { checkBunVersion } from "./bun-floor";
@@ -980,9 +982,11 @@ import {
   fewShotOverlapKey,
   formatFewShotForPrompt,
   harvestFewShot,
+  isConsistentFewShotExample,
   isFewShotExample,
   mergePools,
   poolToJsonl,
+  screenFewShotExamples,
 } from "./fewshot";
 // Item 58 — `crewhaus fleet list|status|run`: cross-harness discovery,
 // inventory/health rollup, and bulk read-only ops, in a side-effect-free
@@ -1289,6 +1293,7 @@ import {
   auditModelSlots,
   auditionReadiness,
   buildSunsetProposal,
+  declaredPricingOfIr,
   formatModelsAudit,
   formatModelsExplain,
   formatModelsList,
@@ -4645,6 +4650,10 @@ async function runRunCli(
       // 0.6.0 — the flag overrides the ceiling only; the spec's `scope`
       // (when declared) rides along like its `on_exceed` ladder does.
       ...(ir.target === "cli" && ir.budget?.scope !== undefined ? { scope: ir.budget.scope } : {}),
+      // The harness's period is not this run's to drop: the run still reserves against it.
+      ...(ir.target === "cli" && ir.budget?.period !== undefined
+        ? { period: ir.budget.period }
+        : {}),
     };
   } else if (ir.target === "cli" && ir.budget !== undefined) {
     runBudget = ir.budget;
@@ -7694,7 +7703,26 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       );
     }
     const fewShotK = intFlag(args, "few-shot-k") ?? 5;
-    const block = formatFewShotForPrompt(kept, fewShotK);
+    // Each example is text from an earlier session read back into the prompt:
+    // its input and output are screened as remembered memory, and one the
+    // classifier would redact is left out.
+    const { classifyBoundary } = await import("@crewhaus/boundary-classifier");
+    const screened = await screenFewShotExamples(
+      kept,
+      fewShotK,
+      async (t) => (await classifyBoundary(t, { origin: "memory" })).action !== "redact",
+    );
+    if (screened.withheld > 0) {
+      process.stdout.write(
+        `[optimize] few-shot: left out ${screened.withheld} pool example(s) the memory screen withheld\n`,
+      );
+    }
+    if (screened.chosen.length === 0) {
+      die(
+        "--few-shot: no pool example passed the memory screen — nothing safe to inject (re-harvest with `crewhaus fewshot harvest`)",
+      );
+    }
+    const block = formatFewShotForPrompt(screened.chosen, fewShotK);
     const yamlText = readFileSync(absSpec, "utf-8");
     const baseSpec = parseSpec(yamlText);
     const augmentedInstructions = `${block}\n\n${extractInstructions(baseSpec)}`;
@@ -7710,7 +7738,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     writeFileSync(optimizeSpecPath, augmentedYaml, { mode: 0o600 });
     fewShotDisablesWriteBack = true;
     process.stdout.write(
-      `[optimize] injected ${Math.min(fewShotK, kept.length)} few-shot example(s) from ${fewShotPoolFile}\n`,
+      `[optimize] injected ${screened.chosen.length} few-shot example(s) from ${fewShotPoolFile}: ${screened.chosen
+        .map((e) => e.id)
+        .join(", ")}\n`,
     );
     if (writeBack) {
       process.stderr.write(
@@ -8178,6 +8208,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
           traceBus,
           ...(stageMutator !== undefined ? { mutator: stageMutator } : {}),
           ...(stageBudget !== undefined ? { budgetUsd: stageBudget } : {}),
+          ...optimizeSpendLedger(optimizeSpecPath),
         });
         process.stdout.write(
           `[optimize] stage ${stage.name} score: ${r.scoreBefore.toFixed(3)} → ${r.scoreAfter.toFixed(3)} ` +
@@ -8286,6 +8317,8 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         traceBus,
         ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
+        // The harness's spending period, when its spec declares one.
+        ...optimizeSpendLedger(optimizeSpecPath),
       }),
     );
 
@@ -9208,6 +9241,8 @@ async function runFlywheelRun(args: ParsedArgs): Promise<void> {
       traceBus,
       budgetUsd: knobs.budgetUsd,
       ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
+      // The harness's spending period, when its spec declares one.
+      ...optimizeSpendLedger(absSpec),
     });
     optimizeResult = result;
     process.stdout.write(
@@ -10260,6 +10295,9 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     }
   }
   const evalIr: typeof ir = parkedBlock !== undefined ? { ...ir, provability: parkedBlock } : ir;
+  // The spec's declared prices (`models.<name>.price`): the eval meters and
+  // reports with the same table every run of the harness prices with.
+  const evalPricing = defaultMatrixPricing(ir.agent.declaredPricing);
 
   let gradersYaml: string;
   try {
@@ -10282,7 +10320,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // so the vocabulary cannot differ between the CLI and library paths.
   // 0.8.0 §9.1 — with the same pricing runEval gets, for provability.* costs.
   const graderRegistry = await graderRegistryForCompiled(compiled, {
-    pricing: defaultMatrixPricing(),
+    pricing: evalPricing,
   });
 
   // The run's id, known before the dataset is read so a held-out use line
@@ -10426,7 +10464,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     process.stdout.write(
       `[eval] regrading ${source.runId}: ${samples.length} case(s), ${compiled.length} grader(s), recorded answers only — no agent calls\n`,
     );
-    const pricing = defaultMatrixPricing();
+    const pricing = evalPricing;
     const judgeCost = (s: EvalRunSummary): number | undefined => {
       const micros = evalRunCost(s, pricing).judgeMicros;
       return micros !== undefined ? micros / 1_000_000 : undefined;
@@ -10594,7 +10632,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
       ...(evalProvability !== undefined ? { provability: evalProvability } : {}),
       // The file's criteria, recorded with the run (absent without any).
       ...(criteriaRecord !== undefined ? { criteria: criteriaRecord } : {}),
-      pricing: defaultMatrixPricing(),
+      pricing: evalPricing,
     },
   }).catch((err: unknown) => {
     if (cassetteOrResume && err instanceof CrewhausError) die(err.message);
@@ -10652,7 +10690,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     const sentinelRetried = summary.samples.filter((s) => s.retried === true).length;
     for (const line of evalRunOutputLines(summary, {
       retriedCount: sentinelRetried,
-      pricing: defaultMatrixPricing(),
+      pricing: evalPricing,
     })) {
       process.stdout.write(`${line}\n`);
     }
@@ -10718,7 +10756,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     retriedCount,
     // C35 — the cost line: agent spend as before, plus the newly metered
     // judge spend, through the same pricing table as the matrix est_$ column.
-    pricing: defaultMatrixPricing(),
+    pricing: evalPricing,
   })) {
     process.stdout.write(`${line}\n`);
   }
@@ -10780,7 +10818,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
   // A pricing miss anywhere (agent model or ANY judge model) leaves the
   // total undefined — the cost gate then warns instead of failing on an
   // undercount nobody can verify.
-  const cost = evalRunCost(summary, defaultMatrixPricing());
+  const cost = evalRunCost(summary, evalPricing);
   const costUsd = cost.totalMicros !== undefined ? cost.totalMicros / 1_000_000 : undefined;
   const agentCostUsd = cost.agentMicros !== undefined ? cost.agentMicros / 1_000_000 : undefined;
   const judgeCostUsd = cost.judgeMicros !== undefined ? cost.judgeMicros / 1_000_000 : undefined;
@@ -10853,7 +10891,7 @@ async function runEvalSubcommand(args: ParsedArgs, hooks: EvalRunHooks = {}): Pr
     ...(regradeParsed.regradeBaseline === true
       ? {
           regradeBaseline: async (pin: BaselineEntry) => {
-            const pricing = defaultMatrixPricing();
+            const pricing = evalPricing;
             const regraded = await regradeRecordedRun({
               ir: evalIr,
               sourceDir: pin.outDir,
@@ -11800,8 +11838,10 @@ async function runModelsCli(argv: readonly string[]): Promise<void> {
   const slots = enumerateModelSlots(ir);
   const pricing = loadUserPricing();
   const today = args.today !== undefined ? new Date(`${args.today}T12:00:00Z`) : new Date();
+  const declared = declaredPricingOfIr(ir);
   const findings = auditModelSlots(slots, {
     pricing,
+    ...(declared !== undefined ? { declared } : {}),
     sunsets: effectiveSunsets(pricing),
     today,
     project: await buildParamProjection(),
@@ -15038,6 +15078,9 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
   const byRole: Record<string, number> = {};
   const byProfile: Record<string, number> = {};
   let count = 0;
+  // Calls nothing could price: their cost is unknown, never $0, so a total
+  // that includes one reads "+ unknown".
+  let unpricedCalls = 0;
   const totalCache: CacheStats = {
     inputTokens: 0,
     outputTokens: 0,
@@ -15076,6 +15119,8 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         outputTokens?: number;
         cachedReadTokens?: number;
         cacheCreationTokens?: number;
+        unpriced?: boolean;
+        unpricedCalls?: number;
       };
       const e = parsed as AccrualFields & { payload?: AccrualFields };
       const provider = e.payload?.provider ?? e.provider;
@@ -15094,6 +15139,14 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
       const role = e.payload?.role ?? e.role;
       const summary = (e.payload?.summary ?? e.summary) === true;
       if (summary && (typeof role !== "string" || role === "")) continue;
+      // A per-call accrual flagged `unpriced` is one unknown call; a nested
+      // run's roll-up says how many of its calls were.
+      const nestedUnknown = e.payload?.unpricedCalls ?? e.unpricedCalls;
+      if (summary && typeof nestedUnknown === "number" && nestedUnknown > 0) {
+        unpricedCalls += nestedUnknown;
+      } else if (!summary && (e.payload?.unpriced ?? e.unpriced) === true) {
+        unpricedCalls += 1;
+      }
       if (typeof provider === "string" && typeof micros === "number") {
         totalMicros += micros;
         byProvider[provider] = (byProvider[provider] ?? 0) + micros;
@@ -15175,12 +15228,20 @@ async function runCostSummary(args: ParsedArgs): Promise<void> {
         cacheHitRatio: cacheHitRatio(totalCache),
         cacheSavingsUsdMicros: totalSavings,
         cacheByModel,
+        // Additive, present only when some call's cost is unknown.
+        ...(unpricedCalls > 0 ? { unpricedCalls } : {}),
       })}\n`,
     );
   } else {
     process.stdout.write(`session: ${session}\n`);
     process.stdout.write(`accrual events: ${count}\n`);
-    process.stdout.write(`total: $${totalDollars.toFixed(4)}\n`);
+    process.stdout.write(
+      `total: $${totalDollars.toFixed(4)}${
+        unpricedCalls > 0
+          ? ` + unknown (${unpricedCalls} call${unpricedCalls === 1 ? "" : "s"} with no price; \`crewhaus models audit\`)`
+          : ""
+      }\n`,
+    );
     for (const [p, m] of Object.entries(byProvider)) {
       process.stdout.write(`  ${p}: $${(m / 1_000_000).toFixed(4)}\n`);
     }
@@ -16581,21 +16642,39 @@ function gatherTurnsAndFeedback(sessionIds: ReadonlyArray<string>): {
   turns: SessionTurn[];
   feedback: FeedbackRecord[];
 } {
+  const { turns, logged, filed } = gatherTurnsAndFeedbackBySource(sessionIds);
+  return { turns, feedback: [...logged, ...filed] };
+}
+
+/**
+ * {@link gatherTurnsAndFeedback}, with the feedback kept by where it was read:
+ * `logged` from the session logs, `filed` from `.crewhaus/feedback/*.jsonl`.
+ */
+function gatherTurnsAndFeedbackBySource(sessionIds: ReadonlyArray<string>): {
+  turns: SessionTurn[];
+  logged: FeedbackRecord[];
+  filed: FeedbackRecord[];
+} {
   const turns: SessionTurn[] = [];
-  const feedback: FeedbackRecord[] = [];
+  const logged: FeedbackRecord[] = [];
   for (const id of sessionIds) {
     const events = readSessionEvents(id);
     for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
-    feedback.push(...extractFeedbackRecords(events));
+    logged.push(...extractFeedbackRecords(events));
   }
-  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
-  return { turns, feedback };
+  const filed = readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR));
+  return { turns, logged, filed };
 }
 
-/** Read a persisted few-shot pool file, skipping malformed lines. */
+/**
+ * Read a persisted few-shot pool file, skipping malformed lines and any line
+ * whose id is not the one its provenance names (`isConsistentFewShotExample`).
+ */
 function readFewShotPool(file: string): FewShotExample[] {
   if (!existsSync(file)) return [];
-  return parseJsonlObjects(readFileSync(file, "utf-8")).filter(isFewShotExample);
+  return parseJsonlObjects(readFileSync(file, "utf-8"))
+    .filter(isFewShotExample)
+    .filter(isConsistentFewShotExample);
 }
 
 /**
@@ -16777,10 +16856,12 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] === true && action === undefined) {
     process.stdout.write(
-      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>] [--yes]\n" +
         '       crewhaus lessons retire <lesson> [--reason "<r>"] [-o <LESSONS.md>]\n' +
         "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
-        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
+        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n" +
+        "  It prints what it will write first; anything that did not come from your own\n" +
+        "  `crewhaus rate` or `crewhaus feedback` entries is written only with --yes.\n",
     );
     return;
   }
@@ -16793,7 +16874,12 @@ async function runLessons(args: ParsedArgs): Promise<void> {
 
   const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
   if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
-  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  // The two feedback sources stay apart: only the session-log entries
+  // `crewhaus rate` and `crewhaus feedback` record (`source: "cli"`) count as
+  // the operator's own.
+  const { turns, logged, filed } = gatherTurnsAndFeedbackBySource(sessionIds);
+  const feedback = [...logged, ...filed];
+  const operatorFeedback = logged.filter((fb) => fb.source === "cli");
 
   // Failure signals reuse dataset-mine's negative-signal detection.
   const failureSignals: Array<{ input: string; reason: string; sessionId: string }> = [];
@@ -16810,6 +16896,18 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const { SYNTHESIZE_PII_DETECTORS } = await import("@crewhaus/dataset-ops/dataset-mine");
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
   const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
+  // Every candidate is screened as remembered memory while it is mined: the
+  // runtime reads LESSONS.md and the preference files back into every later
+  // run. One the classifier would redact is dropped and counted.
+  const { classifyBoundary } = await import("@crewhaus/boundary-classifier");
+  const keeps = async (t: string): Promise<boolean> =>
+    (await classifyBoundary(t, { origin: "memory" })).action !== "redact";
+  let withheld = 0;
+  const screen = async (t: string): Promise<boolean> => {
+    const kept = await keeps(t);
+    if (!kept) withheld += 1;
+    return kept;
+  };
 
   // A lesson a person retired is never added again.
   const { lessonId, readRetiredLessons, recordLessonProvenance } = await import(
@@ -16817,21 +16915,65 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   );
   const retired = readRetiredLessons(process.cwd());
   const freshLessons = (
-    await mineLessons(turns, feedback, failureSignals, { lowScore, redact })
+    await mineLessons(turns, feedback, failureSignals, { lowScore, redact, screen })
   ).filter((l) => !retired.has(lessonId(l)));
+  // What the operator's own ratings alone give: a candidate outside it came
+  // from somewhere else (a feedback file, a failure a session logged).
+  const operatorLessons = new Set(
+    (await mineLessons(turns, operatorFeedback, [], { lowScore, redact, screen: keeps })).map(
+      (l) => l.key,
+    ),
+  );
 
   // Merge into the existing LESSONS.md, preserving its human-authored preamble.
   const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
   const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
   const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
   const merged = mergeLessons(existing, freshLessons);
-  // Which sessions each new lesson came from (ids only), beside the file.
   const known = new Set(existing.map((l) => l.key));
-  recordLessonProvenance(
-    process.cwd(),
-    freshLessons.filter((l) => !known.has(l.key)),
-    () => new Date(),
+  const newLessons = freshLessons.filter((l) => !known.has(l.key));
+
+  // Per-user preference notes, and which of them each file does not hold yet.
+  const prefs = await minePreferences(feedback, { redact, screen });
+  const operatorNotes = new Set(
+    (await minePreferences(operatorFeedback, { redact, screen: keeps })).flatMap((p) =>
+      p.notes.map((n) => `${p.rater}\u0000${n}`),
+    ),
   );
+  const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
+  const newNotes = prefs.flatMap((p) => {
+    const file = join(prefsDir, preferenceFileName(p.rater));
+    const held = new Set(existsSync(file) ? readFileSync(file, "utf-8").split("\n") : []);
+    return p.notes
+      .filter((note) => !held.has(`- ${note}`))
+      .map((note) => ({ rater: p.rater, file, note }));
+  });
+
+  // Everything new, exactly as it will be written, before anything is.
+  if (newLessons.length > 0) {
+    process.stdout.write(`[lessons] new in ${lessonsFile}:\n`);
+    for (const l of newLessons) process.stdout.write(`- ${l.text}\n`);
+  }
+  for (const file of [...new Set(newNotes.map((n) => n.file))]) {
+    process.stdout.write(`[lessons] new in ${file}:\n`);
+    for (const n of newNotes) if (n.file === file) process.stdout.write(`- ${n.note}\n`);
+  }
+  if (withheld > 0) {
+    process.stdout.write(
+      `[lessons] ${withheld} candidate(s) left out: the screen for remembered memory withheld them\n`,
+    );
+  }
+  const notOperator =
+    newLessons.filter((l) => !operatorLessons.has(l.key)).length +
+    newNotes.filter((n) => !operatorNotes.has(`${n.rater}\u0000${n.note}`)).length;
+  if (notOperator > 0 && args.flags["yes"] !== true) {
+    die(
+      `lessons update refused: ${notOperator} of the new lessons and preference notes above did not come from your own \`crewhaus rate\` or \`crewhaus feedback\` entries (they came from feedback files or from failures the sessions recorded). Nothing was written. To write them, run: crewhaus lessons update --yes`,
+    );
+  }
+
+  // Which sessions each new lesson came from (ids only), beside the file.
+  recordLessonProvenance(process.cwd(), newLessons, () => new Date());
   // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
   // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
   // auto-injected LESSONS.md can't bloat the system prompt over time.
@@ -16841,9 +16983,7 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   );
 
   // Per-user preference files.
-  const prefs = await minePreferences(feedback, { redact });
   if (prefs.length > 0) {
-    const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
     mkdirSync(prefsDir, { recursive: true });
     for (const p of prefs) {
       writeFileSync(join(prefsDir, preferenceFileName(p.rater)), renderPreferencesMd(p), {
@@ -24032,11 +24172,18 @@ const argv = process.argv.slice(2);
 const subcommand = argv[0] ?? "";
 const rest = argv.slice(1);
 
-gateEntryPoint(subcommand, rest, {
-  cwd: process.cwd(),
-  write: (line) => process.stderr.write(line),
-  exit: (code) => process.exit(code),
-});
+// The run stamp's pause override comes from this gate alone: an inherited value is
+// cleared first, so a shell export never records one.
+Reflect.deleteProperty(process.env, INTAKE_PAUSE_IGNORED_ENV);
+if (
+  gateEntryPoint(subcommand, rest, {
+    cwd: process.cwd(),
+    write: (line) => process.stderr.write(line),
+    exit: (code) => process.exit(code),
+  }).pauseIgnored
+) {
+  process.env[INTAKE_PAUSE_IGNORED_ENV] = "1";
+}
 
 switch (subcommand) {
   case "compile":
@@ -24444,6 +24591,35 @@ switch (subcommand) {
     try {
       const { runDelegationsCommand } = await import("./delegations-cmd");
       const out = await runDelegationsCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "work": {
+    // A harness's work items (./work-cmd), through the same control service Home uses;
+    // the verbs work with Home stopped.
+    try {
+      const { runWorkCommand } = await import("./work-cmd");
+      const out = await runWorkCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "budget": {
+    // A harness's spending period (./budget-cmd): read, and raised through the control service.
+    try {
+      const { runBudgetCommand } = await import("./budget-cmd");
+      const out = await runBudgetCommand(rest);
       const sink = out.exitCode === 0 ? process.stdout : process.stderr;
       for (const line of out.lines) sink.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);

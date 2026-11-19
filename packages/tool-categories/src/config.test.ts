@@ -853,4 +853,16 @@ describe("what a registrar would refuse, found at compile time", () => {
     expect(problems("registerHttpConfig", HTTP)).toEqual([]);
     expect(problems("registerWebFetchConfig", { allowed_origins: ["nope"] })).toEqual([]);
   });
+
+  test("a closed block names each key it does not read, and passes the ones it does", () => {
+    expect(
+      problems("registerWorkConfig", { accept: ["fix"], ranking: {}, autoMerge: true }),
+    ).toEqual([
+      {
+        path: "tool_config.k.autoMerge",
+        message: "is not a setting: the work tools read accept and ranking.",
+      },
+    ]);
+    expect(problems("registerWorkConfig", { accept: ["fix"] })).toEqual([]);
+  });
 });

@@ -462,7 +462,7 @@ describe("a supervisor execution's stream", () => {
 });
 
 describe("a harness's stream", () => {
-  test("one frame per line, from all five sources in one vector, from now", async () => {
+  test("one frame per line, from all five core sources in one vector beside the work log's, from now", async () => {
     const h = await home.harness("harness-stream");
     row(h.dir, mintRunId(), "running"); // before the stream: not sent
     const feed = await open(`/api/v1/harnesses/${h.id}/events`);
@@ -504,7 +504,7 @@ describe("a harness's stream", () => {
     const last = decodeCursor(frames.at(-1)?.id);
     expect(
       last.ok && last.cursor.kind === "vector" && Object.keys(last.cursor.sources).sort(),
-    ).toEqual(["approvals", "commands", "decisions", "deployments", "runs"]);
+    ).toEqual(["approvals", "commands", "decisions", "deployments", "runs", "work"]);
     everyFrameParses(frames);
   });
 });

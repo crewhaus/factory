@@ -63,13 +63,13 @@ export type NotificationSink = (typeof NOTIFICATION_SINKS)[number];
 /** Human labels — the console renders these rather than the slugs. */
 export const KIND_LABELS: Readonly<Record<NotificationKind, string>> = {
   "approval-parked": "an approval is parked on a human",
-  "exit-30": "a run exited 30 (policy refusal)",
+  "exit-30": "a run exited 30 (provider rejected the credentials)",
   "exit-31": "a run exited 31 (provider funding)",
-  "exit-33": "a run exited 33 (unrecoverable config)",
+  "exit-33": "a run exited 33 (its budget ran out)",
   "eval-gate-failed": "an eval gate failed against its baseline",
   "incident-opened": "an incident was opened",
   "dream-overdue": "a dream is overdue by more than two windows",
-  "budget-80": "spend passed 80% of the declared budget",
+  "budget-80": "spend passed 80% of this period's budget",
   "crash-looping": "a daemon is crash-looping",
   "credential-probe-failed": "a credential probe failed",
 };
@@ -301,7 +301,7 @@ export function deriveEvents(signals: readonly HarnessSignal[]): readonly Notifi
         s,
         "budget-80",
         `d${Math.floor(pct / 10)}`,
-        `${s.specName}: ${pct}% of the declared budget spent`,
+        `${s.specName}: ${pct}% of this period's budget used`,
         null,
       );
     }
