@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { api, streamRunEvents } from "../assets/js/api.js";
+import { api, heldTwinNotes, resetTwinNotes, streamRunEvents } from "../assets/js/api.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { ROUTES, buildPath, m3RouteKeys } from "../assets/js/routes.js";
 
@@ -250,6 +250,12 @@ const DRIVERS: Record<
     params: { plugin: "cost-lens", pane: "spend" },
   },
   panes: { call: () => api.panes(ID), params: { id: ID } },
+  twinNotes: {
+    call: () => {
+      resetTwinNotes();
+      return api.twinNotes();
+    },
+  },
 };
 
 /**
@@ -447,5 +453,33 @@ describe("a typed refusal is surfaced, not thrown", () => {
       )) as typeof fetch;
     const envelope = (await api.controlStatus(ID)) as { code: string };
     expect(envelope.code).toBe("no_control_port");
+  });
+});
+
+describe("the notes beside each write", () => {
+  test("are read once per session, and a read that failed is asked again", async () => {
+    resetTwinNotes();
+    let served = 0;
+    let fail = true;
+    globalThis.fetch = (async () => {
+      served++;
+      return fail
+        ? new Response('{"error":"unavailable"}', {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(JSON.stringify({ notes: { wikiArchive: "Same as `x`." } }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+    }) as typeof fetch;
+    expect(await api.twinNotes()).toBe(null);
+    expect(heldTwinNotes()).toBeUndefined();
+    fail = false;
+    expect(await api.twinNotes()).toEqual({ wikiArchive: "Same as `x`." });
+    expect(await api.twinNotes()).toEqual({ wikiArchive: "Same as `x`." });
+    expect(heldTwinNotes()).toEqual({ wikiArchive: "Same as `x`." });
+    expect(served).toBe(2);
+    resetTwinNotes();
   });
 });

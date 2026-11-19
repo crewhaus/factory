@@ -103,7 +103,7 @@ import { buildRedactionNotice, classifyBoundary } from "@crewhaus/boundary-class
 import type { WikiWriteEventPayload } from "@crewhaus/event-log";
 import { type RunContext, formatAgentIdentity, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext, ToolReadRef } from "@crewhaus/tool-catalog";
 import {
   type WikiCreatedBy,
   type WikiEmbedder,
@@ -699,6 +699,24 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
     };
   }
 
+  /**
+   * One article a read tool returned, by reference: its slug and the version
+   * read, and `withheld` when the tool redacted it before the model saw it.
+   */
+  function articleRead(
+    ref: { readonly slug: string; readonly version: number },
+    shown: boolean,
+  ): ToolReadRef {
+    return {
+      store: "wiki",
+      backend: "local",
+      spec: opts.specName,
+      localId: ref.slug,
+      version: ref.version,
+      ...(shown ? {} : { withheld: true as const }),
+    };
+  }
+
   async function emit(payload: WikiWriteEventPayload): Promise<void> {
     if (opts.appendEvent === undefined) return;
     await opts.appendEvent({ kind: "wiki_write", payload });
@@ -718,6 +736,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         return `no wiki articles matched "${input.query}" — if this is a real gap, record it with log_knowledge_gap`;
       }
       const lines = [`${hits.length} wiki hit(s) for "${input.query}":`];
+      const reads: ToolReadRef[] = [];
       for (const hit of hits) {
         // Header and body are one unit: the title and tags are free text too.
         const c = await classifyMemory(`${hitHeader(hit)}\n${hit.body}`, rc);
@@ -727,7 +746,9 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
         );
         // The body reached the model: this session has read this version.
         if (c.safe) readLedger.noteRead(sessionKey(ctx), hit.ref.slug, hit.ref.version);
+        reads.push(articleRead(hit.ref, c.safe));
       }
+      ctx?.recordReads?.(reads);
       return lines.join("\n");
     },
   });
@@ -808,6 +829,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       // The title, tags and sources are free text too: the whole article is
       // one unit, classified before anything is rendered.
       const c = await classifyMemory(`${header.join("\n")}\n\n${article.body}`, rc);
+      ctx?.recordReads?.([articleRead(article, c.safe)]);
       if (!c.safe) {
         const name = redactedName(article);
         return `slug: ${name.slug} · ${name.version} — [article redacted]\n\n${c.notice}`;

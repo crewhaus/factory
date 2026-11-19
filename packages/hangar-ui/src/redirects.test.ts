@@ -135,7 +135,13 @@ describe("the query, and what never redirects", () => {
   });
 
   test("a new address never redirects: the table is idempotent", () => {
-    const params = { id: ID, run: "run_1", session: "sess_1", slug: "notes" };
+    const params = {
+      id: ID,
+      run: "run_1",
+      session: "sess_1",
+      slug: "notes",
+      wi: "wi_01m76e6f05hp514w9j4v3qymka",
+    };
     expect(r.ROUTE_TEMPLATES.length).toBeGreaterThanOrEqual(40);
     for (const template of r.ROUTE_TEMPLATES) {
       const href = r.routeFor(template, params);

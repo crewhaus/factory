@@ -9,41 +9,22 @@
  * table sit the two fleet-level reads an operator actually acts on: the job
  * queue, and the failure board that turns three red rows into one incident.
  *
- * THE CONSOLE relies on the SSE grammar rather than branching on liveness:
- * `replay` (a whole RunDetail) opens every stream and `done` always closes
- * it, so a finished run replays and terminates through the same code path a
- * live one streams through. Trace events render as feed cards in the M1
- * transcript vocabulary — same chips, same folds — with interleaved prose
- * from the captured (scrubbed) log and a stats/cost HUD folded from the
- * frames as they arrive.
+ * THE CONSOLE is the run view (`../runview/index.js`): one feed for Home's own
+ * run stream and the versioned API's, with filters, a window, follow mode, the
+ * markers a stream says about itself, and a reconnect that resumes where it
+ * stopped.
  */
 
-import { api, streamRunEvents } from "../api.js";
-import {
-  clear,
-  collapsible,
-  dot,
-  el,
-  emptyState,
-  jsonPre,
-  scrollRegion,
-  skeleton,
-  toast,
-} from "../dom.js";
+import { api } from "../api.js";
+import { clear, dot, el, emptyState, scrollRegion, skeleton, toast } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { hrefGlobal, hrefHarness } from "../router.js";
+import { mountRunView } from "../runview/index.js";
 import { shapeAccentVars, shapeLabel } from "../shapes.js";
-import {
-  failureBoard,
-  ledgerExit,
-  procRow,
-  runHud,
-  runLedgerRow,
-  sseFrameToFeed,
-  uptimeLabel,
-} from "../supervision.js";
+import { failureBoard, ledgerExit, procRow, runLedgerRow, uptimeLabel } from "../supervision.js";
 import { timeEl } from "../ui/time.js";
-import { APPROVALS_UNKNOWN, dirTail, fmtUsd, normalizeRows } from "../util.js";
-import { actionTwin } from "./control.js";
+import { APPROVALS_UNKNOWN, dirTail, normalizeRows } from "../util.js";
+import { HOME_WIDE, actionTwin, writeTwin } from "./control.js";
 import { renderJobs } from "./jobs.js";
 import { procActionBar } from "./proc.js";
 
@@ -288,6 +269,7 @@ async function showGroupPlan(body, name, verb, reload) {
     },
   });
   body.appendChild(run);
+  body.appendChild(writeTwin("groupProc", HOME_WIDE, "Run on the group"));
 }
 
 function boardRow(feedRow, proc, nowMs, reload) {
@@ -422,6 +404,12 @@ export async function renderRuns(root, ctx) {
             href: hrefHarness(ctx.id, "runs", row.runId),
             text: row.runId,
           }),
+          actionBar({
+            ref: `${ctx.id}/${/^run_[0-9a-f]{16}$/.test(row.runId) ? "exec" : "run"}/${row.runId}`,
+            label: `run ${row.runId}`,
+            ...(typeof ctx.dir === "string" && ctx.dir !== "" ? { dir: ctx.dir } : {}),
+            operation: { id: "runs.get", params: { run: row.runId }, query: { harness: ctx.id } },
+          }),
         ]),
         el("td", { class: "mono", text: row.kind }),
         el("td", { text: row.startedLabel }),
@@ -457,143 +445,33 @@ export async function renderRuns(root, ctx) {
 }
 
 /**
- * One run's console. Opens the SSE feed, renders `replay` history and any
- * live frames into the same feed, and closes the stream when the view is
- * replaced (a navigation must not leave a reader dangling).
+ * One run's console, drawn by the run view (`../runview/index.js`): its state
+ * in words, the harness, the spec revision, the cost so far, and its events,
+ * live. The stream closes when the view is replaced: a navigation never leaves
+ * a reader holding a connection.
  */
 async function renderRunConsole(root, ctx, runId) {
   clear(root);
+  const ref = `${ctx.id}/${/^run_[0-9a-f]{16}$/.test(runId) ? "exec" : "run"}/${runId}`;
   root.appendChild(
     el("div", { class: "crumb-line" }, [
       el("a", { href: hrefHarness(ctx.id, "runs"), text: "← runs" }),
       el("span", { class: "mono muted", text: runId }),
       actionTwin("logs", { dir: ctx.dir ?? "", runId }),
+      actionBar({
+        ref,
+        label: `run ${runId}`,
+        ...(typeof ctx.dir === "string" ? { dir: ctx.dir } : {}),
+        operation: { id: "runs.get", params: { run: runId }, query: { harness: ctx.id } },
+      }),
     ]),
   );
-
-  const hudNode = el("div", { class: "hud" });
-  const banner = el("div", { class: "run-banner" });
-  const feed = el("div", { class: "transcript run-feed" });
-  root.appendChild(hudNode);
-  root.appendChild(banner);
-  root.appendChild(el("div", { class: "feed-wrap" }, [feed]));
-
-  const items = [];
-  const drawHud = () => {
-    const hud = runHud(items);
-    clear(hudNode);
-    const stat = (label, value) =>
-      el("div", { class: "mini" }, [
-        el("div", { class: "mini-num", text: value }),
-        el("div", { class: "mini-label", text: label }),
-      ]);
-    hudNode.appendChild(
-      el("div", { class: "mini-row" }, [
-        stat("events", String(hud.events)),
-        stat("turns", String(hud.turns)),
-        stat(
-          "tool calls",
-          `${hud.tools}${hud.toolErrors > 0 ? ` / ${hud.toolErrors} failed` : ""}`,
-        ),
-        stat("cost", fmtUsd(hud.costUsd)),
-        stat("tokens in/out", `${hud.inputTokens}/${hud.outputTokens}`),
-      ]),
-    );
-  };
-  drawHud();
-
-  let done = false;
-  const push = (item) => {
-    items.push(item);
-    feed.appendChild(feedNode(item));
-    if (item.type === "exit" && item.banner !== null) {
-      clear(banner).appendChild(exitBannerNode(item.banner));
-    }
-    if (item.type === "done") {
-      done = true;
-      banner.appendChild(el("span", { class: "chip", text: `stream closed — ${item.detail}` }));
-    }
-  };
-
-  // The stream is bound to this navigation: leaving the screen aborts the
-  // reader instead of leaving it holding a connection, and a frame that
-  // arrives after that is dropped.
-  const stream = streamRunEvents(ctx.id, runId, (frame) => {
-    if (ctx.signal?.aborted === true) {
-      stream.close();
-      return;
-    }
-    if (frame.event === "error") {
-      const message = frame.data?.message ? String(frame.data.message) : "stream failed";
-      clear(banner).appendChild(dot("bad", message));
-      return;
-    }
-    if (frame.event === "closed") {
-      // Only worth saying when the server never sent its terminal `done` —
-      // that is the difference between "finished" and "dropped".
-      if (!done) {
-        banner.appendChild(el("span", { class: "chip chip-warn", text: "connection dropped" }));
-      }
-      return;
-    }
-    for (const item of sseFrameToFeed(frame.event, frame.data)) push(item);
-    drawHud();
+  const host = el("section", { class: "run-view", "aria-label": "Run events" });
+  root.appendChild(host);
+  mountRunView(host, {
+    harness: ctx.id,
+    run: runId,
+    harnessName: String(ctx.detail?.inventory?.specName ?? ctx.detail?.entry?.specName ?? ctx.id),
+    ...(ctx.signal !== undefined ? { signal: ctx.signal } : {}),
   });
-  ctx.signal?.addEventListener("abort", () => stream.close(), { once: true });
-}
-
-function exitBannerNode(banner) {
-  return el("div", { class: "exit-banner" }, [
-    dot(banner.dot, banner.title),
-    banner.classLabel !== null
-      ? el("span", { class: "chip chip-warn", text: banner.classLabel })
-      : null,
-    banner.exitCode !== null
-      ? el("span", { class: "chip", text: `exit ${banner.exitCode}` })
-      : null,
-    banner.restartable
-      ? el("span", { class: "chip", text: "restartable" })
-      : el("span", { class: "chip chip-warn", text: "will not auto-restart" }),
-    banner.remediation !== null
-      ? el("div", { class: "muted reason", text: banner.remediation })
-      : null,
-  ]);
-}
-
-/** One feed item → its card, in the M1 transcript vocabulary. */
-function feedNode(item) {
-  if (item.type === "prose") {
-    return el("pre", { class: "prose-pre feed-prose", text: item.lines.join("\n") });
-  }
-  if (item.type === "marker") {
-    return el("div", { class: "gutter" }, [
-      el("span", { class: "chip", text: item.title }),
-      item.detail ? el("span", { class: "muted", text: item.detail }) : null,
-    ]);
-  }
-  if (item.type === "state") {
-    return el("div", { class: "gutter" }, [dot(item.dot, item.title)]);
-  }
-  if (item.type === "exit") {
-    return el("div", { class: "gutter" }, [dot(item.dot, `exited — ${item.title}`)]);
-  }
-  if (item.type === "done") {
-    return el("div", { class: "gutter" }, [
-      el("span", { class: "chip", text: "done" }),
-      el("span", { class: "muted", text: item.detail }),
-    ]);
-  }
-  // A trace event: a fold whose summary reads at a glance and whose body is
-  // the raw (already masked + scrubbed) payload.
-  return collapsible(
-    [
-      el("span", { class: "chip chip-tool", text: item.kind }),
-      item.dot !== null ? dot(item.dot, item.title) : el("span", { text: item.title }),
-      el("span", { class: "muted tool-summary", text: item.detail ?? "" }),
-    ],
-    [
-      item.remediation ? el("p", null, [el("strong", { text: "Fix: " }), item.remediation]) : null,
-      jsonPre(item.payload),
-    ],
-  );
 }

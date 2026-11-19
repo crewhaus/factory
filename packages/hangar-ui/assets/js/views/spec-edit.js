@@ -59,6 +59,7 @@ import {
   maskedMarkerOf,
 } from "../ui/schema-form.js";
 import { call } from "../v1.js";
+import { HOME_WIDE, twinGroup, writeTwin } from "./control.js";
 
 // ---------------------------------------------------------------------------
 // small shared pieces
@@ -1207,6 +1208,10 @@ export function settingsCard(ctx, body, trust, live, reload) {
       }),
       addBlock,
     ]),
+    twinGroup([
+      writeTwin("specPatch", ctx, "Save a setting"),
+      writeTwin("specEdit", ctx, "Edit by path"),
+    ]),
   ];
   const state = settingsState(body, model.groups.length, live.readOnly.held);
   const node = card("Settings", dot(state.tone, state.word), inner);
@@ -1688,6 +1693,7 @@ function valueDialog(
       editor,
       el("div", { class: "modal-actions" }, [preview]),
       out,
+      twinGroup([writeTwin("specEdit", ctx, "Write"), writeTwin("specPropose", ctx, "Propose")]),
     ],
     true,
   );
@@ -1840,6 +1846,8 @@ function pinDialog(ctx, version, confirmName, reload) {
         rollback,
         el("span", { text: "This is a rollback (the environment is moving backwards)" }),
       ]),
+      writeTwin("specPin", ctx, "Move the pin"),
+      writeTwin("specRollback", ctx, "Rollback"),
     ],
     confirmName,
     action: "Move the pin",
@@ -1973,7 +1981,7 @@ function connectorRow(ctx, server, confirmName, reload, live) {
             ),
           ),
     ]),
-    el("td", { class: "cell-actions" }, [remove]),
+    el("td", { class: "cell-actions" }, [remove, writeTwin("mcpConnectorRemove", ctx, "Remove")]),
   ]);
 }
 
@@ -2061,6 +2069,7 @@ function connectorForm(ctx, catalog, confirmName, reload, live) {
     el("label", { class: "field" }, [el("span", { text: "Command" }), command]),
     el("label", { class: "field grow" }, [el("span", { text: "Arguments" }), args]),
     add,
+    writeTwin("mcpConnectorWrite", ctx, "Add"),
   ]);
 }
 
@@ -2128,7 +2137,10 @@ function gradersCard(ctx, body, confirmName, reload) {
     });
   });
   inner.push(
-    collapsible([el("span", { class: "muted", text: "edit graders.yaml" })], [editor, save]),
+    collapsible(
+      [el("span", { class: "muted", text: "edit graders.yaml" })],
+      [editor, save, writeTwin("graderWrite", ctx, "Save")],
+    ),
     el("p", {
       class: "muted",
       text: "Saving checks the file still matches what you loaded and that it is a valid graders file.",
@@ -2278,6 +2290,10 @@ function wizardDialog(template) {
       el("label", { class: "field" }, [el("span", { text: "Spec name" }), nameInput]),
       el("div", { class: "modal-actions" }, [plan]),
       out,
+      twinGroup([
+        writeTwin("wizardCreate", HOME_WIDE, "Create"),
+        writeTwin("addHarness", HOME_WIDE, "Register"),
+      ]),
     ],
     true,
   );

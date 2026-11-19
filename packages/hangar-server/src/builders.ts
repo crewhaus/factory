@@ -426,6 +426,13 @@ function applyGraderField(into: { name: string | null; type: string | null }, te
 const GRADERS_VERB = "crewhaus graders suggest -o eval/graders.yaml";
 
 /**
+ * The command that makes the same structured criteria edits as an `{edits}`
+ * write, against the same `sha256:` revision. One plain literal, so the twin
+ * check reads the whole command.
+ */
+export const CRITERIA_APPLY_VERB = "crewhaus criteria apply <edits-file> --expect <revision>";
+
+/**
  * `GET /api/h/:id/builders/graders` — this harness's `eval/graders.yaml`,
  * rendered with the hash a run's `gradersHash` is compared against, so an
  * operator can see WHICH graders a run was scored by.
@@ -542,7 +549,7 @@ export const graderWrite: M3Handler = (ctx) => {
   if (stored.truncated) {
     throw new HttpError(
       409,
-      `the existing ${GRADERS_PATH.join("/")} is larger than this server reads (${MAX_TEXT_BYTES} bytes) — refusing to replace a file it could only show you the head of. Edit it with \`${GRADERS_VERB}\` or an editor.`,
+      `the existing ${GRADERS_PATH.join("/")} is larger than this server reads (${MAX_TEXT_BYTES} bytes) — refusing to replace a file it could only show you the head of. Make structured edits with \`${CRITERIA_APPLY_VERB}\`, or edit the whole file in an editor.`,
     );
   }
   if (present) {
@@ -584,7 +591,7 @@ export const graderWrite: M3Handler = (ctx) => {
   if (mark !== null) {
     throw new HttpError(
       409,
-      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Edit the file with \`${GRADERS_VERB}\` or an editor.`,
+      `this body introduces a masked span (${mark}) the stored ${GRADERS_PATH.join("/")} does not have — the editor pane is served MASKED, and saving it would replace what the mask hid. Make structured edits with \`${CRITERIA_APPLY_VERB}\`, or edit the whole file in an editor.`,
     );
   }
   let after: GradersConfig;
@@ -643,7 +650,7 @@ export const graderWrite: M3Handler = (ctx) => {
     yaml: maskSpecYaml(onDisk),
     hash: hashOf(onDisk),
     gradersHash: gradersHashOf(onDisk),
-    verb: GRADERS_VERB,
+    verb: typeof yaml === "string" ? GRADERS_VERB : CRITERIA_APPLY_VERB,
     note: "runs scored after this write carry a new gradersHash — earlier runs keep the graders they were scored by",
   };
 };

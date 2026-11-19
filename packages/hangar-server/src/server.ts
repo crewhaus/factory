@@ -120,6 +120,7 @@ import {
   runfileExists,
   shellQuote,
 } from "@crewhaus/harness-supervisor";
+import { EXPORT_JOB_KIND } from "@crewhaus/harness-supervisor/job-kinds";
 import { runPreflight } from "@crewhaus/preflight";
 import {
   type AccessView,
@@ -164,6 +165,7 @@ import {
   refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
+import { budgetUsedRatio } from "./budget";
 import { bundleFreshness } from "./bundle-freshness";
 import {
   DEFAULT_HANGAR_PORT,
@@ -208,7 +210,6 @@ import {
   type HealthResult,
   cadenceToMs,
   computeHealth,
-  declaredBudgetUsd,
   dreamOverdue,
 } from "./health";
 import { allowedHosts, hostAllowed, misdirected } from "./host-allowlist";
@@ -288,7 +289,7 @@ import { commandFields, createReceipts, currentCommand, noteNeed } from "./recei
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import { type RequestMatch, matchRequest } from "./route-match";
-import { type RouteRow, legacyKindPermission } from "./route-table";
+import { type RouteRow, legacyKindPermission, twinNotesOf } from "./route-table";
 import {
   isLiveFeedState,
   isSupervisorRunId,
@@ -303,9 +304,9 @@ import { buildSchedulersView, declaredCadences, dreamStates, readSpecYaml } from
 import {
   isSessionId,
   listSessions,
+  reachableSessionRoot,
   readTranscript,
   readTranscriptRaw,
-  resolveSessionRoot,
 } from "./sessions";
 import {
   type SettingsStore,
@@ -326,6 +327,7 @@ import {
 } from "./spec-view";
 import { assetResponse } from "./static-cache";
 import type { HomePorts } from "./sweeps";
+import { readThredzTasks } from "./thredz";
 import {
   HOME_AREAS,
   type HomeAreaRuntime,
@@ -1383,12 +1385,6 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           }))
           .filter((d) => d.neverRan || (d.windows !== null && d.windows > 2))
           .map((d) => d.specName);
-        const budgetUsd = declaredBudgetUsd(yamlText);
-        // The CACHED rollup, not a fresh fold: this runs on every badge poll
-        // across the whole fleet, and re-reading every session log for a
-        // number the Library already caches would make the cheapest screen
-        // the most expensive request.
-        const spentUsd = cache.get(entry.id, dir, now()).costBreakdown.totalUsdMicros / 1_000_000;
         return {
           harnessId: entry.id,
           specName: view.specName,
@@ -1406,7 +1402,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
               exitCode: r.exitCode as number,
               endedAt: r.endedAt ?? null,
             })),
-          budgetUsedRatio: budgetUsd === null ? null : spentUsd / budgetUsd,
+          budgetUsedRatio: budgetUsedRatio(dir, yamlText, now()),
           credentialProbeFailed: view.envRefs.some((r) => !r.set),
         } satisfies HarnessSignal;
       });
@@ -2619,7 +2615,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const sess = tail[0] as string;
       if (!isSessionId(sess)) throw new HttpError(400, "invalid session id");
       const dir = liveDirOr404(entry);
-      const rootInfo = resolveSessionRoot(dir);
+      const reach = reachableSessionRoot(dir);
+      if (!reach.reachable) throw new HttpError(409, reach.note);
+      const rootInfo = reach.info;
       if (url.searchParams.get("raw") !== null) {
         // The raw lines are the run's record as written: its owner's to read.
         if (!requestAllows("h.files.raw", entry.id)) throw forbiddenOn("h.files.raw", entry.id);
@@ -2733,6 +2731,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "version" && rest.length === 0 && method === "GET") {
       return json({ hangar: version, protocolV: PROTOCOL_V, api: [PROTOCOL_ID] });
+    }
+
+    // The command-line equivalent of each write without a core command kind.
+    if (head === "twin-notes" && rest.length === 0 && method === "GET") {
+      return json({ notes: twinNotesOf() });
     }
 
     // Mint a fresh single-use browser handoff. `crewhaus hangar open` reads
@@ -3408,6 +3411,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     ...(processes.stopApiRun !== undefined
       ? { stopRunJob: processes.stopApiRun.bind(processes) }
       : {}),
+    // A harness archive: one job in the harness folder, writing where Home chose.
+    submitExportJob: (entry, argv, command) =>
+      processes.jobs.submit({
+        harnessDir: entry.dir,
+        harnessId: entry.id,
+        kind: EXPORT_JOB_KIND,
+        argv,
+        commandId: command.commandId,
+        by: command.by,
+      }),
     ...(processes.apiRunCapacity !== undefined
       ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }
       : {}),
@@ -3425,6 +3438,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         : { ok: false, detail: "a live daemon holds the runfile but was not adopted" };
     },
     streamSignal,
+    // The Work view's one read of a harness's Thredz tasks, under the harness's own session.
+    thredzTasks: async (entry) =>
+      readThredzTasks({
+        env: mergedSpawnEnv(env, entry.dir).env,
+        contain: (segments) => {
+          const found = harnessPathOf(entry.dir, hangarRoot, segments);
+          if (found.ok) return found.path;
+          throw new HttpError(400, "path escapes the harness directory");
+        },
+      }),
     accessNow: (caller) => requestAccessFor(caller, accessView(signIn.snapshot())),
     ...(opts.streamTimings !== undefined ? { streamTimings: opts.streamTimings } : {}),
   });

@@ -32,10 +32,16 @@ import { ConfigError } from "@crewhaus/errors";
 import type { IrKnowledge, IrKnowledgeSource } from "@crewhaus/ir";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import {
+  type CorpusSourceReason,
+  type CorpusSourceStatus,
+  corpusDoc,
+  corpusEmbedderModel,
+  corpusSourceLabel,
   fetchFailureName,
   knowledgeSourceLabel,
   registerRetrieveConfig,
   retrieve,
+  writeCorpusManifest,
 } from "@crewhaus/tool-retrieve";
 import { createVectorStore } from "@crewhaus/vector-store";
 
@@ -93,16 +99,29 @@ function bunGlobScan(pattern: string, cwd: string): string[] {
   return [...matcher.scanSync({ cwd, onlyFiles: true })];
 }
 
+/** The closed reason a source failed with, for the corpus manifest. */
+const failureReasons = new WeakMap<Error, CorpusSourceReason>();
+
+/** A source's load error, carrying the closed reason the corpus manifest records. */
+function sourceError(reason: CorpusSourceReason, message: string): ConfigError {
+  const err = new ConfigError(message);
+  failureReasons.set(err, reason);
+  return err;
+}
+
 /** Read one file source (path), failing with the source name when absent. */
 function loadPathSource(path: string, cwd: string): KnowledgeDocument {
   const abs = isAbsolute(path) ? path : resolvePath(cwd, path);
   if (!existsSync(abs)) {
-    throw new ConfigError(`knowledge source path not found: ${path} (resolved ${abs})`);
+    throw sourceError("not-found", `knowledge source path not found: ${path} (resolved ${abs})`);
   }
   try {
     return { id: path, text: readFileSync(abs, "utf-8") };
   } catch (err) {
-    throw new ConfigError(`could not read knowledge source ${path}: ${(err as Error).message}`);
+    throw sourceError(
+      "unreadable",
+      `could not read knowledge source ${path}: ${(err as Error).message}`,
+    );
   }
 }
 
@@ -118,7 +137,8 @@ function loadGlobSource(
     try {
       return { id: rel, text: readFileSync(abs, "utf-8") };
     } catch (err) {
-      throw new ConfigError(
+      throw sourceError(
+        "unreadable",
         `could not read knowledge source ${rel} (glob "${pattern}"): ${(err as Error).message}`,
       );
     }
@@ -145,12 +165,19 @@ async function loadUrlSource(
   try {
     res = await fetchImpl(url);
   } catch (err) {
-    throw new ConfigError(
+    throw sourceError(
+      "fetch-failed",
       `could not fetch knowledge source ${where} ${label}: ${fetchFailureName(err)}`,
     );
   }
   if (!res.ok) {
-    throw new ConfigError(`knowledge source ${where} ${label} returned HTTP ${res.status}`);
+    const status = res.status;
+    throw sourceError(
+      Number.isInteger(status) && status >= 100 && status <= 599
+        ? `http-${status}`
+        : "fetch-failed",
+      `knowledge source ${where} ${label} returned HTTP ${status}`,
+    );
   }
   return { id: label, text: await res.text() };
 }
@@ -163,29 +190,72 @@ export async function loadKnowledgeSources(
   sources: readonly IrKnowledgeSource[],
   deps: Pick<KnowledgeIngestDeps, "cwd" | "fetchImpl" | "globScan">,
 ): Promise<KnowledgeDocument[]> {
+  const loaded = await loadKnowledgeSourcesRecorded(sources, deps);
+  if (loaded.error !== undefined) throw loaded.error;
+  return loaded.docs;
+}
+
+/** One declared source as loading left it: what the corpus manifest lists. */
+type SourceLoad = {
+  readonly source: IrKnowledgeSource;
+  readonly status: CorpusSourceStatus;
+  readonly reason?: CorpusSourceReason;
+  readonly docs: readonly KnowledgeDocument[];
+};
+
+/**
+ * {@link loadKnowledgeSources}, recording what became of each source. Loading
+ * stops at the first failing source; it is recorded `failed` with its closed
+ * reason, and every source after it `failed` with `not-reached`. Never
+ * throws: the failure comes back as `error`.
+ */
+async function loadKnowledgeSourcesRecorded(
+  sources: readonly IrKnowledgeSource[],
+  deps: Pick<KnowledgeIngestDeps, "cwd" | "fetchImpl" | "globScan">,
+): Promise<{
+  readonly docs: KnowledgeDocument[];
+  readonly recorded: SourceLoad[];
+  readonly error?: unknown;
+}> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const scan = deps.globScan ?? bunGlobScan;
   const docs: KnowledgeDocument[] = [];
+  const recorded: SourceLoad[] = [];
   for (const [position, src] of sources.entries()) {
-    switch (src.kind) {
-      case "path":
-        docs.push(loadPathSource(src.path, deps.cwd));
-        break;
-      case "glob":
-        docs.push(...loadGlobSource(src.glob, deps.cwd, scan));
-        break;
-      case "url":
-        docs.push(await loadUrlSource(src.url, position, fetchImpl));
-        break;
-      default: {
-        const exhaustive: never = src;
-        throw new ConfigError(
-          `unknown knowledge source kind ${JSON.stringify(exhaustive)} (unreachable)`,
-        );
+    let found: KnowledgeDocument[];
+    try {
+      switch (src.kind) {
+        case "path":
+          found = [loadPathSource(src.path, deps.cwd)];
+          break;
+        case "glob":
+          found = loadGlobSource(src.glob, deps.cwd, scan);
+          break;
+        case "url":
+          found = [await loadUrlSource(src.url, position, fetchImpl)];
+          break;
+        default: {
+          const exhaustive: never = src;
+          throw new ConfigError(
+            `unknown knowledge source kind ${JSON.stringify(exhaustive)} (unreachable)`,
+          );
+        }
       }
+    } catch (error) {
+      for (const [i, rest] of sources.entries()) {
+        if (i < position) continue;
+        const reason =
+          i === position
+            ? ((error instanceof Error ? failureReasons.get(error) : undefined) ?? "unreadable")
+            : "not-reached";
+        recorded.push({ source: rest, status: "failed", reason, docs: [] });
+      }
+      return { docs, recorded, error };
     }
+    docs.push(...found);
+    recorded.push({ source: src, status: found.length > 0 ? "included" : "empty", docs: found });
   }
-  return docs;
+  return { docs, recorded };
 }
 
 /**
@@ -210,19 +280,56 @@ export async function ingestKnowledge(
     });
   const vectorStore = createVectorStore({ backend: knowledge.vectorBackend });
 
-  const docs = await loadKnowledgeSources(knowledge.sources, deps);
-  const chunks = docs.flatMap((d) =>
-    chunk(
-      { id: d.id, text: d.text },
-      { strategy: "fixed", size: knowledge.chunkSize, overlap: knowledge.chunkOverlap },
-    ),
-  );
-  const vectors = chunks.length === 0 ? [] : await embedder.embed(chunks.map((c) => c.text));
-  for (let i = 0; i < chunks.length; i += 1) {
-    const c = chunks[i];
-    const v = vectors[i];
-    if (c === undefined || v === undefined) continue;
-    await vectorStore.upsert(c.id, v, { docId: c.docId, text: c.text });
+  const loaded = await loadKnowledgeSourcesRecorded(knowledge.sources, deps);
+  // Chunks per document, for the corpus manifest; filled once chunking ran.
+  const parts = new Map<string, number>();
+  // The corpus manifest (`.crewhaus/run/knowledge/corpus.json`), written once
+  // per boot: after ingest, or on a failure before it is rethrown. Labels,
+  // fingerprints, part counts and content hashes; never document text. A
+  // failed write is one log line, never a failed boot.
+  const recordCorpus = (): void => {
+    const written = writeCorpusManifest(deps.cwd, {
+      v: 1,
+      at: new Date().toISOString(),
+      embedderModel: corpusEmbedderModel(embedder.model),
+      vectorBackend: vectorStore.backend,
+      sources: loaded.recorded.map((r) => ({
+        label: corpusSourceLabel(r.source),
+        kind: r.source.kind,
+        status: r.status,
+        ...(r.reason !== undefined ? { reason: r.reason } : {}),
+        docs: r.docs.map((d) => corpusDoc(d.id, d.text, parts.get(d.id) ?? 0)),
+      })),
+    });
+    if (!written.ok) {
+      const line = `[knowledge] corpus manifest not written (${written.reason})\n`;
+      if (deps.log !== undefined) deps.log(line);
+      else process.stderr.write(line);
+    }
+  };
+  if (loaded.error !== undefined) {
+    recordCorpus();
+    throw loaded.error;
+  }
+  const docs = loaded.docs;
+  let chunks: ReturnType<typeof chunk> = [];
+  try {
+    chunks = docs.flatMap((d) =>
+      chunk(
+        { id: d.id, text: d.text },
+        { strategy: "fixed", size: knowledge.chunkSize, overlap: knowledge.chunkOverlap },
+      ),
+    );
+    for (const c of chunks) parts.set(c.docId, (parts.get(c.docId) ?? 0) + 1);
+    const vectors = chunks.length === 0 ? [] : await embedder.embed(chunks.map((c) => c.text));
+    for (let i = 0; i < chunks.length; i += 1) {
+      const c = chunks[i];
+      const v = vectors[i];
+      if (c === undefined || v === undefined) continue;
+      await vectorStore.upsert(c.id, v, { docId: c.docId, text: c.text });
+    }
+  } finally {
+    recordCorpus();
   }
 
   registerRetrieveConfig({ embedder, vectorStore, defaultK: knowledge.defaultK });

@@ -11,12 +11,14 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EXIT_CODES } from "@crewhaus/errors";
 import { makeFixtureHarness } from "./fixture";
 import {
   DEFAULT_QUIET_HOURS,
   DEFAULT_RULES,
   type Delivery,
   type HarnessSignal,
+  KIND_LABELS,
   NOTIFICATION_KINDS,
   type NotificationRule,
   OS_NOTIFICATION_TITLE,
@@ -109,6 +111,25 @@ describe("deriveEvents", () => {
     expect([...new Set(events.map((e) => e.kind))].sort()).toEqual([...NOTIFICATION_KINDS].sort());
     // Exit 0 is not an event.
     expect(events.filter((e) => e.ref === "run_4")).toEqual([]);
+  });
+
+  test("the exit labels say what each exit means, by the numbers EXIT_CODES gives", () => {
+    expect(EXIT_CODES.auth).toBe(30);
+    expect(EXIT_CODES.crewhaus_budget).toBe(33);
+    expect(KIND_LABELS[`exit-${EXIT_CODES.auth}` as "exit-30"]).toBe(
+      `a run exited ${EXIT_CODES.auth} (provider rejected the credentials)`,
+    );
+    expect(KIND_LABELS[`exit-${EXIT_CODES.crewhaus_budget}` as "exit-33"]).toBe(
+      `a run exited ${EXIT_CODES.crewhaus_budget} (its budget ran out)`,
+    );
+  });
+
+  test("budget-80 speaks of this period's budget, which only a declared period has", () => {
+    expect(KIND_LABELS["budget-80"]).toBe("spend passed 80% of this period's budget");
+    expect(deriveEvents([signal({ budgetUsedRatio: null })])).toEqual([]);
+    expect(deriveEvents([signal({ budgetUsedRatio: 0.85 })])[0]?.label).toContain(
+      "85% of this period's budget used",
+    );
   });
 
   test("a budget below 80% produces nothing; the key moves by decile", () => {

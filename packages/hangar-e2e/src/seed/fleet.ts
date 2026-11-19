@@ -10,12 +10,13 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { mintRunId } from "@crewhaus/control-contract";
+import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, runsLedger } from "@crewhaus/control-records";
 import { feedbackRecord, logLine, makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import { createSessionStore } from "@crewhaus/session-store";
+import { openWorkStore } from "@crewhaus/tool-work/work-items";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { loadConsoleGrammar } from "../console-routes";
 import { sandboxEnv } from "../system";
@@ -77,9 +78,13 @@ export type SeededHarness = {
   readonly approvalIds: readonly string[];
   /** The rich seed's open review item id, or null. */
   readonly reviewId: string | null;
+  /** A work item's id, deterministic; every seed writes it as a proposal through the work store. */
+  readonly workItem: string;
 };
 
 const DAY_MS = 86_400_000;
+/** The longest title a work item takes. */
+const WORK_TITLE_MAX = 200;
 
 /** The rich seed's records for one harness, as `makeFixtureHarness` options. */
 function richRecords(
@@ -340,6 +345,58 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       throw new Error(`the memory store did not read back the seeded entry for ${specName}`);
     }
 
+    // Two proposals with their case, in every harness, so the Work view always has a row
+    // that links to an item page, and the item page has another item to move it above.
+    // The second's title is as long as a title may be and carries an unbroken URL, so the
+    // narrow-screen sweep sees what a long title does to the feed and to "Move above…".
+    const workIdOf = (label: string): string =>
+      mintId("wi", {
+        now: opts.now,
+        random: (bytes) =>
+          bytes.set(
+            createHash("sha256")
+              .update(`${opts.seed}:${target}:${label}`)
+              .digest()
+              .subarray(0, bytes.length),
+          ),
+      });
+    const workItem = workIdOf("work");
+    const longTitle =
+      `Keep every column's type in the weekly partner import, as reported at https://example.com/${"reports/weekly-partner-import/".repeat(6)}`.slice(
+        0,
+        WORK_TITLE_MAX,
+      );
+    for (const [id, title] of [
+      [workItem, untrusted("Keep imported dates as dates")],
+      [workIdOf("work-long"), longTitle],
+    ] as const) {
+      const proposed = await openWorkStore(harnessDir, {
+        now: () => opts.now,
+        mintId: () => id,
+      }).propose(
+        {
+          title,
+          kind: "fix",
+          basis: "user-pain",
+          assessment: {
+            problem: untrusted("Imported dates arrive as text."),
+            evidence: [
+              {
+                label: "reported",
+                kind: "user-report",
+                ref: "seed-report-1",
+                note: untrusted("Two people said so."),
+              },
+            ],
+            counterEvidence: [],
+          },
+        },
+        { by: "sys:runtime", via: "tool", role: "harness" },
+      );
+      if (!proposed.ok)
+        throw new Error(`the work store did not take the seeded proposal: ${proposed.message}`);
+    }
+
     const entry = registry.upsert({ dir: harnessDir, specName, target });
     harnesses.push({
       id: entry.id,
@@ -351,6 +408,7 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       runId,
       approvalIds: rich?.approvalIds ?? [],
       reviewId: rich?.reviewId ?? null,
+      workItem,
     });
   }
 

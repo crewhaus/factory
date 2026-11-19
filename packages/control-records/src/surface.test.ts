@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(25);
+    expect(SOURCES.length).toBe(26);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -122,6 +122,9 @@ describe("what the package exports", () => {
         "CACHE_INDEX_DIR",
         "RESERVED_INDEX_NAMES",
         "_setIoTapForTest",
+        "openRecordFd",
+        "readAt",
+        "readRecordFile",
         "_setRollBytesForTest",
         "advanceVector",
         "appendFleetChanges",

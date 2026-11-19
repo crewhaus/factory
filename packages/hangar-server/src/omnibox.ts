@@ -39,7 +39,7 @@ import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { MENU_ACTION_PROVIDERS } from "./menu/actions";
 import { resolveInside } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 import { liveWikiSegments } from "./store-layout";
 
 /** What an omnibox row IS — the kind drives its icon and its deep link. */
@@ -299,9 +299,11 @@ const mtimeOf = (path: string | undefined): number => {
 export function harnessIndexToken(dir: string): string {
   const crewhaus = join(dir, ".crewhaus");
   const wikiStore = liveWikiSegments(dir);
+  const reach = reachableSessionRoot(dir);
+  const sessionRoot = reach.reachable ? reach.root : undefined;
   const parts = [
     mtimeOf(join(dir, "crewhaus.yaml")),
-    mtimeOf(resolveSessionRoot(dir).root),
+    sessionRoot === undefined ? -1 : mtimeOf(sessionRoot),
     mtimeOf(join(crewhaus, "wiki", "articles")),
     mtimeOf(wikiStore && resolveInside(dir, [...wikiStore, "articles"])),
     mtimeOf(join(crewhaus, "memories")),
@@ -309,7 +311,7 @@ export function harnessIndexToken(dir: string): string {
     mtimeOf(join(crewhaus, "evals")),
     mtimeOf(join(crewhaus, "incidents")),
     // The approvals log lives beside the sessions, wherever they resolve.
-    mtimeOf(join(resolveSessionRoot(dir).root, APPROVALS_FILENAME)),
+    mtimeOf(sessionRoot === undefined ? undefined : join(sessionRoot, APPROVALS_FILENAME)),
   ];
   return parts.join(":");
 }
@@ -359,8 +361,12 @@ export function buildHarnessEntries(
   // Sessions — a NAME scan of the resolved session root. Never
   // SessionStore.list(): its TTL sweep deletes transcripts, and an index
   // build is a read.
-  const sessionRoot = resolveSessionRoot(dir).root;
-  const sessions = listSafe(existsSync(sessionRoot) ? sessionRoot : undefined)
+  // Only the harness's own sessions folder: one that is unreachable adds nothing.
+  const reach = reachableSessionRoot(dir);
+  const sessionRoot = reach.reachable ? reach.root : undefined;
+  const sessions = listSafe(
+    sessionRoot !== undefined && existsSync(sessionRoot) ? sessionRoot : undefined,
+  )
     .filter((n) => SESSION_JSON_RE.test(n))
     .slice(-MAX_SESSIONS_INDEXED);
   for (const name of sessions) {

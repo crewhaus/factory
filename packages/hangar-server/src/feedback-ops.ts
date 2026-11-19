@@ -76,6 +76,7 @@ import { jobArg } from "./m3";
 import { maskDeep, maskSpecYaml, maskText } from "./mask";
 import { resolveContained } from "./safety";
 import { readSpecYaml } from "./schedulers";
+import { reachableSessionRoot } from "./sessions";
 import {
   classifyPath,
   commitHomeEdits,
@@ -102,6 +103,8 @@ type Corpus = {
   readonly sinks: readonly string[];
   readonly sessionsScanned: number;
   readonly truncated: boolean;
+  /** Why no transcript was read: the harness's sessions folder is unreachable. */
+  readonly sessionsNote: string | null;
 };
 
 /**
@@ -110,7 +113,9 @@ type Corpus = {
  *   - `.crewhaus/feedback/*.jsonl` — the bare-record sink the web UI and the
  *     managed gateway write (no event-log handle there);
  *   - `<sessionRoot>/sess_*.jsonl` — in-transcript `user_feedback` events
- *     (the exit-rating prompt, `crewhaus rate`, channel reactions).
+ *     (the exit-rating prompt, `crewhaus rate`, channel reactions), read only from
+ *     the harness's own sessions folder (`reachableSessionRoot`); an unreachable one
+ *     adds nothing and says why.
  *
  * Read RAW: no session-store `list()`, whose TTL eviction would DELETE the
  * transcripts this browser exists to show.
@@ -133,8 +138,10 @@ function readCorpus(ctx: M3Context, sessionCap = 200): Corpus {
   }
 
   let sessionsScanned = 0;
-  const sessionsDir = safeContain(ctx, [".crewhaus", "sessions"]);
-  if (sessionsDir !== undefined) {
+  const reach = ctx.harnessDir === null ? undefined : reachableSessionRoot(ctx.harnessDir);
+  const sessionsNote = reach !== undefined && !reach.reachable ? reach.note : null;
+  if (reach?.reachable === true) {
+    const sessionsDir = reach.root;
     let names: string[] = [];
     try {
       names = readdirSync(sessionsDir).filter((n) => SESSION_JSONL_RE.test(n));
@@ -145,7 +152,7 @@ function readCorpus(ctx: M3Context, sessionCap = 200): Corpus {
     // unbounded walk of every transcript a long-lived harness ever wrote.
     const ranked = names
       .map((name) => {
-        const path = safeContain(ctx, [".crewhaus", "sessions", name]);
+        const path = resolveContained(sessionsDir, name);
         let mtimeMs = 0;
         try {
           mtimeMs = path === undefined ? 0 : statSync(path).mtimeMs;
@@ -165,7 +172,7 @@ function readCorpus(ctx: M3Context, sessionCap = 200): Corpus {
       records.push(...extractFeedbackRecords(read.objects));
     }
   }
-  return { records: mergeFeedback(records), sinks, sessionsScanned, truncated };
+  return { records: mergeFeedback(records), sinks, sessionsScanned, truncated, sessionsNote };
 }
 
 type Watermark = {
@@ -234,7 +241,7 @@ export const feedback: M3Handler = (ctx) => {
   if (items.length === 0) {
     return {
       ...absent(
-        "no ratings recorded on this harness yet",
+        corpus.sessionsNote ?? "no ratings recorded on this harness yet",
         "crewhaus rate --session <session> --turn <turn> --thumbs up|down",
       ),
       items,
@@ -243,13 +250,15 @@ export const feedback: M3Handler = (ctx) => {
       sinks: corpus.sinks,
       sessionsScanned: corpus.sessionsScanned,
       truncated: corpus.truncated,
+      sessionsUnreachable: corpus.sessionsNote !== null,
     };
   }
   return {
     ...found(
-      corpus.truncated
-        ? "the rating corpus was read up to the transcript/line caps — counts are a floor"
-        : null,
+      corpus.sessionsNote ??
+        (corpus.truncated
+          ? "the rating corpus was read up to the transcript/line caps — counts are a floor"
+          : null),
       "crewhaus distill --all-sessions --register <dataset>",
     ),
     items,
@@ -258,6 +267,7 @@ export const feedback: M3Handler = (ctx) => {
     sinks: corpus.sinks,
     sessionsScanned: corpus.sessionsScanned,
     truncated: corpus.truncated,
+    sessionsUnreachable: corpus.sessionsNote !== null,
   };
 };
 

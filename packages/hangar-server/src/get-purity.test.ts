@@ -192,6 +192,19 @@ describe("GET routes change nothing", () => {
         readFileSync(join(live.dir, ".crewhaus", "run", "daemon.json"), "utf8"),
       ) as { runId: string };
       const runId = runfile.runId;
+      // An evaluation run and an archive, so the export reads reach real files.
+      mkdirSync(join(live.dir, ".crewhaus", "evals", runId), { recursive: true });
+      writeFileSync(
+        join(live.dir, ".crewhaus", "evals", runId, "results.json"),
+        JSON.stringify({
+          runId,
+          endedAt: new Date(NOW).toISOString(),
+          config: { specHash: "h", datasetName: "d", model: "m" },
+          samples: [],
+        }),
+      );
+      mkdirSync(join(t.hangarRoot, "exports", live.id), { recursive: true });
+      writeFileSync(join(t.hangarRoot, "exports", live.id, "01J.tar.gz"), "archive");
       // The same runfile in `stale`, for a pid no process holds.
       mkdirSync(join(stale.dir, ".crewhaus", "run"), { recursive: true });
       writeFileSync(
@@ -267,6 +280,7 @@ describe("GET routes change nothing", () => {
         "refs.resolve": `${live.id}/exec/${runId}`,
         "decisions.get": `${live.id}/decision/appr_00000000000000d1`,
         "attention.get": `home/attention/att_${"0".repeat(26)}`,
+        "work.get": `${live.id}/work/${mintId("wi")}`,
       };
       const v1Paths: Array<{ key: string; path: string }> = [];
       for (const op of v1Gets.filter((row) => !v1Excluded.has(row.id))) {

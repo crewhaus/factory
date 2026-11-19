@@ -1120,6 +1120,476 @@ export const SUPPORT_MANIFEST: SupportManifest = {
         },
       },
     },
+    "budget.period": {
+      kind: "runtime",
+      at: ["budget.period"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "rejected",
+          reason: "pipeline harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "rejected",
+          reason: "voice harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "rejected",
+          reason: "eval harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "rejected",
+          reason: "onchain harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "rejected",
+          reason: "onchain-game harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+      },
+    },
+    "budget.period.every": {
+      kind: "runtime",
+      at: ["budget.period.every"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "rejected",
+          reason: "pipeline harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "rejected",
+          reason: "voice harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "rejected",
+          reason: "eval harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "rejected",
+          reason: "onchain harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "rejected",
+          reason: "onchain-game harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+      },
+    },
+    "budget.period.usd": {
+      kind: "runtime",
+      at: ["budget.period.usd"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "rejected",
+          reason: "pipeline harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "rejected",
+          reason: "voice harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "rejected",
+          reason: "eval harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "rejected",
+          reason: "onchain harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "rejected",
+          reason: "onchain-game harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+      },
+    },
+    "budget.period.starts": {
+      kind: "runtime",
+      at: ["budget.period.starts"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "rejected",
+          reason: "pipeline harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "rejected",
+          reason: "voice harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "rejected",
+          reason: "eval harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "rejected",
+          reason: "onchain harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "rejected",
+          reason: "onchain-game harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+      },
+    },
+    "budget.period.timezone": {
+      kind: "runtime",
+      at: ["budget.period.timezone"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "rejected",
+          reason:
+            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  budget: a Cloudflare Worker keeps no spend meter; cap spend with a spending limit on the Anthropic account its ANTHROPIC_API_KEY belongs to\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "rejected",
+          reason: "pipeline harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "rejected",
+          reason: "voice harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "rejected",
+          reason: "eval harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "rejected",
+          reason: "onchain harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "rejected",
+          reason: "onchain-game harnesses do not accept this setting",
+          since: "0.9.0",
+        },
+      },
+    },
     chains: {
       kind: "runtime",
       at: ["chains"],
@@ -4474,6 +4944,111 @@ export const SUPPORT_MANIFEST: SupportManifest = {
         "onchain-game": {
           status: "wired",
           via: ["bundle"],
+          since: "0.9.0",
+        },
+      },
+    },
+    "models.*.price": {
+      kind: "runtime",
+      at: ["models.*.price"],
+      cells: {
+        cli: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "cli@cf-worker": {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on a cli spec but the cf-worker edge does not wire it — the worker keeps no cost tracker, so nothing prices a call. Compile without --emit-as to use it, or remove the setting",
+          since: "0.9.0",
+        },
+        workflow: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "workflow@cf-worker": {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on a workflow spec but the cf-worker edge does not wire it — the worker keeps no cost tracker, so nothing prices a call. Compile without --emit-as to use it, or remove the setting",
+          since: "0.9.0",
+        },
+        channel: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        graph: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        "graph@cf-worker": {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on a graph spec but the cf-worker edge does not wire it — the worker keeps no cost tracker, so nothing prices a call. Compile without --emit-as to use it, or remove the setting",
+          since: "0.9.0",
+        },
+        managed: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        pipeline: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        crew: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        research: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        batch: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        voice: {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on the voice shape but its emitter does not wire it yet — its loop does not take the model-wiring fragment, so its calls are priced with the installed table",
+          since: "0.9.0",
+        },
+        browser: {
+          status: "wired",
+          via: ["bundle"],
+          since: "0.9.0",
+        },
+        eval: {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on the eval shape but its emitter does not wire it yet — its loop does not take the model-wiring fragment, so its calls are priced with the installed table",
+          since: "0.9.0",
+        },
+        onchain: {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on the onchain shape but its emitter does not wire it yet — the onchain daemon runs no agent loop yet",
+          since: "0.9.0",
+        },
+        "onchain-game": {
+          status: "unwired",
+          code: "accepted-but-unwired",
+          reason:
+            "models.*.price is accepted on the onchain-game shape but its emitter does not wire it yet — the onchain-game daemon runs no agent loop yet",
           since: "0.9.0",
         },
       },

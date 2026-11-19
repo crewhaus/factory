@@ -1,0 +1,16 @@
+{
+  "cli-price": {
+    "agent.ts": "a1dfe6148661a593ffd391f197e0eda8e21a6ff4d5294523ca40bf13cd3ac787",
+    "README.md": "dc1c36620c445219d10abe521f301a430f75fe34247bf0619ddf54a7824befab"
+  },
+  "crew-price": {
+    "orchestrator.ts": "48a0bf633fb1fde95fbb8bb4affbefffa9c99bc875ecfdb8b1c6b25d73dfd8fd",
+    "daemon.ts": "2e45d3494c2b09d033e53c7b58fc70c12e442e2d592032cec18efa070499c986",
+    "agent_editor.ts": "cb948e2f5d2b3c504607ca9fb5c9b63a6e2562d1fe4d5647ef949b83368f34b1",
+    "README.md": "60639030e48817bb9d6caf3bad83c91d790389d1092a4d6fc611aecc3ca2af4e"
+  },
+  "workflow-price": {
+    "agent.ts": "be68f61b6293fe64528d2db37c6b9ccf45054ef6669b889e3cf707d9fca81bc6",
+    "README.md": "d6bf291d2b9981925e7de1e6740fa047c1ad8d579ec1165d6aa0bed1dc64aac3"
+  }
+}

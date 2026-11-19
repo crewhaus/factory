@@ -74,7 +74,7 @@ import {
 import { shellQuote as supervisorQuote } from "@crewhaus/harness-supervisor";
 import { JOB_KINDS, jobArgv } from "@crewhaus/harness-supervisor/job-kinds";
 import { createWikiStore } from "@crewhaus/wiki-store";
-import { VALUE, commandsIn, commandsUnder } from "./__test__/literals";
+import { VALUE, commandsIn, commandsUnder, stripComments } from "./__test__/literals";
 import {
   REQUIRED,
   checkLine,
@@ -214,8 +214,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(57);
-    expect(pins).toBe(85);
+    expect(Object.keys(REQUIRED).length).toBe(60);
+    expect(pins).toBe(92);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -354,6 +354,11 @@ describe("the server's twins, by import", () => {
       cmd: mintId("cmd"),
       run: mintRunId(),
     };
+    const WORK = {
+      wi: mintId("wi"),
+      belowWi: mintId("wi"),
+      workSource: "continuity-goal:goal-0001",
+    };
     const SAMPLES = [
       {
         hrn: "hrn_0123456789abcdef",
@@ -374,6 +379,11 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "merge",
         ...INBOX,
+        ...WORK,
+        declineReason: "not-now",
+        correctionScope: "item",
+        usd: "50",
+        budgetReason: "planned-work",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -394,6 +404,11 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "rollout",
         ...INBOX,
+        ...WORK,
+        declineReason: "needs-evidence",
+        correctionScope: "all",
+        usd: "12.5",
+        budgetReason: "other",
       },
     ];
     const twins = [
@@ -436,7 +451,7 @@ async function loadSupervision(): Promise<Supervision> {
 }
 
 /** Every value an action's twin can carry, chosen so each needs quoting. */
-const FULL_ARGS: Readonly<Record<string, unknown>> = {
+const FULL_ARGS = {
   dir: "/srv/my harnesses/it's poly",
   force: true,
   acknowledge: ["channel.slack", "mcp $(id)"],
@@ -447,23 +462,72 @@ const FULL_ARGS: Readonly<Record<string, unknown>> = {
   turn: 3,
   verdict: "up",
   kind: "eval",
+  runDir: ".crewhaus/evals/run 1's",
+  out: "/srv/exports/it's here.tar.gz",
+  format: "jsonl",
+} as const satisfies Readonly<Record<string, unknown>>;
+
+type ArgName = keyof typeof FULL_ARGS;
+
+/**
+ * The values each action's twin carries. Every one appears in the line as one
+ * shell word, in its quoted form; `force` is a flag, and `kind` and `format` are
+ * closed choices, so none of them is a carried value.
+ */
+const CONSUMES: Readonly<Record<string, readonly ArgName[]>> = {
+  start: ["dir", "acknowledge"],
+  stop: ["dir"],
+  restart: ["dir"],
+  drain: ["dir"],
+  wake: ["dir", "lane"],
+  logs: ["dir", "runId"],
+  grant: ["dir", "id"],
+  deny: ["dir", "id"],
+  review: ["dir", "id", "verdict"],
+  adjudicate: ["dir", "sessionId", "turn", "id", "verdict"],
+  baseline: ["dir", "runId"],
+  job: ["dir"],
+  "eval-export": ["dir", "runDir"],
+  "state-backup": ["dir", "out"],
 };
+
+/** A carried value as the twin holds it: the acknowledged ids as one value, a turn as text. */
+function carried(key: ArgName): string {
+  const value: unknown = FULL_ARGS[key];
+  return Array.isArray(value) ? value.join(",") : String(value);
+}
+
+/** The `case` labels of the console's `cliTwinFor`, read from its source. */
+function twinCaseLabels(): string[] {
+  const path = join(REPO, "packages", "hangar-ui", "assets", "js", "supervision.js");
+  const js = stripComments(readFileSync(path, "utf8"), "js");
+  const start = js.indexOf("export function cliTwinFor");
+  if (start === -1) throw new Error("supervision.js has no cliTwinFor");
+  const next = js.indexOf("\nexport ", start + 1);
+  const body = js.slice(start, next === -1 ? undefined : next);
+  return [...body.matchAll(/\bcase\s+(["'])([^"']+)\1\s*:/g)].map((m) => m[2] as string);
+}
 
 describe("the console's twins, by import", () => {
   test("every action, rendered with every value and with none", async () => {
     const sup = await loadSupervision();
-    expect(sup.TWIN_ACTIONS.length).toBe(12);
+    const labels = twinCaseLabels();
+    expect(labels.length).toBeGreaterThanOrEqual(14);
+    expect(new Set(labels).size).toBe(labels.length);
+    expect([...labels].sort()).toEqual([...sup.TWIN_ACTIONS].sort());
+    expect(Object.keys(CONSUMES).sort()).toEqual([...sup.TWIN_ACTIONS].sort());
     for (const action of sup.TWIN_ACTIONS) {
       const full = sup.cliTwinFor(action, FULL_ARGS) ?? "";
       expectRunnable(`${action} (every value)`, full);
       expect(`${action}: ${/<[a-z][a-z0-9-]*>/.test(full)}`).toBe(`${action}: false`);
       // Each value round-trips: the shell hands the CLI exactly what Home holds.
       const words = shellWords(full).flat();
-      for (const key of ["dir", "lane", "runId", "id", "sessionId"] as const) {
-        const value = FULL_ARGS[key] as string;
-        if (full.includes(supervisorQuote(value))) {
-          expect(`${action} ${key}: ${words.includes(value)}`).toBe(`${action} ${key}: true`);
-        }
+      for (const key of CONSUMES[action] ?? []) {
+        const value = carried(key);
+        expect(`${action} ${key}: ${words.includes(value)}`).toBe(`${action} ${key}: true`);
+        expect(`${action} ${key}: ${full.includes(supervisorQuote(value))}`).toBe(
+          `${action} ${key}: true`,
+        );
       }
       const bare = sup.cliTwinFor(action, action === "job" ? { kind: "doctor" } : {}) ?? "";
       expectRunnable(`${action} (no values)`, bare);
@@ -477,6 +541,13 @@ describe("the console's twins, by import", () => {
     expectRunnable(
       "adjudicate down",
       sup.cliTwinFor("adjudicate", { ...FULL_ARGS, verdict: "down" }) ?? "",
+    );
+    // An export's format comes from its closed pair only.
+    expect(sup.cliTwinFor("eval-export", { runDir: "r", format: "csv" })).toBe(
+      "crewhaus eval-report export --runs 'r' --format csv",
+    );
+    expect(sup.cliTwinFor("eval-export", { runDir: "r", format: "xlsx; rm -rf ~" })).toBe(
+      "crewhaus eval-report export --runs 'r' --format csv|jsonl",
     );
     // The acknowledged ids travel as one value.
     const start = shellWords(sup.cliTwinFor("start", FULL_ARGS) ?? "").flat();
@@ -541,6 +612,8 @@ describe("one quoting rule", () => {
         runId: tainted("run_1"),
         id: tainted("appr_1"),
         sessionId: tainted("sess_1"),
+        runDir: tainted(".crewhaus/evals/run_1"),
+        out: tainted("/srv/exports/a.tar.gz"),
       };
       const lines = [
         ...sup.TWIN_ACTIONS.map((action) => sup.cliTwinFor(action, args) ?? ""),
@@ -987,5 +1060,139 @@ describe("every write has an equivalent or a note", () => {
       { key: "c", receipt: "none", cliTwin: null },
     ];
     expect(coverage(table, { a: "x", gone: "y" })).toEqual({ uncovered: ["b"], stray: ["gone"] });
+  });
+
+  /**
+   * The commands a route key reads as: every split of its camelCase words into
+   * a verb and a sub-verb, each written joined and hyphenated, that the
+   * inventory has.
+   */
+  function namedCommands(inventory: Inventory, key: string): string[] {
+    const words = key.split(/(?=[A-Z])/).map((w) => w.toLowerCase());
+    const found = new Set<string>();
+    for (let i = 1; i < words.length; i++) {
+      const head = words.slice(0, i);
+      const tail = words.slice(i);
+      for (const verb of new Set([head.join(""), head.join("-")])) {
+        const entry = inventory.entries.find((e) => e.verb === verb);
+        const subs = entry?.sub;
+        if (subs === undefined) continue;
+        for (const sub of new Set([tail[0] as string, tail.join(""), tail.join("-")])) {
+          if (sub !== "" && Object.hasOwn(subs, sub)) found.add(`crewhaus ${verb} ${sub}`);
+        }
+      }
+    }
+    return [...found];
+  }
+
+  /** Each route whose note says there is no equivalent, beside a command its key names. */
+  function noneButNamed(inventory: Inventory, notes: Readonly<Record<string, string>>): string[] {
+    return Object.entries(notes)
+      .filter(([, note]) => note === "No command-line equivalent.")
+      .flatMap(([key]) => namedCommands(inventory, key).map((command) => `${key}: ${command}`));
+  }
+
+  test("a note compared with the CLI names its command first, and says what differs", () => {
+    const COMPARED: Readonly<Record<string, string>> = {
+      wikiArchive: "crewhaus wiki archive ",
+      memoryForget: "crewhaus memory forget ",
+      continuityRestore: "crewhaus state restore --trash ",
+      secretsRotate: "crewhaus secrets rotate ",
+      egressReview: "crewhaus egress review",
+      graderWrite: "crewhaus criteria apply ",
+    };
+    for (const [key, prefix] of Object.entries(COMPARED)) {
+      const note = ROUTE_TWIN_NOTES[key] ?? "";
+      const first = commandsIn(note)[0] ?? "";
+      expect(`${key}: ${first.startsWith(prefix)}`).toBe(`${key}: true`);
+      expectRunnable(key, first);
+    }
+    // A rotated value is never shown as an argument: argv is readable by any process.
+    expect(ROUTE_TWIN_NOTES["secretsRotate"]).not.toContain("--value");
+    expect(ROUTE_TWIN_NOTES["secretsRotate"]).toStartWith("Home does not rotate secrets yet.");
+    expect(ROUTE_TWIN_NOTES["egressReview"]).toStartWith(
+      "No command-line equivalent records a verdict on one decision.",
+    );
+    expect(ROUTE_TWIN_NOTES["memoryForget"]).toContain("`--query <text>`");
+    expect(ROUTE_TWIN_NOTES["wikiArchive"]).toContain("`--undo`");
+    expect(ROUTE_TWIN_NOTES["continuityRestore"]).toContain("lock");
+    const grader = ROUTE_TWIN_NOTES["graderWrite"] ?? "";
+    expect(grader).toContain("`--confirm <spec-name>`");
+    expect(grader).toContain("criteria history");
+    expect(grader).toContain("Replacing the whole file has no command-line equivalent.");
+  });
+
+  test("a note that says there is no equivalent names no command of the same name", () => {
+    expect(noneButNamed(inv, ROUTE_TWIN_NOTES)).toEqual([]);
+  });
+
+  test("a key that names a real command is reported, and one that names none is not", () => {
+    const NONE = "No command-line equivalent.";
+    expect(
+      noneButNamed(inv, {
+        memoryForget: NONE,
+        wikiArchive: NONE,
+        secretsRotate: NONE,
+        egressReview: NONE,
+        wizardCreate: NONE,
+        setHidden: NONE,
+        memoryList: "Same as `crewhaus memory list`.",
+      }),
+    ).toEqual([
+      "memoryForget: crewhaus memory forget",
+      "wikiArchive: crewhaus wiki archive",
+      "secretsRotate: crewhaus secrets rotate",
+      "egressReview: crewhaus egress review",
+    ]);
+  });
+});
+
+type WorkPage = {
+  actionsFor(
+    item: Record<string, unknown>,
+    can: Record<string, boolean>,
+    hrn: string,
+  ): ReadonlyArray<{ readonly id: string; readonly twin: string }>;
+  rankControlModel(
+    item: Record<string, unknown>,
+    candidates: ReadonlyArray<Record<string, unknown>>,
+    hrn: string,
+  ): { readonly twin: string | null };
+  declineTwin(wi: string, reason: string, hrn: string): string;
+  rankTwin(wi: string, above: string, scope: string, hrn: string): string;
+};
+
+describe("the Work page's twins, by import", () => {
+  test("each one the page shows, for every state and every choice, is a command the CLI takes", async () => {
+    const url = new URL("../../../packages/hangar-ui/assets/js/views/work.js", import.meta.url)
+      .href;
+    const page = (await import(url)) as WorkPage;
+    const hrn = "hrn_0123456789abcdef";
+    const wi = mintId("wi");
+    const other = mintId("wi");
+    const can = { "h.run.submit": true, "h.control": true };
+    let checked = 0;
+    for (const state of ["proposed", "open", "closed"]) {
+      for (const action of page.actionsFor({ id: wi, state, rev: 4 }, can, hrn)) {
+        expectRunnable(`work ${state} ${action.id}`, action.twin);
+        checked++;
+      }
+    }
+    for (const reason of ["out-of-scope", "duplicate", "not-now", "wont-fix", "needs-evidence"]) {
+      expectRunnable(`decline ${reason}`, page.declineTwin(wi, reason, hrn));
+      checked++;
+    }
+    for (const scope of ["item", "similar", "all"]) {
+      expectRunnable(`rank ${scope}`, page.rankTwin(wi, other, scope, hrn));
+      checked++;
+    }
+    const rank = page.rankControlModel(
+      { id: wi, state: "open" },
+      [{ id: other, state: "open", title: "Other" }],
+      hrn,
+    ).twin;
+    expectRunnable("rank, as the page starts", rank ?? "");
+    // proposed: accept, decline, edit; open: start, cancel, edit; closed: reopen.
+    expect(checked).toBe(7 + 5 + 3);
   });
 });

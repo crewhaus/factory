@@ -231,6 +231,16 @@ const SHARED: Readonly<Record<string, ReadonlyArray<Block>>> = {
   ],
   "budget.scope": ["run", "session"].map((scope) => ({ budget: { usd: 1, scope } })),
   "budget.judge_share": [{ budget: { usd: 1, judge_share: 0.2 } }],
+  "budget.period.every": ["day", "week", "month"].map((every) => ({
+    budget: { usd: 1, period: { every, usd: 10 } },
+  })),
+  "budget.period.usd": [{ budget: { usd: 1, period: { every: "day", usd: 10 } } }],
+  "budget.period.starts": [
+    { budget: { usd: 1, period: { every: "week", usd: 10, starts: "2026-11-02" } } },
+  ],
+  "budget.period.timezone": [
+    { budget: { usd: 1, period: { every: "day", usd: 10, timezone: "Europe/Berlin" } } },
+  ],
 };
 
 const PROBES: Readonly<Record<Shape, Readonly<Record<string, ReadonlyArray<Block>>>>> = {

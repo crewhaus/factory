@@ -19,6 +19,7 @@ import {
   skeleton,
   toast,
 } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { deploymentRow } from "../supervision.js";
 
 /** The command that activates `dep` in harness `id`: the button's CLI twin. */
@@ -115,7 +116,17 @@ export async function renderDeploy(root, ctx) {
           : el("span", { class: "muted", text: "—" });
       tbody.appendChild(
         el("tr", null, [
-          el("td", { class: "mono", text: cells.id }),
+          el("td", { class: "mono" }, [
+            cells.id,
+            cells.id === ""
+              ? null
+              : actionBar({
+                  ref: `${ctx.id}/deployment/${cells.id}`,
+                  label: `build ${cells.id}`,
+                  ...(typeof ctx.dir === "string" && ctx.dir !== "" ? { dir: ctx.dir } : {}),
+                  operation: { id: "deployments.get", params: { h: ctx.id, dep: cells.id } },
+                }),
+          ]),
           el("td", null, [dot(cells.tone, stateWord(cells.state))]),
           el("td", { text: cells.env }),
           el("td", { class: "mono", text: cells.when }),

@@ -8,9 +8,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMemoryStore } from "@crewhaus/memory-store";
+import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { createMemoryTools } from "./index";
 
 let tmp: string;
+
+/** The run context the runtime hands a call; only its session matters here. */
+function createRunContext(o: { sessionId: string }): NonNullable<ToolExecuteContext["runContext"]> {
+  return { sessionId: o.sessionId } as unknown as NonNullable<ToolExecuteContext["runContext"]>;
+}
 
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "tool-memory-"));
@@ -45,6 +51,41 @@ describe("createMemoryTools — Remember", () => {
       tags: ["personal", "important"],
     });
     expect(result).toContain("[personal, important]");
+  });
+
+  test("records the session of the run that called it", async () => {
+    const { remember, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const runContext = createRunContext({ sessionId: "sess_00000000000000ab" });
+    await remember.execute({ text: "deploys go out on Fridays" }, { runContext });
+    const [item] = await store.list();
+    expect(item?.entry.provenance?.sessionId).toBe("sess_00000000000000ab");
+  });
+
+  test("reads the session through the runtime bridge when that is where the run context is", async () => {
+    const { remember, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const runContext = createRunContext({ sessionId: "sess_00000000000000cd" });
+    await remember.execute({ text: "the report is due Monday" }, { bridge: { runContext } });
+    const [item] = await store.list();
+    expect(item?.entry.provenance?.sessionId).toBe("sess_00000000000000cd");
+  });
+
+  test("never takes a session from the model's input", async () => {
+    const { remember, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    await remember.execute({
+      text: "the user likes tea",
+      sessionId: "sess_00000000000000ef",
+      provenance: { sessionId: "sess_00000000000000ef" },
+    } as unknown as { text: string });
+    const [item] = await store.list();
+    expect(item?.entry.provenance).toBeUndefined();
+  });
+
+  test("a run session that is not a sess_ id is not written", async () => {
+    const { remember, store } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const runContext = createRunContext({ sessionId: "sess_NOT-HEX-0000000" });
+    await remember.execute({ text: "the user likes coffee" }, { runContext });
+    const [item] = await store.list();
+    expect(item?.entry.provenance).toBeUndefined();
   });
 
   test("schema validates text presence (zod rejects empty)", () => {
@@ -86,6 +127,32 @@ describe("createMemoryTools — Recall", () => {
     }
     const out = await recall.execute({ query: "coffee", k: 2 });
     expect((out.match(/•/g) ?? []).length).toBe(2);
+  });
+
+  test("each result names its id, and the call reports one ref per result", async () => {
+    const { remember, recall } = createMemoryTools({ specName: "notes-bot", rootDir: tmp });
+    const a = await remember.execute({ text: "the user prefers TypeScript" });
+    const b = await remember.execute({ text: "TypeScript is the user's daily driver" });
+    const ids = [a, b].map((r) => /\((mem_[0-9a-f]{16})\)/.exec(r as string)?.[1]);
+    const reported: unknown[] = [];
+    const out = (await recall.execute(
+      { query: "TypeScript" },
+      { recordReads: (refs) => reported.push(...refs) },
+    )) as string;
+    for (const id of ids) expect(out).toContain(`  • (${id} · `);
+    expect(reported).toHaveLength(2);
+    expect(reported).toEqual(
+      expect.arrayContaining(
+        ids.map((id) => ({ store: "fact", backend: "local", spec: "notes-bot", localId: id })),
+      ),
+    );
+  });
+
+  test("no result, no report", async () => {
+    const { recall } = createMemoryTools({ specName: "s", rootDir: tmp });
+    const reported: unknown[] = [];
+    await recall.execute({ query: "anything" }, { recordReads: (refs) => reported.push(...refs) });
+    expect(reported).toEqual([]);
   });
 
   test("recall schema validates k bounds", () => {

@@ -73,9 +73,9 @@ describe("round trips", () => {
       ]),
     );
     const largest: Cursor = { v: 1, kind: "page", sources, direction: "older" };
-    expect(CURSOR_SOURCES).toHaveLength(8);
+    expect(CURSOR_SOURCES).toHaveLength(9);
     const text = encodeCursor(largest);
-    expect(text.length).toBeGreaterThan(1800);
+    expect(text.length).toBeGreaterThan(2048);
     expect(text.length).toBeLessThanOrEqual(CURSOR_MAX_LENGTH);
     expect(decodeCursor(text).ok).toBe(true);
   });

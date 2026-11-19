@@ -59,6 +59,16 @@ export type PricingTable = {
    * {@link effectiveSunsets} (feed.ts). Absent on the built-in table.
    */
   readonly sunsets?: SunsetTable;
+  /**
+   * Prices a harness declares for its own models, per provider, keyed by the
+   * exact wire id (a Bedrock id without its geo segment). Unlike `providers`,
+   * whose keys are family prefixes, a declared row prices only the model it
+   * names: {@link resolvePricing} looks it up by exact id, before the prefix
+   * walk. Built by {@link mergeDeclaredPricing}; absent on every other table.
+   */
+  readonly declared?: {
+    readonly [P in ProviderId]?: Readonly<Record<string, PricingRow>>;
+  };
 };
 
 /**
@@ -281,9 +291,12 @@ export function resolvePricing(
   provider: ProviderId,
   modelId: string,
 ): PricingRow | undefined {
+  const bareId = provider === "bedrock" ? modelId.replace(BEDROCK_GEO_PREFIX, "") : modelId;
+  // A declared price names one model exactly; it never prices a model whose id merely extends it.
+  const declared = table.declared?.[provider];
+  if (declared !== undefined && Object.hasOwn(declared, bareId)) return declared[bareId];
   const providerTable = table.providers[provider];
   if (!providerTable) return undefined;
-  const bareId = provider === "bedrock" ? modelId.replace(BEDROCK_GEO_PREFIX, "") : modelId;
   // Sort prefixes longest-first for deterministic specificity.
   const prefixes = Object.keys(providerTable).sort((a, b) => b.length - a.length);
   for (const prefix of prefixes) {
@@ -347,4 +360,104 @@ export function computeCacheSavingsMicros(
   const writePremium =
     cacheCreationTokens * (effectiveCacheWritePer1M(pricing) - pricing.inputPer1M);
   return Math.round(readSavings - writePremium);
+}
+
+/**
+ * Prices a harness declares for its own models (`models.<name>.price`),
+ * keyed by the resolved model string the spec names (`local/qwen3@http://…`,
+ * `bedrock/us.anthropic.claude-…`, `claude-…`), in the table's own row form.
+ */
+export type DeclaredPricing = Readonly<Record<string, PricingRow>>;
+
+/** Named OpenAI-compatible hosts: twin of model-router's `OPENAI_COMPAT_HOSTS` keys. */
+const OPENAI_COMPAT_HOST_IDS: ReadonlySet<string> = new Set([
+  "groq",
+  "together",
+  "fireworks",
+  "openrouter",
+  "deepseek",
+  "xai",
+  "mistral",
+  "cerebras",
+]);
+
+/**
+ * The `(provider, wire id)` a resolved model string is priced under, or
+ * `undefined` for a string the router would refuse. A documented twin of
+ * model-router's `parseModelString` (this package may not import the
+ * router: the worker-safe compiler imports it), reduced to the two fields
+ * pricing needs; a test pins the two against each other. A Bedrock id keeps
+ * no geo segment, so the row matches the bare id and every inference-profile
+ * id alike, as {@link resolvePricing} looks it up.
+ */
+export function declaredPricingKey(
+  modelString: string,
+): { readonly provider: ProviderId; readonly modelId: string } | undefined {
+  if (typeof modelString !== "string" || modelString === "") return undefined;
+  if (modelString.startsWith("local/")) {
+    const rest = modelString.slice("local/".length);
+    const at = rest.indexOf("@");
+    const modelId = at === -1 ? rest : rest.slice(0, at);
+    if (modelId === "" || (at !== -1 && rest.slice(at + 1) === "")) return undefined;
+    return { provider: "openai", modelId };
+  }
+  const tail = (prefix: string): string | undefined =>
+    modelString.startsWith(prefix) && modelString.length > prefix.length
+      ? modelString.slice(prefix.length)
+      : undefined;
+  const azure = tail("azure/");
+  if (azure !== undefined) return { provider: "openai", modelId: azure };
+  const vertex = tail("vertex/");
+  if (vertex !== undefined) {
+    if (vertex.startsWith("claude-")) return { provider: "anthropic", modelId: vertex };
+    if (vertex.startsWith("gemini-") || vertex.startsWith("gemma-")) {
+      return { provider: "gemini", modelId: vertex };
+    }
+    return undefined;
+  }
+  const openai = tail("openai/");
+  if (openai !== undefined) return { provider: "openai", modelId: openai };
+  const gemini = tail("gemini/");
+  if (gemini !== undefined) return { provider: "gemini", modelId: gemini };
+  const bedrock = tail("bedrock/");
+  if (bedrock !== undefined) {
+    return { provider: "bedrock", modelId: bedrock.replace(BEDROCK_GEO_PREFIX, "") };
+  }
+  const slash = modelString.indexOf("/");
+  if (slash > 0 && OPENAI_COMPAT_HOST_IDS.has(modelString.slice(0, slash))) {
+    const modelId = modelString.slice(slash + 1);
+    return modelId === "" ? undefined : { provider: "openai", modelId };
+  }
+  if (modelString.startsWith("claude-")) return { provider: "anthropic", modelId: modelString };
+  return undefined;
+}
+
+/**
+ * The effective table: each declared row added to `table` under the
+ * `(provider, wire id)` {@link declaredPricingKey} gives it, in the table's
+ * exact-match `declared` map, so {@link resolvePricing} finds it for that
+ * model's calls and for no other model (a declared `$0` included: it is a
+ * known price). A declared row wins over a table row for the same model; a
+ * model string the router would refuse is skipped. Pure: `table` is not
+ * changed, and with nothing declared it is returned as is.
+ */
+export function mergeDeclaredPricing(
+  table: PricingTable,
+  declared: DeclaredPricing | undefined,
+): PricingTable {
+  if (declared === undefined) return table;
+  const entries = Object.entries(declared);
+  if (entries.length === 0) return table;
+  const exact: Record<string, Record<string, PricingRow>> = {};
+  for (const [provider, rows] of Object.entries(table.declared ?? {})) {
+    if (rows !== undefined) exact[provider] = { ...rows };
+  }
+  for (const [modelString, row] of entries) {
+    const key = declaredPricingKey(modelString);
+    if (key === undefined) continue;
+    const rows = exact[key.provider] ?? {};
+    rows[key.modelId] = row;
+    exact[key.provider] = rows;
+  }
+  return { ...table, declared: exact as NonNullable<PricingTable["declared"]> };
 }

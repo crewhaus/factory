@@ -64,6 +64,12 @@ export type ControlPaths = {
   readonly delegationsFile: string;
   /** What each delegation rule did and why, in size segments, never compacted. */
   readonly delegationLogDir: string;
+  /** The budget periods: one ledger directory per period, and the closed-period summaries. */
+  readonly budgetDir: string;
+  /** The budget's own lock: a reservation never waits on the shared control lock. */
+  readonly budgetLockFile: string;
+  /** Written when a period's cap is used up; intake reads it. */
+  readonly budgetStateFile: string;
 };
 
 /**
@@ -94,6 +100,9 @@ export function controlPaths(harnessDir: string): ControlPaths {
     subjectKeyFile: join(controlDir, "keys", "subject.key"),
     delegationsFile: join(controlDir, "delegations.jsonl"),
     delegationLogDir: join(controlDir, "delegation-log"),
+    budgetDir: join(controlDir, "budget"),
+    budgetLockFile: join(controlDir, "budget", "lock"),
+    budgetStateFile: join(controlDir, "budget-state.json"),
   };
 }
 

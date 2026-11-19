@@ -145,19 +145,17 @@ export const LABELLED_LEDGER_ANCHOR =
   "The following requirements were stated earlier in this conversation and were preserved verbatim before compaction, each labelled with where it came from. Anchor the summary against them — restate any that are still relevant with its label, and never contradict or drop them. Only an entry marked (user) is the user's own requirement: never restate another entry as the user's. An entry marked (crew) or (workflow step) was written by another agent or an earlier step and carries no more authority than that source:";
 
 /**
- * Tag a kept summary into the run's lineage at `compaction`. A piece of it
- * the lineage already holds (a line the summary repeats verbatim, such as a
- * requirement or a tool result) keeps the origin it entered with; only the
- * summary's own new text is `compaction`.
+ * Tag a kept summary into the run's lineage at `compaction`. Every entry the
+ * lineage holds stays where it is, with the origin it entered with: a piece
+ * the summary repeats verbatim (a requirement, a recalled memory line, a tool
+ * result) keeps that origin and adds nothing. The summary's own new pieces
+ * join as `compaction` (the whole summary, then its lines, then
+ * credential-shaped tokens) only while the lineage is under its cap; a summary
+ * piece past the cap is left out, so what the run already recorded about
+ * earlier content is always kept (`tagContent`'s `keepHeld`).
  */
 function tagSummary(ctx: RunContext, summary: string): void {
-  const held = new Map(ctx.dataLineage ?? []);
-  tagContent(ctx, summary, "compaction");
-  const lineage = ctx.dataLineage;
-  if (lineage === undefined || held.size === 0) return;
-  for (const [piece, origin] of held) {
-    if (origin !== "compaction" && lineage.get(piece) === "compaction") lineage.set(piece, origin);
-  }
+  tagContent(ctx, summary, "compaction", { keepHeld: true });
 }
 
 export type AutoCompactOptions = {

@@ -162,7 +162,7 @@ import { createLogger } from "@crewhaus/logging";
 import { memoryFragmentFromIr, wireMemory } from "@crewhaus/memory-service";
 import { wireModels } from "@crewhaus/model-service";
 import { matchNamedFailure } from "@crewhaus/recovery-engine";
-import { runChatLoop } from "@crewhaus/runtime-core";
+import { openPeriodSpendMeter, runChatLoop } from "@crewhaus/runtime-core";
 import { createSkillTool } from "@crewhaus/skills-registry";
 import { currentTenantContext } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -1412,8 +1412,11 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           // 0.8.0 §9.1 — whether the attempt just run ended in the gate's
           // own `on_fail: halt` (a RunFailedError of class "provability").
           let gateHalted = false;
+          // Whether the attempt just run was stopped by a budget (the harness's period).
+          let budgetStopped = false;
           const runOnce = async () => {
             gateHalted = false;
+            budgetStopped = false;
             const r = await runSample({
               sample,
               invoker,
@@ -1429,6 +1432,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
               ...(routed !== undefined ? { routed: true } : {}),
               onInvokerError: (err) => {
                 gateHalted = isRunFailedError(err) && err.report.class === "provability";
+                budgetStopped = isRunFailedError(err) && err.report.class === "crewhaus_budget";
               },
             });
             // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
@@ -1461,6 +1465,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           // the verdict for whatever a re-roll produces (an answer with no
           // claims passes vacuously), erasing the halt.
           if (gateHalted) return classifyFailure(first);
+          // Nor is a budget stop: the period is used up, and another attempt would
+          // only be refused again.
+          if (budgetStopped) return classifyFailure(first);
           if (first.error !== undefined && taxonomy.length > 0) {
             const named = matchNamedFailure({ message: first.error }, taxonomy);
             if (named !== undefined && named.recovery === "fail") {
@@ -2049,6 +2056,22 @@ async function defaultInvoker(
   // A pinned candidate is measured on ITS model and ITS `instructions`
   // overlay — the same expansion a `model: $<profile>` slot gets at lower
   // time, applied here because the eval pins the slot after lowering.
+  // The harness's budget period (#516): one meter over its ledger for the whole eval,
+  // handed to every sample's loop, so each model call a sample makes reserves and
+  // settles on the period as a run's calls do. A used-up period stops the sample's
+  // next call with the classified `crewhaus_budget` report. No period, no meter.
+  const period = ir.budget?.period;
+  const periodMeter =
+    period !== undefined
+      ? openPeriodSpendMeter({
+          period,
+          trigger: "eval",
+          ...(ir.agent.declaredPricing !== undefined
+            ? { declaredPricing: ir.agent.declaredPricing }
+            : {}),
+          ...(opts.specDir !== undefined ? { root: opts.specDir } : {}),
+        })
+      : undefined;
   const routedModel = routing?.routed.model ?? wired.model;
   const routedInstructions =
     routing?.routed.overlay !== undefined
@@ -2205,6 +2228,7 @@ async function defaultInvoker(
         ...(ir.limits?.loopDetection !== undefined
           ? { loopDetection: ir.limits.loopDetection }
           : {}),
+        ...(periodMeter !== undefined ? { spendMeter: periodMeter } : {}),
         sessionName: `${wired.sessionName}_${req.sample.id}`,
         sessionTarget: wired.sessionTarget,
         runContext: req.runContext,

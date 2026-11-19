@@ -129,7 +129,11 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/routing/freeze.json`, the scope-audit baseline
   `.crewhaus/scope-audit/baseline.json`, the security corpus
   `.crewhaus/security-corpus/corpus.json` and the SLO intake gate
-  `.crewhaus/slo/intake.json`, exactly each of those files; the
+  `.crewhaus/slo/intake.json`, exactly each of those files; the specs
+  `crewhaus watchme synthesize` writes for a person to adopt,
+  `.crewhaus/watchme/synthesized`; the ratings the web UI, the gateway and the
+  CLI record, `.crewhaus/feedback`, and the few-shot pools
+  `crewhaus fewshot harvest` writes, `.crewhaus/fewshot`; the
   durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
@@ -794,6 +798,16 @@ these on: they reach every harness that uses what each one names.
   sessions folder that links to another place inside the harness works as
   before. Keep the sessions folder inside the harness folder.
 
+- **Home shows a harness's sessions only from a sessions folder that belongs to
+  it.** When the sessions folder (`.crewhaus/sessions`, or where
+  `CREWHAUS_SESSION_DIR` moves it) lies outside the harness once every link is
+  followed, or inside another harness nested in it, Home shows no sessions,
+  transcripts, ratings, run traces, activity, costs, model routes or search
+  results from it, reads and decides no approvals there, records no review
+  verdict there, and says the folder is `unreachable`: the cost is unknown,
+  never $0. A sessions folder that links elsewhere inside the harness works as
+  before.
+
 - **Context curation works where it is accepted, and managed harnesses use
   their compaction settings.** Setting `compaction.curate` to `true` now trims
   repeated context before compaction on cli, channel and managed harnesses and
@@ -823,6 +837,56 @@ these on: they reach every harness that uses what each one names.
   graph specs, which only a Cloudflare Worker build reads. Removing the setting
   changes nothing the harness does.
 
+- **Recall shows each memory's id, and Remember records the session that
+  saved it.** Each Recall result reads `• (<id> · <score>) <text>`, so an
+  answer can name the memory it used and `crewhaus memory show <id>` opens it.
+  Remember stamps `provenance.sessionId` from the run that called it, never
+  from what the model passes. If an eval grades Recall's exact output,
+  rebaseline it.
+
+- **Runs record which knowledge they used.** A tool call that returns stored
+  knowledge (Recall's facts, the wiki read tools' articles, Retrieve's
+  documents) adds a `knowledge_read` line to the session log: the items' ids
+  and versions and what the output check did with them, no text. Auto-recall,
+  the plan tail and those calls also add lines to
+  `.crewhaus/run/knowledge/usage/`, one per item the first time a run uses it
+  each way: the item as a keyed digest under the harness's digest key, its
+  store, version and status, no text. `CREWHAUS_RUN_STAMPS=0` turns both off.
+
+- **A harness with `knowledge:` writes `.crewhaus/run/knowledge/corpus.json`
+  at boot.** It lists each declared source by its label, whether it was
+  included, empty or failed and why, and each document by a fingerprint, its
+  part count and a hash of its text. No document text. A failed write is one
+  log line, and boot goes on.
+
+- **A declared Thredz backend that falls back is recorded.** When `thredz:` or
+  `memory.backend: thredz` is declared and no connection comes up, boot adds
+  one line per part Thredz would have served (the wiki, the goal mirror,
+  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, beside the
+  warning it prints.
+
+- **Text the runtime re-reads from earlier work is screened as remembered
+  memory.** The plan, focus and goals in the `<current_plan>` block, a
+  `LESSONS.md` that `crewhaus lessons update` wrote and the per-user
+  preference files are checked with the screen recalled memories pass, line
+  by line, two adjacent lines at a time and as a whole. What it withholds
+  reaches the model as a notice. The findings
+  the dream pass starts from are checked the same way; a withheld one is left
+  out and counted. `crewhaus optimize --few-shot` checks each example's input
+  and output, leaves out one the screen withholds, prints the ids it injects,
+  and skips a pool line whose id is not the one its provenance names.
+  `AGENTS.md`, `CLAUDE.md` and the other project memory files an operator
+  writes are read as the operator's own.
+
+- **`crewhaus lessons update` shows what it will write, and asks for `--yes`
+  when anything came from somewhere other than your own ratings.** It prints
+  every new lesson and preference note as it will be written. When one of
+  them came from a record in `.crewhaus/feedback/` or from a failure a session
+  recorded, rather than from your own `crewhaus rate` or `crewhaus feedback`,
+  it writes nothing and stops with an error that names
+  `crewhaus lessons update --yes`. A candidate the memory screen withholds is
+  left out and counted. A script that runs it unattended adds `--yes`.
+
 - **The permission rule-order check does a bounded amount of work.**
   `crewhaus lint`, `crewhaus compile` and the compiler worker's `POST /compile`
   compare a bounded number of rule pairs, with a bounded amount of matching
@@ -831,6 +895,50 @@ these on: they reach every harness that uses what each one names.
   list where the check stopped, and the rules after it are not checked for
   order. A Cloudflare Worker build does not check the order of
   `permissions.rules`, which a worker reads deny-first.
+
+- **A model with no price has an unknown cost, never $0.** Run summaries, the
+  session log's cost lines, `crewhaus cost-summary`, Home's cost views and the
+  optimizer's report count a call to a model nothing can price as unknown: a
+  total that includes one reads `+ unknown`, and `cost-summary --format json`
+  and Home's costs route carry `unpricedCalls`. Budget gates still let such a
+  call run, and a budgeted run publishes `budget_unpriced` once per model. A
+  price declared in `models.<name>.price` makes the cost known, and the
+  optimizer may never change it, `models.*.price`. The price is ignored, with
+  an `accepted-but-unwired` warning, on voice, eval, onchain and onchain-game
+  harnesses and in a Cloudflare Worker build. Home's harness signal
+  `budgetUsedRatio` is now empty unless the spec declares `budget.period`.
+
+- **Every model call in a budgeted run reserves its worst case first.** Before
+  a call is sent, its worst case (its request at about four characters a
+  token, plus its `max_tokens`) is reserved against the run's cap: it is
+  admitted while the spend so far plus the other calls in flight stays under
+  the cap, and it settles to its real cost when it answers. Sub-agents spend
+  from their parent's budget as they go, so calls made at the same time pass
+  the cap by at most one call. A call that is not admitted ends the run with
+  exit 33, as reaching the cap does, and nothing of it is logged.
+
+- **Managed tenant budgets reserve an estimate of each request instead of
+  zero.** A `runs.create` or `runs.continue` request, and a queued run,
+  reserves its input at about four characters a token plus an output ceiling
+  against the tenant's budget while it runs. One past what the tenant has left
+  is refused with 429 `budget_exceeded`, or for a queued run ends as
+  `crewhaus_budget`. A bundle that supplies its own `estimateUsage` keeps it.
+
+- **A used-up budget period closes intake until it renews.** With
+  `budget.period` declared, a period whose limit is used up writes
+  `budget-state.json` under `.crewhaus/run/control/`, and new work is refused
+  with `budget_exceeded` (exit 33), naming when the period renews and
+  `crewhaus budget extend`. `--ignore-pause`, `crewhaus daemon resume` and SLO
+  recovery never lift it, and renewal never lifts a pause. A daemon keeps
+  answering with the notice, and its refusal carries `Retry-After` until the
+  renewal.
+
+- **A run stopped by its own budget answers 429 `budget_exceeded` on a
+  gateway.** On a managed or gateway harness, a run that stops at its own
+  `budget.usd` cap answers HTTP 429 `budget_exceeded` with
+  `data.retryable: false` and no `Retry-After`, where it answered 500
+  `internal_error`. Sending the same request again starts a new run that
+  spends again, so a client that retries a 429 should check `retryable` first.
 
 ## [0.8.3] - 2026-11-15
 

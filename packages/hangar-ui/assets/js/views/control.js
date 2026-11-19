@@ -15,6 +15,7 @@
  *     sentence. Only `tick_in_flight` retries.
  */
 
+import { heldTwinNotes, twinNotes } from "../api.js";
 import { copyBtn, dot, el, statusBadge, toast } from "../dom.js";
 import { NO_TWIN_NOTES, cliTwinFor, controlOutcome } from "../supervision.js";
 import { openDialog } from "../ui/dialog.js";
@@ -46,6 +47,78 @@ export function cliTwin(command, note = null, label = null) {
     el("code", { class: "twin-cmd", tabindex: "0", text: command }),
     copy,
   ]);
+}
+
+/** A backtick span that is a command someone can paste: `crewhaus …`, or `cd … && crewhaus …`. */
+function isCommand(span) {
+  const t = span.trim();
+  return t.startsWith("crewhaus ") || (t.startsWith("cd ") && t.includes("&& crewhaus "));
+}
+
+/**
+ * A route note as text and code: each backtick span is a `<code>`, and the
+ * first command among them gets a copy button. Pure DOM, from `textContent`.
+ */
+export function noteTwin(note, label = null) {
+  const parts = String(note).split("`");
+  const named = typeof label === "string" && label !== "" ? label : null;
+  const tag = el("span", { class: "twin-label", text: named ?? "CLI twin" });
+  const text = el("span", { class: "twin-note" });
+  let first = null;
+  parts.forEach((part, i) => {
+    if (part === "") return;
+    if (i % 2 === 0 || i === parts.length - 1) {
+      // Outside backticks, or an unclosed one: plain text.
+      text.appendChild(document.createTextNode(i % 2 === 0 ? part : `\`${part}`));
+      return;
+    }
+    text.appendChild(el("code", { class: "twin-cmd", text: part }));
+    if (first === null && isCommand(part)) first = part.trim();
+  });
+  if (first === null) {
+    return el("div", { class: "twin twin-none" }, [tag, el("span", { class: "muted" }, [text])]);
+  }
+  const copy = copyBtn(first, "copy");
+  copy.setAttribute(
+    "aria-label",
+    named !== null ? `Copy the ${named} command` : "Copy the command",
+  );
+  return el("div", { class: "twin twin-noted" }, [tag, text, copy]);
+}
+
+/**
+ * What a write does from the command line: Home's note for the route `key`
+ * (`GET /api/twin-notes`), shown beside the control that sends it. It shows
+ * only where the view already holds the harness's folder (`where.dir`, as a
+ * harness view's `ctx` does) or the write is Home's own (`where.home`); a view
+ * without host paths shows no equivalents. Until the notes are read, and when
+ * they cannot be, nothing shows.
+ */
+export function writeTwin(key, where = {}, label = null) {
+  const slot = el("div", { class: "twin-slot" });
+  const w = where && typeof where === "object" ? where : {};
+  const held = w.home === true || (typeof w.dir === "string" && w.dir !== "");
+  if (!held) return slot;
+  const fill = (notes) => {
+    const note =
+      notes && typeof notes === "object" && Object.hasOwn(notes, key) ? notes[key] : null;
+    if (typeof note === "string" && note !== "") slot.replaceChildren(noteTwin(note, label));
+  };
+  const held0 = heldTwinNotes();
+  if (held0 !== undefined) fill(held0);
+  else void twinNotes().then(fill);
+  return slot;
+}
+
+/** Where a write is Home's own (the registry, Home's settings): no harness folder to hold. */
+export const HOME_WIDE = Object.freeze({ home: true });
+
+/**
+ * Several writes' equivalents under one disclosure, for a card whose controls
+ * sit together. It shows only once one of them has a note to show.
+ */
+export function twinGroup(twins, summary = "Command-line equivalents") {
+  return el("details", { class: "twin-group" }, [el("summary", { text: summary }), ...twins]);
 }
 
 /** The twin for a named action (see `cliTwinFor`), or its honest absence. */
@@ -228,7 +301,9 @@ export function refusalModal(model, handlers = {}) {
   }
   if (model.action && model.action.jobKind !== null && handlers.onRemedy) {
     // A remedy is a BUTTON, never a toast: "no compiled bundle" has an
-    // obvious next step and the console can run it.
+    // obvious next step and the console can run it. Its command shows too.
+    const twin = actionTwin("job", { dir: handlers.dir, kind: model.action.jobKind });
+    if (twin !== null) body.push(twin);
     actions.push(
       el("button", {
         class: "btn btn-primary",

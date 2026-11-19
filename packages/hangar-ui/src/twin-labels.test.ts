@@ -48,6 +48,11 @@ class FakeNode {
     this.children.push(child);
     return child;
   }
+  replaceChildren(...nodes: FakeNode[]): void {
+    this.children.length = 0;
+    this.ownText = "";
+    this.children.push(...nodes);
+  }
 }
 
 const saved = {
@@ -74,6 +79,8 @@ afterAll(() => {
 
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 const control = await import("../assets/js/views/control.js");
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+const apiModule = await import("../assets/js/api.js");
 
 type Rendered = { label: string; command: string | null; copyName: string | null };
 
@@ -138,5 +145,60 @@ describe("a command-line equivalent's label", () => {
       '"grant", { id: row.id, dir: row.dir }, "Grant"',
       '"deny", { id: row.id, dir: row.dir }, "Deny"',
     ]);
+  });
+});
+
+describe("a write's note", () => {
+  const NOTE =
+    "Same as `crewhaus wiki archive <slug> --expect <version>`, run in the harness folder; add `--undo` to publish the article again.";
+
+  test("shows its commands as code, and copies the first one", () => {
+    const node = control.noteTwin(NOTE, "Archive") as FakeNode;
+    expect(node.className).toBe("twin twin-noted");
+    const [label, text, copy] = node.children;
+    expect(label?.textContent).toBe("Archive");
+    expect(text?.children.map((c) => `${c.tag}:${c.textContent}`)).toEqual([
+      "#text:Same as ",
+      "code:crewhaus wiki archive <slug> --expect <version>",
+      "#text:, run in the harness folder; add ",
+      "code:--undo",
+      "#text: to publish the article again.",
+    ]);
+    expect(copy?.getAttribute("aria-label")).toBe("Copy the Archive command");
+    expect(text?.textContent).toBe(NOTE.replaceAll("`", ""));
+  });
+
+  test("that names no command is a muted line with no copy button", () => {
+    const node = control.noteTwin("No command-line equivalent.") as FakeNode;
+    expect(node.className).toBe("twin twin-none");
+    expect(node.children).toHaveLength(2);
+    expect(node.textContent).toBe("CLI twinNo command-line equivalent.");
+  });
+
+  test("shows only where the view holds the harness folder, or the write is Home's own", async () => {
+    const realFetch = globalThis.fetch;
+    apiModule.resetTwinNotes();
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ notes: { wikiArchive: NOTE } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    try {
+      const withDir = control.writeTwin("wikiArchive", { dir: "/h" }) as FakeNode;
+      const homeWide = control.writeTwin("wikiArchive", control.HOME_WIDE) as FakeNode;
+      const noDir = control.writeTwin("wikiArchive", { id: "hrn_1" }) as FakeNode;
+      const unknown = control.writeTwin("noSuchWrite", { dir: "/h" }) as FakeNode;
+      await apiModule.twinNotes();
+      expect(withDir.children[0]?.className).toBe("twin twin-noted");
+      expect(homeWide.children[0]?.className).toBe("twin twin-noted");
+      expect(noDir.children).toHaveLength(0);
+      expect(unknown.children).toHaveLength(0);
+      // Once read, the next one shows at once.
+      const later = control.writeTwin("wikiArchive", { dir: "/h" }) as FakeNode;
+      expect(later.children[0]?.className).toBe("twin twin-noted");
+    } finally {
+      globalThis.fetch = realFetch;
+      apiModule.resetTwinNotes();
+    }
   });
 });

@@ -99,6 +99,7 @@ import { classifyRouteLabel } from "@crewhaus/eval-judge";
 import { escapeJsonString } from "@crewhaus/infra-utils";
 import type {
   IrCircuitBreaker,
+  IrDeclaredPricing,
   IrModelParams,
   IrModelPool,
   IrModelPoolClassifier,
@@ -177,6 +178,13 @@ export type ModelWiringFragment = {
   readonly modelTiers?: IrModelTiers;
   /** The N-candidate pool (spec `model_pool`), carried whole. */
   readonly modelPool?: IrModelPool;
+  /**
+   * Every declared model price (`models.<name>.price`), keyed by model
+   * string. The runtime merges it over the pricing table every tracker of
+   * the run prices with. Not a routing key: wired after the routing quartet,
+   * and kept under a `--model` override (a price is a fact about a model).
+   */
+  readonly declaredPricing?: IrDeclaredPricing;
 };
 
 /**
@@ -198,6 +206,8 @@ export type ModelWiringRunOptions = {
   readonly circuitBreaker?: IrCircuitBreaker;
   readonly modelTiers?: IrModelTiers;
   readonly modelPool?: IrModelPool;
+  /** Declared model prices (see {@link ModelWiringFragment.declaredPricing}). */
+  readonly declaredPricing?: IrDeclaredPricing;
   /**
    * 0.6.0 §7.2.4 — `Consult` + `Escalate`, present only when the (non-
    * overridden) pool declares `strategy.model_directed: true`. runtime-core
@@ -351,6 +361,7 @@ export function modelWiringFragmentFromIr(block: ModelWiringFragment): ModelWiri
     ...(block.circuitBreaker !== undefined ? { circuitBreaker: block.circuitBreaker } : {}),
     ...(block.modelTiers !== undefined ? { modelTiers: block.modelTiers } : {}),
     ...(block.modelPool !== undefined ? { modelPool: block.modelPool } : {}),
+    ...(block.declaredPricing !== undefined ? { declaredPricing: block.declaredPricing } : {}),
   };
 }
 
@@ -412,6 +423,9 @@ export function wireModels(
       ? { modelTiers: fragment.modelTiers }
       : {}),
     ...(pool !== undefined ? { modelPool: pool } : {}),
+    ...(fragment.declaredPricing !== undefined
+      ? { declaredPricing: fragment.declaredPricing }
+      : {}),
     ...(pool !== undefined ? wireHybrid(pool, deps) : {}),
   };
 }
@@ -812,6 +826,10 @@ export function renderModelWiringFields(fragment: ModelWiringFragment, indent: s
   }
   if (fragment.modelPool !== undefined) {
     pieces.push(`\n${indent}modelPool: ${JSON.stringify(fragment.modelPool)},`);
+  }
+  // Declared prices: model strings and validated numbers, as the pool blob is.
+  if (fragment.declaredPricing !== undefined) {
+    pieces.push(`\n${indent}declaredPricing: ${JSON.stringify(fragment.declaredPricing)},`);
   }
   return pieces.join("");
 }

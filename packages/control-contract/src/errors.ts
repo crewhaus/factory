@@ -18,6 +18,7 @@ export const ERROR_CODES = deepFreeze({
   disabled: { statuses: [503], retryable: false },
   unavailable: { statuses: [503], retryable: true },
   rate_limited: { statuses: [429], retryable: true },
+  budget_exceeded: { statuses: [429], retryable: true },
   internal: { statuses: [500], retryable: false },
 } as const);
 

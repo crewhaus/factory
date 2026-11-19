@@ -15,6 +15,7 @@ import {
   LIMIT_SENTENCE,
   STATE_WORDS,
   grantBody,
+  harnessChoiceLabel,
   initialTicks,
   servesThisHarness,
   signatureWords,
@@ -115,7 +116,35 @@ describe("Settings › Plugins", () => {
     }
   });
 
-  test("the harnesses that still load a plugin are named by spec name, else by id", () => {
+  test("two harnesses that share a spec name are told apart by their ids", () => {
+    const harnesses = [
+      { id: "hrn_00000000000000a1", specName: "concierge" },
+      { id: "hrn_00000000000000a2", specName: "concierge" },
+    ];
+    const lines = stillLoadedLines(
+      [
+        { id: "hrn_00000000000000a1", tools: ["Bash"] },
+        { id: "hrn_00000000000000a2", tools: ["Bash"] },
+      ],
+      harnesses,
+    );
+    expect(lines[0]).not.toBe(lines[1]);
+    expect(lines[0]).toContain("hrn_00000000000000a1");
+    expect(lines[1]).toContain("hrn_00000000000000a2");
+    expect(lines[0]?.startsWith("concierge (")).toBe(true);
+  });
+
+  test("in the grant form, two harnesses that share a spec name are told apart by their ids", () => {
+    const a = harnessChoiceLabel({ id: "hrn_00000000000000a1", specName: "concierge" }, true);
+    const b = harnessChoiceLabel({ id: "hrn_00000000000000a2", specName: "concierge" });
+    expect(a).toBe("concierge (hrn_00000000000000a1) (asked for)");
+    expect(b).toBe("concierge (hrn_00000000000000a2)");
+    expect(harnessChoiceLabel({ id: "hrn_00000000000000b2" })).toBe("hrn_00000000000000b2");
+    // The form labels each harness with it.
+    expect(SOURCE).toContain("const label = harnessChoiceLabel(row, asked.has(row.id));");
+  });
+
+  test("the harnesses that still load a plugin are named by spec name and id, else by id", () => {
     const harnesses = [{ id: "hrn_00000000000000a1", specName: "concierge" }];
     expect(
       stillLoadedLines(
@@ -127,11 +156,13 @@ describe("Settings › Plugins", () => {
         harnesses,
       ),
     ).toEqual([
-      "concierge: host tools Bash",
+      "concierge (hrn_00000000000000a1): host tools Bash",
       "hrn_00000000000000b2: no host tools",
       "hrn_00000000000000c3: its crewhaus.yaml could not be read",
     ]);
     expect(stillLoadedLines(undefined, harnesses)).toEqual([]);
+    // Each line links to the harness it names.
+    expect(SOURCE).toContain("href: hrefHarness(line.id)");
     expect(SOURCE).toContain(
       "These harnesses still load it, because their crewhaus.yaml lists it:",
     );

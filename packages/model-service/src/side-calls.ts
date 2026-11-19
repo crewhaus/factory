@@ -46,6 +46,7 @@ import {
   type ShadowSideCall,
   type SideCallTurnContext,
   runChatLoop,
+  spendMeterOf,
 } from "@crewhaus/runtime-core";
 import {
   type ConsultRoster,
@@ -226,6 +227,8 @@ export async function runNestedSingleTurn(
     }
   });
   const injected = deps._consultAdapters?.get(args.target.modelString);
+  // A budgeted parent's spend meter: the side call reserves its own worst case on it.
+  const spendMeter = spendMeterOf(parent);
   const t0 = performance.now();
   try {
     const text = await runChatLoop({
@@ -248,6 +251,7 @@ export async function runNestedSingleTurn(
       settingsDir: null,
       // §16 Q6 — no child session file per side call.
       persistSession: false,
+      ...(spendMeter !== undefined ? { spendMeter } : {}),
       ...(injected !== undefined ? { _adapter: injected } : {}),
     });
     return {

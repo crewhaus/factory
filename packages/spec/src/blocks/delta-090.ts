@@ -1,5 +1,7 @@
 import type { Spec } from "../index";
+import { budgetPeriodIssues } from "./budget-period";
 import { intentIssues } from "./intent";
+import { modelPriceIssues } from "./model-price";
 import { pluginsIssues } from "./plugins";
 import { scheduleIssues, scheduleWakeIssues } from "./schedule";
 
@@ -13,4 +15,11 @@ export type SpecAddIssue = (path: (string | number)[], message: string) => void;
  * cannot move an existing spec's first error. Append, never reorder.
  */
 export const DELTA_090_ISSUES: ReadonlyArray<(data: Spec, custom: SpecAddIssue) => void> =
-  Object.freeze([intentIssues, scheduleIssues, pluginsIssues, scheduleWakeIssues]);
+  Object.freeze([
+    intentIssues,
+    scheduleIssues,
+    pluginsIssues,
+    scheduleWakeIssues,
+    modelPriceIssues,
+    budgetPeriodIssues,
+  ]);

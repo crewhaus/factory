@@ -32,6 +32,7 @@ import {
   toast,
 } from "../dom.js";
 import { fmtCount, fmtPct, fmtRelativeTime } from "../util.js";
+import { writeTwin } from "./control.js";
 import { openConflict } from "./spec-edit.js";
 
 /** The per-harness Feedback tab. */
@@ -280,6 +281,7 @@ function ratingsCard(ctx, res, reload) {
       text: "This runs the distill verb. It does not enable the spec's autoDistill, which the shipped runtime honours only from the CLI.",
     }),
   );
+  card.appendChild(writeTwin("distillRun", ctx, "Distill"));
   return card;
 }
 
@@ -339,6 +341,7 @@ function fewshotCard(ctx, res, reload) {
   });
   card.appendChild(el("div", { class: "editor-actions" }, [harvest]));
   card.appendChild(holder);
+  card.appendChild(writeTwin("fewshotHarvest", ctx, "Harvest"));
   return card;
 }
 
@@ -356,6 +359,7 @@ function faqCard(ctx, res, reload) {
     distill.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [distill]));
+  card.appendChild(writeTwin("faqDistill", ctx, "Distill FAQ"));
   return card;
 }
 
@@ -414,6 +418,7 @@ function lessonsCard(ctx, res, reload) {
   });
   card.appendChild(el("div", { class: "editor-actions" }, [update]));
   card.appendChild(holder);
+  card.appendChild(writeTwin("lessonsUpdate", ctx, "Update"));
   return card;
 }
 
@@ -444,6 +449,7 @@ function adviceCard(ctx, res, reload) {
     mine.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [mine]));
+  card.appendChild(writeTwin("adviceRun", ctx, "Advise"));
   return card;
 }
 
@@ -532,6 +538,7 @@ function proposalRow(ctx, proposal, reload) {
     el("p", { class: "gated-why", text: String(proposal.tierReason ?? "") }),
     el("div", { class: "inbox-actions" }, [previewBtn]),
     holder,
+    writeTwin("adviceApply", ctx, "Apply"),
   ]);
 }
 

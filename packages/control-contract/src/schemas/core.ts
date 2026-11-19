@@ -37,6 +37,7 @@ import {
   SESSION_ID_RE,
   type SupersedeReason,
   TRIGGER_KINDS,
+  WORK_KINDS,
   classifyRunId,
   isCommandKind,
   isCursor,
@@ -326,12 +327,27 @@ export const commandReceipt = z
 
 export const commandAccepted = z.object({ receipt: commandReceipt }).passthrough();
 
+/**
+ * A work item to create with a run: it is opened, origin `api`, and the run is linked to
+ * it. There is no way to ask for a proposal here: a run never starts on an item nobody
+ * accepted.
+ */
+export const workCreateSpec = z
+  .object({
+    title: z.string().min(1).max(200),
+    kind: oneOf(WORK_KINDS),
+    goal: z.string().min(1).max(8192).optional(),
+    acceptance: z.array(z.string().min(1).max(500)).max(20).optional(),
+  })
+  .strict();
+
 export const runCreateRequest = z
   .object({
     input: z.string().min(1),
     subject: z.string().min(1).optional(),
     admission: z.enum(["reject", "queue"]).default("reject"),
-    work: refString.optional(),
+    // A work item of this harness (`<hrn>/work/<wi>` or a bare `wi_` id), or one to create.
+    work: z.union([refString, workItemId, workCreateSpec]).optional(),
   })
   .strict();
 

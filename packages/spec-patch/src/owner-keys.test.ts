@@ -75,6 +75,8 @@ describe("the lists derive from the table", () => {
       ["judge", "protected"],
       // Who may act without asking: the delegation ceiling, wherever `permissions:` is.
       ["permissions", "delegation"],
+      // A model's declared price, under any profile name.
+      ["models", "*", "price"],
       ["transaction_policy", "defaultWriteApproval"],
       ["model_pool", "candidates"],
       // Whether a deployed worker's /chat answers without its bearer.
@@ -253,5 +255,35 @@ describe("plugins: is the owner's (#522)", () => {
 
   test("a graph node called plugins stays tunable", () => {
     expect(humanOwnedReason(["nodes", "plugins", "instructions"])).toBeUndefined();
+  });
+});
+
+describe("a model's price and a spending period are a person's", () => {
+  const PRICE = DELTA_090_KEYS.find((key) => key.pattern.join(".") === "models.*.price");
+  const PERIOD = DELTA_090_KEYS.find((key) => key.pattern.join(".") === "budget.period");
+
+  test("a patch to models.<name>.price is refused as a refused leaf, with the row's reason", () => {
+    const spec = { target: "cli" } as Spec;
+    for (const path of [
+      ["models", "local", "price"],
+      ["models", "local", "price", "input_per_1m"],
+    ]) {
+      let message = "";
+      try {
+        validatePatch(spec, { target: "cli", path, op: "replace", value: 0 });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toContain(PRICE?.reason as string);
+      expect(message).toContain("OPTIMIZER_REFUSED_LEAVES");
+      expect(isOptimizable("cli", path)).toBe(false);
+    }
+  });
+
+  test("budget.period is human-owned with its reason, and never optimizable", () => {
+    expect(PERIOD?.refused).toBe(false);
+    expect(humanOwnedReason(["budget", "period"])).toBe(PERIOD?.reason as string);
+    expect(isOptimizable("cli", ["budget", "period"])).toBe(false);
+    expect(isOptimizable("cli", ["budget", "period", "usd"])).toBe(false);
   });
 });

@@ -745,11 +745,11 @@ describe("harnessForSessionRoot", () => {
     expect(harnessForSessionRoot(root, { cwd: tempDir() })).toEqual({ state: "one", dir: h });
   });
 
-  test("two harnesses that both name the root", () => {
+  test("a root inside a harness nested in another belongs to the nested harness alone", () => {
     const outer = harnessWithEnv(tempDir(), join("inner", "s"));
     const inner = harnessWithEnv(join(outer, "inner"), "s");
     const found = harnessForSessionRoot(join(inner, "s"), { registry: () => [outer, inner] });
-    expect(found.state).toBe("several");
+    expect(found).toEqual({ state: "one", dir: inner });
   });
 
   test("a harness that holds the root inside it answers before one whose sessions folder links to it from outside", () => {

@@ -106,4 +106,19 @@ describe.skipIf(process.platform === "win32")("symlinks", () => {
     symlinkSync(join(root, "sub"), join(root, "alias"));
     expect(resolveInside(root, ["alias", "ok.txt"])).toBe(join(root, "alias", "ok.txt"));
   });
+  test.skipIf(process.platform === "win32")(
+    "a link to nothing is never a name that is free to create",
+    () => {
+      const { workspace, root } = layout();
+      const outsideTarget = join(workspace, "created-outside.txt");
+      symlinkSync(outsideTarget, join(root, "x"));
+      expect(resolveContained(root, "x")).toBeUndefined();
+      expect(resolveInside(root, ["x"])).toBeUndefined();
+      // A link to nothing inside the root does not resolve either.
+      symlinkSync(join(root, "sub", "missing.txt"), join(root, "y"));
+      expect(resolveContained(root, "y")).toBeUndefined();
+      // A name with nothing at it, under a real directory, is still free to create.
+      expect(resolveContained(root, "sub/new.txt")).toBe(join(root, "sub", "new.txt"));
+    },
+  );
 });

@@ -457,6 +457,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["id", "string"],
     ["costs.totalUsdMicros", "number"],
     ["costs.calls", "number"],
+    // Calls nothing could price: the view reads "+ unknown" beside the total.
+    ["costs.unpricedCalls", "number"],
     ["costs.spend7dUsdMicros", "number"],
     ["costs.truncatedFiles", "number"],
     ["costs.byModel[].provider", "string"],
@@ -579,6 +581,11 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["sandbox", "string"],
     ["csp", "string"],
     ["truncated", "boolean"],
+  ],
+  // views/control.js writeTwin — the note beside each write
+  twinNotes: [
+    ["notes", "object"],
+    ["notes.wikiArchive", "string"],
   ],
   // views/panes.js renderPanes
   panes: [
@@ -2648,6 +2655,8 @@ describe("UI route contract", () => {
       const panes = await drive("panes", { id }, { readsKey: "panes" });
       expect((panes["panes"] as Array<{ id: string }>).map((p) => p.id)).toEqual(["spend"]);
       expect(panes["traceObservers"]).toEqual(["cost-lens"]);
+      const twinNotes = await drive("twinNotes", {}, { readsKey: "twinNotes" });
+      expect(Object.keys(twinNotes["notes"] as object).length).toBeGreaterThan(100);
 
       // -- scan root + discover + scan ---------------------------------------
       await drive("addScanRoot", {}, { body: { dir: t.harnessesRoot }, expectStatus: 201 });

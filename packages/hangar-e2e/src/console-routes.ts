@@ -59,11 +59,13 @@ export type RouteHarness = {
   readonly runId?: string;
   readonly sessionIds?: readonly string[];
   readonly wikiSlug?: string;
+  /** A work item of the harness, for the item page. */
+  readonly workItem?: string;
 };
 
 /**
  * A console template filled in from a harness (`:id`, `:run`, `:session`,
- * `:slug`), through the router's own filler. Throws for a template the
+ * `:slug`, `:wi`), through the router's own filler. Throws for a template the
  * console does not serve, so a journey cannot visit a typo.
  */
 export function routeFor(template: string, harness?: RouteHarness): string {
@@ -77,6 +79,7 @@ export function routeFor(template: string, harness?: RouteHarness): string {
     const session = harness.sessionIds?.[0];
     if (session !== undefined) params["session"] = session;
     if (harness.wikiSlug !== undefined) params["slug"] = harness.wikiSlug;
+    if (harness.workItem !== undefined) params["wi"] = harness.workItem;
   }
   return router.routeFor(template, params);
 }

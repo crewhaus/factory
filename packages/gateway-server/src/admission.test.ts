@@ -277,3 +277,56 @@ describe("a loop the runtime refused at its start", () => {
     expect(res.error.code).toBe("paused");
   });
 });
+
+describe("while the harness's budget period is used up", () => {
+  const writeBudgetState = (renewsAt: string): void => {
+    mkdirSync(join(harness, ".crewhaus", "run", "control"), { recursive: true });
+    writeFileSync(
+      join(harness, ".crewhaus", "run", "control", "budget-state.json"),
+      `${JSON.stringify({ v: 1, periodId: "month-2026-11-01", exhaustedAt: "2026-11-18T00:00:00.000Z", renewsAt })}\n`,
+    );
+  };
+
+  test("runs.create answers budget_exceeded, 429, retryAfter to renewal (never the pause default), and nothing runs", async () => {
+    const renewsIn = 7_200;
+    writeBudgetState(new Date(Date.now() + renewsIn * 1000).toISOString());
+    const { server, handled, reserves } = admissionServer();
+    const res = (await server.handle({ bearer: bearer(), body: CREATE })) as {
+      error: { code: string; message: string; data?: { retryAfter?: number } };
+    };
+    expect(res.error.code).toBe(ErrorCode.BudgetExceeded);
+    expect(statusFor(res.error.code)).toBe(429);
+    expect(res.error.message).toContain("budget for this period is used up");
+    const retry = res.error.data?.retryAfter ?? 0;
+    expect(retry).toBeGreaterThan(PAUSED_RETRY_AFTER_SECONDS);
+    expect(retry).toBeLessThanOrEqual(renewsIn);
+    expect(handled).toEqual([]);
+    expect(reserves()).toBe(0);
+  });
+
+  test("a renewed period is open again, with no write", async () => {
+    writeBudgetState(new Date(Date.now() - 1000).toISOString());
+    const { server, handled } = admissionServer();
+    await server.handle({ bearer: bearer(), body: CREATE });
+    expect(handled).toEqual(["runs.create"]);
+  });
+
+  test("a run's own budget stop answers budget_exceeded, not retryable, with no retryAfter", async () => {
+    const { server } = admissionServer({
+      handler: async () => {
+        throw new RunFailedError({
+          class: "crewhaus_budget",
+          title: "budget reached",
+          detail: "$0.0010 spent ≥ $0.0010 cap",
+          exitCode: EXIT_CODES.crewhaus_budget,
+        });
+      },
+    });
+    const res = (await server.handle({ bearer: bearer(), body: CREATE })) as {
+      error: { code: string; data?: unknown };
+    };
+    expect(res.error.code).toBe(ErrorCode.BudgetExceeded);
+    expect(statusFor(res.error.code)).toBe(429);
+    expect(res.error.data).toEqual({ retryable: false });
+  });
+});

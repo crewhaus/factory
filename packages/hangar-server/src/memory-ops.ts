@@ -81,6 +81,7 @@ import { maskDeep, maskText } from "./mask";
 import { resolveInside } from "./safety";
 import { SCAFFOLDED_WORKFLOWS, scaffoldedWorkflowPath } from "./scaffolded-workflows";
 import { readSpecYaml } from "./schedulers";
+import { reachableSessionRoot } from "./sessions";
 import { keyedScalar } from "./spec-lines";
 import {
   STATE_STORE_PROBE,
@@ -922,15 +923,26 @@ function fleetMemorySchemas(
 // continuity — focus / plans / goals / handoff, plus the trash
 // ---------------------------------------------------------------------------
 
-function continuityStoreFor(
-  ctx: M3Context,
-  specName: string,
-): ReturnType<typeof createContinuityStore> {
+/** The continuity store's methods Home calls: none of them reads a session log. */
+type HomeContinuityStore = Pick<
+  ReturnType<typeof createContinuityStore>,
+  "readFocus" | "listPlans" | "listGoals" | "restore"
+>;
+
+/**
+ * The continuity store for one spec. Its session root is the harness's own sessions folder
+ * (`reachableSessionRoot`); when that folder is unreachable the store is given its own
+ * state folder instead, so it is never handed a place outside the harness or inside a
+ * harness nested in it. Home reads no session log through it either way.
+ */
+function continuityStoreFor(ctx: M3Context, specName: string): HomeContinuityStore {
   const dir = harnessDirOf(ctx);
+  const rootDir = join(dir, ".crewhaus", "state");
+  const reach = reachableSessionRoot(dir);
   return createContinuityStore({
     specName,
-    rootDir: join(dir, ".crewhaus", "state"),
-    sessionRootDir: join(dir, ".crewhaus", "sessions"),
+    rootDir,
+    sessionRootDir: reach.reachable ? reach.root : rootDir,
     now: () => new Date(ctx.now()),
   });
 }

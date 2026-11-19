@@ -7,7 +7,7 @@
  * Most readers want the head window (`readJsonlCapped`). A reader whose answer
  * depends on every line (`readJsonlWhole`) gets all of the file or none of it.
  */
-import { closeSync, openSync, readSync, statSync } from "node:fs";
+import { constants, closeSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { MAX_JSONL_BYTES, MAX_JSONL_LINES } from "./constants";
 
 export type JsonlRead = {
@@ -31,24 +31,36 @@ const EMPTY: JsonlRead = {
   tornCount: 0,
 };
 
+/** Open for reading without waiting: a named pipe with no writer opens at once. */
+const READ_NONBLOCK = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
+
 /** Read at most `maxBytes` from the head of a file. Missing/unreadable
- *  files read as empty — absence is not an error anywhere in this server. */
+ *  files read as empty — absence is not an error anywhere in this server.
+ *  Only a regular file is read: the open never waits, and a named pipe, a
+ *  socket, a device or a directory reads as empty. The size is the open
+ *  descriptor's own. */
 export function readTextCapped(
   path: string,
   maxBytes: number,
 ): { text: string; truncated: boolean } {
   let fd: number;
-  let size: number;
   try {
-    size = statSync(path).size;
-    fd = openSync(path, "r");
+    fd = openSync(path, READ_NONBLOCK);
   } catch {
     return { text: "", truncated: false };
   }
   try {
+    const stats = fstatSync(fd);
+    if (!stats.isFile()) return { text: "", truncated: false };
+    const size = stats.size;
     const take = Math.min(size, maxBytes);
     const buf = Buffer.alloc(take);
-    const read = readSync(fd, buf, 0, take, 0);
+    let read = 0;
+    while (read < take) {
+      const got = readSync(fd, buf, read, take - read, read);
+      if (got === 0) break;
+      read += got;
+    }
     return { text: buf.subarray(0, read).toString("utf8"), truncated: size > maxBytes };
   } catch {
     return { text: "", truncated: false };

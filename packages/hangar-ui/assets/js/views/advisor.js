@@ -35,6 +35,7 @@ import { hrefHarness, screenHref, screenLabel } from "../router.js";
 import { chart, chartModel } from "../ui/chart.js";
 import { bindDraft, draftKey } from "../ui/draft.js";
 import { fmtPct } from "../util.js";
+import { writeTwin } from "./control.js";
 
 /** severity → the traffic-light dot state (always paired with text). */
 export function severityDot(severity) {
@@ -303,6 +304,7 @@ function openActForm(row, item, ctx, reload, model) {
       },
     );
   });
+  form.appendChild(writeTwin("advisorAct", ctx, "Act"));
   row.appendChild(form);
   comment.focus();
 }
@@ -340,6 +342,7 @@ function openDismissForm(row, item, ctx, reload) {
       () => reload(),
     );
   });
+  form.appendChild(writeTwin("advisorDismiss", ctx, "Dismiss"));
   row.appendChild(form);
   reason.focus();
 }
@@ -367,7 +370,7 @@ function dismissedRow(item, ctx, reload) {
         text: `by ${String(dismissal.by ?? "?")} ${String(dismissal.at ?? "")} — “${String(dismissal.reason ?? "")}”`,
       }),
     ]),
-    el("div", { class: "adv-actions" }, [reopenBtn]),
+    el("div", { class: "adv-actions" }, [reopenBtn, writeTwin("advisorReopen", ctx, "Reopen")]),
   ]);
 }
 
@@ -482,6 +485,7 @@ function reportsCard(reports, ctx, reload) {
     list.appendChild(holder);
   }
   card.appendChild(list);
+  card.appendChild(writeTwin("advisorReportRun", ctx, "Run report"));
   return card;
 }
 
@@ -589,6 +593,7 @@ function issuesCard(issues, ctx, reload) {
       ]),
     );
   }
+  card.appendChild(writeTwin("advisorIssueSubmit", ctx, "Submit"));
   return card;
 }
 

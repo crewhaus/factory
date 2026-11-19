@@ -348,6 +348,82 @@ describe("optimizeSpec — FR-003 budget gate", () => {
     expect(result.spend.totalUsd).toMatch(/^\$\d+\.\d{4}$/);
   });
 
+  test("an unpriced mutator model never stops the gate, and the report says its cost is unknown", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+    const mutator = new StubModelMutator(
+      BIG_PROMPT,
+      { input: 200_000, output: 2_000 },
+      "no-such-model-9",
+    );
+    const bus = new TraceEventBus({ runId: "r-unpriced", sessionId: "s" });
+    const accruals: CostAccrualEvent[] = [];
+    bus.subscribe((e) => {
+      if (e.kind === "cost_accrual") accruals.push(e);
+    });
+    const outDir = join(tmpRoot, "out-unpriced");
+    const result = await optimizeSpec({
+      specPath,
+      fitness: async (p: string) => p.length / 100,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 3,
+      mutator,
+      budgetUsd: 0.000001,
+      traceBus: bus,
+      outDir,
+    });
+    expect(result.stoppedReason).toBe("iterations-cap");
+    expect(mutator.callCount()).toBe(3);
+    expect(result.spend.unpricedCalls).toBe(3);
+    expect(result.spend.totalUsd).toBe("$0.0000 + unknown");
+    const report = JSON.parse(readFileSync(join(outDir, "report.json"), "utf8"));
+    expect(report.spend.totalUsd).toBe("$0.0000 + unknown");
+    expect(report.spend.unpricedCalls).toBe(3);
+    // Per-call accruals are flagged, and the run total carries the count.
+    expect(accruals.filter((a) => a.summary !== true).every((a) => a.unpriced === true)).toBe(true);
+    expect(accruals.find((a) => a.summary === true)?.unpricedCalls).toBe(3);
+  });
+
+  test("a declared budget period reserves before each call, settles after, and stops the search when used up", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+    const mutator = new StubModelMutator(BIG_PROMPT, { input: 1_000, output: 100 }, undefined, 100);
+    const lines: string[] = [];
+    let admits = 2;
+    const result = await optimizeSpec({
+      specPath,
+      fitness: async (p: string) => p.length / 100,
+      trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+      devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+      iterations: 5,
+      mutator,
+      outDir: join(tmpRoot, "out-ledger"),
+      spendLedger: {
+        reserve: async ({ id }) => {
+          lines.push(`reserve ${id.replace(/^rsv_.*_(\d+)$/, "$1")}`);
+          if (admits === 0) return { admit: false, on: "spent" };
+          admits -= 1;
+          return { admit: true };
+        },
+        settle: async ({ id, usdMicros }) => {
+          lines.push(`settle ${id.replace(/^rsv_.*_(\d+)$/, "$1")} ${usdMicros}`);
+        },
+        release: async (id) => {
+          lines.push(`release ${id}`);
+        },
+      },
+    });
+    expect(mutator.callCount()).toBe(2);
+    expect(result.stoppedReason).toBe("budget-reached");
+    // 1000 in × $3/M + 100 out × $15/M = 4500 micros per call.
+    expect(lines.filter((l) => l.startsWith("settle")).map((l) => l.split(" ")[2])).toEqual([
+      "4500",
+      "4500",
+    ]);
+    expect(lines.filter((l) => l.startsWith("reserve"))).toHaveLength(3);
+  });
+
   test("omitting budgetUsd preserves iterations-cap behaviour", async () => {
     const specPath = join(tmpRoot, "crewhaus.yaml");
     writeFileSync(specPath, CLI_YAML);

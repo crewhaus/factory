@@ -293,7 +293,7 @@ describe("finding the harness when the store was found through the environment",
     expect(foldReadOnly(root).records[0]?.decidedByPrincipal).toBe(owner);
   }, 30_000);
 
-  test("two harnesses, one governed: refused, naming --dir", async () => {
+  test("a root inside a harness nested in another is the nested harness's, decided by its approver list", async () => {
     const { hangarRoot, owner } = await home();
     const outer = harnessWith(join("inner", "s"));
     const inner = join(outer, "inner");
@@ -303,13 +303,18 @@ describe("finding the harness when the store was found through the environment",
     const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
     const root = join(inner, "s");
     const p = await park(root);
-    const answer = await r.run(["grant", p.id], { scopedSessionRoot: () => root });
-    expect(answer.code).toBe(55);
-    expect(answer.stderr).toContain("--dir");
+    const stranger = await r.run(["grant", p.id], {
+      identity: STRANGER,
+      scopedSessionRoot: () => root,
+    });
+    expect(stranger.code).toBe(51);
     expect(foldReadOnly(root).records[0]?.decision).toBeUndefined();
+    const answer = await r.run(["grant", p.id], { scopedSessionRoot: () => root });
+    expect(answer.code).toBe(0);
+    expect(foldReadOnly(root).records[0]?.decidedByPrincipal).toBe(owner);
   }, 30_000);
 
-  test("two ungoverned harnesses: --always is refused, a grant is decided and says so", async () => {
+  test("a root inside a nested harness with no approver list is that harness's alone", async () => {
     const { hangarRoot } = await home();
     const outer = harnessWith(join("inner", "s"));
     const inner = join(outer, "inner");
@@ -318,11 +323,10 @@ describe("finding the harness when the store was found through the environment",
     const r = rig(hangarRoot, tmp("approvals-elsewhere-"));
     const root = join(inner, "s");
     const p = await park(root);
-    const always = await r.run(["grant", p.id, "--always"], { scopedSessionRoot: () => root });
-    expect(always.code).toBe(55);
     const once = await r.run(["grant", p.id], { scopedSessionRoot: () => root });
     expect(once.code).toBe(0);
-    expect(once.stderr).toContain(NO_HARNESS_LINE);
+    expect(once.stderr).not.toContain(NO_HARNESS_LINE);
+    expect(foldReadOnly(root).records[0]?.decision).toBe("grant");
   }, 30_000);
 
   test("a root no harness names: decided, with the line that says pass --dir", async () => {

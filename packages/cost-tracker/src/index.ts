@@ -35,7 +35,10 @@ export {
   DEFAULT_PRICING,
   computeCacheSavingsMicros,
   computeCostMicros,
+  declaredPricingKey,
+  mergeDeclaredPricing,
   resolvePricing,
+  type DeclaredPricing,
   type PricingRow,
   type PricingTable,
 } from "./pricing";
@@ -125,6 +128,17 @@ export type RunCostSummary = {
    * roles sorted alphabetically; only roles that accrued appear.
    */
   readonly byRole: { readonly [R in ModelRole]?: number };
+  /**
+   * Model calls nothing could price (no row in the effective pricing table):
+   * their cost is unknown, not $0, so a total that includes them is a lower
+   * bound. Present only when at least one such call was seen, so a fully
+   * priced summary keeps exactly the three keys above. A role-bearing
+   * roll-up's `unpricedCalls` (a sub-agent's or a side call's unknown calls)
+   * folds in here too.
+   */
+  readonly unpricedCalls?: number;
+  /** Input plus output tokens of the per-call misses above; present only when > 0. */
+  readonly unpricedTokens?: number;
 };
 
 export type CostTrackerOptions = {
@@ -154,7 +168,11 @@ export interface CostTracker {
   unsubscribe(): void;
   /** Diagnostic: number of `model_response` events processed. */
   observed(): number;
-  /** Diagnostic: number of responses where pricing lookup missed (charged $0). */
+  /**
+   * Diagnostic: responses whose model had no price, across every run this
+   * tracker saw. Their cost is unknown: totals leave it out and say so
+   * through `unpricedCalls`; it is never counted as $0 spend.
+   */
   pricingMisses(): number;
 }
 
@@ -162,10 +180,18 @@ type RunRecord = {
   totalUsdMicros: number;
   byProvider: Map<ProviderId, number>;
   byRole: Map<ModelRole, number>;
+  unpricedCalls: number;
+  unpricedTokens: number;
 };
 
 function emptyRecord(): RunRecord {
-  return { totalUsdMicros: 0, byProvider: new Map(), byRole: new Map() };
+  return {
+    totalUsdMicros: 0,
+    byProvider: new Map(),
+    byRole: new Map(),
+    unpricedCalls: 0,
+    unpricedTokens: 0,
+  };
 }
 
 export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions = {}): CostTracker {
@@ -200,6 +226,25 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     }
   }
 
+  /** Count unknown-cost calls (and their tokens) on the run and the tenant. */
+  function recordUnpriced(
+    runId: string,
+    calls: number,
+    tokens: number,
+    forTenantId: string | undefined,
+  ): void {
+    const run = runs.get(runId) ?? emptyRecord();
+    run.unpricedCalls += calls;
+    run.unpricedTokens += tokens;
+    runs.set(runId, run);
+    if (forTenantId !== undefined) {
+      const t = tenants.get(forTenantId) ?? emptyRecord();
+      t.unpricedCalls += calls;
+      t.unpricedTokens += tokens;
+      tenants.set(forTenantId, t);
+    }
+  }
+
   const handler = (event: TraceEvent): void => {
     // 0.6.0 §7.6 / §10.2 — a ROLE-bearing `summary: true` accrual is a nested
     // run's roll-up re-published on this bus (a sub-agent child's
@@ -215,6 +260,9 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
       const accrual = event as CostAccrualEvent;
       if (accrual.summary !== true || accrual.role === undefined) return;
       recordCost(accrual.runId, accrual.provider, accrual.role, accrual.costUsdMicros, tenantId);
+      // The nested run's unknown calls stay unknown on the parent.
+      const nestedUnpriced = accrual.unpricedCalls ?? 0;
+      if (nestedUnpriced > 0) recordUnpriced(accrual.runId, nestedUnpriced, 0, tenantId);
       return;
     }
     if (event.kind !== "model_response") return;
@@ -227,16 +275,14 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     // `resp.model` is the WIRE model id (runtime-core strips the spec
     // grammar before publishing) — the form the pricing table is keyed on.
     const row = resolvePricing(pricing, provider, resp.model);
-    // F1 — on a pricing MISS we no longer early-return silently. We still
-    // count the miss and charge nothing (there is no rate to charge), but we
-    // DO publish a `cost_accrual` carrying costUsdMicros:0 and the REAL token
-    // counts, flagged `unpriced`. Two reasons: (1) a downstream token tally
-    // (the studio cost tile) survives an unpriced model instead of zeroing,
-    // and (2) this is exactly the shape `runtime-core`'s alert-watchdog looks
-    // for (`costUsdMicros === 0 && inputTokens + outputTokens > 0`) to flag a
-    // pricing miss — nothing emitted that shape before. Priced responses are
-    // byte-identical to before: they never carry `unpriced`, `observed`
-    // still counts only priced calls, and only they touch `recordCost`.
+    // A pricing MISS is a call whose cost is unknown. It adds nothing to the
+    // priced totals and is counted as an unknown call on its run (and
+    // tenant), so every total that includes it can say "unknown" instead of
+    // reading as $0. The `cost_accrual` still goes out, flagged `unpriced`,
+    // with the REAL token counts and `costUsdMicros: 0` as a placeholder (no
+    // rate to charge), so a token tally survives and the alert-watchdog's
+    // pricing-miss detector fires. Priced responses never carry `unpriced`,
+    // and `observed` still counts only priced calls.
     let costUsdMicros = 0;
     let unpriced = false;
     if (row) {
@@ -253,6 +299,7 @@ export function createCostTracker(bus: TraceEventBus, opts: CostTrackerOptions =
     } else {
       pricingMisses++;
       unpriced = true;
+      recordUnpriced(resp.runId, 1, inputTokens + outputTokens, tenantId);
     }
     if (!suppressEvents) {
       const accrual: CostAccrualEvent = {
@@ -323,7 +370,13 @@ function summarize(r: RunRecord): RunCostSummary {
   for (const k of [...r.byRole.keys()].sort() as ModelRole[]) {
     byRole[k] = r.byRole.get(k);
   }
-  return { totalUsdMicros: r.totalUsdMicros, byProvider: out, byRole };
+  return {
+    totalUsdMicros: r.totalUsdMicros,
+    byProvider: out,
+    byRole,
+    ...(r.unpricedCalls > 0 ? { unpricedCalls: r.unpricedCalls } : {}),
+    ...(r.unpricedTokens > 0 ? { unpricedTokens: r.unpricedTokens } : {}),
+  };
 }
 
 /**

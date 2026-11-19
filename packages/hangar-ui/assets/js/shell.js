@@ -30,10 +30,11 @@ import {
   routeTemplate,
   sectionLabel,
   subViewAvailability,
+  withInspect,
 } from "./router.js";
 import { SECTIONS, sectionById, subViewGroups, subViewOf } from "./sections/index.js";
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
-import { procRow } from "./supervision.js";
+import { cliTwinFor, procRow } from "./supervision.js";
 import { badgeStrip } from "./ui/badges.js";
 import { announce } from "./ui/live.js";
 
@@ -555,6 +556,18 @@ export function mountRoute(route) {
 /** Draw a route into its container. Resolves to the names its title needs. */
 export async function renderRoute(route, container, { signal }) {
   if (route.view === "harness") return renderHarnessPage(container, route, signal);
+  if (route.view === "inspect-ref") {
+    // An object link: resolved, then replaced by the object's page with the inspector over it.
+    const panel = await import("./inspect/panel.js");
+    if (signal.aborted) return {};
+    return panel.renderRefRoute(container, route, {
+      signal,
+      go: (hash) => {
+        window.history.replaceState(window.history.state, "", hash);
+        hooks.redispatch();
+      },
+    });
+  }
   const area = fleetArea(route.view);
   if (area === null) {
     renderNotFound(container, route);
@@ -642,7 +655,15 @@ function setSubFor(route, signal) {
     if (signal.aborted || route.view !== "harness" || route.sub === null) return;
     const parts = Array.isArray(segments) ? segments.filter((s) => s !== "" && s != null) : [];
     const href = hrefHarness(route.id, route.section, route.sub, ...parts);
-    window.history.replaceState(window.history.state, "", href);
+    // An inspector open over this page stays named in the address.
+    const now = window.location.hash;
+    const at = now.indexOf("?");
+    const inspect = at === -1 ? null : new URLSearchParams(now.slice(at + 1)).get("inspect");
+    window.history.replaceState(
+      window.history.state,
+      "",
+      inspect === null ? href : withInspect(href, inspect),
+    );
   };
 }
 
@@ -902,6 +923,20 @@ function harnessHeader(detail, route, ctx) {
 }
 
 /** Supervision pill + bundle freshness + control availability + remedy. */
+/**
+ * The command a job button runs, with its copy button: the shell's own copy of the
+ * twin line, so the shell loads no screen module up front.
+ */
+function jobTwin(dir, kind) {
+  const command = cliTwinFor("job", { dir, kind });
+  if (typeof command !== "string" || command === "") return null;
+  return el("div", { class: "twin" }, [
+    el("span", { class: "twin-label", text: "CLI twin" }),
+    el("code", { class: "twin-cmd", tabindex: "0", text: command }),
+    copyBtn(command, "copy"),
+  ]);
+}
+
 function supervisionStrip(ctx) {
   if (ctx.proc === null) return null;
   const row = procRow(ctx.proc, Date.now());
@@ -953,6 +988,9 @@ function supervisionStrip(ctx) {
         });
       }
       strip.appendChild(btn);
+      if (planError.action.jobKind !== null) {
+        strip.appendChild(jobTwin(ctx.dir, planError.action.jobKind));
+      }
     }
   }
   return strip;

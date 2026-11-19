@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@crewhaus/abort-controller": "workspace:*",
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/hooks-engine": "workspace:*",

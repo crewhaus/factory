@@ -50,6 +50,36 @@ export function resolveSessionRoot(harnessDir: string): SessionRootInfo {
   return resolveHarnessSessionRoot(harnessDir, readHarnessEnvFiles(harnessDir).vars);
 }
 
+/** Why a harness's sessions read as empty when its sessions folder is not its own. */
+export const SESSIONS_UNREACHABLE_NOTE =
+  "this harness's sessions folder is unreachable: once every link is followed it lies outside the harness, or inside another harness nested in it, so nothing in it is read or written here";
+
+/** The harness's own session root, or why there is none to read. */
+export type SessionRootRead =
+  | { readonly reachable: true; readonly root: string; readonly info: SessionRootInfo }
+  | {
+      readonly reachable: false;
+      readonly reason: "unreachable";
+      readonly note: string;
+      readonly info: SessionRootInfo;
+    };
+
+/**
+ * The session root every session reader and writer in Home uses: the harness's own
+ * when it lies inside the harness, and not inside another harness nested in it, once
+ * every link is followed; otherwise unreachable, with the reason. An unreachable root
+ * is never opened.
+ *
+ * First consumers: the sessions list and transcript, activity, costs, model routes,
+ * the rollups, search, and the review verdict's write.
+ */
+export function reachableSessionRoot(harnessDir: string): SessionRootRead {
+  const info = resolveSessionRoot(harnessDir);
+  return info.contained
+    ? { reachable: true, root: info.root, info }
+    : { reachable: false, reason: "unreachable", note: SESSIONS_UNREACHABLE_NOTE, info };
+}
+
 /** The session root approvals are read from and decided in: the harness's own
  *  when it lies inside the harness dir once every link is followed, else
  *  `undefined` (unreachable). */
@@ -79,6 +109,8 @@ export type EvictedSessionRow = {
 export type SessionListing = {
   readonly sessionRoot: SessionRootInfo;
   readonly sessions: ReadonlyArray<SessionRow | EvictedSessionRow>;
+  /** Why the list is empty when the sessions folder is unreachable; null otherwise. */
+  readonly note: string | null;
 };
 
 function listDirSafe(dir: string): string[] {
@@ -106,7 +138,9 @@ const num = (v: unknown, fallback = 0): number => (typeof v === "number" ? v : f
 
 /** Raw-scan the session root + durable index into newest-first rows. */
 export function listSessions(harnessDir: string, nowMs: number): SessionListing {
-  const rootInfo = resolveSessionRoot(harnessDir);
+  const reach = reachableSessionRoot(harnessDir);
+  if (!reach.reachable) return { sessionRoot: reach.info, sessions: [], note: reach.note };
+  const rootInfo = reach.info;
   const live = new Map<string, { row: SessionRow; sortTs: number }>();
   for (const file of listDirSafe(rootInfo.root)) {
     if (!SESSION_JSON_RE.test(file)) continue;
@@ -167,7 +201,7 @@ export function listSessions(harnessDir: string, nowMs: number): SessionListing 
   }
 
   const rows = [...live.values(), ...evicted].sort((a, b) => b.sortTs - a.sortTs);
-  return { sessionRoot: rootInfo, sessions: rows.map((r) => r.row) };
+  return { sessionRoot: rootInfo, sessions: rows.map((r) => r.row), note: null };
 }
 
 // ---------------------------------------------------------------------------

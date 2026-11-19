@@ -13,6 +13,7 @@ export type {
   AlertRaisedEvent,
   ApprovalRequestedEvent,
   ApprovalResolvedEvent,
+  BudgetUnpricedEvent,
   CacheRotationEvent,
   CircuitStateChangedEvent,
   CompactionFiredEvent,

@@ -14,7 +14,7 @@ import { CREATION_SCHEMAS } from "./creation.js";
 
 import { DELEGATION_SCHEMAS } from "./delegation.js";
 
-// import { HOME_SCHEMAS } from "./home.js";
+import { HOME_SCHEMAS } from "./home.js";
 
 // import { INSPECTION_SCHEMAS } from "./inspection.js";
 
@@ -26,7 +26,7 @@ import { PEOPLE_SCHEMAS } from "./people.js";
 
 // import { QUALITY_SCHEMAS } from "./quality.js";
 
-// import { RUNTIME_SCHEMAS } from "./runtime.js";
+import { RUNTIME_SCHEMAS } from "./runtime.js";
 
 // import { VERIFICATION_SCHEMAS } from "./verification.js";
 
@@ -41,7 +41,7 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   DELEGATION_SCHEMAS,
 
-  // HOME_SCHEMAS,
+  HOME_SCHEMAS,
 
   // INSPECTION_SCHEMAS,
 
@@ -53,7 +53,7 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   // QUALITY_SCHEMAS,
 
-  // RUNTIME_SCHEMAS,
+  RUNTIME_SCHEMAS,
 
   // VERIFICATION_SCHEMAS,
 ];

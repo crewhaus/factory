@@ -18,11 +18,11 @@ import { type BoundaryResult, classifyBoundary } from "@crewhaus/boundary-classi
 import { OPERATIONS, type OperationRow } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { controlPaths } from "@crewhaus/control-records";
-import {
-  _setManagedClassifierForTest,
-  createManagedRuns,
-} from "@crewhaus/gateway-server/managed-runs";
+import { createManagedRuns } from "@crewhaus/gateway-server/managed-runs";
 import { runChatLoop } from "@crewhaus/runtime-core";
+import { createWorkTools } from "@crewhaus/tool-work";
+// gateway-server's published entries export no test seam; this is the module managed-runs loads.
+import { _setManagedClassifierForTest } from "../../../gateway-server/src/managed-classify";
 // runtime-core's package entry exports no test seam; this resolves to the module the run loads.
 import {
   _resetInputOriginForTest,
@@ -104,7 +104,8 @@ describe("every free-text request field says whether it reaches a model", () => 
   test("the walk finds every such row, and each declares every such field", () => {
     const walked = undeclared(OPERATIONS);
     expect(walked.missing).toEqual([]);
-    expect(walked.checked).toBe(18);
+    // The core's rows, and three work rows whose text a person or a caller writes.
+    expect(walked.checked).toBe(21);
   });
 
   test("a planted undeclared field is caught", () => {
@@ -117,13 +118,22 @@ describe("every free-text request field says whether it reaches a model", () => 
     ]);
   });
 
-  test("the only fields that reach a model are the run input, at api on the run's entry", () => {
+  test("the only fields that reach a model: the run input at its entry, and work text when a tool reads it, both at api", () => {
     const bound = OPERATIONS.flatMap((op) =>
       Object.entries(op.modelBound ?? {})
         .filter(([, decl]) => "origin" in decl)
         .map(([field, decl]) => `${op.id}.${field} ${JSON.stringify(decl)}`),
     );
-    expect(bound).toEqual([`runs.create.input {"origin":"api","at":"run-entry"}`]);
+    const write = `{"origin":"api","at":"write"}`;
+    expect(bound).toEqual([
+      `runs.create.input {"origin":"api","at":"run-entry"}`,
+      `runs.create.work ${write}`,
+      ...["title", "goal", "acceptance", "assessment"].map((f) => `work.create.${f} ${write}`),
+      ...["title", "goal", "acceptance", "assessment", "note"].map(
+        (f) => `work.update.${f} ${write}`,
+      ),
+      `work.decline.note ${write}`,
+    ]);
   });
 });
 
@@ -272,5 +282,28 @@ describe("the canary: a run's input is classified at api before it reaches a mod
     expect(order[0]).toBe("classified api");
     expect(order.indexOf("model call")).toBeGreaterThan(-1);
     expect(order.indexOf("classified api")).toBeLessThan(order.indexOf("model call"));
+  });
+
+  test("work text added through Home: WorkGet classifies it at api before the tool returns", async () => {
+    const canary = canaryOf();
+    const h = await home.harness("canary-work");
+    const res = await home.call("POST", `/api/v1/harnesses/${h.id}/work`, {
+      body: { title: canary, kind: "fix" },
+    });
+    expect(res.status).toBe(200);
+    const wi = String((res.body["item"] as Record<string, unknown>)["id"]);
+    const order: string[] = [];
+    const tools = createWorkTools({
+      harnessDir: h.dir,
+      classify: async (text, opts) => {
+        if (text.includes(canary)) order.push(`classified ${opts.origin}`);
+        return classifyBoundary(text, opts);
+      },
+    });
+    const out = String(await tools.workGet.execute({ work: wi }, {}));
+    order.push("returned");
+    expect(out).toContain(canary);
+    expect(order[0]).toBe("classified api");
+    expect(order.at(-1)).toBe("returned");
   });
 });

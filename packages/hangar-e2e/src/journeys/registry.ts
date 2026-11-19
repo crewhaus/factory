@@ -6,9 +6,12 @@ import { axeStates } from "./axe-states.journey";
 import { benchDryRun } from "./bench-dry-run.journey";
 import { cliBoot } from "./cli-boot.journey";
 import { crawl } from "./crawl.journey";
+import { deepLinks } from "./deep-links.journey";
+import { exportJourney } from "./export.journey";
 import type { Journey } from "./journey";
 import { keyboardTour } from "./keyboard-tour.journey";
 import { legacyRedirects } from "./legacy-redirects.journey";
+import { liveFeed } from "./live-feed.journey";
 import { navigation } from "./navigation.journey";
 import { pluginGrant } from "./plugin-grant.journey";
 import { pluginPane } from "./plugin-pane.journey";
@@ -42,4 +45,7 @@ export const JOURNEYS: readonly Journey[] = [
   specForm,
   cliBoot,
   runThenConsole,
+  deepLinks,
+  liveFeed,
+  exportJourney,
 ];

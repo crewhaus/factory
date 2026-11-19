@@ -21,6 +21,7 @@
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, jsonPre, scrollRegion, skeleton, toast } from "../dom.js";
 import { fmtPct, fmtRelativeTime } from "../util.js";
+import { writeTwin } from "./control.js";
 import { m3, m3Card, m3Empty } from "./creds.js";
 
 export async function renderSecurity(root, ctx) {
@@ -240,6 +241,7 @@ function egressCard(body, ctx, reload) {
         tbody,
       ]),
     ]),
+    writeTwin("egressReview", ctx, "Triage"),
   );
   return nodes;
 }
@@ -509,6 +511,7 @@ function justificationCard(body, ctx) {
       ],
     ),
   );
+  nodes.push(writeTwin("justificationCalibrate", ctx, "Calibrate"));
   return nodes;
 }
 
@@ -538,6 +541,7 @@ function piiCard(body, ctx, reload) {
     policyTuner("PII policy", body.policy, ctx, reload, (policy, dryRun, confirmName) =>
       api.piiTune({ id: ctx.id }, { policy, dryRun, ...(confirmName ? { confirmName } : {}) }),
     ),
+    writeTwin("piiTune", ctx, "Apply"),
   );
   return nodes;
 }
@@ -748,6 +752,7 @@ function onchainCard(body, sentinel, ctx) {
           { policy, dryRun, ...(confirmName ? { confirmName } : {}) },
         ),
     ),
+    writeTwin("onchainTune", ctx, "Apply"),
   );
   return nodes;
 }
@@ -819,6 +824,7 @@ function complianceCard(body, ctx, reload) {
       ]),
     ]),
   );
+  nodes.push(writeTwin("complianceEvidence", ctx, "Generate evidence"));
   return nodes;
 }
 
@@ -851,7 +857,12 @@ function retentionCard(body, ctx) {
       ),
     );
   }
-  nodes.push(retentionRun("sweep", ctx), retentionRun("purge", ctx));
+  nodes.push(
+    retentionRun("sweep", ctx),
+    writeTwin("retentionSweep", ctx, "Sweep"),
+    retentionRun("purge", ctx),
+    writeTwin("retentionPurge", ctx, "Purge"),
+  );
   return nodes;
 }
 

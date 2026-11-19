@@ -16,6 +16,10 @@ import apiJs from "../../assets/js/api.js" with { type: "text" };
 import appJs from "../../assets/js/app.js" with { type: "text" };
 import destinationsJs from "../../assets/js/destinations.js" with { type: "text" };
 import domJs from "../../assets/js/dom.js" with { type: "text" };
+import inspectActionsJs from "../../assets/js/inspect/actions.js" with { type: "text" };
+import inspectEquivalentsJs from "../../assets/js/inspect/equivalents.js" with { type: "text" };
+import inspectKindsJs from "../../assets/js/inspect/kinds.js" with { type: "text" };
+import inspectPanelJs from "../../assets/js/inspect/panel.js" with { type: "text" };
 import keysJs from "../../assets/js/keys.js" with { type: "text" };
 import markdownJs from "../../assets/js/markdown.js" with { type: "text" };
 import navigationJs from "../../assets/js/navigation.js" with { type: "text" };
@@ -24,6 +28,12 @@ import omniboxJs from "../../assets/js/omnibox.js" with { type: "text" };
 import prefsJs from "../../assets/js/prefs.js" with { type: "text" };
 import routerJs from "../../assets/js/router.js" with { type: "text" };
 import routesJs from "../../assets/js/routes.js" with { type: "text" };
+import runviewAdapterJs from "../../assets/js/runview/adapter.js" with { type: "text" };
+import runviewCardsJs from "../../assets/js/runview/cards.js" with { type: "text" };
+import runviewFeedDomJs from "../../assets/js/runview/feed-dom.js" with { type: "text" };
+import runviewFeedJs from "../../assets/js/runview/feed.js" with { type: "text" };
+import runviewIndexJs from "../../assets/js/runview/index.js" with { type: "text" };
+import runviewStreamJs from "../../assets/js/runview/stream.js" with { type: "text" };
 import sealedJs from "../../assets/js/sealed.js" with { type: "text" };
 import indexSectionJs from "../../assets/js/sections/index.js" with { type: "text" };
 import knowledgeSectionJs from "../../assets/js/sections/knowledge.js" with { type: "text" };
@@ -105,6 +115,16 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/app.js": asset(appJs, "app.js"),
   "/assets/js/destinations.js": asset(destinationsJs, "destinations.js"),
   "/assets/js/dom.js": asset(domJs, "dom.js"),
+  "/assets/js/inspect/actions.js": asset(inspectActionsJs, "actions.js"),
+  "/assets/js/inspect/equivalents.js": asset(inspectEquivalentsJs, "equivalents.js"),
+  "/assets/js/inspect/kinds.js": asset(inspectKindsJs, "kinds.js"),
+  "/assets/js/inspect/panel.js": asset(inspectPanelJs, "panel.js"),
+  "/assets/js/runview/adapter.js": asset(runviewAdapterJs, "adapter.js"),
+  "/assets/js/runview/cards.js": asset(runviewCardsJs, "cards.js"),
+  "/assets/js/runview/feed-dom.js": asset(runviewFeedDomJs, "feed-dom.js"),
+  "/assets/js/runview/feed.js": asset(runviewFeedJs, "feed.js"),
+  "/assets/js/runview/index.js": asset(runviewIndexJs, "index.js"),
+  "/assets/js/runview/stream.js": asset(runviewStreamJs, "stream.js"),
   "/assets/js/keys.js": asset(keysJs, "keys.js"),
   "/assets/js/markdown.js": asset(markdownJs, "markdown.js"),
   "/assets/js/navigation.js": asset(navigationJs, "navigation.js"),

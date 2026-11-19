@@ -492,3 +492,97 @@ describe("readRetentionPolicy", () => {
     expect(readRetentionPolicy(dir)).toEqual(DEFAULT_RETENTION);
   });
 });
+
+describe("the run records are read only as regular files inside the harness", () => {
+  test.skipIf(process.platform === "win32")(
+    "a link out of the harness reads as no runfile and no run records",
+    () => {
+      const dir = tempHarness();
+      const outside = tempHarness();
+      ensureRunDir(dir);
+      writeFileSync(join(outside, "daemon.json"), `${JSON.stringify(sampleRunfile())}\n`);
+      writeFileSync(
+        join(outside, "runs.jsonl"),
+        `${JSON.stringify({ runId: "run_0123456789abcdef", kind: "daemon", argv: [], startedAt: "x" })}\n`,
+      );
+      symlinkSync(join(outside, "daemon.json"), join(runDir(dir), RUNFILE_NAME));
+      symlinkSync(join(outside, "runs.jsonl"), join(runDir(dir), "runs.jsonl"));
+      expect(readRunfile(dir)).toBeUndefined();
+      expect(readRunLedger(dir)).toEqual([]);
+    },
+  );
+
+  test.skipIf(process.platform === "win32")(
+    "a ledger that links elsewhere inside the harness is read",
+    () => {
+      const dir = tempHarness();
+      ensureRunDir(dir);
+      const kept = join(dir, "kept-runs.jsonl");
+      const line = { runId: "run_0123456789abcdef", kind: "daemon", argv: ["a"], startedAt: "x" };
+      writeFileSync(kept, `${JSON.stringify(line)}\n`);
+      symlinkSync(kept, join(runDir(dir), "runs.jsonl"));
+      expect(readRunLedger(dir).map((e) => e.runId)).toEqual(["run_0123456789abcdef"]);
+    },
+  );
+
+  test("a ledger larger than one read is read whole, its torn last line skipped", () => {
+    const dir = tempHarness();
+    const ids = Array.from({ length: 2000 }, (_, i) => `run_${i.toString(16).padStart(16, "0")}`);
+    for (const runId of ids) {
+      appendRunLedger(dir, {
+        runId,
+        kind: "daemon",
+        argv: ["crewhaus", "run", "x".repeat(40)],
+        startedAt: "2026-08-04T00:00:00.000Z",
+        logFile: `logs/${runId}.log`,
+      });
+    }
+    appendFileSync(join(runDir(dir), "runs.jsonl"), '{"runId":"run_torn');
+    expect(statSync(join(runDir(dir), "runs.jsonl")).size).toBeGreaterThan(64 * 1024);
+    expect(readRunLedger(dir).map((e) => e.runId)).toEqual(ids);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a named pipe reads as no runfile, no run records and the default retention",
+    () => {
+      const dir = tempHarness();
+      ensureRunDir(dir);
+      mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+      for (const path of [
+        join(runDir(dir), RUNFILE_NAME),
+        join(runDir(dir), "runs.jsonl"),
+        join(dir, ".crewhaus", "settings.json"),
+      ]) {
+        expect(Bun.spawnSync({ cmd: ["mkfifo", path], env: { ...process.env } }).exitCode).toBe(0);
+      }
+      const script = join(tempHarness(), "probe.ts");
+      writeFileSync(
+        script,
+        [
+          `import { readRetentionPolicy, readRunLedger, readRunfile } from ${JSON.stringify(join(import.meta.dir, "runfiles.ts"))};`,
+          `import { readManagerSettings } from ${JSON.stringify(join(import.meta.dir, "manager-settings.ts"))};`,
+          `const dir = ${JSON.stringify(dir)};`,
+          "console.log(JSON.stringify({",
+          "  runfile: readRunfile(dir) === undefined,",
+          "  ledger: readRunLedger(dir).length,",
+          "  retention: readRetentionPolicy(dir),",
+          "  envFiles: readManagerSettings(dir).envFiles.length,",
+          "}));",
+        ].join("\n"),
+      );
+      const child = Bun.spawnSync({
+        cmd: [process.execPath, script],
+        env: { ...process.env },
+        timeout: 10_000,
+      });
+      expect(child.exitCode).toBe(0);
+      expect(JSON.parse(child.stdout.toString().trim())).toEqual({
+        runfile: true,
+        ledger: 0,
+        retention: DEFAULT_RETENTION,
+        envFiles: 0,
+      });
+    },
+    20_000, // a child process, with a deadline that only a waiting call reaches
+  );
+});

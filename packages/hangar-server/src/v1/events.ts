@@ -43,6 +43,7 @@ import {
   snapshotAt,
 } from "@crewhaus/control-records";
 import type { RequestAccess } from "../access";
+import { reachableSessionRoot } from "../sessions";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import {
@@ -253,9 +254,14 @@ function traceSource(dir: string, execution: string): RecordSource {
   };
 }
 
-/** `.crewhaus/sessions/<session>.events.jsonl`. */
-function sessionSource(dir: string, session: string): RecordSource {
-  return { root: dir, records: { file: join(".crewhaus", "sessions", `${session}.events.jsonl`) } };
+/**
+ * `<session>.events.jsonl` in the harness's own sessions folder (`reachableSessionRoot`),
+ * contained to that folder; undefined when the folder is unreachable, so nothing is opened.
+ */
+function sessionSource(dir: string, session: string): RecordSource | undefined {
+  const reach = reachableSessionRoot(dir);
+  if (!reach.reachable) return undefined;
+  return { root: reach.root, records: { file: `${session}.events.jsonl` } };
 }
 
 /** The newest execution a run's rows (newest first) name. */
@@ -364,6 +370,7 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
     if (typeof owner === "string" && owner !== runId) return undefined;
     return traceLineEvent(record, harness, runId);
   };
+  let unreachableSession = false;
   const sources: LineSource[] = [
     {
       name: "rows",
@@ -378,7 +385,10 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
   if (content && execution !== undefined) {
     sources.push({ name: "trace", source: traceSource(found.dir, execution), eventOf: traceOf });
   } else if (content && session !== undefined) {
-    sources.push({ name: "session", source: sessionSource(found.dir, session), eventOf: traceOf });
+    const source = sessionSource(found.dir, session);
+    if (source !== undefined) sources.push({ name: "session", source, eventOf: traceOf });
+    // An unreachable sessions folder is never opened; a fresh stream says so once.
+    else if (cursor === undefined) unreachableSession = true;
   }
   // A trace or session position read from another file than the one opened now is not
   // applied to this one: this one is read from its start, and the stream says first that
@@ -421,6 +431,15 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
       return false;
     });
     const frames = batch.frames;
+    if (unreachableSession) {
+      unreachableSession = false;
+      frames.unshift(
+        streamEnvelope("stream.gap", start, new Date().toISOString(), {
+          reason: "unreadable",
+          source: "session",
+        }),
+      );
+    }
     if (missed.length > 0) {
       const opened = start;
       for (const source of missed.splice(0)) {

@@ -33,11 +33,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gradersConfigHash, parseGradersConfig } from "@crewhaus/eval-grader";
+import { CRITERIA_APPLY_CMD } from "@crewhaus/quality-service/criteria-history";
 import { parseSpec } from "@crewhaus/spec";
 import { DELTA_090_KEYS } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
 import { v1Home } from "./__test__/v1-home";
 import {
+  CRITERIA_APPLY_VERB,
   lintMcpEnv,
   looksLikeCredential,
   newlyMaskedSpan,
@@ -45,6 +47,7 @@ import {
   scanMcpServers,
   sseUrlCredential,
 } from "./builders";
+import { MAX_TEXT_BYTES } from "./constants";
 import { makeFixtureHarness } from "./fixture";
 import {
   SECURITY_SURFACES,
@@ -1734,6 +1737,8 @@ describe("builders", () => {
       );
       expect(written.body["ok"]).toBe(true);
       expect(written.body["graders"]).toEqual([{ name: "cites", type: "contains" }]);
+      // Writing the whole file is what `graders suggest` does from the command line.
+      expect(String(written.body["verb"])).toContain("crewhaus graders suggest");
       expect(existsSync(join(dir, "eval", "graders.yaml"))).toBe(true);
       const reread = await t.api(`/api/h/${id}/builders/graders`);
       expect(reread.body["present"]).toBe(true);
@@ -1975,14 +1980,72 @@ describe("builders", () => {
       const masked = await setDescription("***");
       expect(masked.status).toBe(409);
       expect(String(masked.body["error"])).toContain("masked span (***)");
-      expect(String(masked.body["error"])).toContain("crewhaus graders suggest");
+      expect(String(masked.body["error"])).toContain(CRITERIA_APPLY_VERB);
+      expect(String(masked.body["error"])).not.toContain("graders suggest");
       expect(readFileSync(gradersPath, "utf8")).toBe(stored);
       const plain = await setDescription("the answer cites a primary source");
       expect(plain.status).toBe(200);
+      expect(plain.body["verb"]).toBe(CRITERIA_APPLY_VERB);
       expect(readFileSync(gradersPath, "utf8")).toContain("the answer cites a primary source");
     } finally {
       await t.stop();
     }
+  });
+
+  test("graders: a structured edit to a file larger than Home reads names the command that can make it", async () => {
+    const t = boot();
+    try {
+      const dir = specHarness(t, "graders-edits-oversize");
+      const gradersPath = join(dir, "eval", "graders.yaml");
+      mkdirSync(join(dir, "eval"), { recursive: true });
+      const head =
+        "graders:\n  - name: cites\n    type: contains\n    substring: http\ncriteria:\n  - id: cites-sources\n    description: the answer cites a source\n    measured_by: [cites]\n";
+      const stored = `${head}${"# padding\n".repeat(Math.ceil((MAX_TEXT_BYTES + 1) / 10))}`;
+      writeFileSync(gradersPath, stored);
+      const id = await register(t, dir);
+      const refused = await t.api(
+        `/api/h/${id}/builders/graders`,
+        post({
+          edits: [{ op: "setText", id: "cites-sources", field: "description", value: "x" }],
+          expectedRev: `sha256:${"0".repeat(64)}`,
+        }),
+      );
+      expect(refused.status).toBe(409);
+      expect(String(refused.body["error"])).toContain("crewhaus criteria apply");
+      expect(String(refused.body["error"])).not.toContain("graders suggest");
+      expect(readFileSync(gradersPath, "utf8")).toBe(stored);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "graders: a link to nothing is never written through, inside the harness or out",
+    async () => {
+      const t = boot();
+      try {
+        const dir = specHarness(t, "graders-dangling");
+        mkdirSync(join(dir, "eval"), { recursive: true });
+        const outside = join(t.workspace, "created-outside.yaml");
+        symlinkSync(outside, join(dir, "eval", "graders.yaml"));
+        const id = await register(t, dir);
+        const res = await t.api(
+          `/api/h/${id}/builders/graders`,
+          post({
+            yaml: "graders:\n  - name: cites\n    type: contains\n    substring: http\n",
+            confirmName: "spec-edit-fixture",
+          }),
+        );
+        expect(res.status).toBeGreaterThanOrEqual(400);
+        expect(existsSync(outside)).toBe(false);
+      } finally {
+        await t.stop();
+      }
+    },
+  );
+
+  test("graders: the structured edit's command is the CLI's criteria apply", () => {
+    expect(CRITERIA_APPLY_VERB.startsWith(`${CRITERIA_APPLY_CMD} `)).toBe(true);
   });
 
   test("the dataset builder refuses honestly instead of growing a second state machine", async () => {

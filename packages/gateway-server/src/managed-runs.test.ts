@@ -1047,6 +1047,42 @@ describe("queued runs", () => {
     expect(s.calls).toHaveLength(1);
   });
 
+  test("a run queued for a work item resumes as the item, and its context carries it", async () => {
+    const s = setup();
+    const workItem = mintId("wi");
+    const id = queue(s.harnessDir, { workItem });
+    expect(rowsOf(s.harnessDir, id)[0]).toMatchObject({
+      state: "queued",
+      workItem,
+      trigger: { kind: "api", workItem },
+    });
+    await s.runs.claimQueued();
+    const running = rowsOf(s.harnessDir, id).find((row) => row["state"] === "running");
+    expect(running).toMatchObject({ workItem, resumeScope: `work:${workItem}` });
+    expect(s.calls[0]?.runContext.workItem).toBe(workItem);
+    // A run queued for no item keeps the session's scope, and its rows name no item.
+    const plain = queue(s.harnessDir);
+    await s.runs.claimQueued();
+    const plainRunning = rowsOf(s.harnessDir, plain).find((row) => row["state"] === "running");
+    expect(String(plainRunning?.["resumeScope"])).toMatch(/^session:sess_/);
+    expect(rowsOf(s.harnessDir, plain).some((row) => "workItem" in row)).toBe(false);
+  });
+
+  test("a work item that is not a wi_ id is refused before any file is written", () => {
+    const s = setup();
+    const answer = queueManagedRun({
+      harnessDir: s.harnessDir,
+      tenant: "tenant-a",
+      input: CLEAN,
+      by: "sys:scheduler",
+      env: {},
+      workItem: mintId("cmd"),
+    });
+    expect(answer).toEqual({ ok: false, reason: "workItem must be a work item id (wi_…)" });
+    expect(inputsOf(s.harnessDir)).toEqual([]);
+    expect(existsSync(join(s.harnessDir, ".crewhaus/run/control/runs"))).toBe(false);
+  });
+
   test("an input left behind by an ended run is removed by the next claim pass, and nothing runs", async () => {
     const s = setup();
     const id = queue(s.harnessDir);
@@ -1193,6 +1229,24 @@ describe("queued runs", () => {
     await budgetStore.recordUsage("tenant-a", {
       input: s.tenantA.budget.maxInputTokens,
       output: 0,
+    });
+    const id = queue(s.harnessDir);
+    await s.runs.claimQueued();
+    expect(s.calls).toHaveLength(0);
+    expect(rowsOf(s.harnessDir, id).map((r) => [r["state"], r["failureClass"]])).toEqual([
+      ["queued", undefined],
+      ["running", undefined],
+      ["failed", "crewhaus_budget"],
+    ]);
+  });
+
+  test("a queued run whose estimate is past the tenant's remaining tokens ends crewhaus_budget, with no turn", async () => {
+    const budgetStore = new InMemoryBudgetStore();
+    const s = setup({ budgetStore });
+    // Room for the input, not for the output ceiling the run's estimate reserves.
+    await budgetStore.recordUsage("tenant-a", {
+      input: 0,
+      output: s.tenantA.budget.maxOutputTokens - 1,
     });
     const id = queue(s.harnessDir);
     await s.runs.claimQueued();

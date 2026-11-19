@@ -40,7 +40,7 @@ function wireWith(areas: readonly AreaRuntime[]) {
 describe("the composition", () => {
   test("the shipped composition passes, and the core registers daemon control, activation and decisions", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
-    expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core", "delegation"]);
+    expect(AREA_RUNTIMES.map((runtime) => runtime.area)).toEqual(["core", "delegation", "runtime"]);
     expect(Object.keys(CORE_RUNTIME.executors ?? {}).sort()).toEqual([
       "controls.disable",
       "controls.drain",
@@ -282,13 +282,12 @@ describe("areas.ts keeps one guarded placeholder per area", () => {
     "KNOWLEDGE",
     "PEOPLE",
     "QUALITY",
-    "RUNTIME",
     "VERIFICATION",
   ];
   // A Windows checkout may carry CRLF line ends.
   const lines = readFileSync(join(import.meta.dir, "areas.ts"), "utf8").split(/\r?\n/);
 
-  test("eleven commented imports and eleven commented list entries, each between blank lines", () => {
+  test("ten commented imports and ten commented list entries, each between blank lines", () => {
     const imports = lines
       .map((line, at) => ({ line, at }))
       .filter(({ line }) =>
@@ -297,8 +296,8 @@ describe("areas.ts keeps one guarded placeholder per area", () => {
     const entries = lines
       .map((line, at) => ({ line, at }))
       .filter(({ line }) => /^ {2}\/\/ [A-Z]+_RUNTIME,$/.test(line));
-    expect(imports).toHaveLength(11);
-    expect(entries).toHaveLength(11);
+    expect(imports).toHaveLength(10);
+    expect(entries).toHaveLength(10);
     expect(imports.map(({ line }) => line.split(" ")[3])).toEqual(AREAS.map((a) => `${a}_RUNTIME`));
     expect(entries.map(({ line }) => line.trim().slice(3, -1))).toEqual(
       AREAS.map((a) => `${a}_RUNTIME`),

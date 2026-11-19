@@ -98,3 +98,12 @@ batch.** Each `nextDueAt` reads the armed timer's recorded fire time (`nextAt`) 
 `schedule-lanes.present.digests.json` (channel-lanes `daemon.ts`, managed-lanes `daemon.ts`, batch-lanes
 `agent.ts`) and `schedule-object.digests.json` (channel-cron and channel-interval `daemon.ts`, batch-cron and
 batch-interval `agent.ts`). No other digest moves.
+
+**Spend settings — new pins only.** `budget.period` lowers inside `IrBudget` as `period: {every,
+usdMicros, starts?, timezone?}`, so the emitters that render the whole budget carry it;
+`budget-period.present.digests.json` pins cli, channel and workflow with every period key. A declared
+`models.<name>.price` lowers onto the profile and, as `declaredPricing` sorted by model string, onto
+each model-wiring block; `renderModelWiringFields` appends `declaredPricing: {...}` after the routing
+fields only when it is present, and a workflow's shared budget meter prices with it.
+`models-price.present.digests.json` pins cli, workflow and crew. A spec that declares neither compiles
+to the same bytes, so no other digest moves.

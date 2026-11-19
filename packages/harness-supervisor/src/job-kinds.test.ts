@@ -3,7 +3,16 @@
  * line, and so the one place a mistake becomes an injection.
  */
 import { describe, expect, test } from "bun:test";
-import { JOB_KINDS, JobArgumentError, isJobKind, jobArgv } from "./job-kinds";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  EXPORT_JOB_KIND,
+  JOB_KINDS,
+  JobArgumentError,
+  exportHarnessArgv,
+  isJobKind,
+  jobArgv,
+} from "./job-kinds";
 
 describe("job kinds", () => {
   test("the four kinds, and nothing else, are jobs", () => {
@@ -71,5 +80,21 @@ describe("jobArgv", () => {
         expect((caught as Error).message).toContain(JSON.stringify(bad));
       }
     }
+  });
+});
+
+describe("the harness export job", () => {
+  test("runs `state backup --out` for an absolute path, and is not a kind the job route takes", () => {
+    const out = join(tmpdir(), "exports", "hrn_0123456789abcdef", "01J.tar.gz");
+    expect(exportHarnessArgv(out)).toEqual(["state", "backup", "--out", out]);
+    expect(isJobKind(EXPORT_JOB_KIND)).toBe(false);
+    expect((JOB_KINDS as readonly string[]).includes(EXPORT_JOB_KIND)).toBe(false);
+  });
+
+  test("refuses a relative path, an empty one, and one with a control character", () => {
+    for (const bad of ["", "exports/x.tar.gz", "--out", `${join(tmpdir(), "x")}\n--force`]) {
+      expect(() => exportHarnessArgv(bad)).toThrow(JobArgumentError);
+    }
+    expect(() => exportHarnessArgv(`${join(tmpdir(), "x")}\u001b[201~`)).toThrow("control");
   });
 });

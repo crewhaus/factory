@@ -290,8 +290,9 @@ describe("a schedule's time zone and cron are checked", () => {
     expect(JSON.parse(run.stdout.toString())).toEqual([[], [], [], [["schedule", "cron"]], []]);
   }, 20_000); // runs a child bun process with a 15 s deadline
 
-  test("the check runs last of the 0.9.0 checks, once", () => {
-    expect(DELTA_090_ISSUES.indexOf(scheduleWakeIssues)).toBe(DELTA_090_ISSUES.length - 1);
+  test("the check runs after the 0.9.0 checks older than it, once", () => {
+    // Fourth, as it was appended: checks appended later run after it.
+    expect(DELTA_090_ISSUES.indexOf(scheduleWakeIssues)).toBe(3);
     expect(DELTA_090_ISSUES.filter((check) => check === scheduleWakeIssues).length).toBe(1);
   });
 });

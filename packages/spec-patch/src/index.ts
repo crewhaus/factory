@@ -568,7 +568,7 @@ export function applySpecEdits(
 
   if (opts.restrictToOptimizable === true) {
     const docTarget = doc.getIn(["target"]);
-    if (typeof docTarget !== "string" || !(docTarget in OPTIMIZABLE_PATHS)) {
+    if (typeof docTarget !== "string" || !Object.hasOwn(OPTIMIZABLE_PATHS, docTarget)) {
       throw new SpecPatchError(
         `cannot restrict to optimizable paths: spec target ${JSON.stringify(docTarget)} is not a known target`,
       );
@@ -1951,6 +1951,9 @@ export function isOptimizable(
 ): boolean {
   // 0.6.0 §6.1 — the enforced refusals win over every admission rule below.
   if (isRefusedLeaf(path)) return false;
+  // Own property only: a target that is not a shape (`constructor`,
+  // `__proto__`) has no entry, so it is never optimizable.
+  if (!Object.hasOwn(OPTIMIZABLE_PATHS, target)) return false;
   const allowed = OPTIMIZABLE_PATHS[target];
   if (allowed === undefined || path.length === 0) return false;
   for (const ok of allowed) {

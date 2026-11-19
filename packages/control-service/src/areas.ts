@@ -32,7 +32,7 @@ import { DELEGATION_RUNTIME } from "./areas/delegation";
 
 // import { QUALITY_RUNTIME } from "./areas/quality";
 
-// import { RUNTIME_RUNTIME } from "./areas/runtime";
+import { RUNTIME_RUNTIME } from "./areas/runtime";
 
 // import { VERIFICATION_RUNTIME } from "./areas/verification";
 
@@ -59,7 +59,7 @@ export const AREA_RUNTIMES: readonly AreaRuntime[] = [
 
   // QUALITY_RUNTIME,
 
-  // RUNTIME_RUNTIME,
+  RUNTIME_RUNTIME,
 
   // VERIFICATION_RUNTIME,
 ];

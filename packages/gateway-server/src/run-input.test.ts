@@ -64,7 +64,10 @@ function countingBudget(): { store: BudgetStore; reserves: () => number; release
   return { store, reserves: () => reserves, releases: () => releases };
 }
 
-function setup(handler: RunHandler): {
+function setup(
+  handler: RunHandler,
+  options: { readonly reserveNothing?: boolean } = {},
+): {
   server: ReturnType<typeof createGatewayServer>;
   tenant: Tenant;
   budget: ReturnType<typeof countingBudget>;
@@ -77,6 +80,7 @@ function setup(handler: RunHandler): {
     handler,
     tenantOverrides: { "tenant-a": tenant },
     budgetStore: budget.store,
+    ...(options.reserveNothing === true ? { estimateUsage: () => ({ input: 0, output: 0 }) } : {}),
   });
   return { server, tenant, budget };
 }
@@ -192,10 +196,15 @@ describe("managed run input is classified at api", () => {
 
   test("an input too long for the check to read is refused, naming scan-limit", async () => {
     let handled = 0;
-    const { server } = setup(async () => {
-      handled += 1;
-      return { ok: true };
-    });
+    // A 4 MiB input's own estimate is past the tenant's budget: reserve nothing, so the
+    // check is what refuses it.
+    const { server } = setup(
+      async () => {
+        handled += 1;
+        return { ok: true };
+      },
+      { reserveNothing: true },
+    );
     const res = await call(server, createBody("a".repeat(4 * 1024 * 1024 + 1)));
     expect(res.error?.code).toBe("input_blocked");
     expect(res.error?.data?.rules).toEqual(["scan-limit"]);

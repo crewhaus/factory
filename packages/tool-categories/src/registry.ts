@@ -887,6 +887,11 @@ export const CATEGORIES: Readonly<Record<string, CategoryDef>> = Object.freeze({
     tools: ["proofCheckers", "proofCheck", "provabilityPreflight"],
   },
 
+  work: {
+    title: "Work items",
+    tools: ["workList", "workGet", "workPropose", "workUpdate"],
+  },
+
   // ---- roll-ups ----
   code: {
     title: "Everything for working in a codebase",

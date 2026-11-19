@@ -1,8 +1,9 @@
 /**
  * Harness detail — Overview tab: the process card (M2's Start/Stop/Restart/
  * Drain, with the preflight-refusal flow), health checklist, eval trend
- * mini-line, memory-fabric mini-cards, cost mini-chart, and the expandable
- * preflight report. Every absent payload renders as "nothing yet".
+ * mini-line, memory-fabric mini-cards, cost mini-chart, the spending limit
+ * (`./budget.js`), and the expandable preflight report. Every absent payload
+ * renders as "nothing yet".
  */
 
 import { api } from "../api.js";
@@ -16,16 +17,18 @@ import {
   measuredNothing,
   notMeasuredCopy,
   passRateWord,
-  usdFromMicros,
 } from "../util.js";
+import { budgetCard } from "./budget.js";
+import { dayRow, totalText } from "./costs.js";
 import { procCard } from "./proc.js";
 
 export async function renderOverview(root, ctx) {
   clear(root).appendChild(skeleton(5));
-  const [preflightRes, evalsRes, costsRes] = await Promise.allSettled([
+  const [preflightRes, evalsRes, costsRes, budgetRes] = await Promise.allSettled([
     api.preflight(ctx.id),
     api.evals(ctx.id),
     api.costs(ctx.id),
+    budgetCard(ctx),
   ]);
   clear(root);
   // The process picture came with the page load — render it without a
@@ -36,6 +39,8 @@ export async function renderOverview(root, ctx) {
   grid.appendChild(evalTrendCard(settled(evalsRes)));
   grid.appendChild(memoryCard(ctx.detail));
   grid.appendChild(costCard(settled(costsRes)));
+  const budget = settled(budgetRes);
+  if (budget !== null) grid.appendChild(budget);
   root.appendChild(grid);
   root.appendChild(preflightCard(settled(preflightRes)));
 }
@@ -146,20 +151,22 @@ function costCard(payload) {
   // `/api/h/:id/costs` returns { id, costs: { spend7dUsdMicros, days, … } }.
   const costs = payload?.costs && typeof payload.costs === "object" ? payload.costs : null;
   const days = Array.isArray(costs?.days) ? costs.days : [];
+  if (costs !== null && typeof costs.unknown === "string" && costs.unknown !== "") {
+    return card("Spend (7d)", emptyState(`Cost unknown: ${costs.unknown}`, null));
+  }
   if (costs === null || (costs.calls === 0 && days.every((d) => d.usdMicros === 0))) {
     return card(
       "Spend (7d)",
       emptyState("No cost data yet. Cost tracking is on by default.", "crewhaus run crewhaus.yaml"),
     );
   }
-  // A day with no figure is unknown, never $0.
-  const rows = days.slice(-7).map((d) => ({
-    label: String(d.day ?? ""),
-    value: usdFromMicros(d.usdMicros),
-  }));
-  const total = usdFromMicros(costs.spend7dUsdMicros);
+  // A day with no figure is unknown, never $0; one whose calls had no price says so.
+  const rows = days.slice(-7).map(dayRow);
+  const unpriced = days.slice(-7).reduce((n, d) => n + (Number(d.unpricedCalls) || 0), 0);
   return card("Spend (7d)", [
-    el("div", { class: "big-stat" }, [el("span", { class: "stat-num", text: fmtUsd(total) })]),
+    el("div", { class: "big-stat" }, [
+      el("span", { class: "stat-num", text: totalText(costs.spend7dUsdMicros, unpriced) }),
+    ]),
     chart(chartModel({ kind: "bars", title: "Spend per day", rows, format: fmtUsd, noun: "day" }), {
       labelHead: "Day",
       valueHead: "Spend",

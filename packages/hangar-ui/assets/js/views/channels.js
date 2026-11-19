@@ -26,6 +26,7 @@
 
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, jsonPre, numberedCode, skeleton, toast } from "../dom.js";
+import { writeTwin } from "./control.js";
 import { m3, m3Card, m3Empty } from "./creds.js";
 
 /**
@@ -180,6 +181,7 @@ function verifyControls(ctx, reload) {
   return el("div", { class: "control-action" }, [
     el("div", { class: "control-row" }, [offline, live]),
     state,
+    writeTwin("channelVerify", ctx, "Verify"),
   ]);
 }
 
@@ -325,6 +327,8 @@ function tierControls(row, ctx, reload) {
       ? el("div", { class: "row-editor" }, [text])
       : el("p", { class: "muted gated-why", text: String(tier2.reason ?? "") }),
     outcome,
+    writeTwin("channelProbe", ctx, "Probe"),
+    writeTwin("channelSynthetic", ctx, "Synthetic"),
   ]);
 }
 
@@ -440,6 +444,7 @@ function planNodes(answer, platform, ctx) {
     );
   });
   nodes.push(el("div", { class: "row-editor" }, [baseUrl, run, state]));
+  nodes.push(writeTwin("channelProvisionRun", ctx, "Provision"));
   return nodes.filter((node) => node !== null);
 }
 

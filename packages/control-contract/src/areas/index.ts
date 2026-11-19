@@ -18,7 +18,7 @@ import { CREATION_MODULE } from "./creation.js";
 
 import { DELEGATION_MODULE } from "./delegation.js";
 
-// import { HOME_MODULE } from "./home.js";
+import { HOME_MODULE } from "./home.js";
 
 // import { INSPECTION_MODULE } from "./inspection.js";
 
@@ -30,7 +30,7 @@ import { PEOPLE_MODULE } from "./people.js";
 
 import { QUALITY_MODULE } from "./quality.js";
 
-// import { RUNTIME_MODULE } from "./runtime.js";
+import { RUNTIME_MODULE } from "./runtime.js";
 
 // import { VERIFICATION_MODULE } from "./verification.js";
 
@@ -45,7 +45,7 @@ export const AREA_MODULES = [
 
   DELEGATION_MODULE,
 
-  // HOME_MODULE,
+  HOME_MODULE,
 
   // INSPECTION_MODULE,
 
@@ -57,7 +57,7 @@ export const AREA_MODULES = [
 
   QUALITY_MODULE,
 
-  // RUNTIME_MODULE,
+  RUNTIME_MODULE,
 
   // VERIFICATION_MODULE,
 ] as const satisfies readonly AreaModule[];

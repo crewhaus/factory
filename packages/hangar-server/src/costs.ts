@@ -44,7 +44,7 @@ import { readdirSync, statSync } from "node:fs";
 import { SESSION_JSONL_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
 import { resolveContained } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 
 export type ModelCostRow = {
   readonly provider: string;
@@ -53,6 +53,8 @@ export type ModelCostRow = {
   readonly usdMicros: number;
   readonly inputTokens: number;
   readonly outputTokens: number;
+  /** Some call of this model had no price: its spend is unknown, not the `usdMicros` shown. */
+  readonly unpriced?: true;
 };
 
 /**
@@ -92,11 +94,20 @@ export type DailyCostRow = {
   readonly day: string;
   readonly usdMicros: number;
   readonly calls: number;
+  /** Calls that day nothing could price; present only when > 0, so the day is never a $0 bar. */
+  readonly unpricedCalls?: number;
 };
 
 export type HarnessCosts = {
   readonly totalUsdMicros: number;
   readonly calls: number;
+  /**
+   * Per-call accruals nothing could price (`unpriced: true`). Their cost is
+   * unknown, so a total beside a non-zero count reads "+ unknown", never as
+   * if it were the whole spend. A skipped roll-up's own count is not added:
+   * its child's per-call lines are folded on their own (module docblock).
+   */
+  readonly unpricedCalls: number;
   readonly spend7dUsdMicros: number;
   readonly byModel: readonly ModelCostRow[];
   /** 0.6.0 — spend by `role`, biggest first (ties broken by name). */
@@ -119,6 +130,12 @@ export type HarnessCosts = {
   readonly days: readonly DailyCostRow[];
   /** Session files whose read hit a cap (the totals are floors, not lies). */
   readonly truncatedFiles: number;
+  /**
+   * Why the cost is unknown, when it is: the sessions folder is unreachable, so no
+   * log was read and every total here stands for nothing, never for $0. Null when
+   * the logs were read.
+   */
+  readonly unknown: string | null;
 };
 
 type AccrualFields = {
@@ -128,6 +145,7 @@ type AccrualFields = {
   provider?: string;
   modelId?: string;
   costUsdMicros?: number;
+  unpriced?: boolean;
   inputTokens?: number;
   outputTokens?: number;
   ts?: string;
@@ -170,10 +188,11 @@ const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
 /** Fold every `sess_*.jsonl` under the harness's resolved session root. */
 export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCosts {
-  const { root } = resolveSessionRoot(harnessDir);
+  const reach = reachableSessionRoot(harnessDir);
+  const root = reach.reachable ? reach.root : "";
   let files: string[];
   try {
-    files = readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f));
+    files = reach.reachable ? readdirSync(root).filter((f) => SESSION_JSONL_RE.test(f)) : [];
   } catch {
     files = [];
   }
@@ -182,14 +201,15 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
   let spend7d = 0;
   let truncatedFiles = 0;
   let rollups = 0;
+  let unpricedCalls = 0;
   const byModel = new Map<string, ModelCostRow>();
   const byRole = new Map<string, Bucket>();
   const byProfile = new Map<string, Bucket>();
   // Zero-filled trailing-7-day buckets, oldest first — the UI bar chart
   // renders absence as a baseline sliver, never as missing data.
-  const byDay = new Map<string, { usdMicros: number; calls: number }>();
+  const byDay = new Map<string, { usdMicros: number; calls: number; unpricedCalls: number }>();
   for (let i = 6; i >= 0; i -= 1) {
-    byDay.set(utcDay(nowMs - i * DAY_MS), { usdMicros: 0, calls: 0 });
+    byDay.set(utcDay(nowMs - i * DAY_MS), { usdMicros: 0, calls: 0, unpricedCalls: 0 });
   }
 
   for (const file of files.sort()) {
@@ -231,8 +251,10 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
       const outputTokens = typeof fields.outputTokens === "number" ? fields.outputTokens : 0;
       const profile =
         typeof fields.profile === "string" && fields.profile !== "" ? fields.profile : NO_PROFILE;
+      const unpriced = fields.unpriced === true;
       totalUsdMicros += micros;
       calls += 1;
+      if (unpriced) unpricedCalls += 1;
       fold(byRole, role ?? DEFAULT_COST_ROLE, micros, inputTokens, outputTokens);
       fold(byProfile, profile, micros, inputTokens, outputTokens);
       const tsRaw =
@@ -244,6 +266,7 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
       if (bucket !== undefined) {
         bucket.usdMicros += micros;
         bucket.calls += 1;
+        if (unpriced) bucket.unpricedCalls += 1;
       }
       const key = `${provider}/${modelId}`;
       const row = byModel.get(key) ?? {
@@ -260,6 +283,7 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
         usdMicros: row.usdMicros + micros,
         inputTokens: row.inputTokens + inputTokens,
         outputTokens: row.outputTokens + outputTokens,
+        ...(unpriced || row.unpriced === true ? { unpriced: true as const } : {}),
       });
     }
   }
@@ -267,6 +291,7 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
   return {
     totalUsdMicros,
     calls,
+    unpricedCalls,
     spend7dUsdMicros: spend7d,
     byModel: [...byModel.values()].sort((a, b) =>
       `${a.provider}/${a.modelId}`.localeCompare(`${b.provider}/${b.modelId}`),
@@ -274,7 +299,13 @@ export function foldHarnessCosts(harnessDir: string, nowMs: number): HarnessCost
     byRole: rankBuckets(byRole).map(({ key, ...b }) => ({ role: key, ...b })),
     byProfile: rankBuckets(byProfile).map(({ key, ...b }) => ({ profile: key, ...b })),
     rollups,
-    days: [...byDay.entries()].map(([day, b]) => ({ day, ...b })),
+    days: [...byDay.entries()].map(([day, b]) => ({
+      day,
+      usdMicros: b.usdMicros,
+      calls: b.calls,
+      ...(b.unpricedCalls > 0 ? { unpricedCalls: b.unpricedCalls } : {}),
+    })),
     truncatedFiles,
+    unknown: reach.reachable ? null : reach.note,
   };
 }

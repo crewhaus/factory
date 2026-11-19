@@ -1595,3 +1595,23 @@ provability: checked
     expect(auditProvability(lowerIr(crew))).toEqual([]);
   });
 });
+
+describe("a spending period below the per-run cap", () => {
+  const budgeted = (period: number): string =>
+    `${validCli}budget: {usd: 5, period: {every: month, usd: ${period}}}\n`;
+
+  test("is a note, never a warning or an error", () => {
+    const result = runLint(budgeted(2), noTools);
+    const notes = result.findings.filter((f) => f.rule === "budget-period-below-run-cap");
+    expect(notes.map((f) => [f.severity, f.path])).toEqual([["info", "budget.period.usd"]]);
+    expect(result.ok).toBe(true);
+    expect(formatLintText(result)).toContain("0 warning(s), 1 note(s).");
+  });
+
+  test("a period at or above the cap says nothing", () => {
+    for (const period of [5, 50]) {
+      const result = runLint(budgeted(period), noTools);
+      expect(result.findings.some((f) => f.rule === "budget-period-below-run-cap")).toBe(false);
+    }
+  });
+});

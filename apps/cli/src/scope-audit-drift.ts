@@ -371,6 +371,10 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
   // A voice caller's transcribed speech and text sent into a session, at
   // "channel". A voice session has no run context to tag.
   { name: "voice-runtime", path: "packages/voice-runtime/src/index.ts" },
+  // Work item text read back by WorkList and WorkGet, field by field at the origin each
+  // field was written through ("api", "memory", "mcp"), and tagged inside the tools (they
+  // opt out of the runtime's own pass).
+  { name: "tool-work", path: "packages/tool-work/src/index.ts", requireTag: true },
 ];
 
 /**

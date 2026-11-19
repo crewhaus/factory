@@ -182,9 +182,11 @@ describe("ROUTE_TEMPLATES", () => {
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
     // The device sign-in page is a fleet address of its own.
     expect(fleetTemplates.length).toBe(21);
-    // Setup › Delegations is the twenty-eighth.
-    expect(harnessTemplates.length).toBe(28);
+    // Setup › Delegations is the twenty-eighth; Work › Work items and an item's page follow.
+    expect(harnessTemplates.length).toBe(30);
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/setup/delegations");
+    expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items");
+    expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items/:wi");
     expect(new Set(ROUTE_TEMPLATES).size).toBe(ROUTE_TEMPLATES.length);
     expect(Object.isFrozen(ROUTE_TEMPLATES)).toBe(true);
     for (const t of [
@@ -209,7 +211,13 @@ describe("ROUTE_TEMPLATES", () => {
   });
 
   test("each one, filled in, parses to a screen whose template it is", () => {
-    const params = { id: ID, run: "run_1", session: "sess_1", slug: "notes" };
+    const params = {
+      id: ID,
+      run: "run_1",
+      session: "sess_1",
+      slug: "notes",
+      wi: "wi_01m76e6f05hp514w9j4v3qymka",
+    };
     for (const template of ROUTE_TEMPLATES) {
       const route = parseRoute(routeFor(template, params));
       expect(`${template}:${route.view}`).not.toBe(`${template}:notfound`);
@@ -251,5 +259,77 @@ describe("pageTitle", () => {
 
   test("not found", () => {
     expect(pageTitle(parseRoute("#/nope"))).toBe("Nothing at this address — Hangar");
+  });
+});
+
+describe("object links", () => {
+  const links = router as {
+    refShape(text: unknown): { scope: string; kind: string; id: string } | null;
+    withInspect(hash: string, ref: string): string;
+    withoutInspect(hash: string): string;
+    hrefInspect(ref: string, harness?: string | null): string;
+  };
+  const REF = `${ID}/run/run_01m76e6f05hp514w9j4v3qymka`;
+
+  test("#/i/<scope>/<kind>/<id> opens a ref, its query kept", () => {
+    expect(parseRoute(`#/i/${REF}`)).toEqual({
+      view: "inspect-ref",
+      ref: REF,
+      bare: false,
+      query: {},
+    });
+    expect(parseRoute(`#/i/home/harness/${ID}?tab=technical`)).toEqual({
+      view: "inspect-ref",
+      ref: `home/harness/${ID}`,
+      bare: false,
+      query: { tab: "technical" },
+    });
+  });
+
+  test("a bare id opens with the harness it is in", () => {
+    expect(parseRoute(`#/i/run_0123456789abcdef?harness=${ID}`)).toEqual({
+      view: "inspect-ref",
+      ref: "run_0123456789abcdef",
+      bare: true,
+      query: { harness: ID },
+    });
+  });
+
+  test("a malformed link is not found", () => {
+    for (const hash of [
+      "#/i",
+      `#/i/${ID}/run`,
+      `#/i/${ID}/run/x/y`,
+      "#/i/nope/run/run_1",
+      "#/i/hrn_ABC/run/run_1",
+      `#/i/${ID}/run/${"x".repeat(200)}`,
+      `#/i/${ID}/run/a%20b`,
+      `#/i/${ID}/run/a%25b`,
+    ]) {
+      expect([hash, parseRoute(hash).view]).toEqual([hash, "notfound"]);
+    }
+  });
+
+  test("?inspect= is kept beside any route, and set or dropped without touching the rest", () => {
+    expect(parseRoute(`#/h/${ID}/work/runs?inspect=${encodeURIComponent(REF)}`)).toMatchObject({
+      view: "harness",
+      section: "work",
+      sub: "runs",
+      query: { inspect: REF },
+    });
+    expect(parseRoute(`#/?inspect=${encodeURIComponent(REF)}`).query).toEqual({ inspect: REF });
+    const on = links.withInspect(`#/h/${ID}/work/runs?x=1&inspect=old`, REF);
+    expect(on).toBe(`#/h/${ID}/work/runs?x=1&inspect=${encodeURIComponent(REF)}`);
+    expect(links.withoutInspect(on)).toBe(`#/h/${ID}/work/runs?x=1`);
+    expect(links.withoutInspect(`#/h/${ID}?inspect=a`)).toBe(`#/h/${ID}`);
+    expect(links.hrefInspect(REF)).toBe(`#/i/${REF}`);
+    expect(parseRoute(links.hrefInspect("run_0123456789abcdef", ID))).toMatchObject({
+      view: "inspect-ref",
+      bare: true,
+    });
+  });
+
+  test("a link's page is named while it opens", () => {
+    expect(pageTitle(parseRoute(`#/i/${REF}`))).toBe("Opening a link — Hangar");
   });
 });

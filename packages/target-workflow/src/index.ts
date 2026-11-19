@@ -1190,10 +1190,18 @@ ${hasRetryJudges ? 'import { admitJudgeFeedback } from "@crewhaus/runtime-core";
   const hybridImport = ir.steps.some((s) => poolNeedsHybridWiring(s.modelPool))
     ? `${HYBRID_WIRING_IMPORT}\n`
     : "";
+  // Declared model prices: the shared meter prices with them too (only when declared).
+  const declaredPricing = ir.steps.find((s) => s.declaredPricing !== undefined)?.declaredPricing;
+  const pricingImport =
+    declaredPricing !== undefined ? ", DEFAULT_PRICING, mergeDeclaredPricing" : "";
+  const meterPricing =
+    declaredPricing !== undefined
+      ? `, pricing: mergeDeclaredPricing(DEFAULT_PRICING, ${JSON.stringify(declaredPricing)})`
+      : "";
   const budgetMeterImport = hasBudget
     ? hasJudges
-      ? `import { createCostTracker, sumRoleCost } from "@crewhaus/cost-tracker";\nimport { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\nimport { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";\n`
-      : `import { createCostTracker } from "@crewhaus/cost-tracker";\n`
+      ? `import { createCostTracker${pricingImport}, sumRoleCost } from "@crewhaus/cost-tracker";\nimport { DEFAULT_JUDGE_SHARE } from "@crewhaus/runtime-core";\nimport { AUXILIARY_MODEL_ROLES } from "@crewhaus/trace-event-bus";\n`
+      : `import { createCostTracker${pricingImport} } from "@crewhaus/cost-tracker";\n`
     : "";
   const budgetMeterBoot =
     ir.budget !== undefined
@@ -1202,7 +1210,7 @@ ${hasRetryJudges ? 'import { admitJudgeFeedback } from "@crewhaus/runtime-core";
           "  // 0.6.0 §7.12 — ONE budget meter for the whole run: every step's",
           "  // model calls (and its judge/compaction side-calls) publish on the",
           "  // shared bus, so budget.usd bounds the run, not each step.",
-          "  const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true });",
+          `  const __budgetMeter = createCostTracker(__runContext.eventBus, { suppressEvents: true${meterPricing} });`,
           ...(hasJudges
             ? [
                 "  // 0.6.0 §6.2 — budget.judge_share over that meter: once the run's",

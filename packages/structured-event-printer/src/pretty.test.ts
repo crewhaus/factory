@@ -1089,6 +1089,19 @@ describe("formatBody — every kind + optional-field branches", () => {
     );
     expect(line.split("\n")).toHaveLength(1);
   });
+
+  test("budget_unpriced says the cost is unknown, never $0", () => {
+    const ev = {
+      ...envelope,
+      kind: "budget_unpriced",
+      provider: "openai",
+      modelId: "qwen3",
+      role: "primary",
+    } satisfies TraceEvent;
+    expect(formatLine(ev)).toBe(
+      `${prefix("budget_unpriced")}provider=openai model=qwen3 role=primary cost=unknown`,
+    );
+  });
 });
 
 describe("formatJsonLine — JSON Lines", () => {

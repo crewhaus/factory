@@ -54,6 +54,18 @@ describe("the checker sees a planted defect", () => {
     };
     expect(checkMachine("m", planted)).toEqual(["m: dead end stuck"]);
   });
+  test("a lifecycle with no end passes while every state moves on, and a stuck state is reported", () => {
+    const endless: MachineDef = {
+      states: ["a", "b"],
+      entry: ["a"],
+      terminal: [],
+      transitions: { a: ["a", "b"], b: ["b", "a"] },
+      recoveryOwner: { a: "operator", b: "operator" },
+    };
+    expect(checkMachine("m", endless)).toEqual([]);
+    const stuck = { ...endless, transitions: { a: ["a", "b"], b: ["b"] } };
+    expect(checkMachine("m", stuck)).toEqual(["m: dead end b"]);
+  });
   test("an orphan", () => {
     const planted = {
       ...sound,
