@@ -1411,7 +1411,8 @@ describe("the identity file, by any path that leads to it", () => {
   });
 
   test("every inspect view reads a file's bytes from one open of it", () => {
-    const source = readFileSync(join(import.meta.dir, "inspect.ts"), "utf8");
+    // A Windows checkout ends lines with CRLF; the anchors below match LF.
+    const source = readFileSync(join(import.meta.dir, "inspect.ts"), "utf8").replace(/\r\n/g, "\n");
     const at = (needle: string): number[] => {
       const hits: number[] = [];
       for (let i = source.indexOf(needle); i > -1; i = source.indexOf(needle, i + 1)) hits.push(i);
@@ -1434,6 +1435,7 @@ describe("the identity file, by any path that leads to it", () => {
     const writerAt = source.indexOf("function writeSettingsFile(");
     const writerEnd = source.indexOf("\n}\n", writerAt);
     expect(writerAt).toBeGreaterThan(-1);
+    expect(writerEnd).toBeGreaterThan(writerAt);
     expect(opens[1] as number).toBeGreaterThan(writerAt);
     expect(opens[1] as number).toBeLessThan(writerEnd);
     const create = source.slice(opens[1] as number, writerEnd);

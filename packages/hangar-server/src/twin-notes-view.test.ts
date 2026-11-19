@@ -11,12 +11,13 @@
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { ROUTE_TABLE, twinNotesOf } from "./route-table";
 import { ROUTE_TWIN_NOTES } from "./route-twin-notes";
 import { bootTestServer } from "./testkit";
 
-const UI_JS = new URL("../../hangar-ui/assets/js/", import.meta.url).pathname;
+const UI_JS = fileURLToPath(new URL("../../hangar-ui/assets/js/", import.meta.url));
 
 /** Every console module but the two that only name routes. */
 function consoleModules(): { readonly rel: string; readonly text: string }[] {
@@ -25,13 +26,15 @@ function consoleModules(): { readonly rel: string; readonly text: string }[] {
     for (const name of readdirSync(dir)) {
       const path = join(dir, name);
       if (statSync(path).isDirectory()) walk(path);
-      else if (name.endsWith(".js")) out.push({ rel: relative(UI_JS, path), text: "" });
+      // Forward slashes on every OS: the tables below name modules that way.
+      else if (name.endsWith(".js"))
+        out.push({ rel: relative(UI_JS, path).split(sep).join("/"), text: "" });
     }
   };
   walk(UI_JS);
   return out
     .filter((m) => m.rel !== "api.js" && m.rel !== "routes.js")
-    .map((m) => ({ rel: m.rel, text: readFileSync(join(UI_JS, m.rel), "utf8") }))
+    .map((m) => ({ rel: m.rel, text: readFileSync(join(UI_JS, ...m.rel.split("/")), "utf8") }))
     .sort((a, b) => (a.rel < b.rel ? -1 : 1));
 }
 
