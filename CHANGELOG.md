@@ -823,6 +823,15 @@ these on: they reach every harness that uses what each one names.
   graph specs, which only a Cloudflare Worker build reads. Removing the setting
   changes nothing the harness does.
 
+- **The permission rule-order check does a bounded amount of work.**
+  `crewhaus lint`, `crewhaus compile` and the compiler worker's `POST /compile`
+  compare a bounded number of rule pairs, with a bounded amount of matching
+  work, when they look for a deny or ask that an allow above it always beats.
+  A spec that needs more gets one `permission-rule-note` naming the rule and
+  list where the check stopped, and the rules after it are not checked for
+  order. A Cloudflare Worker build does not check the order of
+  `permissions.rules`, which a worker reads deny-first.
+
 ## [0.8.3] - 2026-11-15
 
 A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers
