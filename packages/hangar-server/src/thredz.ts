@@ -288,9 +288,12 @@ type Resolution = {
   readonly backend: "local" | "thredz";
 };
 
+/** What resolving a harness's Thredz session reads: its files, contained, and its environment. */
+export type SessionContext = Pick<M3Context, "contain" | "env">;
+
 /** Read one harness-relative text file through the containment helper. Every
  *  read goes through it per FILE: a listed name can be a symlink out. */
-function readContained(ctx: M3Context, segments: readonly string[]): string | undefined {
+function readContained(ctx: SessionContext, segments: readonly string[]): string | undefined {
   let path: string;
   try {
     path = ctx.contain(segments);
@@ -306,7 +309,7 @@ function readContained(ctx: M3Context, segments: readonly string[]): string | un
 
 /** The harness's own `.env` chain, values included — read to answer "does
  *  this harness carry the key ITSELF", never to serialize anything. */
-function harnessEnvVars(ctx: M3Context): Record<string, string> {
+function harnessEnvVars(ctx: SessionContext): Record<string, string> {
   const vars: Record<string, string> = {};
   for (const name of [".env", ".env.local"]) {
     const text = readContained(ctx, [name]);
@@ -327,7 +330,7 @@ function harnessEnvVars(ctx: M3Context): Record<string, string> {
  * is reported so an operator can see a manager-level variable shadowing the
  * harness's own.
  */
-export function resolveHarnessSession(ctx: M3Context): Resolution {
+export function resolveHarnessSession(ctx: SessionContext): Resolution {
   const yamlText = readContained(ctx, ["crewhaus.yaml"]);
   if (yamlText === undefined) {
     return {
@@ -2324,3 +2327,64 @@ export const thredzGlobal: M3Handler = async (ctx) => {
     },
   );
 };
+
+// ---------------------------------------------------------------------------
+// The Work view's one read of a harness's tasks
+// ---------------------------------------------------------------------------
+
+/** One Thredz task, as the Work view lists it and an adoption reads it. */
+export type ThredzTaskRow = {
+  readonly id: string;
+  readonly title: string;
+  readonly status?: string;
+  readonly description?: string;
+};
+
+/** What one read of a harness's Thredz tasks answers. */
+export type ThredzTasksRead =
+  | { readonly state: "ok"; readonly tasks: readonly ThredzTaskRow[] }
+  | { readonly state: "unsupported"; readonly remedy?: string }
+  | { readonly state: "unreachable"; readonly remedy: string };
+
+/** The most tasks one read asks for. */
+export const WORK_TASKS_LIMIT = PAGE_LIMIT;
+
+/**
+ * One `GET /tasks` for the harness's Thredz workspace, under its own session: the Work
+ * view's tasks, and the list an adoption finds its task in. A harness that declares no
+ * `thredz:` block answers `unsupported`; a session that cannot be made, or a call that
+ * fails, answers why, and never old data.
+ */
+export async function readThredzTasks(ctx: SessionContext): Promise<ThredzTasksRead> {
+  const r = resolveHarnessSession(ctx);
+  if (r.backend === "local") return { state: "unsupported" };
+  if (r.session === null) {
+    return { state: "unsupported", remedy: r.note ?? "This harness's Thredz key is not set." };
+  }
+  const result = await callThredz(r.session, "GET", "/tasks", {
+    query: { limit: WORK_TASKS_LIMIT },
+  });
+  if (!result.ok) {
+    const failure = classifyThredzFailure(result);
+    return {
+      state: "unreachable",
+      remedy: `Couldn't reach Thredz (${failure.remediation ?? failure.message}). Nothing is shown rather than old data.`,
+    };
+  }
+  const tasks: ThredzTaskRow[] = [];
+  for (const raw of arrayFrom(result.data, "tasks")) {
+    const task = asRecord(raw);
+    const id = stringField(task["id"]);
+    const title = stringField(task["title"]);
+    if (id === null || title === null) continue;
+    const status = stringField(task["status"]);
+    const description = stringField(task["description"]);
+    tasks.push({
+      id,
+      title,
+      ...(status !== null ? { status } : {}),
+      ...(description !== null ? { description } : {}),
+    });
+  }
+  return { state: "ok", tasks };
+}

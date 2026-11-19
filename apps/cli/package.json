@@ -128,6 +128,7 @@
     "@crewhaus/trace-event-bus": "workspace:*",
     "@crewhaus/tool-bash": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-work": "workspace:*",
     "@crewhaus/tool-proof": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*",
     "@crewhaus/tool-capability": "workspace:*",

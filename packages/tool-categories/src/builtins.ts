@@ -114,6 +114,11 @@ export type BootRegistrar = {
 
 /** The data-only half of a registrar's validation. See {@link BootRegistrar.checks}. */
 export type RegistrarChecks = {
+  /**
+   * The only keys the block may hold, for a registrar that refuses every other one; `fix`
+   * says what the block does read.
+   */
+  readonly closed?: { readonly keys: ReadonlyArray<string>; readonly fix: string };
   /** Keys a spec may not set at all, and the sentence that says why and what to write. */
   readonly refused?: { readonly keys: ReadonlyArray<string>; readonly fix: string };
   /**
@@ -182,6 +187,15 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     label: "the codehost tools",
     keys: ["codehost"],
     checks: ORIGINS_CAMEL_FIRST,
+  },
+  registerWorkConfig: {
+    package: "@crewhaus/tool-work",
+    source: "tool_config",
+    label: "the work tools",
+    keys: ["work"],
+    checks: {
+      closed: { keys: ["accept", "ranking"], fix: "the work tools read accept and ranking" },
+    },
   },
   registerNotifyConfig: {
     package: "@crewhaus/tool-notify",
@@ -2636,6 +2650,30 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     package: "@crewhaus/tool-proof",
     export: "provabilityPreflight",
     name: "ProvabilityPreflight",
+  },
+  workList: {
+    package: "@crewhaus/tool-work",
+    export: "workList",
+    name: "WorkList",
+    initSymbol: "registerWorkConfig",
+  },
+  workGet: {
+    package: "@crewhaus/tool-work",
+    export: "workGet",
+    name: "WorkGet",
+    initSymbol: "registerWorkConfig",
+  },
+  workPropose: {
+    package: "@crewhaus/tool-work",
+    export: "workPropose",
+    name: "WorkPropose",
+    initSymbol: "registerWorkConfig",
+  },
+  workUpdate: {
+    package: "@crewhaus/tool-work",
+    export: "workUpdate",
+    name: "WorkUpdate",
+    initSymbol: "registerWorkConfig",
   },
   // ---- scripts/wire-tool-package.ts inserts new builtins above this line ----
 

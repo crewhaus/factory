@@ -89,6 +89,7 @@ export const TOOL_PACKAGE_LOADERS: Readonly<Record<string, () => Promise<ToolMod
   "@crewhaus/tool-verify": () => import("@crewhaus/tool-verify"),
   "@crewhaus/tool-web": () => import("@crewhaus/tool-web"),
   "@crewhaus/tool-proof": () => import("@crewhaus/tool-proof"),
+  "@crewhaus/tool-work": () => import("@crewhaus/tool-work"),
 };
 
 /** Import one tool package through its literal loader. */

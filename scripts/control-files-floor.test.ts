@@ -146,6 +146,7 @@ import {
 import { createTaskTool } from "../packages/tool-task/src/index";
 import { getCurrentTodos, todoWrite } from "../packages/tool-todo/src/index";
 import { createWikiTools } from "../packages/tool-wiki/src/index";
+import { workPropose } from "../packages/tool-work/src/index";
 import type { TraceEvent } from "../packages/trace-event-bus/src/index";
 import { createWikiStore } from "../packages/wiki-store/src/index";
 
@@ -2255,10 +2256,18 @@ describe("a tool whose text reads like one of these names", () => {
       createTaskTool(),
       ...createWikiTools({ specName: "floor", rootDir: join(ws, "wiki") }).all,
       ...Object.values(createAllMouseKeyboardTools({ driver })),
+      workPropose,
     ].map((tool) => (RUN_FOR_REAL.has(tool.name) ? tool : asRun(tool)));
   };
   /** These run for real, so a test sees that nothing lands in the file its text names. */
-  const RUN_FOR_REAL = new Set(["Remember", "TodoWrite", "FocusWrite", "PlanUpdate", "GoalWrite"]);
+  const RUN_FOR_REAL = new Set([
+    "Remember",
+    "TodoWrite",
+    "FocusWrite",
+    "PlanUpdate",
+    "GoalWrite",
+    "WorkPropose",
+  ]);
   const TEXT_CALLS: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
     ["Remember", { text: ".env: the project keeps the deploy region here" }],
     ["Remember", { text: "note", tags: [".env"] }],
@@ -2292,6 +2301,7 @@ describe("a tool whose text reads like one of these names", () => {
     ["wiki_set_signals", { slug: ".env" }],
     ["log_knowledge_gap", { topic: ".npmrc", detail: ".env: where it lives", tags: [".env"] }],
     ["Type", { text: ".env" }],
+    ["WorkPropose", { title: ".env: move the deploy region", kind: "fix", basis: "speculative" }],
   ];
 
   test("a tool that declares no place is allowed, under an allow rule and in auto, with such text", async () => {
@@ -2330,6 +2340,7 @@ describe("a tool whose text reads like one of these names", () => {
       "ProcessOutput",
       "ProcessStop",
       "TodoWrite",
+      "WorkPropose",
     ]);
   });
 

@@ -14,6 +14,7 @@
     { "path": "../memory-store" },
     { "path": "../service-fakes" },
     { "path": "../session-store" },
+    { "path": "../tool-work" },
     { "path": "../wiki-store" }
   ],
   "include": ["src/**/*"]

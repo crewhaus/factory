@@ -26,7 +26,7 @@ import { PEOPLE_SCHEMAS } from "./people.js";
 
 // import { QUALITY_SCHEMAS } from "./quality.js";
 
-// import { RUNTIME_SCHEMAS } from "./runtime.js";
+import { RUNTIME_SCHEMAS } from "./runtime.js";
 
 // import { VERIFICATION_SCHEMAS } from "./verification.js";
 
@@ -53,7 +53,7 @@ export const AREA_SCHEMAS: readonly Readonly<Record<string, z.ZodTypeAny>>[] = [
 
   // QUALITY_SCHEMAS,
 
-  // RUNTIME_SCHEMAS,
+  RUNTIME_SCHEMAS,
 
   // VERIFICATION_SCHEMAS,
 ];

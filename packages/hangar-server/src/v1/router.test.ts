@@ -56,7 +56,7 @@ describe("discovery", () => {
     expect(res.body["limits"]).toEqual({
       pageLimitDefault: 50,
       pageLimitMax: 500,
-      cursorMaxLength: 2048,
+      cursorMaxLength: 4096,
     });
   });
 

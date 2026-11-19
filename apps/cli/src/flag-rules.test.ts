@@ -220,6 +220,8 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
     ProcessOutput: "reads output from a process this session started",
     TodoWrite: "writes this session's own task list",
     Typecheck: "runs the project's type checker with --noEmit; changes nothing",
+    WorkPropose:
+      "records a proposal in this harness's own work list; a person or the owner's policy decides whether it is accepted",
   };
 
   test("the tools auto mode allows without a rule are exactly the reviewed ones", () => {

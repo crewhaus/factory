@@ -52,7 +52,9 @@ import {
   type ReceiptEffect,
   type RunControlShape,
   SHAPE_RUN_CONTROLS,
+  type WorkCreateSpec,
   canTransition,
+  isId,
   parseRef,
 } from "@crewhaus/control-contract";
 import {
@@ -78,6 +80,7 @@ import {
   resolveBundle,
 } from "@crewhaus/harness-supervisor";
 import { containedSessionRoot, createPendingApprovalStore } from "@crewhaus/session-store";
+import { type WorkActor, openWorkStore } from "@crewhaus/tool-work/work-items";
 import type { ReconcileContext, Reconciler, Reconciliation, Settlement } from "./executor";
 import { type Outcome, outcomeOf } from "./refusal";
 
@@ -118,6 +121,8 @@ export type RunRefusal = {
   readonly remedy?: string;
   /** When to ask again, for a refusal that passes once capacity frees. */
   readonly retryAfterMs?: number;
+  /** The object's present state, on a conflict. */
+  readonly current?: string;
 };
 
 /**
@@ -202,8 +207,12 @@ export type CreateRunRequest = {
   /** Who the run serves, as a verified source named them. Kept in the input file only. */
   readonly subject?: string;
   readonly admission: "reject" | "queue";
-  /** A work item; not served by this release. */
-  readonly work?: string;
+  /**
+   * The work item the run serves: an accepted item of this harness (`wi_…` or
+   * `<hrn>/work/<wi>`), or one to create, opened at origin `api` in the run's own effect.
+   * The run's rows name it, and the run resumes as `work:<wi>`.
+   */
+  readonly work?: string | WorkCreateSpec;
   readonly home: RunHome;
 };
 
@@ -227,9 +236,120 @@ function refused<T>(
   code: ErrorCode,
   reason: string,
   message: string,
-  more: { readonly verb?: string; readonly remedy?: string; readonly retryAfterMs?: number } = {},
+  more: {
+    readonly verb?: string;
+    readonly remedy?: string;
+    readonly retryAfterMs?: number;
+    readonly current?: string;
+  } = {},
 ): RunPlan<T> {
   return { ok: false, refusal: { code, reason, message, ...more } };
+}
+
+// ---------------------------------------------------------------------------
+// A run for a work item
+// ---------------------------------------------------------------------------
+
+/** What a run's `work` resolved to: an accepted item, or one to create in the effect. */
+type RunWork = { readonly wi: string } | { readonly spec: WorkCreateSpec } | undefined;
+
+/** Who a receipt says wrote, as the work store takes it. */
+export function workActorOf(receipt: CommandReceipt): WorkActor {
+  const via = receipt.via;
+  const role =
+    via === "sdk" ? "service" : via === "system" || via === "resident" ? "system" : "person";
+  return {
+    by: receipt.actor,
+    via: via === "github" || via === "resident" ? "system" : via,
+    role,
+    cmd: receipt.id,
+  };
+}
+
+/** The work item a ref names, when it is this harness's: `wi_…` or `<hrn>/work/<wi>`. */
+export function workIdOfRef(harness: string, raw: string): string | undefined {
+  if (isId("wi", raw)) return raw;
+  const parsed = parseRef(raw);
+  if ("error" in parsed || parsed.kind !== "work") return undefined;
+  return parsed.scope === harness || parsed.scope === "home" ? parsed.id : undefined;
+}
+
+/** Check a run's `work` before anything is written: an open item of this harness, or a spec. */
+function planRunWork(
+  req: CreateRunRequest,
+): { readonly work: RunWork } | { readonly refusal: RunRefusal } {
+  const work = req.work;
+  if (work === undefined) return { work: undefined };
+  if (typeof work !== "string") return { work: { spec: work } };
+  const wi = workIdOfRef(req.harness, work);
+  if (wi === undefined) {
+    return {
+      refusal: {
+        code: "invalid",
+        reason: "work_other_harness",
+        message: "work names a work item of this harness: wi_… or <harness>/work/wi_….",
+      },
+    };
+  }
+  const read = openWorkStore(req.harnessDir).get(wi);
+  if ("ok" in read) {
+    return {
+      refusal: {
+        code: read.code === "not_found" ? "not_found" : "unavailable",
+        reason: read.code === "not_found" ? "work_unknown" : read.reason,
+        message: read.message,
+      },
+    };
+  }
+  if (read.item.state !== "open") {
+    return {
+      refusal: {
+        code: "conflict",
+        reason: "not_accepted",
+        message:
+          read.item.state === "proposed"
+            ? "This work item has not been accepted, so no run starts on it."
+            : "This work item is closed. Reopen it to start a run on it.",
+        current: read.item.state,
+      },
+    };
+  }
+  return { work: { wi } };
+}
+
+/** The item a run serves, created now when the request carried one to create. */
+async function workItemFor(
+  req: CreateRunRequest,
+  work: RunWork,
+  receipt: CommandReceipt,
+): Promise<{ readonly wi?: string } | { readonly problem: string }> {
+  if (work === undefined) return {};
+  if ("wi" in work) return { wi: work.wi };
+  const created = await openWorkStore(req.harnessDir, {
+    ...(req.home.now !== undefined ? { now: req.home.now } : {}),
+  }).create(
+    {
+      title: work.spec.title,
+      kind: work.spec.kind,
+      ...(work.spec.goal !== undefined ? { goal: work.spec.goal } : {}),
+      ...(work.spec.acceptance !== undefined ? { acceptance: work.spec.acceptance } : {}),
+    },
+    workActorOf(receipt),
+  );
+  return created.ok ? { wi: created.item.id } : { problem: created.message };
+}
+
+/** Record that the run serves the item: a `linked` line under the run's own receipt. */
+async function linkWork(
+  req: CreateRunRequest,
+  wi: string | undefined,
+  receipt: CommandReceipt,
+): Promise<readonly string[]> {
+  if (wi === undefined) return [];
+  const linked = await openWorkStore(req.harnessDir, {
+    ...(req.home.now !== undefined ? { now: req.home.now } : {}),
+  }).link(wi, req.runId, workActorOf(receipt));
+  return linked.ok ? [] : [`the run was not linked to its work item (${linked.reason})`];
 }
 
 /** The run's newest row, folded from the whole ledger (it decides a write). */
@@ -429,13 +549,8 @@ const jobRunAdapter: RunAdapter = {
     if (req.home.startRunJob === undefined) {
       return refused("unavailable", "executor_offline", "This head cannot start jobs.");
     }
-    if (req.work !== undefined) {
-      return refused(
-        "unsupported",
-        "not_served",
-        "Starting a run for a work item is not served yet.",
-      );
-    }
+    const planned = planRunWork(req);
+    if ("refusal" in planned) return { ok: false, refusal: planned.refusal };
     if (req.subject !== undefined && STDIN_SHAPES.has(req.target)) {
       return refused(
         "unsupported",
@@ -450,6 +565,13 @@ const jobRunAdapter: RunAdapter = {
       ok: true,
       async effect(receipt) {
         const cli = req.target === "cli";
+        const item = await workItemFor(req, planned.work, receipt);
+        if ("problem" in item) {
+          return {
+            settle: { state: "failed", outcome: outcomeOf("unavailable") },
+            value: { problem: item.problem, warnings: [] },
+          };
+        }
         const written = writeInputFile(
           req.harnessDir,
           cli ? `${req.runId}.json` : `${req.runId}.txt`,
@@ -473,7 +595,9 @@ const jobRunAdapter: RunAdapter = {
           id: req.runId,
           state: "queued",
           at: new Date(now()).toISOString(),
-          trigger: API_TRIGGER,
+          trigger:
+            item.wi !== undefined ? { kind: "api" as const, workItem: item.wi } : API_TRIGGER,
+          ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
@@ -508,9 +632,10 @@ const jobRunAdapter: RunAdapter = {
             },
           };
         }
+        const warnings = await linkWork(req, item.wi, receipt);
         return {
           settle: { state: "succeeded", effects: [runEffect(req.harness, req.runId)] },
-          value: { run: row, warnings: [] },
+          value: { run: row, warnings },
         };
       },
     };
@@ -1002,16 +1127,18 @@ const managedRunAdapter: RunAdapter = {
         { verb: "crewhaus daemon start" },
       );
     }
-    if (req.work !== undefined) {
-      return refused(
-        "unsupported",
-        "not_served",
-        "Starting a run for a work item is not served yet.",
-      );
-    }
+    const planned = planRunWork(req);
+    if ("refusal" in planned) return { ok: false, refusal: planned.refusal };
     return {
       ok: true,
       async effect(receipt) {
+        const item = await workItemFor(req, planned.work, receipt);
+        if ("problem" in item) {
+          return {
+            settle: { state: "failed", outcome: outcomeOf("unavailable") },
+            value: { problem: item.problem, warnings: [] },
+          };
+        }
         const queued = queueManagedRun({
           harnessDir: req.harnessDir,
           runId: req.runId,
@@ -1021,6 +1148,7 @@ const managedRunAdapter: RunAdapter = {
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
           ...(req.subject !== undefined ? { subject: req.subject } : {}),
+          ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           ...(req.home.now !== undefined ? { now: req.home.now } : {}),
         });
         if (!queued.ok) {
@@ -1029,7 +1157,7 @@ const managedRunAdapter: RunAdapter = {
             value: { problem: queued.reason, warnings: [] },
           };
         }
-        const warnings: string[] = [];
+        const warnings: string[] = [...(await linkWork(req, item.wi, receipt))];
         // A nudge only: the follower's own poll claims it when the wake is lost.
         if (wake && client !== undefined && target !== undefined) {
           const nudged = await client.claimRuns(target);

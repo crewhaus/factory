@@ -11,6 +11,7 @@ import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-regis
 import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
 import type { Caller, HomeAccess, RequestAccess } from "../access";
 import type { TextScrubber } from "../mask";
+import type { ThredzTasksRead } from "../thredz";
 import type { StreamSourceDecl } from "./event-map";
 import type { StreamPlan, StreamTimings } from "./stream";
 
@@ -95,6 +96,11 @@ export type V1Deps = {
   readonly accessNow?: (caller: Caller) => RequestAccess;
   /** A stream's pacing, shortened by tests. */
   readonly streamTimings?: StreamTimings;
+  /**
+   * One read of a harness's Thredz tasks, for the Work view and an adoption. Absent: no
+   * Thredz workspace is read, and both answer that Home cannot reach one.
+   */
+  readonly thredzTasks?: (entry: HangarHarnessEntry) => Promise<ThredzTasksRead>;
 };
 
 export type V1Context = {

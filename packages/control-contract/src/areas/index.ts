@@ -30,7 +30,7 @@ import { PEOPLE_MODULE } from "./people.js";
 
 import { QUALITY_MODULE } from "./quality.js";
 
-// import { RUNTIME_MODULE } from "./runtime.js";
+import { RUNTIME_MODULE } from "./runtime.js";
 
 // import { VERIFICATION_MODULE } from "./verification.js";
 
@@ -57,7 +57,7 @@ export const AREA_MODULES = [
 
   QUALITY_MODULE,
 
-  // RUNTIME_MODULE,
+  RUNTIME_MODULE,
 
   // VERIFICATION_MODULE,
 ] as const satisfies readonly AreaModule[];

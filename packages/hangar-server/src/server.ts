@@ -326,6 +326,7 @@ import {
 } from "./spec-view";
 import { assetResponse } from "./static-cache";
 import type { HomePorts } from "./sweeps";
+import { readThredzTasks } from "./thredz";
 import {
   HOME_AREAS,
   type HomeAreaRuntime,
@@ -3425,6 +3426,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         : { ok: false, detail: "a live daemon holds the runfile but was not adopted" };
     },
     streamSignal,
+    // The Work view's one read of a harness's Thredz tasks, under the harness's own session.
+    thredzTasks: async (entry) =>
+      readThredzTasks({
+        env: mergedSpawnEnv(env, entry.dir).env,
+        contain: (segments) => {
+          const found = harnessPathOf(entry.dir, hangarRoot, segments);
+          if (found.ok) return found.path;
+          throw new HttpError(400, "path escapes the harness directory");
+        },
+      }),
     accessNow: (caller) => requestAccessFor(caller, accessView(signIn.snapshot())),
     ...(opts.streamTimings !== undefined ? { streamTimings: opts.streamTimings } : {}),
   });
