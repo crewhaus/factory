@@ -980,9 +980,11 @@ import {
   fewShotOverlapKey,
   formatFewShotForPrompt,
   harvestFewShot,
+  isConsistentFewShotExample,
   isFewShotExample,
   mergePools,
   poolToJsonl,
+  screenFewShotExamples,
 } from "./fewshot";
 // Item 58 — `crewhaus fleet list|status|run`: cross-harness discovery,
 // inventory/health rollup, and bulk read-only ops, in a side-effect-free
@@ -7694,7 +7696,26 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
       );
     }
     const fewShotK = intFlag(args, "few-shot-k") ?? 5;
-    const block = formatFewShotForPrompt(kept, fewShotK);
+    // Each example is text from an earlier session read back into the prompt:
+    // its input and output are screened as remembered memory, and one the
+    // classifier would redact is left out.
+    const { classifyBoundary } = await import("@crewhaus/boundary-classifier");
+    const screened = await screenFewShotExamples(
+      kept,
+      fewShotK,
+      async (t) => (await classifyBoundary(t, { origin: "memory" })).action !== "redact",
+    );
+    if (screened.withheld > 0) {
+      process.stdout.write(
+        `[optimize] few-shot: left out ${screened.withheld} pool example(s) the memory screen withheld\n`,
+      );
+    }
+    if (screened.chosen.length === 0) {
+      die(
+        "--few-shot: no pool example passed the memory screen — nothing safe to inject (re-harvest with `crewhaus fewshot harvest`)",
+      );
+    }
+    const block = formatFewShotForPrompt(screened.chosen, fewShotK);
     const yamlText = readFileSync(absSpec, "utf-8");
     const baseSpec = parseSpec(yamlText);
     const augmentedInstructions = `${block}\n\n${extractInstructions(baseSpec)}`;
@@ -7710,7 +7731,9 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
     writeFileSync(optimizeSpecPath, augmentedYaml, { mode: 0o600 });
     fewShotDisablesWriteBack = true;
     process.stdout.write(
-      `[optimize] injected ${Math.min(fewShotK, kept.length)} few-shot example(s) from ${fewShotPoolFile}\n`,
+      `[optimize] injected ${screened.chosen.length} few-shot example(s) from ${fewShotPoolFile}: ${screened.chosen
+        .map((e) => e.id)
+        .join(", ")}\n`,
     );
     if (writeBack) {
       process.stderr.write(
@@ -16581,21 +16604,39 @@ function gatherTurnsAndFeedback(sessionIds: ReadonlyArray<string>): {
   turns: SessionTurn[];
   feedback: FeedbackRecord[];
 } {
+  const { turns, logged, filed } = gatherTurnsAndFeedbackBySource(sessionIds);
+  return { turns, feedback: [...logged, ...filed] };
+}
+
+/**
+ * {@link gatherTurnsAndFeedback}, with the feedback kept by where it was read:
+ * `logged` from the session logs, `filed` from `.crewhaus/feedback/*.jsonl`.
+ */
+function gatherTurnsAndFeedbackBySource(sessionIds: ReadonlyArray<string>): {
+  turns: SessionTurn[];
+  logged: FeedbackRecord[];
+  filed: FeedbackRecord[];
+} {
   const turns: SessionTurn[] = [];
-  const feedback: FeedbackRecord[] = [];
+  const logged: FeedbackRecord[] = [];
   for (const id of sessionIds) {
     const events = readSessionEvents(id);
     for (const t of deriveTurns(events)) turns.push({ ...t, sessionId: id });
-    feedback.push(...extractFeedbackRecords(events));
+    logged.push(...extractFeedbackRecords(events));
   }
-  feedback.push(...readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR)));
-  return { turns, feedback };
+  const filed = readFeedbackDir(join(process.cwd(), FEEDBACK_SUBDIR));
+  return { turns, logged, filed };
 }
 
-/** Read a persisted few-shot pool file, skipping malformed lines. */
+/**
+ * Read a persisted few-shot pool file, skipping malformed lines and any line
+ * whose id is not the one its provenance names (`isConsistentFewShotExample`).
+ */
 function readFewShotPool(file: string): FewShotExample[] {
   if (!existsSync(file)) return [];
-  return parseJsonlObjects(readFileSync(file, "utf-8")).filter(isFewShotExample);
+  return parseJsonlObjects(readFileSync(file, "utf-8"))
+    .filter(isFewShotExample)
+    .filter(isConsistentFewShotExample);
 }
 
 /**
@@ -16777,10 +16818,12 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const action = args.positional[0];
   if (args.flags["help"] === true && action === undefined) {
     process.stdout.write(
-      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>]\n" +
+      "usage: crewhaus lessons update [--sessions N|all] [--low-score F] [-o <LESSONS.md>] [--yes]\n" +
         '       crewhaus lessons retire <lesson> [--reason "<r>"] [-o <LESSONS.md>]\n' +
         "  Mine corrections + recurring failure→fix patterns into a deduped LESSONS.md\n" +
-        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n",
+        "  (auto-loaded into the system prompt), plus per-user prefs under .crewhaus/preferences/.\n" +
+        "  It prints what it will write first; anything that did not come from your own\n" +
+        "  `crewhaus rate` or `crewhaus feedback` entries is written only with --yes.\n",
     );
     return;
   }
@@ -16793,7 +16836,12 @@ async function runLessons(args: ParsedArgs): Promise<void> {
 
   const sessionIds = resolveScanSessionIds(strFlag(args, "sessions"));
   if (sessionIds.length === 0) die("no sessions found under .crewhaus/sessions/");
-  const { turns, feedback } = gatherTurnsAndFeedback(sessionIds);
+  // The two feedback sources stay apart: only the session-log entries
+  // `crewhaus rate` and `crewhaus feedback` record (`source: "cli"`) count as
+  // the operator's own.
+  const { turns, logged, filed } = gatherTurnsAndFeedbackBySource(sessionIds);
+  const feedback = [...logged, ...filed];
+  const operatorFeedback = logged.filter((fb) => fb.source === "cli");
 
   // Failure signals reuse dataset-mine's negative-signal detection.
   const failureSignals: Array<{ input: string; reason: string; sessionId: string }> = [];
@@ -16810,6 +16858,18 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   const { SYNTHESIZE_PII_DETECTORS } = await import("@crewhaus/dataset-ops/dataset-mine");
   const redactor = createPiiRedactor({ regexDetectors: SYNTHESIZE_PII_DETECTORS });
   const redact = async (t: string): Promise<string> => (await redactor.redact(t)).text;
+  // Every candidate is screened as remembered memory while it is mined: the
+  // runtime reads LESSONS.md and the preference files back into every later
+  // run. One the classifier would redact is dropped and counted.
+  const { classifyBoundary } = await import("@crewhaus/boundary-classifier");
+  const keeps = async (t: string): Promise<boolean> =>
+    (await classifyBoundary(t, { origin: "memory" })).action !== "redact";
+  let withheld = 0;
+  const screen = async (t: string): Promise<boolean> => {
+    const kept = await keeps(t);
+    if (!kept) withheld += 1;
+    return kept;
+  };
 
   // A lesson a person retired is never added again.
   const { lessonId, readRetiredLessons, recordLessonProvenance } = await import(
@@ -16817,21 +16877,65 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   );
   const retired = readRetiredLessons(process.cwd());
   const freshLessons = (
-    await mineLessons(turns, feedback, failureSignals, { lowScore, redact })
+    await mineLessons(turns, feedback, failureSignals, { lowScore, redact, screen })
   ).filter((l) => !retired.has(lessonId(l)));
+  // What the operator's own ratings alone give: a candidate outside it came
+  // from somewhere else (a feedback file, a failure a session logged).
+  const operatorLessons = new Set(
+    (await mineLessons(turns, operatorFeedback, [], { lowScore, redact, screen: keeps })).map(
+      (l) => l.key,
+    ),
+  );
 
   // Merge into the existing LESSONS.md, preserving its human-authored preamble.
   const lessonsFile = strFlag(args, "out") ?? join(process.cwd(), "LESSONS.md");
   const existingRaw = existsSync(lessonsFile) ? readFileSync(lessonsFile, "utf-8") : "";
   const { preamble, lessons: existing } = parseLessonsMd(existingRaw);
   const merged = mergeLessons(existing, freshLessons);
-  // Which sessions each new lesson came from (ids only), beside the file.
   const known = new Set(existing.map((l) => l.key));
-  recordLessonProvenance(
-    process.cwd(),
-    freshLessons.filter((l) => !known.has(l.key)),
-    () => new Date(),
+  const newLessons = freshLessons.filter((l) => !known.has(l.key));
+
+  // Per-user preference notes, and which of them each file does not hold yet.
+  const prefs = await minePreferences(feedback, { redact, screen });
+  const operatorNotes = new Set(
+    (await minePreferences(operatorFeedback, { redact, screen: keeps })).flatMap((p) =>
+      p.notes.map((n) => `${p.rater}\u0000${n}`),
+    ),
   );
+  const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
+  const newNotes = prefs.flatMap((p) => {
+    const file = join(prefsDir, preferenceFileName(p.rater));
+    const held = new Set(existsSync(file) ? readFileSync(file, "utf-8").split("\n") : []);
+    return p.notes
+      .filter((note) => !held.has(`- ${note}`))
+      .map((note) => ({ rater: p.rater, file, note }));
+  });
+
+  // Everything new, exactly as it will be written, before anything is.
+  if (newLessons.length > 0) {
+    process.stdout.write(`[lessons] new in ${lessonsFile}:\n`);
+    for (const l of newLessons) process.stdout.write(`- ${l.text}\n`);
+  }
+  for (const file of [...new Set(newNotes.map((n) => n.file))]) {
+    process.stdout.write(`[lessons] new in ${file}:\n`);
+    for (const n of newNotes) if (n.file === file) process.stdout.write(`- ${n.note}\n`);
+  }
+  if (withheld > 0) {
+    process.stdout.write(
+      `[lessons] ${withheld} candidate(s) left out: the screen for remembered memory withheld them\n`,
+    );
+  }
+  const notOperator =
+    newLessons.filter((l) => !operatorLessons.has(l.key)).length +
+    newNotes.filter((n) => !operatorNotes.has(`${n.rater}\u0000${n.note}`)).length;
+  if (notOperator > 0 && args.flags["yes"] !== true) {
+    die(
+      `lessons update refused: ${notOperator} of the new lessons and preference notes above did not come from your own \`crewhaus rate\` or \`crewhaus feedback\` entries (they came from feedback files or from failures the sessions recorded). Nothing was written. To write them, run: crewhaus lessons update --yes`,
+    );
+  }
+
+  // Which sessions each new lesson came from (ids only), beside the file.
+  recordLessonProvenance(process.cwd(), newLessons, () => new Date());
   // TODO(#56 F7): `merged` grows unbounded across updates (dedupe never evicts)
   // — add a cap/prune (e.g. keep the newest/highest-signal N lessons) so the
   // auto-injected LESSONS.md can't bloat the system prompt over time.
@@ -16841,9 +16945,7 @@ async function runLessons(args: ParsedArgs): Promise<void> {
   );
 
   // Per-user preference files.
-  const prefs = await minePreferences(feedback, { redact });
   if (prefs.length > 0) {
-    const prefsDir = join(process.cwd(), PREFERENCES_SUBDIR);
     mkdirSync(prefsDir, { recursive: true });
     for (const p of prefs) {
       writeFileSync(join(prefsDir, preferenceFileName(p.rater)), renderPreferencesMd(p), {

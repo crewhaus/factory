@@ -6388,6 +6388,10 @@
             {
               "name": "reason",
               "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
             }
           ]
         },
@@ -6414,6 +6418,10 @@
             {
               "name": "reason",
               "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
             }
           ]
         }
@@ -6440,6 +6448,10 @@
         {
           "name": "reason",
           "takesValue": true
+        },
+        {
+          "name": "yes",
+          "takesValue": false
         }
       ]
     },

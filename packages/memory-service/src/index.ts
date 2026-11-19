@@ -129,6 +129,7 @@ import type { Tenant } from "@crewhaus/tenancy";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { createMemoryTools } from "@crewhaus/tool-memory";
 import { type ContinuityEvent, createPlanTools } from "@crewhaus/tool-plan";
+import { appendContained } from "@crewhaus/tool-safety/fs";
 import {
   type KnowledgeGap,
   type WikiEvent,
@@ -590,12 +591,19 @@ export type WireMemoryDeps = {
   readonly examRunner?: ExamRunner;
 };
 
-/** Where a recalled item lives: its store, backend, its id there and its version. */
+/**
+ * Where a recalled item lives: its store, backend, the spec and partition it
+ * belongs to (`-` for the spec's own, `s.sess_<16 hex>` for a session's,
+ * `t.<tenant>` for a tenant's), its id there and its version. Structurally
+ * runtime-core's recalled ref (the assignability pin holds the two equal).
+ */
 export type RecalledRef = {
-  readonly store: "fact" | "wiki" | "session";
+  readonly store: "fact" | "wiki" | "session" | "plan" | "goal" | "focus" | "document";
   readonly backend: "local" | "thredz";
+  readonly spec?: string;
+  readonly partition?: string;
   readonly localId: string;
-  readonly version?: number;
+  readonly version?: number | string;
 };
 
 /** One recalled item: the line `recall` returns, and the entry it came from when known. */
@@ -674,6 +682,13 @@ export type ContinuitySeam = {
    * under a tenant, whose root already holds the store.
    */
   readonly storeFiles?: readonly string[];
+  /**
+   * What the `<current_plan>` tail renders, by reference: the focus, the
+   * active plan and each open goal, read from the same store state
+   * `loadPlan` renders from. The runtime reads them after each plan load and
+   * records them by id. Ids only, never text.
+   */
+  readonly tailRefs?: () => Promise<RecalledRef[]>;
 };
 
 /**
@@ -783,6 +798,71 @@ function thredzConfigured(fragment: Pick<MemoryWiringFragment, "memory" | "thred
   return fragment.thredz !== undefined || fragment.memory?.backend === "thredz";
 }
 
+/** Where a declared backend that fell back is recorded, under the harness's working directory. */
+export const BACKEND_MARKERS_FILE = join(".crewhaus", "run", "knowledge", "backends.jsonl");
+
+/**
+ * The places a live Thredz connection serves instead of the local stores:
+ * the wiki (unless `memory.wiki.enabled: false`), the goal mirror (spec-scoped
+ * continuity with plans on and `thredz.goals` not off) and the record of
+ * questions learning could not answer (when `learning:` is declared). Facts
+ * always stay local.
+ */
+export type ThredzTier = "wiki" | "goals" | "gaps";
+
+/** The tiers `fragment` routes to Thredz when a connection is live. Pure. */
+export function thredzTiers(fragment: MemoryWiringFragment): ThredzTier[] {
+  if (!thredzConfigured(fragment)) return [];
+  const tiers: ThredzTier[] = [];
+  if (fragment.memory?.wiki?.enabled !== false) tiers.push("wiki");
+  if (
+    fragment.thredz !== undefined &&
+    (fragment.thredz.goals ?? true) &&
+    continuityEnabled(fragment) &&
+    fragment.continuity?.plan !== false &&
+    fragment.continuity?.scope !== "session"
+  ) {
+    tiers.push("goals");
+  }
+  if (fragment.learning !== undefined) tiers.push("gaps");
+  return tiers;
+}
+
+/**
+ * Record that a declared Thredz backend fell back to the local stores: one
+ * line per tier in `<cwd>/.crewhaus/run/knowledge/backends.jsonl` (0600),
+ * appended without following a link out of the working directory. Ids and
+ * closed codes only. Best effort: a failed append is logged and boot goes on.
+ */
+function recordThredzFallback(fragment: MemoryWiringFragment, deps: WireMemoryDeps): void {
+  const tiers = thredzTiers(fragment);
+  if (tiers.length === 0) return;
+  const at = (deps.now?.() ?? new Date()).toISOString();
+  const lines = tiers
+    .map((tier) =>
+      JSON.stringify({
+        v: 1,
+        at,
+        pid: process.pid,
+        spec: fragment.specName,
+        tier,
+        declared: "thredz",
+        effective: "local",
+        cause: "unavailable",
+      }),
+    )
+    .join("\n");
+  try {
+    const result = appendContained(deps.cwd, BACKEND_MARKERS_FILE, `${lines}\n`, {
+      createParents: true,
+      mode: 0o600,
+    });
+    if (!result.ok) deps.log?.(`[memory] backend fallback not recorded (${result.code})\n`);
+  } catch (err) {
+    deps.log?.(`[memory] backend fallback not recorded (${(err as Error).name})\n`);
+  }
+}
+
 /** The §4.4 degrade line, printed once per boot when Thredz is configured
  *  but no live connection arrived (offline, npx failure, no MCP host). */
 const THREDZ_DEGRADE_NOTE =
@@ -852,7 +932,14 @@ function wireFacts(fragment: MemoryWiringFragment, deps: WireMemoryDeps): WiredF
           ...recallPair(async (query, k) =>
             (await store.recall(query, k)).map((r) => ({
               text: r.entry.text,
-              ref: { store: "fact", backend: "local", localId: r.entry.id },
+              // The spec names the store, as Recall's own report does, so a
+              // run's usage of one fact joins across both routes.
+              ref: {
+                store: "fact",
+                backend: "local",
+                spec: fragment.specName,
+                localId: r.entry.id,
+              },
               score: r.score,
             })),
           ),
@@ -929,11 +1016,26 @@ async function renderPlanTail(
   store: ContinuityStore,
   includePlans: boolean,
   proofMode: ContinuityProofMode | undefined,
+  rendered?: (refs: RecalledRef[]) => void,
+  where: { readonly spec?: string; readonly partition?: string } = {},
 ): Promise<string | null> {
   const focus = await store.readFocus();
   const activePlan = includePlans ? await store.getActivePlan() : null;
   const goals = includePlans ? await store.listGoals() : [];
   const openGoals = goals.filter((g) => !countsAsProven(g, proofMode));
+
+  // What this render shows, by reference, for the runtime's usage records.
+  const ref = (kind: "plan" | "goal" | "focus", localId: string): RecalledRef => ({
+    store: kind,
+    backend: "local",
+    ...where,
+    localId,
+  });
+  rendered?.([
+    ...(focus !== null && focus.body !== "" ? [ref("focus", "focus")] : []),
+    ...(activePlan !== null ? [ref("plan", activePlan.id)] : []),
+    ...openGoals.map((g) => ref("goal", g.id)),
+  ]);
 
   const lines: string[] = [];
   if (focus !== null && focus.body !== "") {
@@ -1043,9 +1145,25 @@ export function wireContinuity(
   const plan = cont.plan !== false;
   const tools = plan ? bundle.all : [bundle.focusRead, bundle.focusWrite, bundle.memoryClear];
 
+  // The refs of the last tail rendered, so `tailRefs` names exactly what the
+  // runtime was handed.
+  let lastTailRefs: RecalledRef[] = [];
+  const noteTail = (refs: RecalledRef[]): void => {
+    lastTailRefs = refs;
+  };
+  const where = {
+    spec: fragment.specName,
+    partition:
+      scope.kind === "session"
+        ? `s.${scope.sessionId}`
+        : deps.tenant !== undefined
+          ? `t.${deps.tenant.id}`
+          : "-",
+  };
   const continuity: ContinuitySeam = {
-    loadPlan: () => renderPlanTail(store, plan, cont.proof),
-    onPlanDirty: () => renderPlanTail(store, plan, cont.proof),
+    loadPlan: () => renderPlanTail(store, plan, cont.proof, noteTail, where),
+    onPlanDirty: () => renderPlanTail(store, plan, cont.proof, noteTail, where),
+    tailRefs: async () => [...lastTailRefs],
     ledger: cont.ledger !== false,
     // The store's files under `.crewhaus/state/<spec>/`, kept from every tool
     // but the plan tools. Under a tenant the tenants root holds them already.
@@ -1232,7 +1350,13 @@ export function wireWiki(
     ...recallPair(async (query, k) =>
       (await store.recall(query, k)).map((h) => ({
         text: `[wiki:${h.ref.slug}] ${h.ref.title} — ${excerpt(h.body)}`,
-        ref: { store: "wiki", backend: "local", localId: h.ref.slug, version: h.ref.version },
+        ref: {
+          store: "wiki",
+          backend: "local",
+          spec: fragment.specName,
+          localId: h.ref.slug,
+          version: h.ref.version,
+        },
         score: h.score,
       })),
     ),
@@ -1345,6 +1469,7 @@ export async function wireMemory(
   // subscription must not kill a local-first harness.
   if (thredzConfigured(fragment) && deps.thredz == null) {
     deps.log?.(THREDZ_DEGRADE_NOTE);
+    recordThredzFallback(fragment, deps);
   }
 
   const factsOn = memoryEnabled(fragment);

@@ -257,6 +257,7 @@ export function usageText(): string {
     "       [--min-score F] [--min-occurrences N] [-o <skill-dir>]",
     "  lessons update [--sessions N|all]    mine corrections + failures into an auto-loaded LESSONS.md (#56)",
     "       [--low-score F] [-o <LESSONS.md>]  + per-user prefs under .crewhaus/preferences/",
+    "       [--yes]                        write what came from anything but your own ratings",
     "  lessons retire <lesson>              remove a lesson that is wrong; it is never added back",
     "  sessions summarize [--before <date>] summarize sessions into a durable index before TTL eviction (#57)",
     "  sessions tail [<session>]            follow a session's transcript live (per-turn view; --no-follow to dump)",

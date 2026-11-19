@@ -19,6 +19,10 @@
  * Pure + deterministic (stable order, normalized-text dedupe → idempotent
  * re-runs); FS + redaction wiring lives in `apps/cli/src/index.ts`. Lesson +
  * preference text is model/user output → PII/secret-redacted by the caller.
+ * Every candidate is also passed to the caller's `screen` before it is kept:
+ * the CLI classifies it as remembered memory, and drops one the classifier
+ * would redact, because LESSONS.md and the preference files are read back
+ * into every later run's system prompt.
  */
 
 import { mergeFeedback, normalizeRating } from "./feedback";
@@ -51,6 +55,11 @@ export type LessonsOptions = {
   readonly lowScore?: number;
   /** Async redactor for lesson text. Identity by default. */
   readonly redact?: (text: string) => Promise<string>;
+  /**
+   * Whether a candidate, as it would be written, may be kept: `false` drops
+   * it. Keeps everything by default.
+   */
+  readonly screen?: (text: string) => Promise<boolean>;
 };
 
 function normalizeKey(s: string): string {
@@ -77,6 +86,7 @@ export async function mineLessons(
 ): Promise<Lesson[]> {
   const lowScore = opts.lowScore ?? 0.5;
   const redact = opts.redact ?? (async (t: string) => t);
+  const screen = opts.screen ?? (async () => true);
   const turnByKey = new Map<string, SessionTurn>();
   for (const t of turns) turnByKey.set(`${t.sessionId}#${t.turnNumber}`, t);
 
@@ -85,13 +95,14 @@ export async function mineLessons(
     string,
     { sessions: Set<string>; turns: Map<string, { sessionId: string; turnNumber: number }> }
   >();
-  const add = (
+  const add = async (
     text: string,
     kind: Lesson["kind"],
     from: { sessionId?: string; turnNumber?: number },
-  ): void => {
+  ): Promise<void> => {
     const clean = clip(text, 300);
     if (clean === "") return;
+    if (!(await screen(clean))) return;
     const key = normalizeKey(clean);
     if (!byKey.has(key)) byKey.set(key, { key, text: clean, kind });
     let sources = sourcesByKey.get(key);
@@ -119,7 +130,7 @@ export async function mineLessons(
     const score = normalizeRating(fb);
     if (fb.correction !== undefined && fb.correction.trim() !== "") {
       const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
-      add(`${q}prefer this answer — ${await redact(fb.correction)}`, "correction", fb);
+      await add(`${q}prefer this answer — ${await redact(fb.correction)}`, "correction", fb);
     } else if (
       fb.comment !== undefined &&
       fb.comment.trim() !== "" &&
@@ -127,7 +138,7 @@ export async function mineLessons(
       score <= lowScore
     ) {
       const q = question ? `For "${await redact(clip(question, 80))}": ` : "";
-      add(`${q}avoid — ${await redact(fb.comment)}`, "correction", fb);
+      await add(`${q}avoid — ${await redact(fb.comment)}`, "correction", fb);
     }
   }
 
@@ -138,7 +149,7 @@ export async function mineLessons(
   for (const sig of failureSignals) {
     const redactedInput = sig.input.trim() !== "" ? await redact(clip(sig.input, 80)) : "";
     const q = redactedInput !== "" ? ` on "${redactedInput}"` : "";
-    add(
+    await add(
       `Watch out${q}: ${await redact(sig.reason)}.`,
       "failure-fix",
       sig.sessionId !== undefined ? { sessionId: sig.sessionId } : {},
@@ -256,9 +267,14 @@ export type UserPreferences = {
  */
 export async function minePreferences(
   feedback: ReadonlyArray<FeedbackRecord>,
-  opts: { redact?: (text: string) => Promise<string> } = {},
+  opts: {
+    redact?: (text: string) => Promise<string>;
+    /** Whether a note, as it would be written, may be kept: `false` drops it. */
+    screen?: (text: string) => Promise<boolean>;
+  } = {},
 ): Promise<UserPreferences[]> {
   const redact = opts.redact ?? (async (t: string) => t);
+  const screen = opts.screen ?? (async () => true);
   const byRater = new Map<string, { keys: Set<string>; notes: string[] }>();
   for (const fb of mergeFeedback(feedback)) {
     if (fb.rater === undefined || fb.rater.trim() === "") continue;
@@ -273,7 +289,7 @@ export async function minePreferences(
     for (const c of candidates) {
       const clean = clip(c, 240);
       const key = normalizeKey(clean);
-      if (clean !== "" && !bucket.keys.has(key)) {
+      if (clean !== "" && !bucket.keys.has(key) && (await screen(clean))) {
         bucket.keys.add(key);
         bucket.notes.push(clean);
       }

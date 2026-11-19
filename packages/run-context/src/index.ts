@@ -581,6 +581,17 @@ function lineagePieces(content: string): string[] {
   return out;
 }
 
+/** How {@link tagContent} makes room. */
+export type TagContentOptions = {
+  /**
+   * `true` keeps every entry the lineage holds, where it is and with its
+   * origin, and leaves out the new pieces past `DATA_LINEAGE_CAP`. For text
+   * that restates what the run already holds (a kept compaction summary).
+   * Default `false`: the oldest entries make room.
+   */
+  readonly keepHeld?: boolean;
+};
+
 /**
  * Tag `content` as having entered the run from `origin`. Called by every
  * Pillar-3 boundary site immediately after `classifyBoundary` returns a
@@ -595,8 +606,18 @@ function lineagePieces(content: string): string[] {
  * `MIN_TOKEN_TAG_LENGTH` for vetted tokens) are skipped — any tag we'd create
  * could never produce a match. The floors are duplicated here deliberately:
  * callers reading `dataLineage` directly shouldn't have to filter again.
+ *
+ * With `{ keepHeld: true }` nothing the lineage holds moves or goes: a piece it
+ * already holds keeps its origin and place, and a new piece joins, in
+ * `lineagePieces` order, only while the lineage is under `DATA_LINEAGE_CAP`;
+ * the rest are left out.
  */
-export function tagContent(ctx: RunContext, content: string, origin: TrustOrigin): void {
+export function tagContent(
+  ctx: RunContext,
+  content: string,
+  origin: TrustOrigin,
+  opts: TagContentOptions = {},
+): void {
   if (typeof content !== "string") return;
   const pieces = lineagePieces(content);
   if (pieces.length === 0) return;
@@ -605,6 +626,14 @@ export function tagContent(ctx: RunContext, content: string, origin: TrustOrigin
     (ctx as any).dataLineage = new Map<string, TrustOrigin>();
   }
   const map = ctx.dataLineage as Map<string, TrustOrigin>;
+  if (opts.keepHeld === true) {
+    for (const piece of pieces) {
+      if (map.has(piece)) continue;
+      if (map.size >= DATA_LINEAGE_CAP) break;
+      map.set(piece, origin);
+    }
+    return;
+  }
   for (const piece of pieces) {
     // Refresh recency by deleting then re-inserting.
     if (map.has(piece)) map.delete(piece);

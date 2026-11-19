@@ -34,14 +34,21 @@
  * configured embedder, never one the model picks. `Remember` and
  * `MemoryForget` never call the embedder.
  *
- * Deliberately NOT surfaced to the model: provenance. Model-supplied
- * evidence toolUseIds would be unverified claims — provenance stamping
- * belongs to the auto-capture path (`captureFacts`), which reads the
- * ids from the session event log itself.
+ * Provenance is never taken from the model. `Remember` stamps
+ * `provenance.sessionId` from the run itself (the run context the runtime
+ * hands every call), and only a well-formed `sess_<16 hex>` id. Evidence
+ * toolUseIds come only from the auto-capture path (`captureFacts`), which
+ * reads them from the session event log; a model-supplied id would be an
+ * unverified claim.
+ *
+ * `Recall` names each result's id, and reports the facts it returned to the
+ * runtime by reference (`recordReads`), so a run records which memories it
+ * used without recording their text.
  */
+import { SESSION_ID_RE } from "@crewhaus/control-contract";
 import { type MemoryStore, createMemoryStore } from "@crewhaus/memory-store";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 export type CreateMemoryToolsOptions = {
@@ -61,6 +68,19 @@ export type MemoryToolBundle = {
 };
 
 const MS_PER_DAY = 86_400_000;
+
+/**
+ * The session of the run that made this call, from the run context the
+ * runtime supplies (`ctx.runContext`, else the bridge's), never from model
+ * input. `undefined` when there is none or it is not a `sess_<16 hex>` id.
+ */
+function runSessionId(ctx: ToolExecuteContext | undefined): string | undefined {
+  const rc =
+    ctx?.runContext ??
+    (ctx?.bridge as { runContext?: ToolExecuteContext["runContext"] } | undefined)?.runContext;
+  const id = rc?.sessionId;
+  return typeof id === "string" && SESSION_ID_RE.test(id) ? id : undefined;
+}
 
 const rememberSchema = z.object({
   text: z.string().min(1).describe("The fact to remember. One short, self-contained sentence."),
@@ -128,12 +148,12 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
       "Store a fact for future sessions. Use sparingly — once a user mentions something they want you to remember (preferences, important dates, contact details, opinions), call this. The memory persists in `.crewhaus/memories/<spec>.jsonl` and is searchable via Recall. An optional ttlDays makes the memory expire.",
     inputSchema: rememberSchema,
     destructive: true, // writes to disk — gate behind permissions
-    execute: async (input) => {
-      const entry = await store.remember(
-        input.text,
-        input.tags ?? [],
-        input.ttlDays !== undefined ? { ttlMs: input.ttlDays * MS_PER_DAY } : {},
-      );
+    execute: async (input, ctx) => {
+      const sessionId = runSessionId(ctx);
+      const entry = await store.remember(input.text, input.tags ?? [], {
+        ...(input.ttlDays !== undefined ? { ttlMs: input.ttlDays * MS_PER_DAY } : {}),
+        ...(sessionId !== undefined ? { provenance: { sessionId } } : {}),
+      });
       const tagSuffix = entry.tags.length > 0 ? ` [${entry.tags.join(", ")}]` : "";
       const ttlSuffix =
         entry.expiresAt !== undefined
@@ -154,7 +174,7 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
     inputSchema: recallSchema,
     readOnly: true,
     ...(networked ? { scope: "external" as const, ioCapability: "network" as const } : {}),
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const k = input.k ?? 5;
       const results = await store.recall(input.query, k);
       if (results.length === 0) {
@@ -163,8 +183,17 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
       const lines = [`${results.length} memory match(es) for "${input.query}":`];
       for (const r of results) {
         const tagSuffix = r.entry.tags.length > 0 ? ` [${r.entry.tags.join(", ")}]` : "";
-        lines.push(`  • (${r.score.toFixed(2)}) ${r.entry.text}${tagSuffix}`);
+        lines.push(`  • (${r.entry.id} · ${r.score.toFixed(2)}) ${r.entry.text}${tagSuffix}`);
       }
+      // Which facts reached the model, by id; the runtime records them.
+      ctx?.recordReads?.(
+        results.map((r) => ({
+          store: "fact" as const,
+          backend: "local" as const,
+          spec: opts.specName,
+          localId: r.entry.id,
+        })),
+      );
       return lines.join("\n");
     },
   });

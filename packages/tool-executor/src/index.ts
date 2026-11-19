@@ -1,5 +1,10 @@
 import { CrewhausError, isRunFailedError } from "@crewhaus/errors";
-import type { RegisteredTool, ToolExecuteModel, ToolExecuteResult } from "@crewhaus/tool-catalog";
+import type {
+  RegisteredTool,
+  ToolExecuteModel,
+  ToolExecuteResult,
+  ToolReadRef,
+} from "@crewhaus/tool-catalog";
 import { compilePattern, matchesPattern } from "@crewhaus/tool-permission-matcher";
 import { validateToolInput } from "@crewhaus/tool-validate";
 import { type PathCanonicalizer, operativeValuesFor } from "./permission-subject";
@@ -66,6 +71,13 @@ export type ExecutionContext = {
    */
   readonly model?: ToolExecuteModel;
   readonly toolConfig?: unknown;
+  /**
+   * Forwarded verbatim into the tool's `ToolExecuteContext.recordReads`:
+   * the runtime's per-call collector of the knowledge items the tool
+   * returned. Presence-gated: a call without it hands the tool the same
+   * context it gets without the field.
+   */
+  readonly recordReads?: (refs: ReadonlyArray<ToolReadRef>) => void;
 };
 
 export class ToolPermissionError extends CrewhausError {
@@ -120,6 +132,7 @@ export async function executeTool(
       signal: context.signal,
       ...(context.bridge !== undefined ? { bridge: context.bridge } : {}),
       ...(context.onStreamChunk !== undefined ? { onStreamChunk: context.onStreamChunk } : {}),
+      ...(context.recordReads !== undefined ? { recordReads: context.recordReads } : {}),
       ...(context.model !== undefined ? { model: context.model } : {}),
       ...(context.toolConfig !== undefined ? { toolConfig: context.toolConfig } : {}),
     });
