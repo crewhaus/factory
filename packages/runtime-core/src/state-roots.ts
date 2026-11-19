@@ -24,7 +24,8 @@
  *   environments, the graders, the judge calibration, the evals, datasets,
  *   retention pins, audit trail, graph checkpoints, advice, the knowledge-sync
  *   marker, the staged proposals, the routing freeze marker, the scope-audit
- *   baseline and the security corpus.
+ *   baseline, the security corpus, the specs watchme synthesizes, the
+ *   recorded ratings and the few-shot pools.
  * - The operator's configuration in the working directory: the environment
  *   files Bun loads there, any file `manager.envFiles` declares, and the
  *   `bunfig.toml` and `.npmrc` there.
@@ -105,6 +106,13 @@ const GATE_RECORDS: readonly string[] = [
   // The SLO intake gate the monitor flips: exactly that file. The operator record is a
   // separate file under `.crewhaus/run`.
   join(".crewhaus", "slo", "intake.json"),
+  // The specs `crewhaus watchme synthesize` writes for a person to review and adopt.
+  join(".crewhaus", "watchme", "synthesized"),
+  // The ratings and feedback the web UI host, the gateway and the CLI record, which
+  // distill, the janitor's auto-distill and `lessons update` read.
+  join(".crewhaus", "feedback"),
+  // The few-shot pools `crewhaus fewshot harvest` writes and `optimize --few-shot` reads.
+  join(".crewhaus", "fewshot"),
 ];
 
 /** Where the durable-execution idempotency store keeps its records by default. */

@@ -19,6 +19,7 @@
  * survives into the pool or the optimizer meta-prompt.
  */
 
+import { SESSION_ID_RE } from "@crewhaus/control-contract";
 import { mergeFeedback, normalizeRating } from "./feedback";
 import type { FeedbackRecord, SessionTurn } from "./feedback";
 
@@ -157,6 +158,44 @@ export function isFewShotExample(value: unknown): value is FewShotExample {
   if (typeof p !== "object" || p === null) return false;
   const pr = p as Record<string, unknown>;
   return typeof pr["sessionId"] === "string" && typeof pr["turnNumber"] === "number";
+}
+
+/**
+ * Whether a pool line's id is the one its provenance names:
+ * `${provenance.sessionId}_t${provenance.turnNumber}`, with a `sess_<16 hex>`
+ * session and a whole turn number of at least 1. A pool line is read only when
+ * its id is the one its provenance names.
+ */
+export function isConsistentFewShotExample(e: FewShotExample): boolean {
+  const { sessionId, turnNumber } = e.provenance;
+  return (
+    SESSION_ID_RE.test(sessionId) &&
+    Number.isSafeInteger(turnNumber) &&
+    turnNumber >= 1 &&
+    e.id === `${sessionId}_t${turnNumber}`
+  );
+}
+
+/**
+ * The examples an injection carries: the first `k` of `examples`, in order,
+ * whose input and output both pass `screen` (the CLI classifies each as
+ * remembered memory, since a pool line is text from an earlier session read
+ * back into a prompt). `withheld` counts the examples the screen rejected on
+ * the way.
+ */
+export async function screenFewShotExamples(
+  examples: ReadonlyArray<FewShotExample>,
+  k: number,
+  screen: (text: string) => Promise<boolean>,
+): Promise<{ chosen: FewShotExample[]; withheld: number }> {
+  const chosen: FewShotExample[] = [];
+  let withheld = 0;
+  for (const e of examples) {
+    if (chosen.length >= Math.max(0, k)) break;
+    if ((await screen(e.input)) && (await screen(e.output))) chosen.push(e);
+    else withheld += 1;
+  }
+  return { chosen, withheld };
 }
 
 /**

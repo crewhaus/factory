@@ -1194,3 +1194,92 @@ describe("createWikiReadLedger bounds", () => {
     expect(ledger.lastRead("s", "a")).toBe(2);
   });
 });
+
+describe("read tools report the articles they returned", () => {
+  const collect = (): {
+    reported: unknown[];
+    recordReads: (refs: ReadonlyArray<unknown>) => void;
+  } => {
+    const reported: unknown[] = [];
+    return { reported, recordReads: (refs) => reported.push(...refs) };
+  };
+
+  test("wiki_get reports the slug and the version it read", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({ slug: "grind", title: "Grind", body: "a fine espresso grind" });
+    await bundle.store.write({
+      slug: "grind",
+      title: "Grind",
+      body: "a finer espresso grind",
+      expectedVersion: 1,
+    });
+    const { reported, recordReads } = collect();
+    await bundle.get.execute({ slug: "grind" }, { recordReads });
+    expect(reported).toEqual([
+      { store: "wiki", backend: "local", spec: "spec", localId: "grind", version: 2 },
+    ]);
+  });
+
+  test("wiki_recall reports every hit, and a hit it redacted as withheld", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({ slug: "benign", title: "Coffee", body: "coffee extraction facts" });
+    await bundle.store.write({
+      slug: "evil",
+      title: "Coffee too",
+      body: `coffee ${MALICIOUS_BODY}`,
+    });
+    const { reported, recordReads } = collect();
+    await bundle.recall.execute({ query: "coffee" }, { recordReads });
+    expect(reported).toHaveLength(2);
+    expect(reported).toContainEqual({
+      store: "wiki",
+      backend: "local",
+      spec: "spec",
+      localId: "benign",
+      version: 1,
+    });
+    expect(reported).toContainEqual({
+      store: "wiki",
+      backend: "local",
+      spec: "spec",
+      localId: "evil",
+      version: 1,
+      withheld: true,
+    });
+  });
+
+  test("a redacted wiki_get is reported as withheld", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({ slug: "evil", title: "Evil", body: MALICIOUS_BODY });
+    const { reported, recordReads } = collect();
+    await bundle.get.execute({ slug: "evil" }, { recordReads });
+    expect(reported).toEqual([
+      {
+        store: "wiki",
+        backend: "local",
+        spec: "spec",
+        localId: "evil",
+        version: 1,
+        withheld: true,
+      },
+    ]);
+  });
+
+  test("tools that print only ref lines report nothing", async () => {
+    const bundle = makeBundle();
+    await bundle.store.write({ slug: "grind", title: "Grind", body: "a fine espresso grind" });
+    const { reported, recordReads } = collect();
+    await bundle.list.execute({}, { recordReads });
+    await bundle.search.execute({ query: "espresso" }, { recordReads });
+    await bundle.semanticSearch.execute({ query: "espresso" }, { recordReads });
+    await bundle.related.execute({ slug: "grind" }, { recordReads });
+    expect(reported).toEqual([]);
+  });
+
+  test("a missing article reports nothing", async () => {
+    const bundle = makeBundle();
+    const { reported, recordReads } = collect();
+    await bundle.get.execute({ slug: "absent" }, { recordReads });
+    expect(reported).toEqual([]);
+  });
+});

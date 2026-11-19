@@ -993,6 +993,8 @@ const WATCHME_MIRRORED_KIND_RECORD: Readonly<Record<EventKind, true>> = {
   // How the run's spans nested and what each check decided (`./run-spans`).
   span_closed: true,
   verdict: true,
+  // Which knowledge items a tool call returned, by reference (`./knowledge-usage`).
+  knowledge_read: true,
 };
 export const WATCHME_MIRRORED_KINDS: ReadonlySet<string> = new Set(
   Object.keys(WATCHME_MIRRORED_KIND_RECORD),

@@ -25,13 +25,14 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { isAbsolute, resolve as resolvePath } from "node:path";
+import { isAbsolute, join, resolve as resolvePath } from "node:path";
 import { type ChunkStrategy, type Document, chunk } from "@crewhaus/chunker";
 import { type Embedder, createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool } from "@crewhaus/tool-catalog";
+import type { RegisteredTool, ToolReadRef } from "@crewhaus/tool-catalog";
 import { redactUrlCredentials, redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
+import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { type VectorBackendId, type VectorStore, createVectorStore } from "@crewhaus/vector-store";
 import { z } from "zod";
 
@@ -149,6 +150,28 @@ function formatHits(
 }
 
 /**
+ * The documents a Retrieve call returned, by reference: one ref per source
+ * document, named by {@link knowledgeSourceFingerprint} of the `docId` its
+ * chunks carry (the same `source` the corpus manifest lists). A hit without a
+ * `docId` names no document and reports nothing.
+ */
+function documentReads(
+  hits: ReadonlyArray<{ metadata?: Readonly<Record<string, unknown>> }>,
+): ToolReadRef[] {
+  const seen = new Set<string>();
+  const refs: ToolReadRef[] = [];
+  for (const h of hits) {
+    const docId = h.metadata?.["docId"];
+    if (typeof docId !== "string" || docId === "") continue;
+    const source = knowledgeSourceFingerprint(docId);
+    if (seen.has(source)) continue;
+    seen.add(source);
+    refs.push({ store: "document", backend: "local", localId: source });
+  }
+  return refs;
+}
+
+/**
  * Whether a Retrieve bound to this embedder and vector store stays inside the
  * process: only `@crewhaus/embedder`'s `mock` provider over an `in-memory` or
  * on-disk `lance` store does. Every other embedder POSTs the query to its
@@ -197,7 +220,7 @@ function makeRetrieveTool(
     ...(opts.local === true
       ? { scope: "internal" as const }
       : { scope: "external" as const, ioCapability: "network" as const }),
-    execute: async (input) => {
+    execute: async (input, ctx) => {
       const cfg = getConfig();
       if (cfg === undefined) {
         throw new RetrieveConfigError(
@@ -211,6 +234,7 @@ function makeRetrieveTool(
         throw new RetrieveConfigError("embedder returned 0 vectors for the query");
       }
       const hits = await cfg.vectorStore.query(vec, k, inp.filter);
+      ctx?.recordReads?.(documentReads(hits));
       return formatHits(hits);
     },
   });
@@ -388,12 +412,7 @@ export type KnowledgeRetrieveConfig = {
  * source's position in `knowledge.sources`.
  */
 export function knowledgeSourceLabel(raw: string): string {
-  const fingerprint = (): string =>
-    createHash("sha256")
-      .update("crewhaus/knowledge-source\u0000")
-      .update(raw)
-      .digest("hex")
-      .slice(0, 12);
+  const fingerprint = (): string => knowledgeSourceFingerprint(raw);
   const withoutFragment = (text: string): string => {
     const hashAt = text.indexOf("#");
     return hashAt === -1 ? text : text.slice(0, hashAt);
@@ -427,6 +446,21 @@ export function knowledgeSourceLabel(raw: string): string {
   return `${withoutFragment(shown)}#src-${fingerprint()}`;
 }
 
+/**
+ * The 12-hex fingerprint a knowledge document is known by in run records: of
+ * the `docId` its chunks carry (a declared path, a glob match, or a url
+ * source's {@link knowledgeSourceLabel}). The hash the label appends to a
+ * cleaned url (`#src-<12 hex>` of the raw url), so a Retrieve usage line and
+ * a corpus manifest entry name a document the same way without its text.
+ */
+export function knowledgeSourceFingerprint(id: string): string {
+  return createHash("sha256")
+    .update("crewhaus/knowledge-source\u0000")
+    .update(id)
+    .digest("hex")
+    .slice(0, 12);
+}
+
 /** The error code or name of a failed fetch, never its message or `path`:
  *  Bun's fetch errors carry the full URL in both. Exported for the CLI's
  *  `crewhaus run` knowledge loader, which names its failures the same way. */
@@ -452,47 +486,120 @@ export async function loadKnowledgeSources(
   sources: readonly KnowledgeSource[],
   opts: { readonly cwd?: string; readonly fetch?: KnowledgeFetch } = {},
 ): Promise<Document[]> {
+  const loaded = await loadKnowledgeSourcesRecorded(sources, opts);
+  if (loaded.error !== undefined) throw loaded.error;
+  return loaded.docs;
+}
+
+/** One declared source as loading left it: what the corpus manifest lists. */
+type SourceLoad = {
+  readonly label: string;
+  readonly kind: KnowledgeSource["kind"];
+  readonly status: CorpusSourceStatus;
+  readonly reason?: CorpusSourceReason;
+  readonly docs: readonly Document[];
+};
+
+/**
+ * {@link loadKnowledgeSources}, recording what became of each source: the
+ * documents it gave, or the closed reason it failed. Loading stops at the
+ * first failing source, as the throwing form does; the sources after it are
+ * recorded `not-reached`. Never throws: the failure comes back as `error`.
+ */
+async function loadKnowledgeSourcesRecorded(
+  sources: readonly KnowledgeSource[],
+  opts: { readonly cwd?: string; readonly fetch?: KnowledgeFetch },
+): Promise<{
+  readonly docs: Document[];
+  readonly recorded: SourceLoad[];
+  readonly error?: RetrieveConfigError;
+}> {
   const cwd = opts.cwd ?? process.cwd();
   const fetchImpl = opts.fetch ?? (globalThis.fetch as unknown as KnowledgeFetch | undefined);
   const docs: Document[] = [];
+  const recorded: SourceLoad[] = [];
+  const fail = (
+    at: number,
+    reason: CorpusSourceReason,
+    error: RetrieveConfigError,
+  ): { docs: Document[]; recorded: SourceLoad[]; error: RetrieveConfigError } => {
+    for (const [i, src] of sources.entries()) {
+      if (i < at) continue;
+      recorded.push({
+        label: corpusSourceLabel(src),
+        kind: src.kind,
+        status: "failed",
+        reason: i === at ? reason : "not-reached",
+        docs: [],
+      });
+    }
+    return { docs, recorded, error };
+  };
   for (const [position, src] of sources.entries()) {
+    const label = corpusSourceLabel(src);
+    const done = (found: Document[]): void => {
+      docs.push(...found);
+      recorded.push({
+        label,
+        kind: src.kind,
+        status: found.length > 0 ? "included" : "empty",
+        docs: found,
+      });
+    };
     if (src.kind === "path") {
       const abs = isAbsolute(src.path) ? src.path : resolvePath(cwd, src.path);
       if (!existsSync(abs)) {
-        throw new RetrieveConfigError(`knowledge source path not found: ${src.path}`);
+        return fail(
+          position,
+          "not-found",
+          new RetrieveConfigError(`knowledge source path not found: ${src.path}`),
+        );
       }
       let text: string;
       try {
         text = await readFile(abs, "utf-8");
       } catch (cause) {
-        throw new RetrieveConfigError(`knowledge source path unreadable: ${src.path}`, cause);
+        return fail(
+          position,
+          "unreadable",
+          new RetrieveConfigError(`knowledge source path unreadable: ${src.path}`, cause),
+        );
       }
-      docs.push({ id: src.path, text, metadata: { docId: src.path, source: src.path } });
+      done([{ id: src.path, text, metadata: { docId: src.path, source: src.path } }]);
     } else if (src.kind === "glob") {
       // Bun.Glob — the same matcher tool-fs's Glob tool uses.
       const matcher = new Bun.Glob(src.glob);
       const rels: string[] = [];
       for await (const rel of matcher.scan({ cwd, onlyFiles: true })) rels.push(rel);
       rels.sort(); // deterministic chunk ids across boots
+      const found: Document[] = [];
       for (const rel of rels) {
         const abs = resolvePath(cwd, rel);
         let text: string;
         try {
           text = await readFile(abs, "utf-8");
         } catch (cause) {
-          throw new RetrieveConfigError(`knowledge glob match unreadable: ${rel}`, cause);
+          return fail(
+            position,
+            "unreadable",
+            new RetrieveConfigError(`knowledge glob match unreadable: ${rel}`, cause),
+          );
         }
-        docs.push({ id: rel, text, metadata: { docId: rel, source: rel } });
+        found.push({ id: rel, text, metadata: { docId: rel, source: rel } });
       }
+      done(found);
     } else {
       // Fetched as written; named everywhere else by its cleaned label. A
       // label can hide the host (see knowledgeSourceLabel), so a boot error
       // also names the source's position, which always identifies it.
-      const label = knowledgeSourceLabel(src.url);
       const where = `knowledge.sources[${position}]`;
       if (fetchImpl === undefined) {
-        throw new RetrieveConfigError(
-          `knowledge url source needs a fetch implementation: ${where} ${label}`,
+        return fail(
+          position,
+          "fetch-failed",
+          new RetrieveConfigError(
+            `knowledge url source needs a fetch implementation: ${where} ${label}`,
+          ),
         );
       }
       let res: KnowledgeFetchResponse;
@@ -502,21 +609,125 @@ export async function loadKnowledgeSources(
         // The runtime's error quotes the URL (message and `path`), so only
         // its code travels on.
         const reason = fetchFailureName(cause);
-        throw new RetrieveConfigError(
-          `knowledge url fetch failed (${reason}): ${where} ${label}`,
-          new Error(reason),
+        return fail(
+          position,
+          "fetch-failed",
+          new RetrieveConfigError(
+            `knowledge url fetch failed (${reason}): ${where} ${label}`,
+            new Error(reason),
+          ),
         );
       }
       if (!res.ok) {
-        throw new RetrieveConfigError(
-          `knowledge url fetch failed (${res.status}): ${where} ${label}`,
+        return fail(
+          position,
+          httpReason(res.status),
+          new RetrieveConfigError(`knowledge url fetch failed (${res.status}): ${where} ${label}`),
         );
       }
       const text = await res.text();
-      docs.push({ id: label, text, metadata: { docId: label, source: label } });
+      done([{ id: label, text, metadata: { docId: label, source: label } }]);
     }
   }
-  return docs;
+  return { docs, recorded };
+}
+
+// ---------------------------------------------------------------------------
+// The corpus manifest — what a `knowledge:` ingest indexed, without its text
+// ---------------------------------------------------------------------------
+
+/** Where the corpus manifest lives, under the harness's working directory. */
+export const CORPUS_MANIFEST_FILE = join(".crewhaus", "run", "knowledge", "corpus.json");
+
+/** What became of one declared source at ingest. */
+export type CorpusSourceStatus = "included" | "empty" | "failed";
+
+/** Why a source failed, as a closed code: never an error message or a url. */
+export type CorpusSourceReason =
+  | "not-found"
+  | "unreadable"
+  | "fetch-failed"
+  | `http-${number}`
+  | "not-reached";
+
+/** One indexed document: its fingerprint, how many chunks it gave, and a hash of its text. */
+export type CorpusDoc = {
+  /** {@link knowledgeSourceFingerprint} of the document's id. */
+  readonly source: string;
+  readonly parts: number;
+  /** The first 16 hex of sha256 of the document's text. */
+  readonly contentHash16: string;
+};
+
+export type CorpusSource = {
+  /** The declared path or glob, or a url's {@link knowledgeSourceLabel}. */
+  readonly label: string;
+  readonly kind: "path" | "glob" | "url";
+  readonly status: CorpusSourceStatus;
+  readonly reason?: CorpusSourceReason;
+  readonly docs: readonly CorpusDoc[];
+};
+
+/**
+ * `.crewhaus/run/knowledge/corpus.json`: what one boot's ingest indexed, by
+ * label, fingerprint, part count and content hash. No document text, and no
+ * url beyond its credential-safe label.
+ */
+export type CorpusManifest = {
+  readonly v: 1;
+  readonly at: string;
+  readonly embedderModel: string;
+  readonly vectorBackend: string;
+  readonly sources: readonly CorpusSource[];
+};
+
+/** `http-<status>` for a response that was not ok; a status outside 100-599 is a failed fetch. */
+function httpReason(status: number): CorpusSourceReason {
+  return Number.isInteger(status) && status >= 100 && status <= 599
+    ? `http-${status}`
+    : "fetch-failed";
+}
+
+/** How a declared source is named in the corpus manifest. */
+export function corpusSourceLabel(src: KnowledgeSource): string {
+  if (src.kind === "url") return knowledgeSourceLabel(src.url);
+  return src.kind === "path" ? src.path : src.glob;
+}
+
+/** One document's manifest entry: its fingerprint, part count and content hash. */
+export function corpusDoc(id: string, text: string, parts: number): CorpusDoc {
+  return {
+    source: knowledgeSourceFingerprint(id),
+    parts,
+    contentHash16: createHash("sha256").update(text).digest("hex").slice(0, 16),
+  };
+}
+
+/** An embedder model as the manifest names it: any credential in a url it carries removed. */
+export function corpusEmbedderModel(model: string): string {
+  return redactUrlCredentialsInText(model);
+}
+
+/**
+ * Replace `<cwd>/.crewhaus/run/knowledge/corpus.json` whole with `manifest`
+ * (0600 when created; through a temp file and a rename, never following a
+ * link out of `cwd`). Never throws: a failed write comes back as
+ * `{ok: false, reason}` for the caller to log, and boot goes on.
+ */
+export function writeCorpusManifest(
+  cwd: string,
+  manifest: CorpusManifest,
+): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  try {
+    const written = writeFileSafe(cwd, CORPUS_MANIFEST_FILE, `${JSON.stringify(manifest)}\n`, {
+      overwrite: true,
+      createParents: true,
+      mode: 0o600,
+    });
+    return written.ok ? { ok: true } : { ok: false, reason: written.code };
+  } catch (err) {
+    return { ok: false, reason: err instanceof Error ? err.name : "unknown" };
+  }
 }
 
 /**
@@ -559,31 +770,68 @@ export async function knowledgeRetrieve(config: KnowledgeRetrieveConfig): Promis
       ...(config.collection !== undefined ? { collection: config.collection } : {}),
     });
 
-  const docs = await loadKnowledgeSources(config.sources, {
+  const loaded = await loadKnowledgeSourcesRecorded(config.sources, {
     ...(config.cwd !== undefined ? { cwd: config.cwd } : {}),
     ...(config.fetch !== undefined ? { fetch: config.fetch } : {}),
   });
+  // Chunks per document, for the corpus manifest; filled once chunking ran.
+  const parts = new Map<string, number>();
+  const embedderModel = corpusEmbedderModel(embedder.model);
+  // The corpus manifest, written once per boot: after ingest, or on a failure
+  // before it is rethrown. A failed write is one log line, never a failed boot.
+  const recordCorpus = (): void => {
+    const manifest: CorpusManifest = {
+      v: 1,
+      at: new Date().toISOString(),
+      embedderModel,
+      vectorBackend: vectorStore.backend,
+      sources: loaded.recorded.map((r) => ({
+        label: r.label,
+        kind: r.kind,
+        status: r.status,
+        ...(r.reason !== undefined ? { reason: r.reason } : {}),
+        docs: r.docs.map((d) => corpusDoc(d.id, d.text, parts.get(d.id) ?? 0)),
+      })),
+    };
+    const written = writeCorpusManifest(config.cwd ?? process.cwd(), manifest);
+    if (!written.ok) {
+      const line = `[knowledge] corpus manifest not written (${written.reason})\n`;
+      if (config.log !== undefined) config.log(line);
+      else process.stderr.write(line);
+    }
+  };
+  if (loaded.error !== undefined) {
+    recordCorpus();
+    throw loaded.error;
+  }
+  const docs = loaded.docs;
   if (docs.length === 0) {
+    recordCorpus();
     throw new RetrieveConfigError(
       "knowledgeRetrieve indexed zero documents — every source was empty or matched nothing",
     );
   }
 
-  const chunks = docs.flatMap((doc) =>
-    chunk(doc, {
-      strategy: config.chunkStrategy ?? DEFAULT_KNOWLEDGE_CHUNK_STRATEGY,
-      size: config.chunkSize ?? DEFAULT_KNOWLEDGE_CHUNK_SIZE,
-      overlap: config.chunkOverlap ?? DEFAULT_KNOWLEDGE_CHUNK_OVERLAP,
-    }),
-  );
-  if (chunks.length > 0) {
-    const vectors = await embedder.embed(chunks.map((c) => c.text));
-    for (let i = 0; i < chunks.length; i += 1) {
-      const c = chunks[i];
-      const v = vectors[i];
-      if (c === undefined || v === undefined) continue;
-      await vectorStore.upsert(c.id, v, { docId: c.docId, text: c.text });
+  try {
+    const chunks = docs.flatMap((doc) =>
+      chunk(doc, {
+        strategy: config.chunkStrategy ?? DEFAULT_KNOWLEDGE_CHUNK_STRATEGY,
+        size: config.chunkSize ?? DEFAULT_KNOWLEDGE_CHUNK_SIZE,
+        overlap: config.chunkOverlap ?? DEFAULT_KNOWLEDGE_CHUNK_OVERLAP,
+      }),
+    );
+    for (const c of chunks) parts.set(c.docId, (parts.get(c.docId) ?? 0) + 1);
+    if (chunks.length > 0) {
+      const vectors = await embedder.embed(chunks.map((c) => c.text));
+      for (let i = 0; i < chunks.length; i += 1) {
+        const c = chunks[i];
+        const v = vectors[i];
+        if (c === undefined || v === undefined) continue;
+        await vectorStore.upsert(c.id, v, { docId: c.docId, text: c.text });
+      }
     }
+  } finally {
+    recordCorpus();
   }
   config.log?.(
     `[knowledge] indexed ${await vectorStore.count()} chunks from ${docs.length} source doc(s)\n`,

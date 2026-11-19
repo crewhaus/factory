@@ -175,6 +175,11 @@ const GATE_DIRS = [
   ".crewhaus/idempotency",
   // The proposals staged for a person to adopt.
   ".crewhaus/proposals",
+  // The specs `crewhaus watchme synthesize` writes for a person to adopt.
+  ".crewhaus/watchme/synthesized",
+  // The recorded ratings and the few-shot pools.
+  ".crewhaus/feedback",
+  ".crewhaus/fewshot",
 ];
 const GATE_FILES = [
   ".crewhaus/environments.json",

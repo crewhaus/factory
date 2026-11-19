@@ -1,17 +1,20 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import { createVectorStore } from "@crewhaus/vector-store";
 import {
+  CORPUS_MANIFEST_FILE,
+  type CorpusManifest,
   DEFAULT_KNOWLEDGE_EMBEDDER_MODEL,
   type KnowledgeFetch,
   RetrieveConfigError,
   _resetRetrieveConfig,
   getRetrieveConfig,
   knowledgeRetrieve,
+  knowledgeSourceFingerprint,
   knowledgeSourceLabel,
   loadKnowledgeSources,
   registerRetrieveConfig,
@@ -19,8 +22,11 @@ import {
   retrieve,
 } from "./index";
 
+const TEMP_DIRS: string[] = [];
+
 afterEach(() => {
   _resetRetrieveConfig();
+  for (const dir of TEMP_DIRS.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
 async function seedStore(): Promise<{
@@ -393,10 +399,13 @@ describe("knowledgeRetrieve flags follow its backends", () => {
     embedder: Parameters<typeof knowledgeRetrieve>[0]["embedder"],
     vectorStore: Parameters<typeof knowledgeRetrieve>[0]["vectorStore"],
   ) {
+    const cwd = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(cwd);
     return knowledgeRetrieve({
       sources: [{ kind: "url", url: "https://docs.example.com/a.md" }],
       embedder,
       vectorStore,
+      cwd,
       fetch: async () => ({ ok: true, status: 200, text: async () => "refund policy body" }),
     });
   }
@@ -449,10 +458,13 @@ describe("knowledge url sources never show a credential", () => {
 
   test("hits name the document by host and path, never its credential", async () => {
     const seen: string[] = [];
+    const cwd = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(cwd);
     const tool = await knowledgeRetrieve({
       sources: [{ kind: "url", url: DIRTY }],
       embedder: createEmbedder({ model: "mock/det" }),
       vectorStore: createVectorStore({ backend: "in-memory" }),
+      cwd,
       fetch: async (url) => {
         seen.push(url);
         return { ok: true, status: 200, text: async () => "refunds are issued within 14 days" };
@@ -464,6 +476,10 @@ describe("knowledge url sources never show a credential", () => {
     expect(leaked(out)).toEqual([]);
     expect(out).toContain("docs.example.com/h.md");
     expect(out).toContain("#src-");
+    // The corpus manifest names the source by the same credential-free label.
+    const manifest = readFileSync(join(cwd, CORPUS_MANIFEST_FILE), "utf-8");
+    expect(leaked(manifest)).toEqual([]);
+    expect(manifest).toContain("docs.example.com/h.md");
   });
 
   test("labels: userinfo and credential params go, a clean URL and an npm @scope path stay as written", () => {
@@ -567,5 +583,161 @@ describe("knowledge url sources never show a credential", () => {
     const out = (await retrieve.execute({ query: "refund window" })) as string;
     expect(out).toContain("docs.example.com/h.md");
     expect(leaked(out)).toEqual([]);
+  });
+});
+
+describe("Retrieve reports the documents it returned", () => {
+  test("one ref per document, named by the fingerprint of the docId its chunks carry", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    writeFileSync(join(dir, "fox.md"), "the quick brown fox jumps over the lazy dog", "utf-8");
+    writeFileSync(join(dir, "lorem.md"), "lorem ipsum dolor sit amet", "utf-8");
+    const tool = await knowledgeRetrieve({
+      sources: [{ kind: "glob", glob: "*.md" }],
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+      cwd: dir,
+    });
+    const reported: unknown[] = [];
+    await tool.execute({ query: "fox", k: 2 }, { recordReads: (refs) => reported.push(...refs) });
+    expect(reported).toHaveLength(2);
+    for (const id of ["fox.md", "lorem.md"]) {
+      expect(reported).toContainEqual({
+        store: "document",
+        backend: "local",
+        localId: knowledgeSourceFingerprint(id),
+      });
+    }
+    expect(knowledgeSourceFingerprint("fox.md")).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  test("a hit without a docId reports nothing", async () => {
+    const embedder = createEmbedder({ model: "mock/det" });
+    const vectorStore = createVectorStore({ backend: "in-memory" });
+    const [vec] = await embedder.embed(["the quick brown fox"]);
+    await vectorStore.upsert("loose", vec ?? [], { text: "the quick brown fox" });
+    registerRetrieveConfig({ embedder, vectorStore });
+    const reported: unknown[] = [];
+    await retrieve.execute(
+      { query: "fox", k: 2 },
+      { recordReads: (refs) => reported.push(...refs) },
+    );
+    expect(reported).toEqual([]);
+  });
+
+  test("a url source's fingerprint is the one its label carries", () => {
+    const raw = `https://user:${["to", "ken"].join("")}@docs.example.com/a.md`;
+    expect(knowledgeSourceLabel(raw)).toEndWith(`#src-${knowledgeSourceFingerprint(raw)}`);
+  });
+});
+
+describe("the corpus manifest", () => {
+  const DOC_TEXT = "the refund window is thirty days for every plan";
+  const readManifest = (dir: string): CorpusManifest =>
+    JSON.parse(readFileSync(join(dir, CORPUS_MANIFEST_FILE), "utf-8")) as CorpusManifest;
+
+  test("an ingest writes what it indexed: labels, fingerprints, parts and hashes, no text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    writeFileSync(join(dir, "refunds.md"), DOC_TEXT, "utf-8");
+    await knowledgeRetrieve({
+      sources: [
+        { kind: "path", path: "refunds.md" },
+        { kind: "glob", glob: "*.nomatch" },
+      ],
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+      cwd: dir,
+    });
+    const file = join(dir, CORPUS_MANIFEST_FILE);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const manifest = readManifest(dir);
+    expect(manifest).toMatchObject({
+      v: 1,
+      embedderModel: createEmbedder({ model: "mock/det" }).model,
+      vectorBackend: "in-memory",
+    });
+    expect(manifest.sources).toEqual([
+      {
+        label: "refunds.md",
+        kind: "path",
+        status: "included",
+        docs: [
+          {
+            source: knowledgeSourceFingerprint("refunds.md"),
+            parts: 1,
+            contentHash16: expect.stringMatching(/^[0-9a-f]{16}$/),
+          },
+        ],
+      },
+      { label: "*.nomatch", kind: "glob", status: "empty", docs: [] },
+    ]);
+    expect(readFileSync(file, "utf-8")).not.toContain("refund window");
+  });
+
+  test("a failing source is recorded failed, later ones not-reached, and the error still thrown", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    writeFileSync(join(dir, "refunds.md"), DOC_TEXT, "utf-8");
+    const token = ["sec", "ret", "tok", "en"].join("");
+    await expect(
+      knowledgeRetrieve({
+        sources: [
+          { kind: "path", path: "refunds.md" },
+          { kind: "url", url: `https://docs.example.com/a.md?private_token=${token}` },
+          { kind: "path", path: "missing.md" },
+          { kind: "glob", glob: "*.md" },
+        ],
+        embedder: createEmbedder({ model: "mock/det" }),
+        vectorStore: createVectorStore({ backend: "in-memory" }),
+        cwd: dir,
+        fetch: async () => ({ ok: false, status: 403, text: async () => "denied" }),
+      }),
+    ).rejects.toThrow(/knowledge url fetch failed \(403\)/);
+    const manifest = readManifest(dir);
+    expect(manifest.sources.map((s) => [s.kind, s.status, s.reason])).toEqual([
+      ["path", "included", undefined],
+      ["url", "failed", "http-403"],
+      ["path", "failed", "not-reached"],
+      ["glob", "failed", "not-reached"],
+    ]);
+    const raw = readFileSync(join(dir, CORPUS_MANIFEST_FILE), "utf-8");
+    expect(raw).not.toContain(token);
+    expect(raw).not.toContain("refund window");
+  });
+
+  test("a missing path is recorded not-found", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    await expect(
+      knowledgeRetrieve({
+        sources: [{ kind: "path", path: "missing.md" }],
+        embedder: createEmbedder({ model: "mock/det" }),
+        vectorStore: createVectorStore({ backend: "in-memory" }),
+        cwd: dir,
+      }),
+    ).rejects.toThrow(/not found/);
+    expect(readManifest(dir).sources).toEqual([
+      { label: "missing.md", kind: "path", status: "failed", reason: "not-found", docs: [] },
+    ]);
+  });
+
+  test("a manifest that cannot be written never fails the ingest", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    writeFileSync(join(dir, "refunds.md"), DOC_TEXT, "utf-8");
+    // A file where the manifest's directory would go.
+    writeFileSync(join(dir, ".crewhaus"), "not a directory", "utf-8");
+    const lines: string[] = [];
+    const tool = await knowledgeRetrieve({
+      sources: [{ kind: "path", path: "refunds.md" }],
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+      cwd: dir,
+      log: (line) => lines.push(line),
+    });
+    expect(tool.name).toBe("Retrieve");
+    expect(existsSync(join(dir, CORPUS_MANIFEST_FILE))).toBe(false);
+    expect(lines.filter((l) => l.includes("corpus manifest not written"))).toHaveLength(1);
   });
 });
