@@ -221,6 +221,9 @@
         "yaml": "^2.6.0",
         "zod": "^3.23.8",
       },
+      "devDependencies": {
+        "@crewhaus/channel-adapter-base": "workspace:*",
+      },
       "optionalDependencies": {
         "@crewhaus/adapter-bedrock": "workspace:*",
         "@crewhaus/adapter-gemini": "workspace:*",
@@ -445,6 +448,10 @@
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/access-control": "workspace:*",
+        "@crewhaus/durable-state": "workspace:*",
       },
     },
     "packages/channel-adapter-discord": {
@@ -1343,6 +1350,7 @@
         "@crewhaus/wiki-store": "workspace:*",
       },
       "devDependencies": {
+        "@crewhaus/channel-adapter-base": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",

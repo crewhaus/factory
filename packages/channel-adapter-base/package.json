@@ -20,6 +20,10 @@
     "@crewhaus/run-context": "workspace:*",
     "@crewhaus/session-store": "workspace:*"
   },
+  "devDependencies": {
+    "@crewhaus/access-control": "workspace:*",
+    "@crewhaus/durable-state": "workspace:*"
+  },
   "license": "Apache-2.0",
   "author": {
     "name": "Max Meier",

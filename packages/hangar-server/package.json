@@ -52,6 +52,7 @@
     "@crewhaus/wiki-store": "workspace:*"
   },
   "devDependencies": {
+    "@crewhaus/channel-adapter-base": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
     "@crewhaus/gateway-server": "workspace:*",
