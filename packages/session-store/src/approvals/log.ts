@@ -25,9 +25,13 @@
  */
 import { join, resolve } from "node:path";
 import {
+  APPROVAL_ID_RE,
   type CursorPosition,
+  DECISION_LOG_EVENTS,
+  DECISION_LOG_KEYS,
   DECISION_LOG_REASONS,
   type DecisionLogEvent,
+  SESSION_ID_RE,
   canonicalJson,
 } from "@crewhaus/control-contract";
 import {
@@ -227,4 +231,100 @@ export function logHasLine(
     if (page.next === undefined) return false;
     before = page.next;
   }
+}
+
+/** One decision-log line read back, and where its line starts. */
+export type DecisionLogEntry = {
+  readonly line: DecisionLogLine;
+  readonly at: CursorPosition;
+};
+
+/** What {@link readDecisionLog} answers. */
+export type DecisionLogRead = {
+  /** Oldest first, across segments. */
+  readonly lines: ReadonlyArray<DecisionLogEntry>;
+  /** Lines that were not decision-log lines, or could not be read. */
+  readonly skipped: number;
+  /** Older lines remain beyond `maxLines`. */
+  readonly truncated: boolean;
+};
+
+/** Lines a read keeps by default: the newest ones when the log holds more. */
+const DECISION_LOG_READ_MAX = 100_000;
+/** Lines read per page. */
+const DECISION_LOG_READ_PAGE = 1000;
+
+const LOG_EVENTS: ReadonlySet<string> = new Set(DECISION_LOG_EVENTS);
+const LOG_KEYS: ReadonlySet<string> = new Set(DECISION_LOG_KEYS);
+const LOG_STRING_FIELDS = ["at", "tool", "inputDigest", "placesDigest", "surface"] as const;
+
+/** Whether a parsed record is a decision-log line this reader answers. */
+function isDecisionLogLine(record: Readonly<Record<string, unknown>>): boolean {
+  if (record["v"] !== 1) return false;
+  const event = record["event"];
+  if (typeof event !== "string" || !LOG_EVENTS.has(event)) return false;
+  const decision = record["decision"];
+  if (typeof decision !== "string" || !APPROVAL_ID_RE.test(decision)) return false;
+  const sessionId = record["sessionId"];
+  if (typeof sessionId !== "string" || !SESSION_ID_RE.test(sessionId)) return false;
+  for (const field of LOG_STRING_FIELDS) if (typeof record[field] !== "string") return false;
+  const runId = record["runId"];
+  if (runId !== undefined && typeof runId !== "string") return false;
+  return Object.keys(record).every((key) => LOG_KEYS.has(key));
+}
+
+/**
+ * The session root's decision log, read: every line of `approvals.d/decisions/`, oldest
+ * first across segments. A line counts only when it is a decision-log line (`v` 1, an
+ * event from `DECISION_LOG_EVENTS`, an `appr_` decision, a session id, the string
+ * fields every line carries, and no key outside `DECISION_LOG_KEYS`); anything else,
+ * and every line or segment that cannot be read, adds to `skipped`. At most `maxLines`
+ * lines are read (default 100 000), the newest ones, and `truncated` says when older
+ * lines remain.
+ *
+ * Read-only: it takes no lock and no claim, reads no key, and creates nothing; a root
+ * with no decision log answers no lines. Pass the root `containedSessionRoot` answers
+ * for the harness, never one taken from a request.
+ *
+ * First consumer: `@crewhaus/run-inspect`, which shows an approval's later outcome.
+ */
+export function readDecisionLog(
+  rootDir: string,
+  options: { readonly maxLines?: number } = {},
+): DecisionLogRead {
+  const maxLines = options.maxLines ?? DECISION_LOG_READ_MAX;
+  if (!Number.isInteger(maxLines) || maxLines < 1) {
+    throw new RangeError("session-store: maxLines must be a whole number of at least 1");
+  }
+  const ledger = approvalsLedger(rootDir);
+  const newestFirst: DecisionLogEntry[] = [];
+  let skipped = 0;
+  let visited = 0;
+  let truncated = false;
+  let before: CursorPosition | undefined;
+  for (;;) {
+    const page = readPage(ledger, {
+      limit: Math.min(DECISION_LOG_READ_PAGE, maxLines - visited),
+      ...(before !== undefined ? { before } : {}),
+    });
+    for (const item of page.items) {
+      if (isDecisionLogLine(item.record)) {
+        newestFirst.push({ line: item.record as unknown as DecisionLogLine, at: item.at });
+      } else {
+        skipped += 1;
+      }
+    }
+    skipped += page.gaps.length;
+    // A page's limit counts its lines, a line that is not a record included.
+    visited +=
+      page.items.length +
+      page.gaps.filter((gap) => gap.reason === "unreadable" && gap.bytes > 0).length;
+    if (page.next === undefined) break;
+    if (visited >= maxLines) {
+      truncated = true;
+      break;
+    }
+    before = page.next;
+  }
+  return { lines: newestFirst.reverse(), skipped, truncated };
 }

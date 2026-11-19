@@ -111,6 +111,7 @@
     "@crewhaus/regression-runner": "workspace:*",
     "@crewhaus/routing-store": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/run-inspect": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
     "@crewhaus/secrets-manager": "workspace:*",
     "@crewhaus/service-setup": "workspace:*",

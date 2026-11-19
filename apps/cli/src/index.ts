@@ -4276,7 +4276,7 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
     process.stdout.write(
       "usage: crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--model <m>]\n" +
         "                        [--ask-mode <pause|deny>] [--trace off|ring|pretty|json]\n" +
-        "                        [--budget-usd <n>] [--streaming]\n" +
+        "                        [--budget-usd <n>] [--streaming] [--ignore-pause]\n" +
         "  Re-drives a persisted cli session (a sess_<16 hex> id) — replaying its\n" +
         "  transcript and continuing the loop. A run id resumes the session that\n" +
         "  run belongs to, read from the run records under\n" +
@@ -4292,7 +4292,9 @@ async function runRunsResume(args: ParsedArgs): Promise<void> {
         "  interactive REPL, where an `ask` prompts on stdin instead.\n" +
         "  --prompt <text> runs one more turn non-interactively and exits.\n" +
         "  --ask-mode <pause|deny> overrides the spec's permissions.ask_mode,\n" +
-        "  exactly as on `crewhaus run`.\n",
+        "  exactly as on `crewhaus run`.\n" +
+        "  --ignore-pause, with --prompt, runs once while the harness's operator\n" +
+        "  has paused new work, exactly as on `crewhaus run`.\n",
     );
     return;
   }

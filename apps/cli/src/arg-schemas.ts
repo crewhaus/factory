@@ -168,6 +168,9 @@ export const RUNS_SCHEMA: ParseArgsSchema = {
     { name: "user", takesValue: true },
     { name: "no-mcp-quarantine", takesValue: false },
     { name: "help", short: "h" },
+    // With --prompt: run once while the harness's operator has paused new work. The
+    // entry gate reads it (./operator-gate); the resumed run itself ignores it.
+    { name: "ignore-pause", takesValue: false },
   ],
 };
 

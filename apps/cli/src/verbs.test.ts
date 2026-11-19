@@ -257,8 +257,8 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    // harness gained `capabilities` (#514); inbox is list, show and stats.
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 5));
+    // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect` (#518).
+    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6));
   }, 30_000); // fourteen modules' imports and a hundred and eighty calls; slow on a loaded runner
 });
 
