@@ -120,6 +120,7 @@ import {
   runfileExists,
   shellQuote,
 } from "@crewhaus/harness-supervisor";
+import { EXPORT_JOB_KIND } from "@crewhaus/harness-supervisor/job-kinds";
 import { runPreflight } from "@crewhaus/preflight";
 import {
   type AccessView,
@@ -288,7 +289,7 @@ import { commandFields, createReceipts, currentCommand, noteNeed } from "./recei
 import { type ReviewHarness, adjudicateReview, isReviewVerdict, reviewInbox } from "./review";
 import { type HarnessRollup, openRollupCache } from "./rollups";
 import { type RequestMatch, matchRequest } from "./route-match";
-import { type RouteRow, legacyKindPermission } from "./route-table";
+import { type RouteRow, legacyKindPermission, twinNotesOf } from "./route-table";
 import {
   isLiveFeedState,
   isSupervisorRunId,
@@ -303,9 +304,9 @@ import { buildSchedulersView, declaredCadences, dreamStates, readSpecYaml } from
 import {
   isSessionId,
   listSessions,
+  reachableSessionRoot,
   readTranscript,
   readTranscriptRaw,
-  resolveSessionRoot,
 } from "./sessions";
 import {
   type SettingsStore,
@@ -2619,7 +2620,9 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const sess = tail[0] as string;
       if (!isSessionId(sess)) throw new HttpError(400, "invalid session id");
       const dir = liveDirOr404(entry);
-      const rootInfo = resolveSessionRoot(dir);
+      const reach = reachableSessionRoot(dir);
+      if (!reach.reachable) throw new HttpError(409, reach.note);
+      const rootInfo = reach.info;
       if (url.searchParams.get("raw") !== null) {
         // The raw lines are the run's record as written: its owner's to read.
         if (!requestAllows("h.files.raw", entry.id)) throw forbiddenOn("h.files.raw", entry.id);
@@ -2733,6 +2736,11 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
     if (head === "version" && rest.length === 0 && method === "GET") {
       return json({ hangar: version, protocolV: PROTOCOL_V, api: [PROTOCOL_ID] });
+    }
+
+    // The command-line equivalent of each write without a core command kind.
+    if (head === "twin-notes" && rest.length === 0 && method === "GET") {
+      return json({ notes: twinNotesOf() });
     }
 
     // Mint a fresh single-use browser handoff. `crewhaus hangar open` reads
@@ -3408,6 +3416,16 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     ...(processes.stopApiRun !== undefined
       ? { stopRunJob: processes.stopApiRun.bind(processes) }
       : {}),
+    // A harness archive: one job in the harness folder, writing where Home chose.
+    submitExportJob: (entry, argv, command) =>
+      processes.jobs.submit({
+        harnessDir: entry.dir,
+        harnessId: entry.id,
+        kind: EXPORT_JOB_KIND,
+        argv,
+        commandId: command.commandId,
+        by: command.by,
+      }),
     ...(processes.apiRunCapacity !== undefined
       ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }
       : {}),

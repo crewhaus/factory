@@ -13,7 +13,9 @@
  * before the real run), the note names the command's preview form first and
  * says what the command does without it.
  *
- * Data only: the notes are not served yet.
+ * Served as they are by `GET /api/twin-notes`, and shown beside each write in
+ * the console: data, never a route row's `cliTwin`, which only a core command
+ * kind carries.
  */
 
 const NONE = "No command-line equivalent.";
@@ -31,7 +33,8 @@ export const ROUTE_TWIN_NOTES: Readonly<Record<string, string>> = Object.freeze(
   scan: same("crewhaus harness scan"),
   addGroup: same("crewhaus harness group <name>"),
   groupProc: same("crewhaus daemon start|stop|restart --group <name>"),
-  addScanRoot: NONE,
+  addScanRoot:
+    "Same as `crewhaus harness scan --root <dir>`, which keeps the root and scans it at once, as Home does; adding a root without scanning it has no command-line equivalent.",
   removeHarness: same("crewhaus harness remove <id>"),
   setHidden: NONE,
   relocate: same("crewhaus harness relocate <id> <dir>"),
@@ -63,22 +66,26 @@ export const ROUTE_TWIN_NOTES: Readonly<Record<string, string>> = Object.freeze(
   specRollback: same("crewhaus deploy rollback <name> <env> <version> --require-approval"),
   specPropose: same("crewhaus propose <candidate> --current crewhaus.yaml --source manual"),
   wizardCreate: NONE,
-  graderWrite: NONE,
+  graderWrite:
+    "Structured edits are `crewhaus criteria apply <edits-file> --expect <revision>`, with the same `sha256:` revision Home shows; loosening a protected criterion also needs `--confirm <spec-name>` and the harness's owner. The CLI also adds a line to the criteria history, and Home's write does not. Replacing the whole file has no command-line equivalent.",
   datasetBuilderStep: NONE,
   mcpConnectorWrite: NONE,
   mcpConnectorRemove: NONE,
   pluginUseWrite: "No command-line equivalent: edit `plugins:` in crewhaus.yaml.",
   // Memory.
-  memoryForget: NONE,
+  memoryForget:
+    "Same as `crewhaus memory forget <fact-id> --spec <spec> --reason <reason>`, run in the harness folder. The CLI asks you to confirm unless you add `--yes`, and with `--query <text>` also forgets every fact that matches some text, which Home does not offer.",
   memorySweep:
     "Same as `crewhaus memory sweep --spec <spec>` without the preview: the CLI has no dry run, and tombstones expired facts at once.",
   memoryMigrate: dryRunFirst("crewhaus migrate memories", "migrates"),
-  continuityRestore: NONE,
+  continuityRestore:
+    "Same as `crewhaus state restore --trash <stamp>`, run in the harness folder. Home waits for the continuity store's lock first, so it never restores while a running agent writes the same files; the CLI restores at once.",
   knowledgeSync:
     "Same as `crewhaus knowledge sync --pull --dry-run` or `crewhaus knowledge sync --push --dry-run`; without `--dry-run` the CLI syncs at once and asks for no confirmation.",
   wikiWrite: same("crewhaus wiki write <slug> --body-file <file> --expect <version>"),
   wikiSignals: NONE,
-  wikiArchive: NONE,
+  wikiArchive:
+    "Same as `crewhaus wiki archive <slug> --expect <version>`, run in the harness folder; add `--undo` to publish the article again. The CLI always needs the article's current version, and Home checks it only when it has one.",
   watchmeToggle: same("crewhaus watchme start|stop"),
   watchmeApply: NONE,
   watchmePublish: dryRunFirst("crewhaus watchme publish", "publishes"),
@@ -113,7 +120,8 @@ export const ROUTE_TWIN_NOTES: Readonly<Record<string, string>> = Object.freeze(
   envUnset: NONE,
   credentialsSetAcross: NONE,
   doctorRun: same("crewhaus doctor"),
-  secretsRotate: NONE,
+  secretsRotate:
+    "Home does not rotate secrets yet. `crewhaus secrets rotate <name> --backend file`, run in the harness folder, makes the new value itself and stores it in `.crewhaus/secrets`, so the value never appears on a command line.",
   channelVerify: same("crewhaus channel verify crewhaus.yaml"),
   channelProvisionRun: same(
     "crewhaus channel provision crewhaus.yaml --platform <platform> --base-url <url>",
@@ -121,7 +129,8 @@ export const ROUTE_TWIN_NOTES: Readonly<Record<string, string>> = Object.freeze(
   channelProbe: NONE,
   channelSynthetic: NONE,
   // Security.
-  egressReview: NONE,
+  egressReview:
+    "No command-line equivalent records a verdict on one decision. `crewhaus egress review`, run in the harness folder, summarises its egress decisions instead, and with `--propose` suggests policy changes.",
   piiTune:
     "No command-line equivalent writes a policy you give. `crewhaus pii tune --secret <secret>` proposes one from redaction history, and writes it only with `--write`.",
   justificationCalibrate: same("crewhaus justification calibrate"),

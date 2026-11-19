@@ -75,7 +75,7 @@ export const GATE_EXPECTS: Readonly<Record<string, string>> = {
   "#/h/:id/overview/needs-you": "figure.chart",
   "#/h/:id/work": ".section-index a",
   "#/h/:id/work/runs": "table.fleet tbody tr",
-  "#/h/:id/work/runs/:run": ".run-feed > *",
+  "#/h/:id/work/runs/:run": ".rv-list > *",
   "#/h/:id/work/schedule": ".tab-body .lane-card",
   "#/h/:id/work/sessions": "table.fleet tbody tr",
   "#/h/:id/work/sessions/:session": ".transcript > *",

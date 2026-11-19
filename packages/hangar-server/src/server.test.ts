@@ -533,6 +533,7 @@ describe("/api/harnesses rows + rollup cache", () => {
           ],
           days: goldenDays(),
           truncatedFiles: 0,
+          unknown: null,
         },
       },
     });
@@ -668,6 +669,7 @@ describe("cost routes", () => {
         rollups: 0,
         days: goldenDays(),
         truncatedFiles: 0,
+        unknown: null,
       },
     });
 

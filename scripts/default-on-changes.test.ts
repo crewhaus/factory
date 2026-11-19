@@ -5167,7 +5167,7 @@ describe("Home's inspector, onboarding and a library start with sign-in off", ()
     const write = source.indexOf("export const settingsWrite");
     expect(write).toBeGreaterThan(-1);
     const guard = source.indexOf("refuseSettingsPlace(ctx, def.segments, path);", write);
-    const read = source.indexOf("readTextCapped(path", write);
+    const read = source.indexOf("readOpened(path)", write);
     expect(guard).toBeGreaterThan(-1);
     expect(read).toBeGreaterThan(-1);
     expect(guard).toBeLessThan(read);
@@ -6038,6 +6038,87 @@ describe("a harness reads and decides only the approvals inside its own sessions
     const bullet = bulletFor("only inside that harness's folder");
     expect(bullet).not.toBe("");
     for (const needle of ["`unreachable`", "404", "409", "`decisions_unreachable`"]) {
+      expect(`${needle}: ${bullet.includes(needle)}`).toBe(`${needle}: true`);
+    }
+  });
+});
+
+describe("Home shows a harness's sessions only from a sessions folder that belongs to it", () => {
+  const bulletFor = (needle: string): string =>
+    defaultOnBullets(changelog, LATER_HEADINGS).find((b) => b.includes(needle)) ?? "";
+
+  test("a linked-out and a nested sessions folder are unreachable, and the bullet says so", async () => {
+    const { containedSessionRoot, resolveHarnessSessionRoot } = await import(
+      "../packages/session-store/src/index"
+    );
+    if (process.platform !== "win32") {
+      const base = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-reach-")));
+      try {
+        const linked = join(base, "a");
+        mkdirSync(join(linked, ".crewhaus"), { recursive: true });
+        mkdirSync(join(base, "b", "sessions"), { recursive: true });
+        symlinkSync(join(base, "b", "sessions"), join(linked, ".crewhaus", "sessions"));
+        expect(resolveHarnessSessionRoot(linked, {}).contained).toBe(false);
+        const outer = join(base, "p");
+        const nested = join(outer, "inner", ".crewhaus", "sessions");
+        mkdirSync(join(outer, ".crewhaus"), { recursive: true });
+        mkdirSync(nested, { recursive: true });
+        symlinkSync(nested, join(outer, ".crewhaus", "sessions"));
+        expect(resolveHarnessSessionRoot(outer, {}).contained).toBe(false);
+        expect(containedSessionRoot(outer, {})).toBeUndefined();
+      } finally {
+        rmSync(base, { recursive: true, force: true });
+      }
+    }
+    // Every session reader in Home goes through the one reachable root: a scan of every
+    // non-test source file, so a reader added later is found without a list to update.
+    const server = join(ROOT, "packages/hangar-server/src");
+    const sources: Array<{ file: string; source: string }> = [];
+    const walk = (dir: string): void => {
+      for (const name of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, name.name);
+        if (name.isDirectory()) {
+          if (name.name !== "__test__") walk(path);
+        } else if (name.name.endsWith(".ts") && !name.name.endsWith(".test.ts")) {
+          sources.push({ file: relative(server, path), source: readFileSync(path, "utf8") });
+        }
+      }
+    };
+    walk(server);
+    expect(sources.length).toBeGreaterThan(100);
+    // A literal `.crewhaus/sessions` join is only these, each for a reason.
+    const SESSIONS_JOINS: Record<string, string> = {
+      "approvals.ts": "the default approvals path, named in messages and never opened",
+    };
+    const unrouted: string[] = [];
+    const joins: string[] = [];
+    let readers = 0;
+    for (const { file, source } of sources) {
+      if (file !== "sessions.ts" && source.includes("resolveSessionRoot(")) {
+        unrouted.push(`${file}: resolveSessionRoot(`);
+      }
+      const joined = source.match(/"\.crewhaus",\s*"sessions"/g)?.length ?? 0;
+      if (joined > 0) joins.push(file);
+      if (joined > 0 && !(file in SESSIONS_JOINS)) unrouted.push(`${file}: a sessions-folder join`);
+      // A directory read filtered to session files reads a sessions folder.
+      const lists =
+        source.match(/readdirSync\([^)]*\)\s*\.filter\([^)]*SESSION_JSONL?_RE/g)?.length ?? 0;
+      const named = /SESSION_JSONL?_RE/.test(source);
+      if (lists > 0 || (named && file !== "constants.ts")) {
+        readers += 1;
+        if (file !== "sessions.ts" && !source.includes("reachableSessionRoot(")) {
+          unrouted.push(`${file}: reads session files without the reachable root`);
+        }
+      }
+    }
+    expect(unrouted).toEqual([]);
+    expect(joins.sort()).toEqual(Object.keys(SESSIONS_JOINS).sort());
+    // The readers this scan finds: sessions itself, and activity, costs, feedback, models,
+    // omnibox and rollups.
+    expect(readers).toBe(7);
+    const bullet = bulletFor("belongs to it");
+    expect(bullet).not.toBe("");
+    for (const needle of ["unreachable", "nested", "review verdict", "never $0"]) {
       expect(`${needle}: ${bullet.includes(needle)}`).toBe(`${needle}: true`);
     }
   });

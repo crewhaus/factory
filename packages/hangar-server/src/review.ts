@@ -30,7 +30,7 @@ import {
 import { SESSION_ID_RE } from "./constants";
 import { maskText } from "./mask";
 import { resolveInside } from "./safety";
-import { resolveSessionRoot } from "./sessions";
+import { reachableSessionRoot } from "./sessions";
 
 /** Verdicts the review route accepts. `up`/`down` adjudicate a rated turn;
  *  `pass`/`fail` record a verdict on the item itself. */
@@ -160,7 +160,9 @@ export async function adjudicateReview(args: {
     if (!SESSION_ID_RE.test(sessionId)) {
       return { outcome: "rejected", reason: "queue entry names an invalid session id" };
     }
-    const { root } = resolveSessionRoot(args.harnessDir);
+    const reach = reachableSessionRoot(args.harnessDir);
+    if (!reach.reachable) return { outcome: "rejected", reason: reach.note };
+    const root = reach.root;
     let record: ReturnType<typeof buildFeedbackRecord>;
     try {
       record = buildFeedbackRecord({

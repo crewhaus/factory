@@ -34,6 +34,7 @@ import {
 import { hrefFleet, hrefHarness } from "../router.js";
 import { signOut } from "../sign-in.js";
 import { fmtRelativeTime } from "../util.js";
+import { HOME_WIDE, writeTwin } from "./control.js";
 
 /** kind → the sentence the rule row shows. Mirrors the server's KIND_LABELS;
  *  an unknown kind falls back to its slug rather than disappearing. */
@@ -318,6 +319,7 @@ function readOnlyCard(state) {
       }),
     ]),
   );
+  card.appendChild(writeTwin("setReadOnly", HOME_WIDE, "Read-only"));
   return card;
 }
 
@@ -527,6 +529,8 @@ function notificationCard(state, groupsPayload, reload) {
   card.appendChild(pendingList(state));
   const why = suppressedList(state);
   if (why !== null) card.appendChild(why);
+  card.appendChild(writeTwin("setNotifications", HOME_WIDE, "Save"));
+  card.appendChild(writeTwin("clearNotifications", HOME_WIDE, "Clear"));
   return card;
 }
 

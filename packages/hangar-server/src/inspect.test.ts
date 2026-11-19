@@ -21,8 +21,10 @@ import {
   copyFileSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -36,6 +38,9 @@ import { bearer, signInFromBootLink } from "./__test__/browser";
 import { makeFixtureHarness } from "./fixture";
 import {
   INSPECT_EXCLUSIONS,
+  type InspectReadPhase,
+  _setInspectOpenHookForTest,
+  _setSettingsTempNameForTest,
   exclusionFor,
   isIdentityPath,
   maskRawText,
@@ -1243,27 +1248,148 @@ describe("the identity file, by any path that leads to it", () => {
     }
   });
 
-  test("a JSON file that does not parse answers a fixed parse error and no key bytes", async () => {
+  test("a JSON file that does not parse answers a fixed parse error", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
       const dir = inspectHarness(t);
-      const whole = readFileSync(join(dir, ".crewhaus", "identity.json"), "utf8");
-      // The private key's value unquoted, so the file does not parse.
-      const malformed = whole.replace(/"privateKey": "([^"]*)"/, '"privateKey": $1');
-      expect(malformed).not.toBe(whole);
       mkdirSync(join(dir, "notes"), { recursive: true });
-      writeFileSync(join(dir, "notes", "copy.json"), malformed);
+      writeFileSync(join(dir, "notes", "broken.json"), '{"name": "notes", "count": 1,\n');
       const id = await register(t, dir);
       const { status, body } = await t.api(
-        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/copy.json")}`,
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/broken.json")}`,
       );
       expect(status).toBe(200);
       expect(body["parseError"]).toBe("not valid JSON");
       expect(body["note"]).toBe("this file did not parse: not valid JSON");
-      for (const run of KEY_RUNS) expect(JSON.stringify(body)).not.toContain(run);
     } finally {
       await t.stop();
     }
+  });
+
+  test("a torn identity document answers as an identity file: no text, and no key bytes", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      // Another harness's identity, so neither its path nor its inode is this harness's.
+      const foreignKey = `MC4CAQAwBQYDK2Vw${"Q".repeat(40)}`;
+      const whole = JSON.stringify(
+        {
+          schemaVersion: 1,
+          agentId: "b".repeat(64),
+          algorithm: "ed25519",
+          publicKey: `MCowBQYDK2Vw${"P".repeat(20)}`,
+          privateKey: foreignKey,
+        },
+        null,
+        2,
+      );
+      const unquoted = whole.replace(
+        `"privateKey": "${foreignKey}"`,
+        `"privateKey": ${foreignKey}`,
+      );
+      expect(unquoted).not.toBe(whole);
+      const cutShort = whole.slice(0, whole.indexOf(foreignKey) + 30);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      const id = await register(t, dir);
+      for (const [label, text] of [
+        ["unquoted", unquoted],
+        ["cut short", cutShort],
+      ] as const) {
+        writeFileSync(join(dir, "notes", "foreign.json"), text);
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/foreign.json")}`,
+        );
+        expect(`${label}: ${status}`).toBe(`${label}: 200`);
+        expect(`${label}: ${body["text"]}`).toBe(`${label}: null`);
+        expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+        for (const run of [...KEY_RUNS, "Q".repeat(20), "P".repeat(20)]) {
+          expect(`${label}: ${JSON.stringify(body).includes(run)}`).toBe(`${label}: false`);
+        }
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a fingerprint is shown only when it is one", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const held = "placeholder-not-a-credential";
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      writeFileSync(
+        join(dir, "notes", "x.json"),
+        JSON.stringify({ privateKey: "", agentId: held }),
+      );
+      const id = await register(t, dir);
+      const { status, body } = await t.api(
+        `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/x.json")}`,
+      );
+      expect(status).toBe(200);
+      expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+      const doc = body["document"] as Record<string, unknown>;
+      expect([doc["fingerprint"], doc["fingerprintShort"]]).toEqual([null, null]);
+      const answered = JSON.stringify(body);
+      for (let i = 0; i + 16 <= held.length; i++) {
+        const piece = held.slice(i, i + 16);
+        expect(`${piece}: ${answered.includes(piece)}`).toBe(`${piece}: false`);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  /**
+   * The seam runs at one phase of a raw read of `notes/swap.md`; when it does, the file
+   * becomes a link to the control token. Whichever phase it runs at, no token byte is served.
+   */
+  const swapDuringRead = async (phase: InspectReadPhase) => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const token = ["approved", "file", "swap", "marker"].join("-");
+      mkdirSync(join(dir, ".crewhaus", "run"), { recursive: true });
+      writeFileSync(join(dir, ".crewhaus", "run", "control-token"), `${token}\n`);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      const swap = join(dir, "notes", "swap.md");
+      writeFileSync(swap, "plain notes\n");
+      const id = await register(t, dir);
+      const read = () =>
+        t.api(`/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/swap.md")}`);
+      // Unswapped, the file reads as itself.
+      expect(String((await read()).body["text"])).toContain("plain notes");
+      let swaps = 0;
+      _setInspectOpenHookForTest((resolved, at) => {
+        if (resolved !== swap || at !== phase) return;
+        swaps++;
+        rmSync(swap, { force: true });
+        symlinkSync("../.crewhaus/run/control-token", swap);
+      });
+      try {
+        const { status, body } = await read();
+        expect(swaps).toBe(1);
+        expect(JSON.stringify(body)).not.toContain(token);
+        return { status, body };
+      } finally {
+        _setInspectOpenHookForTest(undefined);
+      }
+    } finally {
+      await t.stop();
+    }
+  };
+
+  test("a read serves only the bytes of a file that passed its checks after it was opened", async () => {
+    if (process.platform === "win32") return;
+    const { status, body } = await swapDuringRead("before-open");
+    expect(status).toBe(403);
+    expect(String(body["error"])).toContain("excluded from every inspect route");
+  });
+
+  test("a read serves only the bytes of the file it opened, checked as it is now", async () => {
+    if (process.platform === "win32") return;
+    const { status, body } = await swapDuringRead("before-approval");
+    expect(status).toBe(403);
+    expect(String(body["error"])).toContain("excluded from every inspect route");
   });
 
   test("a named pipe in the tree answers empty without waiting for a writer", async () => {
@@ -1291,19 +1417,29 @@ describe("the identity file, by any path that leads to it", () => {
       for (let i = source.indexOf(needle); i > -1; i = source.indexOf(needle, i + 1)) hits.push(i);
       return hits;
     };
-    const capped = at("readTextCapped(");
-    expect(capped.length).toBe(1);
+    // The settings write reads the file it replaces through the same one open.
+    expect(at("readTextCapped(")).toHaveLength(0);
     const settingsWriteAt = source.indexOf("export const settingsWrite");
     expect(settingsWriteAt).toBeGreaterThan(-1);
-    expect(capped[0] as number).toBeGreaterThan(settingsWriteAt);
+    expect(source.indexOf("readOpened(path)", settingsWriteAt)).toBeGreaterThan(settingsWriteAt);
+    // Two opens in all: the one read, and the settings write's exclusive create.
     const opens = at("openSync(");
-    expect(opens.length).toBe(1);
+    expect(opens.length).toBe(2);
     const helperAt = source.indexOf("function readOpened(");
     const bodyAt = source.indexOf("function readBody(");
     expect(helperAt).toBeGreaterThan(-1);
     expect(bodyAt).toBeGreaterThan(-1);
     expect(opens[0] as number).toBeGreaterThan(helperAt);
     expect(opens[0] as number).toBeLessThan(bodyAt);
+    const writerAt = source.indexOf("function writeSettingsFile(");
+    const writerEnd = source.indexOf("\n}\n", writerAt);
+    expect(writerAt).toBeGreaterThan(-1);
+    expect(opens[1] as number).toBeGreaterThan(writerAt);
+    expect(opens[1] as number).toBeLessThan(writerEnd);
+    const create = source.slice(opens[1] as number, writerEnd);
+    for (const flag of ["O_CREAT", "O_EXCL", "O_NOFOLLOW", "O_NONBLOCK"]) {
+      expect(`${flag}: ${create.includes(`constants.${flag}`)}`).toBe(`${flag}: true`);
+    }
   });
 
   test("a skill whose SKILL.md links to the identity file answers its projection", async () => {
@@ -1505,6 +1641,34 @@ describe("a harness inside the one being browsed", () => {
     }
   });
 
+  test("a link is answered by where it leads, whether or not anything is there", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const sub = makeFixtureHarness(join(dir, "apps", "sub"), { specName: "sub" });
+      writeFileSync(join(sub, "notes.md"), "sub notes\n");
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      const links: ReadonlyArray<readonly [string, string]> = [
+        ["dangling", "../apps/sub/missing.md"],
+        ["live", "../apps/sub/notes.md"],
+        ["adangling", "../.crewhaus/audit/missing.jsonl"],
+        ["alive", "../.crewhaus/audit/2026-08-01.jsonl"],
+      ];
+      for (const [name, target] of links) {
+        if (!linked(target, join(dir, "notes", name))) return;
+      }
+      const parent = await register(t, dir);
+      await register(t, sub);
+      const raw = (path: string) => `/api/h/${parent}/inspect/raw?path=${encodeURIComponent(path)}`;
+      for (const [name] of links) {
+        const { status } = await t.api(raw(`notes/${name}`));
+        expect(`${name}: ${status}`).toBe(`${name}: 403`);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("a path through a link into an excluded folder is refused whether or not anything is there", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
@@ -1591,6 +1755,27 @@ describe("the settings write, on the harness's own settings file only", () => {
     }
   });
 
+  test("a settings file that is the identity file under another name is neither shown nor replaced", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const ch = join(dir, ".crewhaus");
+      const settings = join(ch, "settings.json");
+      rmSync(settings, { force: true });
+      if (!hardLinked(join(ch, "identity.json"), settings)) return;
+      const identityBytes = readFileSync(join(ch, "identity.json"), "utf8");
+      const id = await register(t, dir);
+      for (const answer of await bothWrites(t, id, "inspect-harness")) {
+        expect(`${answer.label}: ${answer.status}`).toBe(`${answer.label}: 409`);
+        expect(answer.text).toContain("is not this harness's own settings file here");
+        for (const run of ["Z".repeat(20), "A".repeat(20)]) expect(answer.text).not.toContain(run);
+      }
+      expect(readFileSync(join(ch, "identity.json"), "utf8")).toBe(identityBytes);
+    } finally {
+      await t.stop();
+    }
+  });
+
   test("a settings file another registered harness holds is never read or replaced through this one", async () => {
     const t = bootTestServer({ now: () => NOW });
     try {
@@ -1646,6 +1831,80 @@ describe("the settings write, on the harness's own settings file only", () => {
       expect([dry?.status, confirmed?.status]).toEqual([200, 200]);
       const written = JSON.parse(readFileSync(join(dir, ".crewhaus", "settings.json"), "utf8"));
       expect(written).toEqual(NEXT);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  /** Another registered harness whose settings deny Bash, and its settings' path and bytes. */
+  async function otherHarness(t: TestServer): Promise<{ path: string; bytes: string }> {
+    const other = makeFixtureHarness(join(t.harnessesRoot, "other"), { specName: "other" });
+    const path = join(other, ".crewhaus", "settings.json");
+    mkdirSync(join(other, ".crewhaus"), { recursive: true });
+    writeFileSync(path, `${JSON.stringify({ permissions: { allow: [], deny: ["Bash"] } })}\n`);
+    await register(t, other);
+    return { path, bytes: readFileSync(path, "utf8") };
+  }
+
+  test("the write's new file is one it created itself: anything already at that name refuses it", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const id = await register(t, dir);
+      const other = await otherHarness(t);
+      const settings = join(dir, ".crewhaus", "settings.json");
+      const ownBytes = readFileSync(settings, "utf8");
+      const tmp = `${settings}.fixed-name`;
+      const outside = join(t.harnessesRoot, "outside.json");
+      _setSettingsTempNameForTest(() => tmp);
+      try {
+        for (const [label, target] of [
+          ["another harness's settings", other.path],
+          ["a file not there yet", outside],
+        ] as const) {
+          rmSync(tmp, { force: true });
+          if (!linked(target, tmp)) return;
+          const res = await t.apiText(`/api/h/${id}/inspect/settings`, {
+            method: "PUT",
+            body: JSON.stringify({ settings: NEXT, confirmName: "inspect-harness" }),
+          });
+          expect(`${label}: ${res.status}`).toBe(`${label}: 500`);
+          expect(readFileSync(other.path, "utf8")).toBe(other.bytes);
+          expect(existsSync(outside)).toBe(false);
+          expect(lstatSync(settings).isFile()).toBe(true);
+          expect(readFileSync(settings, "utf8")).toBe(ownBytes);
+          expect(lstatSync(tmp).isSymbolicLink()).toBe(true);
+        }
+      } finally {
+        _setSettingsTempNameForTest(undefined);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the write's new file has a name of its own, so nothing planted beside the settings is followed", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const id = await register(t, dir);
+      const other = await otherHarness(t);
+      const settings = join(dir, ".crewhaus", "settings.json");
+      const planted = `${settings}.hangar-tmp`;
+      if (!linked(other.path, planted)) return;
+      const res = await t.apiText(`/api/h/${id}/inspect/settings`, {
+        method: "PUT",
+        body: JSON.stringify({ settings: NEXT, confirmName: "inspect-harness" }),
+      });
+      expect(res.status).toBe(200);
+      expect(readFileSync(other.path, "utf8")).toBe(other.bytes);
+      expect(lstatSync(settings).isFile()).toBe(true);
+      expect(JSON.parse(readFileSync(settings, "utf8"))).toEqual(NEXT);
+      expect(lstatSync(planted).isSymbolicLink()).toBe(true);
+      const left = readdirSync(join(dir, ".crewhaus")).filter((n) => n.endsWith(".hangar-tmp"));
+      expect(left).toEqual(["settings.json.hangar-tmp"]);
     } finally {
       await t.stop();
     }

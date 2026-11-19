@@ -1388,9 +1388,9 @@ describe("the versioned API: every served operation, for every role and credenti
       }
       if (capped(op.permission)) return refuse;
       // A `{cmd}` alone names no receipt this Home has, and a sampled `{run}` no run: nothing
-      // to authorize against. A `{cmd}` under `{h}` (a delegation's watch) is authorized
-      // against that harness.
-      if ((cmdRow && !op.path.includes("{h}")) || runRow) return refuse;
+      // to authorize against. A `{cmd}` under `{h}` (a delegation's watch) and a `{run}` under
+      // `{h}` (an evaluation run's export) are authorized against that harness.
+      if ((cmdRow || runRow) && !op.path.includes("{h}")) return refuse;
       if (harnessAbout) return holds(best(grants.home, grants.a), op.permission) ? ALLOW : refuse;
       return [grants.home, grants.a, grants.b].some((role) => holds(role, op.permission))
         ? ALLOW

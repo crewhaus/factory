@@ -794,6 +794,16 @@ these on: they reach every harness that uses what each one names.
   sessions folder that links to another place inside the harness works as
   before. Keep the sessions folder inside the harness folder.
 
+- **Home shows a harness's sessions only from a sessions folder that belongs to
+  it.** When the sessions folder (`.crewhaus/sessions`, or where
+  `CREWHAUS_SESSION_DIR` moves it) lies outside the harness once every link is
+  followed, or inside another harness nested in it, Home shows no sessions,
+  transcripts, ratings, run traces, activity, costs, model routes or search
+  results from it, reads and decides no approvals there, records no review
+  verdict there, and says the folder is `unreachable`: the cost is unknown,
+  never $0. A sessions folder that links elsewhere inside the harness works as
+  before.
+
 - **Context curation works where it is accepted, and managed harnesses use
   their compaction settings.** Setting `compaction.curate` to `true` now trims
   repeated context before compaction on cli, channel and managed harnesses and

@@ -44,7 +44,13 @@ export async function renderSessions(root, ctx) {
   clear(root);
   const list = Array.isArray(data) ? data : Array.isArray(data?.sessions) ? data.sessions : [];
   if (list.length === 0) {
-    root.appendChild(emptyState("No sessions yet", "crewhaus run crewhaus.yaml"));
+    // An unreachable sessions folder is not "no sessions yet": it says why.
+    const note = typeof data?.note === "string" && data.note !== "" ? data.note : null;
+    root.appendChild(
+      note !== null
+        ? emptyState(`Sessions are not shown: ${note}`, null)
+        : emptyState("No sessions yet", "crewhaus run crewhaus.yaml"),
+    );
     return;
   }
   const nowMs = Date.now();

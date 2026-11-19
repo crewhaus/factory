@@ -253,3 +253,75 @@ describe("pageTitle", () => {
     expect(pageTitle(parseRoute("#/nope"))).toBe("Nothing at this address — Hangar");
   });
 });
+
+describe("object links", () => {
+  const links = router as {
+    refShape(text: unknown): { scope: string; kind: string; id: string } | null;
+    withInspect(hash: string, ref: string): string;
+    withoutInspect(hash: string): string;
+    hrefInspect(ref: string, harness?: string | null): string;
+  };
+  const REF = `${ID}/run/run_01m76e6f05hp514w9j4v3qymka`;
+
+  test("#/i/<scope>/<kind>/<id> opens a ref, its query kept", () => {
+    expect(parseRoute(`#/i/${REF}`)).toEqual({
+      view: "inspect-ref",
+      ref: REF,
+      bare: false,
+      query: {},
+    });
+    expect(parseRoute(`#/i/home/harness/${ID}?tab=technical`)).toEqual({
+      view: "inspect-ref",
+      ref: `home/harness/${ID}`,
+      bare: false,
+      query: { tab: "technical" },
+    });
+  });
+
+  test("a bare id opens with the harness it is in", () => {
+    expect(parseRoute(`#/i/run_0123456789abcdef?harness=${ID}`)).toEqual({
+      view: "inspect-ref",
+      ref: "run_0123456789abcdef",
+      bare: true,
+      query: { harness: ID },
+    });
+  });
+
+  test("a malformed link is not found", () => {
+    for (const hash of [
+      "#/i",
+      `#/i/${ID}/run`,
+      `#/i/${ID}/run/x/y`,
+      "#/i/nope/run/run_1",
+      "#/i/hrn_ABC/run/run_1",
+      `#/i/${ID}/run/${"x".repeat(200)}`,
+      `#/i/${ID}/run/a%20b`,
+      `#/i/${ID}/run/a%25b`,
+    ]) {
+      expect([hash, parseRoute(hash).view]).toEqual([hash, "notfound"]);
+    }
+  });
+
+  test("?inspect= is kept beside any route, and set or dropped without touching the rest", () => {
+    expect(parseRoute(`#/h/${ID}/work/runs?inspect=${encodeURIComponent(REF)}`)).toMatchObject({
+      view: "harness",
+      section: "work",
+      sub: "runs",
+      query: { inspect: REF },
+    });
+    expect(parseRoute(`#/?inspect=${encodeURIComponent(REF)}`).query).toEqual({ inspect: REF });
+    const on = links.withInspect(`#/h/${ID}/work/runs?x=1&inspect=old`, REF);
+    expect(on).toBe(`#/h/${ID}/work/runs?x=1&inspect=${encodeURIComponent(REF)}`);
+    expect(links.withoutInspect(on)).toBe(`#/h/${ID}/work/runs?x=1`);
+    expect(links.withoutInspect(`#/h/${ID}?inspect=a`)).toBe(`#/h/${ID}`);
+    expect(links.hrefInspect(REF)).toBe(`#/i/${REF}`);
+    expect(parseRoute(links.hrefInspect("run_0123456789abcdef", ID))).toMatchObject({
+      view: "inspect-ref",
+      bare: true,
+    });
+  });
+
+  test("a link's page is named while it opens", () => {
+    expect(pageTitle(parseRoute(`#/i/${REF}`))).toBe("Opening a link — Hangar");
+  });
+});

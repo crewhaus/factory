@@ -208,6 +208,9 @@ export const ROUTES = {
   plugins: { method: "GET", path: "/api/plugins" },
   pluginPane: { method: "GET", path: "/api/plugins/:plugin/panes/:pane" },
   panes: { method: "GET", path: "/api/h/:id/panes" },
+  // What each write does from the command line, or why nothing does: the
+  // notes shown beside every write that has no core command of its own.
+  twinNotes: { method: "GET", path: "/api/twin-notes" },
 
   // ======================================================================
   // M3 — the detail surface. Every entry carries `group`.

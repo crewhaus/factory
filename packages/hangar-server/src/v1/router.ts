@@ -59,6 +59,7 @@ const QUERY_NAMES: Readonly<Record<string, readonly string[]>> = {
   noBody: [],
   attentionListQuery: ["harness", "kind", "band", "state", "limit", "cursor"],
   attentionMetricsQuery: ["harness", "since"],
+  exportFormatQuery: ["format"],
 };
 
 export type V1Router = {

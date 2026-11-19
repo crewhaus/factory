@@ -15,6 +15,7 @@
 
 import { api } from "../api.js";
 import { clear, dot, el, jsonPre, skeleton, toast } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { hrefHarness } from "../router.js";
 import { APPROVAL_KEYS, approvalRow } from "../supervision.js";
 import { emptyFor } from "../ui/empty.js";
@@ -165,6 +166,15 @@ function approvalCard(row, { perform }) {
       el("a", { class: "name-link", href: hrefHarness(row.harnessId), text: row.specName }),
       el("span", { class: "chip", text: row.surface }),
       el("span", { class: "muted", text: row.age }),
+      actionBar({
+        ref: `${row.harnessId}/decision/${row.id}`,
+        label: `${row.toolName} for ${row.specName} (${row.harnessId})`,
+        ...(typeof row.dir === "string" && row.dir !== "" ? { dir: row.dir } : {}),
+        operation: {
+          id: "decisions.get",
+          params: { ref: `${row.harnessId}/decision/${row.id}` },
+        },
+      }),
     ]),
     // Verbatim (already masked) — the whole point of an approval screen — unless this
     // person may not read the harness's content.

@@ -146,6 +146,9 @@ function costCard(payload) {
   // `/api/h/:id/costs` returns { id, costs: { spend7dUsdMicros, days, … } }.
   const costs = payload?.costs && typeof payload.costs === "object" ? payload.costs : null;
   const days = Array.isArray(costs?.days) ? costs.days : [];
+  if (costs !== null && typeof costs.unknown === "string" && costs.unknown !== "") {
+    return card("Spend (7d)", emptyState(`Cost unknown: ${costs.unknown}`, null));
+  }
   if (costs === null || (costs.calls === 0 && days.every((d) => d.usdMicros === 0))) {
     return card(
       "Spend (7d)",

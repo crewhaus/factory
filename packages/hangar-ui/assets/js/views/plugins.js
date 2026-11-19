@@ -25,10 +25,12 @@
 
 import { api } from "../api.js";
 import { clear, dot, el, emptyState, skeleton, statusBadge } from "../dom.js";
+import { hrefHarness } from "../router.js";
 import { confirmAction } from "../ui/dialog.js";
 import { announce } from "../ui/live.js";
 import { normalizeRows } from "../util.js";
 import { call, createAction } from "../v1.js";
+import { HOME_WIDE, writeTwin } from "./control.js";
 
 /** The state words, never colour alone. */
 export const STATE_WORDS = Object.freeze({
@@ -85,21 +87,50 @@ const asList = (value) => (Array.isArray(value) ? value.map(String) : []);
 
 /**
  * One sentence per harness that still loads the plugin (`stillLoadedBy` on a grant
- * or revoke answer), naming it by its spec name from `harnesses`, else its id.
- * `tools: null` means its crewhaus.yaml could not be read.
+ * or revoke answer). Each names the harness by its spec name AND its id, so two
+ * harnesses that share a spec name are told apart; by its id alone when it has no
+ * name. `tools: null` means its crewhaus.yaml could not be read.
  */
 export function stillLoadedLines(list, harnesses) {
+  return stillLoadedItems(list, harnesses).map((item) => item.text);
+}
+
+/**
+ * A harness as a person picks it: its spec name with its id, or its id alone when it
+ * has no name of its own, so two harnesses that share a spec name are told apart.
+ * `asked` adds that the plugin asked to see it.
+ */
+export function harnessChoiceLabel(row, asked = false) {
+  const id = String(row?.id ?? "");
+  const specName = row?.specName;
+  const name =
+    typeof specName === "string" && specName !== "" && specName !== id ? `${specName} (${id})` : id;
+  return `${name}${asked ? " (asked for)" : ""}`;
+}
+
+/** {@link stillLoadedLines}, each with the harness id its line names, for a link. */
+export function stillLoadedItems(list, harnesses) {
   if (!Array.isArray(list)) return [];
   const names = new Map(
     (Array.isArray(harnesses) ? harnesses : []).map((h) => [String(h?.id), h?.specName]),
   );
   return list.map((item) => {
     const id = String(item?.id ?? "");
-    const name = String(names.get(id) ?? id);
-    if (!Array.isArray(item?.tools)) return `${name}: its crewhaus.yaml could not be read`;
-    return item.tools.length === 0
-      ? `${name}: no host tools`
-      : `${name}: host tools ${item.tools.map(String).join(", ")}`;
+    const specName = names.get(id);
+    const name =
+      typeof specName === "string" && specName !== "" && specName !== id
+        ? `${specName} (${id})`
+        : id;
+    if (!Array.isArray(item?.tools)) {
+      return { id, text: `${name}: its crewhaus.yaml could not be read` };
+    }
+    return {
+      id,
+      text:
+        item.tools.length === 0
+          ? `${name}: no host tools`
+          : `${name}: host tools ${item.tools.map(String).join(", ")}`,
+    };
   });
 }
 
@@ -295,7 +326,7 @@ function reviewForm(host, name, review, harnesses, ticks, opts = {}) {
     }),
   );
   for (const row of rows) {
-    const label = `${String(row.specName ?? row.id)}${asked.has(row.id) ? " (asked for)" : ""}`;
+    const label = harnessChoiceLabel(row, asked.has(row.id));
     harnessSet.appendChild(
       checkboxRow(
         label,
@@ -411,7 +442,7 @@ function resultBlock(res, title, harnesses = []) {
         : (res.error?.message ?? "Home did not take it."),
     }),
   ]);
-  const lines = res.ok ? stillLoadedLines(res.body?.stillLoadedBy, harnesses) : [];
+  const lines = res.ok ? stillLoadedItems(res.body?.stillLoadedBy, harnesses) : [];
   if (lines.length > 0) {
     node.appendChild(
       el("p", {
@@ -422,7 +453,11 @@ function resultBlock(res, title, harnesses = []) {
       el(
         "ul",
         null,
-        lines.map((line) => el("li", { text: line })),
+        lines.map((line) =>
+          el("li", null, [
+            line.id === "" ? line.text : el("a", { href: hrefHarness(line.id), text: line.text }),
+          ]),
+        ),
       ),
     );
     node.appendChild(
@@ -501,10 +536,7 @@ export function useInHarness(ctx, plugin, servedTools, reload) {
   return el("div", { class: "plugin-use" }, [
     set,
     go,
-    el("p", {
-      class: "muted small",
-      text: "No command-line equivalent: edit plugins: in crewhaus.yaml.",
-    }),
+    writeTwin("pluginUseWrite", HOME_WIDE, "Use"),
     host,
   ]);
 }

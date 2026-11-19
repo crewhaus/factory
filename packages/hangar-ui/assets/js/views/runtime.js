@@ -38,7 +38,7 @@ import {
 } from "../dom.js";
 import { hrefHarness } from "../router.js";
 import { fmtRelativeTime } from "../util.js";
-import { cliTwin, gatedBtn, runAction } from "./control.js";
+import { cliTwin, gatedBtn, runAction, writeTwin } from "./control.js";
 
 export async function renderRuntime(root, ctx) {
   clear(root).appendChild(skeleton(6));
@@ -255,6 +255,7 @@ function mcpCard(ctx, res, reload) {
       typeof view.cliTwin === "string" ? view.cliTwin : "",
       "no crewhaus.yaml at the harness root — there is no command to run",
     ),
+    writeTwin("mcpServerStop", ctx, "Stop"),
   ]);
 
   if (runs.length === 0) {
@@ -436,6 +437,7 @@ function devCard(ctx, res, reload) {
       typeof view.cliTwin === "string" ? view.cliTwin : "",
       "no crewhaus.yaml at the harness root — there is no command to run",
     ),
+    writeTwin("devStop", ctx, "Stop"),
   ]);
 
   if (runs.length === 0) {

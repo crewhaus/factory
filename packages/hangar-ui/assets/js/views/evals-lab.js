@@ -38,6 +38,7 @@ import {
   toast,
 } from "../dom.js";
 import { fmtCount, fmtPct, fmtRelativeTime, fmtUsd } from "../util.js";
+import { writeTwin } from "./control.js";
 
 export async function renderEvalsLab(root, ctx) {
   clear(root).appendChild(skeleton(4));
@@ -324,6 +325,7 @@ export function launcherCard(ctx, flywheelRes, reload) {
       el("p", { class: "gated-why" }, [dot("warn", "dataset precedence"), text(precedence.note)]),
     );
   }
+  card.appendChild(writeTwin("evalLaunch", ctx, "Run"));
   return card;
 }
 
@@ -542,6 +544,7 @@ function suitesCard(ctx, res, reload) {
     }
   });
   card.appendChild(runner);
+  card.appendChild(writeTwin("evalSuiteRun", ctx, "Run suite"));
   return card;
 }
 
@@ -646,6 +649,7 @@ function judgeCard(ctx, res, reload) {
     apply.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [preview, apply]));
+  card.appendChild(writeTwin("judgeCalibrate", ctx, "Calibrate"));
   return card;
 }
 
@@ -682,6 +686,8 @@ function gradersCard(ctx, res, reload) {
     meta.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [suggest, meta]));
+  card.appendChild(writeTwin("gradersSuggest", ctx, "Suggest"));
+  card.appendChild(writeTwin("gradersTest", ctx, "Meta-eval"));
   return card;
 }
 
@@ -729,6 +735,7 @@ function redteamCard(ctx, res, reload) {
     generate.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [generate]));
+  card.appendChild(writeTwin("redteamGenerate", ctx, "Generate"));
   return card;
 }
 
@@ -766,6 +773,7 @@ function coverageCard(ctx, res, reload) {
       mine.disabled = false;
     });
     node.appendChild(el("div", { class: "editor-actions" }, [mine]));
+    node.appendChild(writeTwin("datasetMine", ctx, "Mine"));
   });
 }
 
@@ -809,6 +817,7 @@ export function sentinelCard(ctx, res, reload, flywheelRes) {
     run.disabled = false;
   });
   card.appendChild(el("div", { class: "editor-actions" }, [run]));
+  card.appendChild(writeTwin("sentinelRun", ctx, "Run sentinel"));
   return card;
 }
 
@@ -879,6 +888,7 @@ export function optimizerCard(ctx, res, reload, flywheelRes) {
     go.disabled = false;
   });
   card.appendChild(form);
+  card.appendChild(writeTwin("optimizerRun", ctx, "Optimize"));
   return card;
 }
 
@@ -959,6 +969,7 @@ export function flywheelCard(ctx, res, reload) {
     });
     card.appendChild(btn);
   }
+  card.appendChild(writeTwin("flywheelRun", ctx, "Flywheel"));
   return card;
 }
 
@@ -1035,6 +1046,7 @@ function experimentsCard(ctx, res, reload) {
     go.disabled = false;
   });
   card.appendChild(form);
+  card.appendChild(writeTwin("experimentRecord", ctx, "Record"));
   return card;
 }
 

@@ -10,6 +10,7 @@
  * same bindings, so `instanceof JobArgumentError` holds across the two), for
  * one release.
  */
+import { isAbsolute } from "node:path";
 
 /** Job kinds the M2 action faces submit. Anything else is a 400. */
 export const JOB_KINDS = ["doctor", "compile", "eval", "dream-run"] as const;
@@ -66,4 +67,25 @@ export function jobArgv(kind: JobKind, options: JobOptions = {}): string[] {
       return argv;
     }
   }
+}
+
+/**
+ * The job that archives a whole harness for its owner: `crewhaus state backup --out <path>`.
+ * It is not one of {@link JOB_KINDS}, so the job route that names a kind never starts it;
+ * only the export operation does, with a path it chose itself.
+ */
+export const EXPORT_JOB_KIND = "export-harness";
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is the point
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f-\u009f]/;
+
+/** The argv the export job runs, for an absolute archive path with no control character. */
+export function exportHarnessArgv(out: string): string[] {
+  if (typeof out !== "string" || out === "" || !isAbsolute(out)) {
+    throw new JobArgumentError("export: the archive path must be absolute");
+  }
+  if (CONTROL_CHAR_RE.test(out)) {
+    throw new JobArgumentError("export: the archive path holds a control character");
+  }
+  return ["state", "backup", "--out", out];
 }

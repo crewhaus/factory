@@ -37,6 +37,7 @@ import { DEVICE_HANDLERS } from "./device";
 import { CORE_STREAM_SOURCES, type StreamSourceDecl } from "./event-map";
 import { EVENT_HANDLERS } from "./events";
 import { HARNESS_HANDLERS } from "./harnesses";
+import { HOME_HOME } from "./home";
 import { HOME_INTEGRATIONS } from "./integrations";
 import { CORE_REF_RESOLVERS, META_HANDLERS } from "./meta";
 import { RULE_HANDLERS } from "./rules";
@@ -96,7 +97,7 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   HOME_DELEGATION,
 
-  // HOME_HOME,
+  HOME_HOME,
 
   // HOME_INSPECTION,
 

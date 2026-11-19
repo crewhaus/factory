@@ -175,3 +175,49 @@ describe("resolveHarnessSessionRoot", () => {
     expect(containedSessionRoot(dir, { [SESSION_DIR_ENV]: "state" })).toBe(join(dir, "state"));
   });
 });
+
+describe("a session root inside another harness nested in this one", () => {
+  /** A harness `p` holding a nested harness `p/b`, each with its own `.crewhaus` folder. */
+  function nested(): { readonly p: string; readonly bSessions: string } {
+    const { dir: p } = harness();
+    mkdirSync(join(p, ".crewhaus"));
+    const bSessions = join(p, "b", ".crewhaus", "sessions");
+    mkdirSync(bSessions, { recursive: true });
+    return { p, bSessions };
+  }
+
+  test.skipIf(process.platform === "win32")(
+    "a sessions link into the nested harness's sessions is not contained",
+    () => {
+      const { p, bSessions } = nested();
+      symlinkSync(bSessions, join(p, ".crewhaus", "sessions"));
+      expect(resolveHarnessSessionRoot(p, {}).contained).toBe(false);
+      expect(containedSessionRoot(p, {})).toBeUndefined();
+    },
+  );
+
+  test("an override into the nested harness's sessions is ignored, and its sessions are never the root", () => {
+    const { p, bSessions } = nested();
+    for (const override of ["b/.crewhaus/sessions", bSessions, "b"]) {
+      const answer = resolveHarnessSessionRoot(p, { [SESSION_DIR_ENV]: override });
+      expect(`${override}: ${answer.overrideIgnored}`).toBe(`${override}: true`);
+      expect(answer.root).toBe(join(p, ".crewhaus", "sessions"));
+      expect(containedSessionRoot(p, { [SESSION_DIR_ENV]: override })).toBe(
+        join(p, ".crewhaus", "sessions"),
+      );
+    }
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "a sessions link elsewhere inside the harness is contained",
+    () => {
+      const { p } = nested();
+      mkdirSync(join(p, ".crewhaus", "state"));
+      symlinkSync("../.crewhaus/state", join(p, ".crewhaus", "sessions"));
+      // A relative link resolves against its own folder: `../.crewhaus/state` from
+      // `.crewhaus` is `p/.crewhaus/state`.
+      expect(resolveHarnessSessionRoot(p, {}).contained).toBe(true);
+      expect(containedSessionRoot(p, {})).toBe(join(p, ".crewhaus", "sessions"));
+    },
+  );
+});

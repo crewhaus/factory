@@ -319,6 +319,44 @@ async function authCall(route, body, bearer) {
   return { ok: res.status >= 200 && res.status < 300, status: res.status, body: parsed ?? {} };
 }
 
+let twinNotesRead = null;
+let twinNotesHeld;
+
+/**
+ * The note beside each write that has no core command of its own (`GET
+ * /api/twin-notes`), read once per session. It answers the notes, or `null`
+ * when they cannot be read; a failed read is not kept, so the next one asks
+ * again. Never throws.
+ */
+export function twinNotes() {
+  if (twinNotesRead !== null) return twinNotesRead;
+  twinNotesRead = call(ROUTES.twinNotes, {}).then(
+    (body) => {
+      const notes =
+        body && typeof body.notes === "object" && body.notes !== null ? body.notes : null;
+      if (notes === null) twinNotesRead = null;
+      else twinNotesHeld = notes;
+      return notes;
+    },
+    () => {
+      twinNotesRead = null;
+      return null;
+    },
+  );
+  return twinNotesRead;
+}
+
+/** The notes already read this session, or `undefined` before they are. */
+export function heldTwinNotes() {
+  return twinNotesHeld;
+}
+
+/** Forget the notes read this session. */
+export function resetTwinNotes() {
+  twinNotesRead = null;
+  twinNotesHeld = undefined;
+}
+
 export const api = {
   ...m3Api,
   // signing in (answers, never throws; see authCall)
@@ -454,6 +492,7 @@ export const api = {
   plugins: () => call(ROUTES.plugins, {}),
   pluginPane: (plugin, pane) => call(ROUTES.pluginPane, { plugin, pane }),
   panes: (id) => call(ROUTES.panes, { id }),
+  twinNotes: () => twinNotes(),
 
   // cross-cutting
   version: () => call(ROUTES.version, {}),

@@ -11,16 +11,18 @@
  *      stop `../` traversal; the realpath check additionally stops a symlink
  *      planted inside a harness tree from walking the read outside it.
  *
- * The containment check resolves the deepest EXISTING ancestor of the target
- * (so probing a not-yet-created file still validates) and requires the
- * not-yet-existing suffix to be separator- and dot-dot-free.
+ * The containment check resolves the deepest PRESENT ancestor of the target
+ * (so probing a not-yet-created file still validates): a link counts as
+ * present whether or not its target exists, and must resolve, so a link to
+ * nothing is never treated as a name that is free to create. Containment is
+ * decided by `relative()`, never by a string prefix.
  *
  * It moved here from `@crewhaus/hangar-server` (which still re-exports it,
  * for one release) together with run detail, which reads through it: a
  * second copy of realpath containment is how two readers drift apart.
  */
-import { existsSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, resolve, sep } from "node:path";
+import { lstatSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 /** One decoded path segment that may safely be joined onto a directory:
  *  non-empty, no separators, no NUL, not `.`/`..`. */
@@ -39,28 +41,40 @@ function realOf(path: string): string | undefined {
   }
 }
 
-/** True when `child` equals `parent` or sits strictly inside it. Both
+/** True when `child` equals `parent` or sits inside it, by `relative()`. Both
  *  arguments must already be real (symlink-resolved) absolute paths. */
 function within(parent: string, child: string): boolean {
-  return child === parent || child.startsWith(parent.endsWith(sep) ? parent : parent + sep);
+  const rel = relative(parent, child);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** Something is at `path` itself: a link counts, whether or not its target exists. */
+function present(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
  * Resolve `candidate` (absolute, or relative to `rootDir`) and verify it
  * realpath-contains inside `rootDir`. Returns the resolved path to use, or
- * undefined when the root is unreadable or the candidate escapes it.
+ * undefined when the root is unreadable, the candidate escapes it, or a
+ * present part of it (a link to nothing, say) cannot be resolved.
  */
 export function resolveContained(rootDir: string, candidate: string): string | undefined {
   const realRoot = realOf(rootDir);
   if (realRoot === undefined) return undefined;
   const target = isAbsolute(candidate) ? resolve(candidate) : resolve(rootDir, candidate);
 
-  // Deepest existing ancestor: realpath what exists, then re-append what
-  // doesn't (which must be clean of `..` — `resolve` already folded those,
+  // Deepest present ancestor: realpath what is there, then re-append what
+  // isn't (which must be clean of `..` — `resolve` already folded those,
   // but a folded `..` can only have moved the path UP, which the realpath
-  // check below catches).
+  // check below catches). A link to nothing is present and does not resolve.
   let existing = target;
-  while (!existsSync(existing)) {
+  while (!present(existing)) {
     const parent = dirname(existing);
     if (parent === existing) return undefined; // hit the fs root without a match
     existing = parent;

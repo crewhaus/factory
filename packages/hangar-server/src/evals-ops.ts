@@ -79,7 +79,9 @@ import { readJsonlCapped, readTextCapped } from "./jsonl";
 import type { M3Context, M3Handler } from "./m3";
 import { jobArg, requireString } from "./m3";
 import { maskText } from "./mask";
+import { resolveContained } from "./safety";
 import { WORKFLOWS_DIR_SEGMENTS, isScaffoldedWorkflow } from "./scaffolded-workflows";
+import { reachableSessionRoot } from "./sessions";
 import { twinWord } from "./twin-word";
 
 // ---------------------------------------------------------------------------
@@ -122,6 +124,16 @@ export function safeContain(ctx: M3Context, segments: readonly string[]): string
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Whether session `sessionId`'s transcript is in the harness's own sessions folder
+ * (`reachableSessionRoot`); false when that folder is unreachable.
+ */
+function transcriptPresent(ctx: M3Context, sessionId: string): boolean {
+  if (ctx.harnessDir === null) return false;
+  const reach = reachableSessionRoot(ctx.harnessDir);
+  return reach.reachable && isFileAt(resolveContained(reach.root, `${sessionId}.jsonl`));
 }
 
 /** Directory entry names, shape-filtered. The name is all a listing gives —
@@ -1680,8 +1692,7 @@ export const annotateSample: M3Handler = (ctx) => {
     appendJsonl(ctx.contain([".crewhaus", "feedback", `${ANNOTATION_SINK}.jsonl`]), feedbackRecord);
   }
 
-  const transcriptInSessionsRoot =
-    joinable && isFileAt(safeContain(ctx, [".crewhaus", "sessions", `${sessionId}.jsonl`]));
+  const transcriptInSessionsRoot = joinable && transcriptPresent(ctx, sessionId);
   return {
     ...found(
       "annotation recorded",
@@ -1759,8 +1770,7 @@ export const annotations: M3Handler = (ctx) => {
         if (row === undefined) continue;
         const sessionId = str(row["sessionId"]);
         const joinable = sessionId !== undefined && SESSION_ID_SHAPE.test(sessionId);
-        const transcriptPresent =
-          joinable && isFileAt(safeContain(ctx, [".crewhaus", "sessions", `${sessionId}.jsonl`]));
+        const transcriptHere = joinable && transcriptPresent(ctx, sessionId);
         rows.push({
           runId,
           sampleId,
@@ -1770,7 +1780,7 @@ export const annotations: M3Handler = (ctx) => {
           by: str(row["by"]) ?? null,
           ts: str(row["ts"]) ?? null,
           sessionId: sessionId ?? null,
-          join: joinResolution(joinable, transcriptPresent),
+          join: joinResolution(joinable, transcriptHere),
         });
       }
     }

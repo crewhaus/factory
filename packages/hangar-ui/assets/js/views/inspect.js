@@ -48,6 +48,7 @@ import {
   toast,
 } from "../dom.js";
 import { fmtCount, fmtRelativeTime } from "../util.js";
+import { writeTwin } from "./control.js";
 
 /** The store opened when the screen first paints — the one that answers
  *  "what is this agent allowed to do", which is what people come here for. */
@@ -605,6 +606,7 @@ function settingsPanel(ctx, view, reload) {
         editor,
         el("div", { class: "editor-actions" }, [previewBtn, confirm, applyBtn]),
         diffHost,
+        writeTwin("settingsWrite", ctx, "Apply"),
       ],
     ),
     collapsible(

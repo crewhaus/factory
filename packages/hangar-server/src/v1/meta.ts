@@ -129,7 +129,7 @@ const me: V1Handler = async (ctx) => {
 };
 
 /** The page an object opens on in Home, and its absolute address when one is set. */
-function hrefOf(ctx: V1Context, ref: string): { href: string; url?: string } {
+export function hrefOf(ctx: V1Context, ref: string): { href: string; url?: string } {
   const href = `/#/i/${ref}`;
   const base = ctx.deps.baseUrl;
   return base === undefined ? { href } : { href, url: `${base.replace(/\/+$/, "")}${href}` };
