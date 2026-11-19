@@ -28,7 +28,7 @@ import {
   servedOverview,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
-import { pendingApprovalCount } from "../approvals";
+import { pendingApprovalsOf } from "../approvals";
 import type { DaemonStatus, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, fleetSnapshot } from "./lists";
@@ -87,19 +87,22 @@ export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
       : servedOverview(model.state);
   // Tool approvals are counted from the approvals file, where every daemon parks them and
   // where Home's other surfaces count them (a relocated session root included); the other
-  // open decisions come from the decision records.
+  // open decisions come from the decision records. A sessions folder outside the harness
+  // makes the count unknown: the row says so and carries no count.
+  const pending = dir === undefined || model === undefined ? undefined : pendingApprovalsOf(dir);
+  const approvalsUnreachable = dir !== undefined && model !== undefined && pending === undefined;
   const openDecisions =
-    dir === undefined || model === undefined
+    pending === undefined || model === undefined
       ? undefined
-      : pendingApprovalCount(dir) +
-        Object.keys(model.state.open).filter((id) => !APPROVAL_ID_RE.test(id)).length;
+      : pending + Object.keys(model.state.open).filter((id) => !APPROVAL_ID_RE.test(id)).length;
   // An area's own overview projections, beside the core's.
   const areas: Record<string, unknown> = {};
   if (dir !== undefined) {
     for (const { area, projection: other } of ctx.projections) {
       if (other.overview !== true || area === "core") continue;
       const read = readModel(ctx.deps.hangarRoot, entry.id, dir, other, now);
-      areas[area] = { ...((areas[area] as object | undefined) ?? {}), [other.name]: read.state };
+      const shown = other.served === undefined ? read.state : other.served(read.state, dir, now);
+      areas[area] = { ...((areas[area] as object | undefined) ?? {}), [other.name]: shown };
     }
   }
   return {
@@ -108,13 +111,20 @@ export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
     ...(typeof owner === "string" ? { owner } : {}),
     createdAt: entry.registeredAt,
     display: await displayOf(ctx, entry, dir),
-    ...records,
+    ...(approvalsUnreachable ? withoutCount(records) : records),
     ...(openDecisions !== undefined ? { openDecisions } : {}),
+    ...(approvalsUnreachable ? { approvalsUnreachable: true as const } : {}),
     ...(Object.keys(areas).length > 0 ? { areas } : {}),
     asOf: new Date(now).toISOString(),
     ...(model !== undefined ? { stale: model.stale } : {}),
     freshness: model?.freshness ?? ("direct-fold" as const),
   };
+}
+
+/** The records' part of a row without its decision count: a count that cannot be whole. */
+function withoutCount(records: Readonly<Record<string, unknown>>): Record<string, unknown> {
+  const { openDecisions: _unknown, ...rest } = records;
+  return rest;
 }
 
 function epochOf(ctx: V1Context): number {

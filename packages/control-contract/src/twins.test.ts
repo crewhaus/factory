@@ -8,6 +8,7 @@ import {
   OPERATIONS,
   OPERATOR_SUPERSEDE_REASONS,
   TWIN_PLACEHOLDERS,
+  attIdFromDigest,
   isId,
   mintId,
   mintRunId,
@@ -42,6 +43,9 @@ const ACCESS = {
 
 const RUN = mintRunId();
 
+/** An attention item's id as the area derives it, from a digest's bytes. */
+const ATT = attIdFromDigest(new Uint8Array(32).map((_, i) => (i * 37 + 11) % 256));
+
 const SAMPLES = [
   {
     hrn: HRN,
@@ -62,6 +66,7 @@ const SAMPLES = [
     plugin: "notes-pane",
     delegationAction: "merge",
     run: RUN,
+    att: ATT,
   },
   {
     hrn: HRN,
@@ -82,6 +87,7 @@ const SAMPLES = [
     plugin: "abc",
     delegationAction: "rollout",
     run: RUN,
+    att: ATT,
   },
 ];
 
@@ -212,6 +218,7 @@ test("the placeholders, pinned, with empty flags", () => {
     "{plugin}",
     "{delegationAction}",
     "{run}",
+    "{att}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });

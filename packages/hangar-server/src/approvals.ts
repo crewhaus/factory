@@ -84,6 +84,8 @@ export type ApprovalsView = {
   readonly pending: number;
   /** Harness ids whose approvals file was capped mid-read. */
   readonly truncatedHarnesses: readonly string[];
+  /** Harnesses whose sessions folder lies outside them: their approvals are not read. */
+  readonly unreachableHarnesses: ReadonlyArray<{ readonly id: string; readonly specName: string }>;
 };
 
 /** One request's state, the inbox's own rule: only `"pending"` waits on a person.
@@ -141,9 +143,13 @@ export function approvalsInbox(
 ): ApprovalsView {
   const rows: ApprovalRow[] = [];
   const truncatedHarnesses: string[] = [];
+  const unreachableHarnesses: Array<{ id: string; specName: string }> = [];
   for (const harness of harnesses) {
-    const { approvals, truncated } = foldApprovals(harness.dir);
+    const { approvals, truncated, unreachable } = foldApprovals(harness.dir);
     if (truncated) truncatedHarnesses.push(harness.id);
+    if (unreachable === true) {
+      unreachableHarnesses.push({ id: harness.id, specName: harness.specName });
+    }
     const content = opts.showsContent?.(harness.id) ?? true;
     for (const a of approvals) {
       const status = statusOf(a);
@@ -177,6 +183,7 @@ export function approvalsInbox(
     approvals: rows,
     pending: rows.filter((r) => r.status === "pending").length,
     truncatedHarnesses,
+    unreachableHarnesses,
   };
 }
 
@@ -277,7 +284,17 @@ export function refusedDecisionMessage(
 
 /** Count pending approvals for one harness — the cheap fleet-badge read. */
 export function pendingApprovalCount(harnessDir: string): number {
-  return foldApprovals(harnessDir).approvals.filter((a) => statusOf(a) === "pending").length;
+  return pendingApprovalsOf(harnessDir) ?? 0;
+}
+
+/**
+ * Pending approvals for one harness, or `undefined` when its sessions folder lies outside
+ * it: then nothing was read, and the count is unknown rather than none.
+ */
+export function pendingApprovalsOf(harnessDir: string): number | undefined {
+  const folded = foldApprovals(harnessDir);
+  if (folded.unreachable === true) return undefined;
+  return folded.approvals.filter((a) => statusOf(a) === "pending").length;
 }
 
 /** The default (un-relocated) approvals path, for messages. */

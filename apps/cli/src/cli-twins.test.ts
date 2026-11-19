@@ -37,6 +37,7 @@ import {
   CLI_VERBS,
   COMMAND_KINDS,
   OPERATIONS,
+  attIdFromDigest,
   mintId,
   mintRunId,
   renderTwin,
@@ -213,8 +214,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(56);
-    expect(pins).toBe(84);
+    expect(Object.keys(REQUIRED).length).toBe(57);
+    expect(pins).toBe(85);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -342,6 +343,9 @@ describe("the server's twins, by import", () => {
       dataset: "support-cases",
       evalRun: "run_0123456789abcdef",
     };
+    const INBOX = {
+      att: attIdFromDigest(new Uint8Array(32).fill(7)),
+    };
     const ACCESS = {
       grt: mintId("grt"),
       inv: mintId("inv"),
@@ -369,6 +373,7 @@ describe("the server's twins, by import", () => {
         deferReason: "scheduled",
         plugin: "notes-pane",
         delegationAction: "merge",
+        ...INBOX,
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -388,6 +393,7 @@ describe("the server's twins, by import", () => {
         deferReason: "other",
         plugin: "notes-pane",
         delegationAction: "rollout",
+        ...INBOX,
       },
     ];
     const twins = [
@@ -408,7 +414,8 @@ describe("the server's twins, by import", () => {
       }
     }
     // Thirty-nine operation twins, thirty-one command kinds and eight route rows, each
-    // rendered twice: pause, resume, disable and enable are `crewhaus daemon` verbs.
+    // rendered twice: pause, resume, disable and enable are `crewhaus daemon` verbs. The
+    // inbox's three reads came later.
     expect(checked).toBeGreaterThanOrEqual(156);
   });
 });

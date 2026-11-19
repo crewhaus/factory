@@ -149,13 +149,13 @@ const list: V1Handler = async (ctx) => {
   const now = ctx.deps.now();
   const rows: Record<string, unknown>[] = [];
   const cut: string[] = [];
-  let unreachable = false;
+  const unreachable: string[] = [];
   for (const entry of visibleHarnesses(ctx.deps)) {
     const dir = liveDirOf(entry);
     if (dir === undefined) continue;
     const folded = foldApprovals(dir);
     if (folded.truncated) cut.push(entry.id);
-    if (folded.unreachable === true) unreachable = true;
+    if (folded.unreachable === true) unreachable.push(entry.id);
     const content = ctx.access.canReadContent(entry.id);
     for (const record of folded.approvals) rows.push(decisionView(record, entry.id, content, now));
   }
@@ -175,15 +175,18 @@ const list: V1Handler = async (ctx) => {
             },
           }
         : {}),
+      // Named whether or not anything is listed, so a short list never reads as complete.
+      ...(unreachable.length > 0 ? { unreachable } : {}),
       ...(items.length === 0
         ? {
-            empty: unreachable
-              ? {
-                  reason: "unreachable",
-                  remedy:
-                    "A harness keeps its sessions folder outside its own folder, so Home shows no decisions from it. Keep the sessions folder inside the harness folder.",
-                }
-              : { reason: "no-data", remedy: "Nothing is waiting for a decision." },
+            empty:
+              unreachable.length > 0
+                ? {
+                    reason: "unreachable",
+                    remedy:
+                      "A harness keeps its sessions folder outside its own folder, so Home shows no decisions from it. Keep the sessions folder inside the harness folder.",
+                  }
+                : { reason: "no-data", remedy: "Nothing is waiting for a decision." },
           }
         : {}),
     },

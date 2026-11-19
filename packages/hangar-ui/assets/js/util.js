@@ -15,6 +15,38 @@ export const RECENT_ACTIVITY_MS = 48 * HOUR_MS;
 /** Default transcript retention used for the TTL countdown column. */
 export const DEFAULT_SESSION_TTL_DAYS = 30;
 
+/** Said where a harness's approvals cannot be read: never a count of 0. */
+export const APPROVALS_UNKNOWN = "Approvals unknown";
+
+/** The names of the harnesses whose approvals could not be read. Pure. */
+export function unreachableNames(payload) {
+  const list =
+    payload && Array.isArray(payload.unreachableHarnesses) ? payload.unreachableHarnesses : [];
+  return list
+    .map((h) =>
+      typeof h === "string"
+        ? h
+        : h && typeof h.specName === "string" && h.specName !== ""
+          ? h.specName
+          : h && typeof h.id === "string"
+            ? h.id
+            : null,
+    )
+    .filter((name) => name !== null);
+}
+
+/** One sentence naming them, so the list never reads as complete. Pure. */
+export function unreachableNote(names) {
+  if (names.length === 0) return "";
+  const list =
+    names.length === 1
+      ? names[0]
+      : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return names.length === 1
+    ? `Couldn't read the approvals of ${list}: its sessions folder is outside its folder.`
+    : `Couldn't read the approvals of ${list}: each keeps its sessions folder outside its folder.`;
+}
+
 /** Parse an ISO timestamp to epoch ms, or null when absent/invalid. */
 export function parseTs(iso) {
   if (typeof iso !== "string" || iso === "") return null;
@@ -226,7 +258,14 @@ export function normalizeRows(feed) {
       // read, null when the dir is missing) and the parked-approval count —
       // neither opens a transcript, so the feed stays a fold.
       supervision: typeof src.supervision === "string" ? src.supervision : null,
-      pendingApprovals: typeof src.pendingApprovals === "number" ? src.pendingApprovals : 0,
+      // A harness whose approvals cannot be read has no count: `null`, said as unknown.
+      pendingApprovals:
+        typeof src.pendingApprovals === "number"
+          ? src.pendingApprovals
+          : src.approvalsUnreachable === true
+            ? null
+            : 0,
+      approvalsUnreachable: src.approvalsUnreachable === true,
       capabilities: caps,
       // What each declared badge does on the row's shape (an object keyed by
       // badge), so the table can say which ones the shape does not use.

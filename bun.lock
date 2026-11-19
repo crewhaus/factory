@@ -22,6 +22,7 @@
         "@crewhaus/access-control": "workspace:*",
         "@crewhaus/adapter-anthropic": "workspace:*",
         "@crewhaus/agent-context-isolation": "workspace:*",
+        "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
@@ -338,6 +339,19 @@
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "zod": "^3.23.8",
+      },
+    },
+    "packages/attention": {
+      "name": "@crewhaus/attention",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/audit-encryption": {
@@ -1276,6 +1290,8 @@
       "name": "hangar-e2e",
       "version": "0.0.0",
       "devDependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/hangar-server": "workspace:*",
         "@crewhaus/hangar-ui": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
@@ -1292,6 +1308,7 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/access-control": "workspace:*",
+        "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
@@ -1306,6 +1323,7 @@
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/gateway-protocol": "workspace:*",
+        "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/harness-inventory": "workspace:*",
         "@crewhaus/harness-registry": "workspace:*",
         "@crewhaus/harness-supervisor": "workspace:*",
@@ -4147,6 +4165,8 @@
     "@crewhaus/agent-context-isolation": ["@crewhaus/agent-context-isolation@workspace:packages/agent-context-isolation"],
 
     "@crewhaus/agent-handoff": ["@crewhaus/agent-handoff@workspace:packages/agent-handoff"],
+
+    "@crewhaus/attention": ["@crewhaus/attention@workspace:packages/attention"],
 
     "@crewhaus/audit-encryption": ["@crewhaus/audit-encryption@workspace:packages/audit-encryption"],
 

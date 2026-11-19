@@ -10,6 +10,8 @@
     "bench": "bun src/perf/bench.ts"
   },
   "devDependencies": {
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/hangar-server": "workspace:*",
     "@crewhaus/hangar-ui": "workspace:*",
     "@crewhaus/harness-registry": "workspace:*",

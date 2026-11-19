@@ -4,6 +4,7 @@
  * is a `--flag {param}` pair. `renderTwin` fills a template in and `parseTwin` maps
  * a command line back to its params, so one type serves both directions.
  */
+import { ATTENTION_ID_RE } from "./areas/attention.js";
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
@@ -41,6 +42,7 @@ export const CLI_VERBS = deepFreeze({
   "eval-report": ["baseline"],
   plugins: ["grants", "revoke"],
   delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
+  inbox: ["list", "show", "stats"],
 } as const);
 
 /**
@@ -68,6 +70,8 @@ export const CLI_VERBS = deepFreeze({
  *
  * `{run}` is a run's canonical id (`run_` and 26 characters), the id the run ledger
  * keys a run by; an execution's `run_<16 hex>` never fits it.
+ *
+ * `{att}` is an attention item's id, `att_` and 26 characters derived from what it is about.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -99,6 +103,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{plugin}": PLUGIN_NAME_RE,
   "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
   "{run}": CANONICAL_RUN_ID_RE,
+  "{att}": ATTENTION_ID_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

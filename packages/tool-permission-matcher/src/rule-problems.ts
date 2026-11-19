@@ -34,7 +34,13 @@
  *
  * Pure: plain data in, findings out.
  */
-import { PatternParseError, compilePattern, globIncludedIn, matchesToolName } from "./index";
+import {
+  type InclusionBudget,
+  PatternParseError,
+  compilePattern,
+  globIncludedIn,
+  matchesToolName,
+} from "./index";
 
 /** What the checker needs to know about one tool. */
 export type RuleToolDescriptor = {
@@ -91,7 +97,15 @@ export type PermissionRuleProblemCode =
    * Plan mode reads no allow, so the rule fires as the spec runs; it would
    * stop firing if the spec were run in another mode (`--permission-mode`).
    */
-  | "shadowed-outside-plan";
+  | "shadowed-outside-plan"
+  /**
+   * INFORMATIONAL: the rule-order check does a bounded amount of work (see
+   * {@link RULE_ORDER_LIMITS}) and reached that bound at this rule, so this
+   * rule, the rules after it and any later list were not checked for an
+   * allow above them that always matches first. The findings it had already
+   * shown are kept.
+   */
+  | "order-not-checked";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -744,9 +758,23 @@ export function specPermissionRuleLists(spec: unknown): PermissionRuleList[] {
 export type ShadowedRuleProblem = PermissionRuleProblem & {
   /** Where the shadowed rule sits, e.g. `permissions.rules`. */
   readonly list: string;
-  /** The allow that decides every call the rule would. */
-  readonly shadowedBy: string;
+  /**
+   * The allow that decides every call the rule would. Absent exactly on the
+   * `order-not-checked` note, which names no allow.
+   */
+  readonly shadowedBy?: string;
 };
+
+/**
+ * How much work one {@link shadowedPermissionRules} call does at most, over
+ * every list it reads. `pairs`: how many (deny or ask, allow above it) pairs
+ * of tool patterns it compares. `steps`: how much automaton work those
+ * comparisons do together, counted as {@link InclusionBudget} counts it, so
+ * a few very long patterns are bounded as well as many short ones. `steps`
+ * leaves room for `pairs` comparisons of long MCP-style names, so on a list
+ * of ordinary rules the pair bound is the one that decides.
+ */
+export const RULE_ORDER_LIMITS = { pairs: 2048, steps: 1 << 23 } as const;
 
 /** Options for {@link shadowedPermissionRules}. */
 export type ShadowedRuleOptions = {
@@ -756,6 +784,11 @@ export type ShadowedRuleOptions = {
    * `shadowed-outside-plan`, never as `shadowed-by-allow`.
    */
   readonly mode?: string;
+  /**
+   * Tighter (or, in a test, looser) bounds than {@link RULE_ORDER_LIMITS},
+   * for tests and callers that need one; a bound left out is the default.
+   */
+  readonly limits?: { readonly pairs?: number; readonly steps?: number };
 };
 
 /**
@@ -781,6 +814,14 @@ export type ShadowedRuleOptions = {
  * Two orders are read. A list (`permissions.rules`) top to bottom. And a
  * sub-agent's `permissions.allow` then its `permissions.deny`, which is the
  * order its rules are read in when they replace the parent's.
+ *
+ * The whole call does a bounded amount of work ({@link RULE_ORDER_LIMITS},
+ * or `opts.limits`): at most `pairs` comparisons of a deny or ask with an
+ * allow above it, and at most `steps` of automaton work across them. When a
+ * bound is reached, the check stops there: the findings already shown are
+ * kept, and one `order-not-checked` note names the rule and the list where
+ * it stopped. Nothing after that rule is checked, in that list or a later
+ * one.
  */
 export function shadowedPermissionRules(
   lists: ReadonlyArray<PermissionRuleList>,
@@ -793,9 +834,27 @@ export function shadowedPermissionRules(
     plan
       ? `rule "${rule.type} ${rule.pattern}" fires in this spec's plan mode, which reads no allow, and in no other mode (\`--permission-mode\` sets one):`
       : `rule "${rule.type} ${rule.pattern}" never fires outside plan mode:`;
+  const budget: OrderBudget = {
+    pairs: opts.limits?.pairs ?? RULE_ORDER_LIMITS.pairs,
+    inclusion: { steps: opts.limits?.steps ?? RULE_ORDER_LIMITS.steps },
+  };
   const out: ShadowedRuleProblem[] = [];
+  const stopAt = (
+    rule: { readonly type: string; readonly pattern: string },
+    list: string,
+  ): ShadowedRuleProblem[] => {
+    out.push({
+      type: rule.type,
+      pattern: rule.pattern,
+      code: "order-not-checked",
+      message: `rule "${rule.type} ${rule.pattern}" in ${list}: the rule-order check does a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for an allow above them that always matches first.`,
+      list,
+    });
+    return out;
+  };
   for (const list of lists) {
-    for (const hit of shadowsIn(list.rules)) {
+    const found = shadowsIn(list.rules, budget);
+    for (const hit of found.hits) {
       out.push({
         type: hit.rule.type,
         pattern: hit.rule.pattern,
@@ -805,6 +864,7 @@ export function shadowedPermissionRules(
         shadowedBy: hit.allow,
       });
     }
+    if (found.stoppedAt !== undefined) return stopAt(found.stoppedAt, list.path);
   }
   const allowLists = new Map<string, PermissionRuleList>();
   for (const list of lists) {
@@ -817,7 +877,8 @@ export function shadowedPermissionRules(
     const allow = allowLists.get(list.path.slice(0, -".deny".length));
     if (allow === undefined) continue;
     const combined = [...allow.rules, ...list.rules];
-    for (const hit of shadowsIn(combined)) {
+    const found = shadowsIn(combined, budget);
+    for (const hit of found.hits) {
       out.push({
         type: hit.rule.type,
         pattern: hit.rule.pattern,
@@ -827,18 +888,37 @@ export function shadowedPermissionRules(
         shadowedBy: hit.allow,
       });
     }
+    if (found.stoppedAt !== undefined) return stopAt(found.stoppedAt, list.path);
   }
   return out;
 }
 
-/** The deny and ask rules an earlier bare allow shadows, with the first such allow. */
+/** What one {@link shadowedPermissionRules} call may still spend. */
+type OrderBudget = {
+  /** Pair comparisons left. */
+  pairs: number;
+  /** Automaton work left, spent by {@link globIncludedIn}. */
+  readonly inclusion: InclusionBudget;
+};
+
+/**
+ * The deny and ask rules an earlier bare allow shadows, with the first such
+ * allow. Each comparison spends one pair of `budget`, and its automaton work
+ * spends `budget.inclusion`. When either bound is reached, `stoppedAt` is the
+ * deny or ask being checked: it and every rule after it are unchecked, and
+ * `hits` holds what was shown before it.
+ */
 function shadowsIn(
   rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>,
-): Array<{
-  readonly rule: { readonly type: string; readonly pattern: string };
-  readonly allow: string;
-}> {
-  const out: Array<{
+  budget: OrderBudget,
+): {
+  readonly hits: ReadonlyArray<{
+    readonly rule: { readonly type: string; readonly pattern: string };
+    readonly allow: string;
+  }>;
+  readonly stoppedAt?: { readonly type: string; readonly pattern: string };
+} {
+  const hits: Array<{
     readonly rule: { readonly type: string; readonly pattern: string };
     readonly allow: string;
   }> = [];
@@ -859,8 +939,17 @@ function shadowsIn(
       continue;
     }
     if (rule.type !== "alwaysDeny" && rule.type !== "alwaysAsk") continue;
-    const cover = bareAllows.find((a) => globIncludedIn(compiled.toolGlob, a.toolGlob));
-    if (cover !== undefined) out.push({ rule, allow: cover.pattern });
+    for (const allow of bareAllows) {
+      if (budget.pairs <= 0) return { hits, stoppedAt: rule };
+      budget.pairs -= 1;
+      const covered = globIncludedIn(compiled.toolGlob, allow.toolGlob, budget.inclusion);
+      // A spent budget's `false` proves nothing: the rule is unchecked.
+      if (budget.inclusion.steps <= 0) return { hits, stoppedAt: rule };
+      if (covered) {
+        hits.push({ rule, allow: allow.pattern });
+        break;
+      }
+    }
   }
-  return out;
+  return { hits };
 }

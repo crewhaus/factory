@@ -6528,3 +6528,18 @@ describe("0.9.0 — compaction where it is accepted, and settings a shape ignore
     for (const shape of [...shapes, "crew"]) expect(later[0], shape).toContain(shape);
   });
 });
+
+describe("the permission rule-order check does a bounded amount of work", () => {
+  test("a spec past the bound gets one permission-rule-note, and a bullet names it", () => {
+    // 500 allow/deny pairs that shadow nothing.
+    const yaml = `${ABSENT_CORPUS.cli}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+    const warnings = compile(yaml, { applyIrPasses: true, readme: false }).warnings;
+    expect(warnings.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    const bullets = defaultOnBullets(changelog, LATER_HEADINGS).filter(
+      (b) => b.includes("`permission-rule-note`") && b.includes("order"),
+    );
+    expect(bullets.length).toBe(1);
+  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+});

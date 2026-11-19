@@ -128,6 +128,11 @@ export type Projection<S = unknown> = {
   fold(state: S, item: ResumeItem): S;
   sources(harnessDir: string): ResumeSources;
   refresh?(state: S, harnessDir: string, now: number): S;
+  /**
+   * What a harness's overview row shows of an `overview` projection's state (its counts,
+   * say); the whole state when absent. Never written: it reads the state it is given.
+   */
+  served?(state: S, harnessDir: string, now: number): unknown;
 };
 
 /** At most this many run ids are kept by a model; past it the oldest-seen go first. */

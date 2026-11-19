@@ -27,6 +27,9 @@ import {
 } from "./a11y-states";
 import type { Journey } from "./journey";
 
+/** Needs you, All: every request with what its harness sent. */
+const NEEDS_YOU = "#/home/needs-you";
+
 /** The approvals inbox, where the announcements are heard. */
 const APPROVALS = "#/home/needs-you?type=approvals";
 
@@ -271,7 +274,7 @@ export const a11yFloor: Journey = {
   id: "a11y-floor",
   shard: "axe",
   proves:
-    "Every toured screen, and the shell's open Menu, reflows at 320 px and loses nothing under the text-spacing overrides; the header, a harness's section nav and sub-view list, the command menu and each overlay name every control and carry their roles; nothing animates under reduced motion from the system or from Readability; and information is announced politely, an error assertively.",
+    "Every toured screen, the shell's open Menu and Needs you with each request's input open reflow at 320 px and lose nothing under the text-spacing overrides; the header, a harness's section nav and sub-view list, the command menu and each overlay name every control and carry their roles; nothing animates under reduced motion from the system or from Readability; and information is announced politely, an error assertively.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "a11y-floor");
     const id = world.harness.id;
@@ -299,6 +302,16 @@ export const a11yFloor: Journey = {
     await narrow.page.locator("button.menu-toggle").click();
     await waitFor(narrow.page, "#narrow-menu .menu-link", "the Menu at 320");
     note(out, "the open Menu at 320", [await reflowFinding(narrow.page)]);
+    // Needs you with what each harness sent open: a long single-line input wraps in its card.
+    await freshVisit(narrow, NEEDS_YOU);
+    await waitFor(narrow.page, ".attention-body summary", "a request's input on Needs you");
+    for (const summary of await narrow.page.locator(".attention-body summary").all()) {
+      await summary.click();
+    }
+    if ((await narrow.page.locator(".attention-body[open] pre").count()) === 0) {
+      out.push("Needs you at 320: no request's input opened");
+    }
+    note(out, "Needs you at 320 with each input open", [await reflowFinding(narrow.page)]);
     narrow.assertClean();
     await narrow.close();
 

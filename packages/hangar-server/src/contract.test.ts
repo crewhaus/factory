@@ -139,7 +139,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["harnesses[].cachedAt", "string|null"],
     ["harnesses[].rollup", "object|null"],
     ["harnesses[].supervision", "string|null"],
-    ["harnesses[].pendingApprovals", "number"],
+    // Unknown, never 0, for a harness whose sessions folder is outside it.
+    ["harnesses[].pendingApprovals", "number|null"],
   ],
   // …and hydrated: the nested rollup the table's columns come from
   harnesses: [
@@ -400,6 +401,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["approvals[].parkedRun.sessionId", "string"],
     ["pending", "number"],
     ["truncatedHarnesses", "array"],
+    ["unreachableHarnesses", "array"],
   ],
   // views/review.js — the fleet review queue
   review: [

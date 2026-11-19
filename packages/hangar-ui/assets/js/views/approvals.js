@@ -19,8 +19,11 @@ import { hrefHarness } from "../router.js";
 import { APPROVAL_KEYS, approvalRow } from "../supervision.js";
 import { emptyFor } from "../ui/empty.js";
 import { toggleBtn } from "../ui/toggle.js";
+import { unreachableNames, unreachableNote } from "../util.js";
 import { actionTwin, gatedBtn } from "./control.js";
 import { mountTriage } from "./inbox.js";
+
+export { unreachableNames, unreachableNote };
 
 /** Said where an input is withheld from someone who may not read the harness's content. */
 const WITHHELD_INPUT =
@@ -85,6 +88,7 @@ async function draw(host, view) {
   const pending = payload && typeof payload.pending === "number" ? payload.pending : 0;
   const truncated =
     payload && Array.isArray(payload.truncatedHarnesses) ? payload.truncatedHarnesses : [];
+  const unreachable = unreachableNames(payload);
   const reload = () => draw(host, view);
 
   view.rollup.textContent = `${pending} pending · ${rows.length} shown`;
@@ -95,6 +99,19 @@ async function draw(host, view) {
         text: `${truncated.length} harness log${truncated.length === 1 ? " was" : "s were"} capped mid-read — older entries are not shown.`,
       }),
     );
+  }
+  if (unreachable.length > 0) {
+    body.appendChild(el("p", { class: "muted", text: unreachableNote(unreachable) }));
+  }
+  if (rows.length === 0 && unreachable.length > 0) {
+    body.appendChild(
+      emptyFor({
+        cause: "unreachable",
+        subject: "every harness's approvals",
+        detail: "Nothing else is waiting for a decision.",
+      }),
+    );
+    return;
   }
   if (rows.length === 0) {
     body.appendChild(

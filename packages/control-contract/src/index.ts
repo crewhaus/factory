@@ -3,6 +3,45 @@
  * surface shares. Types, data, minters and a few pure functions. This entry opens
  * no file, makes no network call and imports no package; zod is in `./schemas`.
  */
+export {
+  ATTENTION_BANDS,
+  ATTENTION_EVIDENCE_KINDS,
+  ATTENTION_ID_RE,
+  ATTENTION_KIND_ROWS,
+  ATTENTION_KINDS,
+  ATTENTION_MODULE,
+  ATTENTION_RESOLUTIONS,
+  ATTENTION_SOURCE_KINDS,
+  ATTENTION_STATES,
+  type AttentionBand,
+  type AttentionCause,
+  type AttentionChoice,
+  type AttentionEvidence,
+  type AttentionFreshness,
+  type AttentionItem,
+  type AttentionKind,
+  type AttentionList,
+  type AttentionListQuery,
+  type AttentionMetrics,
+  type AttentionMetricsQuery,
+  type AttentionOpenRow,
+  type AttentionOverview,
+  type AttentionResolution,
+  type AttentionResolutionRow,
+  type AttentionSourceKind,
+  type AttentionState,
+  type AttentionText,
+  type AttentionViaRow,
+  CAUSE_KINDS,
+  CROSS_HARNESS_CAUSES,
+  type CauseKind,
+  TITLE_TEMPLATES,
+  type TitleTemplate,
+  attIdFromDigest,
+  attentionBandOf,
+  attentionKey,
+  attentionRef,
+} from "./areas/attention.js";
 export { COMPILER_MODULE } from "./areas/compiler.js";
 export { COMPILER_FEATURE_KEYS } from "./areas/compiler-features.generated.js";
 export { CORE_MODULE, DEFER_REASONS } from "./areas/core.js";

@@ -266,6 +266,7 @@ describe("GET routes change nothing", () => {
       const refFor: Readonly<Record<string, string>> = {
         "refs.resolve": `${live.id}/exec/${runId}`,
         "decisions.get": `${live.id}/decision/appr_00000000000000d1`,
+        "attention.get": `home/attention/att_${"0".repeat(26)}`,
       };
       const v1Paths: Array<{ key: string; path: string }> = [];
       for (const op of v1Gets.filter((row) => !v1Excluded.has(row.id))) {

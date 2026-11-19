@@ -155,11 +155,12 @@ import {
   parseSince,
   recoveryItems,
 } from "./activity";
+import { advisorSweepItems } from "./advisor";
 import {
   type ApprovalHarness,
   approvalsInbox,
   isApprovalId,
-  pendingApprovalCount,
+  pendingApprovalsOf,
   refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
@@ -433,6 +434,8 @@ export type HangarServerOptions = {
   readonly areas?: readonly HomeAreaRuntime[];
   /** The timers Home's tick arms; injected in tests, which drive `scheduler.tick()`. */
   readonly schedulerTimers?: SchedulerTimers;
+  /** Gathers one harness's Advisor findings for the attention sweep; injected in tests. */
+  readonly advisorItems?: HomePorts["advisorItems"];
   /** When the machine last booted, epoch ms; injected in tests. */
   readonly hostBootedAt?: () => number;
 };
@@ -1060,6 +1063,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
 
   // ---- route bodies -------------------------------------------------------
 
+  /**
+   * A fleet row's parked-approval count. A missing folder has none; a harness whose
+   * sessions folder lies outside it has an unknown count, said as such, never 0.
+   */
+  const approvalsOfRow = (
+    missing: boolean,
+    dir: string,
+  ): { pendingApprovals: number | null; approvalsUnreachable?: true } => {
+    if (missing) return { pendingApprovals: 0 };
+    const pending = pendingApprovalsOf(dir);
+    return pending === undefined
+      ? { pendingApprovals: null, approvalsUnreachable: true }
+      : { pendingApprovals: pending };
+  };
+
   const harnessRows = (hydrate: boolean): unknown => {
     const rows = visibleEntries().map((entry) => {
       const missing = entry.missingSince !== null;
@@ -1123,7 +1141,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         // parked on a human? Both are cheap (a runfile stat, a folded
         // approvals log) — no transcript is opened for a fleet row.
         supervision: missing ? null : (processes.peek(entry.dir)?.snapshot().state ?? null),
-        pendingApprovals: missing ? 0 : pendingApprovalCount(entry.dir),
+        ...approvalsOfRow(missing, entry.dir),
         cachedAt: rollup?.cachedAt ?? rollupStaleCachedAt ?? null,
         rollup,
         ...(rollupStaleCachedAt !== undefined ? { rollupStaleCachedAt } : {}),
@@ -1375,7 +1393,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           harnessId: entry.id,
           specName: view.specName,
           groups: entry.groups,
-          pendingApprovals: pendingApprovalCount(dir),
+          // An unreadable count raises nothing: the signal's count is a number.
+          pendingApprovals: pendingApprovalsOf(dir) ?? 0,
           procState: processes.peek(dir)?.snapshot().state ?? null,
           evalHealthy: evalHealthyFlag(evalHealth(join(dir, ".crewhaus", "evals"), view.specName)),
           openIncidents: countOpenIncidents(dir),
@@ -3679,6 +3698,13 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
     notificationsTick,
     delegations: controlService.delegations,
     projections: projectionsOf(areas).map((row) => row.projection),
+    advisorItems:
+      opts.advisorItems ??
+      ((harness) =>
+        advisorSweepItems(
+          { env, now, warn: onWarn, control, jobs: processes.jobs, operator, hangarRoot },
+          harness,
+        )),
   };
   const scheduler = createSchedulerHost<HomePorts>({
     now,

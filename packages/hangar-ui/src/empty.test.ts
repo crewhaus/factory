@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 import { EMPTY_CAUSES, emptyModel } from "../assets/js/ui/empty.js";
 
 describe("empty states", () => {
-  test("there are exactly six causes, and each has its words", () => {
+  test("there are exactly seven causes, and each has its words", () => {
     expect(Object.keys(EMPTY_CAUSES).sort()).toEqual(
       [
         "connection-failed",
@@ -11,6 +11,7 @@ describe("empty states", () => {
         "no-access",
         "no-data",
         "not-indexed",
+        "unreachable",
         "unsupported",
       ].sort(),
     );

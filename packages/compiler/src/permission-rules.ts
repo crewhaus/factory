@@ -184,13 +184,13 @@ export function permissionRuleProblemsOf(
   }
   // A deny or ask that an allow above it in the same layer always beats —
   // except in a plan-mode spec, which reads no allow, where it is a note. A
-  // worker reads the shape's deny and ask rules first, so on its build that
-  // list's order decides nothing.
+  // worker reads the shape's deny and ask rules first, so its build does not
+  // check that list's order: the order check never receives it there.
   const permissions = (spec as { readonly permissions?: { readonly mode?: unknown } } | null)
     ?.permissions;
   const mode = typeof permissions?.mode === "string" ? permissions.mode : undefined;
-  for (const p of shadowedPermissionRules(lists, mode !== undefined ? { mode } : {})) {
-    if (opts.edge === true && p.list === "permissions.rules") continue;
+  const ordered = opts.edge === true ? lists.filter((l) => l.path !== "permissions.rules") : lists;
+  for (const p of shadowedPermissionRules(ordered, mode !== undefined ? { mode } : {})) {
     const { shadowedBy: _allow, ...problem } = p;
     out.push({ ...problem, path: `${p.list}[${p.type} ${p.pattern}]` });
   }
@@ -201,13 +201,16 @@ export function permissionRuleProblemsOf(
  * Rule findings that inform without saying the rule is dead, so `--strict`
  * never escalates them: a `builtin-not-reached` note is about a rule that
  * still fires (on a declared MCP server's tools), a `tool-not-known` one about
- * a name a plugin or custom tool may still supply, and a
- * `shadowed-outside-plan` one about a rule a plan-mode spec still fires.
+ * a name a plugin or custom tool may still supply, a
+ * `shadowed-outside-plan` one about a rule a plan-mode spec still fires, and
+ * an `order-not-checked` one names where the rule-order check, which does a
+ * bounded amount of work, stopped.
  */
 export const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
   "builtin-not-reached",
   "tool-not-known",
   "shadowed-outside-plan",
+  "order-not-checked",
 ]);
 
 /**
