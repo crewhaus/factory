@@ -70,6 +70,25 @@ export const INBOX_BINDINGS = [
   { keys: "?", does: "show the inbox's own keys" },
 ];
 
+/** The Needs-you list (All): it moves between cards and nothing more. */
+export const ATTENTION_BINDINGS = [
+  { keys: "j / ↓", does: "move to the next card" },
+  { keys: "k / ↑", does: "move to the previous card" },
+  { keys: "Home / End", does: "move to the first or last card" },
+];
+
+/**
+ * Which list a route puts on the page, for the sheet: `"triage"` (the
+ * approvals or review inbox, whose own `?` help it opens), `"attention"`
+ * (Needs you, All, which only moves between cards), or `false`. Pure.
+ */
+export function inboxKindOf(route) {
+  if (route?.view !== "home" || route?.sub !== "needs-you") return false;
+  const type = route.query?.type;
+  if (type === undefined) return "attention";
+  return type === "approvals" || type === "review" ? "triage" : false;
+}
+
 /** Fields that own their keystrokes. */
 const FIELD_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
 
@@ -193,8 +212,17 @@ export function globalKey(state, shape) {
   return keep;
 }
 
-/** Every binding the sheet shows, grouped. Pure — the overlay renders it. */
+/**
+ * Every binding the sheet shows, grouped. Pure — the overlay renders it.
+ * `inboxMounted` is {@link inboxKindOf}'s answer (`true` reads as `"triage"`).
+ */
 export function bindingSheet(inboxMounted = false) {
+  if (inboxMounted === "attention") {
+    return [
+      { section: "Anywhere", bindings: GLOBAL_BINDINGS },
+      { section: "This list", bindings: ATTENTION_BINDINGS },
+    ];
+  }
   return [
     { section: "Anywhere", bindings: GLOBAL_BINDINGS },
     {

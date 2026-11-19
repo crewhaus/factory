@@ -1807,6 +1807,21 @@ dialog.modal::backdrop {
 .inbox-twins {
   margin-top: 4px;
 }
+/* What a harness sent and its commands wrap inside the card: the page reflows at 320 px. */
+.attention-body pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+.attention-choices {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+}
+.attention-choices code,
+.attention-card .inbox-twins code {
+  overflow-wrap: anywhere;
+}
 .activity-row {
   display: flex;
   gap: 10px;

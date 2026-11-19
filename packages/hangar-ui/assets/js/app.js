@@ -15,7 +15,7 @@
 
 import { ApiError, onUnauthorized } from "./api.js";
 import { clear, el } from "./dom.js";
-import { bindingSheet, globalKey, initialKeyState, keyShape } from "./keys.js";
+import { bindingSheet, globalKey, inboxKindOf, initialKeyState, keyShape } from "./keys.js";
 import { createNavigator } from "./navigation.js";
 import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
@@ -63,13 +63,6 @@ function initTheme() {
   applyPrefs(document.documentElement, readPrefs());
 }
 
-/** Whether a route puts an inbox list on the page (the `?` key is then the list's). */
-function hasInbox(route) {
-  if (route.view !== "home" || route.sub !== "needs-you") return false;
-  const type = route.query?.type;
-  return type === undefined || type === "approvals" || type === "review";
-}
-
 const navigator = createNavigator({
   mount: (route) => mountRoute(route),
   render: (route, container, opts) => renderRoute(route, container, opts),
@@ -95,7 +88,7 @@ function dispatch(route) {
   // The screens that bind `?` for their own inbox sheet. Tracked here rather
   // than sniffed from the DOM so the ownership rule stays a pure input to the
   // `keys.js` reducer.
-  keyState = { ...keyState, inboxMounted: hasInbox(route) };
+  keyState = { ...keyState, inboxMounted: inboxKindOf(route) };
   viewStale = false;
   return navigator.navigate(route).then((outcome) => {
     if (outcome === "done") navigatedBefore = true;

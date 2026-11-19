@@ -57,6 +57,11 @@ export type SeedFleetOptions = {
 
 /** The tools the rich seed's approvals ask for, in order. */
 export const RICH_APPROVAL_TOOLS = ["Bash", "SendMessage", "Fetch"] as const;
+/**
+ * The rich seed's Fetch input: one long line with no break in it, as real URLs and shell
+ * commands are, so the reflow check sees a request's input wrap inside its card.
+ */
+export const LONG_FETCH_URL = `https://example.invalid/status/${"region-eu-west-1/".repeat(12)}health?verbose=true`;
 /** The archived spec version the rich seed registers. */
 export const RICH_SPEC_VERSION = "1.0.0";
 
@@ -99,7 +104,7 @@ function richRecords(
         ? { command: "ls -la" }
         : toolName === "SendMessage"
           ? { channel: "ops", text: "ship it" }
-          : { url: "https://example.invalid/status" },
+          : { url: LONG_FETCH_URL },
     runId,
     sessionId,
     surface: "daemon",

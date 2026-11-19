@@ -18,6 +18,35 @@ export const DEFAULT_SESSION_TTL_DAYS = 30;
 /** Said where a harness's approvals cannot be read: never a count of 0. */
 export const APPROVALS_UNKNOWN = "Approvals unknown";
 
+/** The names of the harnesses whose approvals could not be read. Pure. */
+export function unreachableNames(payload) {
+  const list =
+    payload && Array.isArray(payload.unreachableHarnesses) ? payload.unreachableHarnesses : [];
+  return list
+    .map((h) =>
+      typeof h === "string"
+        ? h
+        : h && typeof h.specName === "string" && h.specName !== ""
+          ? h.specName
+          : h && typeof h.id === "string"
+            ? h.id
+            : null,
+    )
+    .filter((name) => name !== null);
+}
+
+/** One sentence naming them, so the list never reads as complete. Pure. */
+export function unreachableNote(names) {
+  if (names.length === 0) return "";
+  const list =
+    names.length === 1
+      ? names[0]
+      : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
+  return names.length === 1
+    ? `Couldn't read the approvals of ${list}: its sessions folder is outside its folder.`
+    : `Couldn't read the approvals of ${list}: each keeps its sessions folder outside its folder.`;
+}
+
 /** Parse an ISO timestamp to epoch ms, or null when absent/invalid. */
 export function parseTs(iso) {
   if (typeof iso !== "string" || iso === "") return null;

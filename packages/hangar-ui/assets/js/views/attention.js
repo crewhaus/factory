@@ -4,11 +4,14 @@
  * labelled bands, Decide, Fix and Consider, newest first within each; a card
  * per item says what it is, why now, which harness, since when, the deadline
  * only when there is a real one, who may decide, and the command that shows it
- * (`crewhaus inbox show <id>`). Acting stays on the screens the filters open
- * (Approvals, Review, Advice): each card links there.
+ * (`crewhaus inbox show <id>`), and each choice with its own command or why
+ * there is none. Acting stays on the screens the filters open (Approvals,
+ * Review, Advice) and on the harness page that fixes a problem: each card
+ * links there.
  *
  * Reading never moves anything under you: the list is fetched again now and
- * then, and new items wait behind "Show N new". `j`/`k` (and the arrows) move
+ * then, and new items wait behind "Show N new", which keeps what was open and
+ * moves focus to the first new card. `j`/`k` (and the arrows) move
  * between cards only while focus is inside the list, and the letters follow
  * the "Single-key shortcuts" setting. `?item=<id>` moves focus to that card,
  * or says it is no longer open.
@@ -23,7 +26,7 @@ import { hrefFleet, hrefHarness } from "../router.js";
 import { emptyFor } from "../ui/empty.js";
 import { rovingList } from "../ui/listbox.js";
 import { announce } from "../ui/live.js";
-import { fmtRelativeTime } from "../util.js";
+import { parseTs } from "../util.js";
 import { call } from "../v1.js";
 
 /** The bands, in the order they are shown. */
@@ -34,6 +37,8 @@ export const BANDS = Object.freeze([
 ]);
 
 const s = (n) => (Number(n) === 1 ? "" : "s");
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
 const word = (value, fallback) => (typeof value === "string" && value !== "" ? value : fallback);
 
 /**
@@ -119,14 +124,46 @@ export function classWord(requiredClass) {
   return "Needs an operator";
 }
 
+/**
+ * How far a time is from now, as a span ("2h"), and whether it is still ahead.
+ * `null` for a time that does not parse. Pure.
+ */
+export function spanOf(at, nowMs) {
+  const ts = typeof at === "number" ? at : parseTs(at);
+  if (ts === null) return null;
+  const diff = ts - nowMs;
+  const abs = Math.abs(diff);
+  const label =
+    abs < HOUR_MS
+      ? `${Math.max(1, Math.round(abs / MINUTE_MS))}m`
+      : abs < 24 * HOUR_MS
+        ? `${Math.round(abs / HOUR_MS)}h`
+        : `${Math.round(abs / (24 * HOUR_MS))}d`;
+  return { label, ahead: diff > 0 };
+}
+
 /** The deadline line: a real deadline only, else that it waits. Pure. */
 export function deadlineLine(item, nowMs) {
   const at = item?.deadline?.at;
   if (typeof at !== "string") return "No deadline. It waits until someone decides.";
-  const when = fmtRelativeTime(at, nowMs);
-  return item.deadline.source === "agreement"
-    ? `Decide by ${when}, as agreed.`
-    : `This request lapses ${when}.`;
+  const span = spanOf(at, nowMs);
+  const agreed = item.deadline.source === "agreement";
+  if (span === null) return agreed ? "It has an agreed deadline." : "It lapses after a while.";
+  if (agreed) {
+    return span.ahead
+      ? `Decide within ${span.label} (agreed deadline).`
+      : `The agreed deadline passed ${span.label} ago.`;
+  }
+  return span.ahead ? `Lapses in ${span.label}.` : `Lapsed ${span.label} ago.`;
+}
+
+/** How long an item has waited (a request) or since it was first seen (a problem). Pure. */
+export function sinceLine(item, nowMs) {
+  const span = spanOf(item?.since, nowMs);
+  const decide = item?.band === "decide";
+  if (span === null) return decide ? "Waiting" : "Seen before";
+  if (span.ahead) return decide ? "Waiting 1m" : "First seen 1m ago";
+  return decide ? `Waiting ${span.label}` : `First seen ${span.label} ago`;
 }
 
 /** The name of a harness, from the answer's names, else its id. Pure. */
@@ -151,9 +188,8 @@ export function asksLine(item, nowMs) {
   if (asks === undefined || asks === null) return null;
   const count = Number(asks.count ?? 1);
   const asked = count > 1 ? `Asked ${count} times.` : "Asked once.";
-  return typeof asks.refusedAt === "string"
-    ? `${asked} Refused ${fmtRelativeTime(asks.refusedAt, nowMs)}.`
-    : asked;
+  const refused = spanOf(asks.refusedAt, nowMs);
+  return refused === null ? asked : `${asked} Refused ${refused.label} ago.`;
 }
 
 /** The `att_` id of a ref. Pure. */
@@ -165,6 +201,51 @@ export function itemIdOf(ref) {
 /** The command that shows an item in full. Pure. */
 export function showTwin(ref) {
   return `crewhaus inbox show ${itemIdOf(ref)}`;
+}
+
+/** The one harness an item is about, or `null` for a group across several. Pure. */
+function oneHarness(item) {
+  if (typeof item?.harness === "string" && item.harness !== "") return item.harness;
+  const list = Array.isArray(item?.harnesses) ? item.harnesses : [];
+  return list.length === 1 && typeof list[0] === "string" ? list[0] : null;
+}
+
+/** Where a problem is fixed: the harness page that changes what broke. Pure. */
+function fixOn(item) {
+  const kind = item?.kind;
+  const harness = oneHarness(item);
+  const params = item?.title?.params ?? {};
+  if (kind === "credential") {
+    const env = typeof params.envName === "string" && params.envName !== "" ? params.envName : null;
+    return {
+      label: env === null ? "Fix the key" : `Fix the ${env} key`,
+      href:
+        harness === null
+          ? hrefFleet("connections", "credentials")
+          : hrefHarness(harness, "setup", "credentials"),
+    };
+  }
+  if (kind === "budget" && harness !== null) {
+    return { label: "Review the budget", href: hrefHarness(harness, "setup", "budget") };
+  }
+  if (kind === "spec" && harness !== null) {
+    return { label: "Fix the spec", href: hrefHarness(harness, "setup", "spec") };
+  }
+  if (kind === "provider-limit" && harness !== null) {
+    return { label: "Review model settings", href: hrefHarness(harness, "setup", "models") };
+  }
+  if (kind === "run-failures" && harness !== null) {
+    return item?.title?.template === "deployment.failing"
+      ? { label: "Check the deployment", href: hrefHarness(harness, "setup", "deployment") }
+      : { label: "See the failed runs", href: hrefHarness(harness, "work", "runs") };
+  }
+  if (kind === "provider-limit" || kind === "run-failures") {
+    return { label: "See the failed runs", href: hrefFleet("home", "working") };
+  }
+  if (item?.band === "fix" && harness !== null) {
+    return { label: "Open the harness", href: hrefHarness(harness) };
+  }
+  return null;
 }
 
 /** Where an item is acted on today, or `null` when nowhere yet. Pure. */
@@ -191,7 +272,33 @@ export function actOn(item) {
   if (item?.source?.kind === "advisor") {
     return { label: "Open in Advice", href: hrefFleet("home", "needs-you", { type: "advice" }) };
   }
-  return null;
+  return fixOn(item);
+}
+
+/** A choice's name, as words. */
+const CHOICE_WORDS = Object.freeze({
+  grant: "Grant",
+  deny: "Deny",
+  resolve: "Resolve",
+  review: "Preview",
+  adopt: "Adopt",
+});
+
+/** Each choice with its exact command, or why there is none. Pure. */
+export function choiceLines(item) {
+  const list = Array.isArray(item?.choices) ? item.choices : [];
+  return list
+    .filter((c) => c && typeof c.id === "string")
+    .map((c) => ({
+      label: Object.hasOwn(CHOICE_WORDS, c.id) ? CHOICE_WORDS[c.id] : c.id,
+      twin: typeof c.cliTwin === "string" && c.cliTwin !== "" ? c.cliTwin : null,
+      reason:
+        typeof c.cliTwin === "string" && c.cliTwin !== ""
+          ? null
+          : typeof c.nullReason === "string" && c.nullReason !== ""
+            ? c.nullReason
+            : "There is no command for this.",
+    }));
 }
 
 /** Everything a card says, in the order it says it. Pure. */
@@ -211,7 +318,7 @@ export function cardModel(item, ctx = {}) {
     title: textOf(item?.title),
     whyNow: textOf(item?.whyNow),
     harnesses: harnessIds.map((id) => nameOf(names, id)),
-    since: `Since ${fmtRelativeTime(item?.since, nowMs)}`,
+    since: sinceLine(item, nowMs),
     deadline: decide ? deadlineLine(item, nowMs) : null,
     ifUnanswered: item?.ifUnanswered ? textOf({ template: item.ifUnanswered.template }) : null,
     who: decide ? classWord(item?.requiredClass) : null,
@@ -223,6 +330,7 @@ export function cardModel(item, ctx = {}) {
         : null,
     twin: showTwin(item?.ref),
     act: actOn(item),
+    choices: choiceLines(item),
     hasBody: item !== null && typeof item === "object" && "body" in item,
     bodyWithheld: item?.bodyWithheld === true,
   };
@@ -277,6 +385,12 @@ export function emptyOptsOf(list) {
     return { cause: "no-access", detail: remedy, action: "Ask the owner to share a harness" };
   if (reason === "filtered") return { cause: "filtered", detail: remedy };
   return { cause: "no-data", detail: "Nothing needs you right now." };
+}
+
+/** The index of the first ref `shownRefs` does not hold, or -1. Pure. */
+export function firstNewIndex(shownRefs, refs) {
+  const shown = new Set(Array.isArray(shownRefs) ? shownRefs : []);
+  return (Array.isArray(refs) ? refs : []).findIndex((ref) => !shown.has(ref));
 }
 
 /** How many items `fresh` holds that the shown list does not. Pure. */
@@ -339,6 +453,18 @@ function drawCard(item, names, nowMs) {
       el("div", { class: "inbox-actions" }, [
         m.act === null ? null : el("a", { class: "btn", href: m.act.href, text: m.act.label }),
       ]),
+      m.choices.length === 0
+        ? null
+        : el(
+            "ul",
+            { class: "attention-choices", "aria-label": "Choices" },
+            m.choices.map((c) =>
+              el("li", null, [
+                el("span", { class: "muted", text: `${c.label}: ` }),
+                c.twin === null ? el("span", { text: c.reason }) : el("code", { text: c.twin }),
+              ]),
+            ),
+          ),
       el("div", { class: "inbox-twins" }, [
         el("span", { class: "muted", text: "Show it in a terminal: " }),
         el("code", { text: m.twin }),
@@ -402,6 +528,41 @@ function focusItem(drawn, itemId, status) {
   drawn.roving.focus(index);
 }
 
+/** The cards whose "What the harness sent" is open, by ref. */
+function openBodyRefs(host) {
+  return [...host.querySelectorAll(".attention-card details[open]")]
+    .map((details) => details.closest("[data-ref]")?.getAttribute("data-ref"))
+    .filter((ref) => typeof ref === "string");
+}
+
+/**
+ * After "Show N new": what was open stays open, focus moves to the first new card (or
+ * the list's heading when none is left), and the count is said.
+ */
+function restoreAfterNew(host, drawn, restore) {
+  const rows = drawn.roving.rows();
+  const open = new Set(restore.openRefs ?? []);
+  for (const row of rows) {
+    if (!open.has(row.getAttribute("data-ref"))) continue;
+    const details = row.querySelector("details");
+    if (details !== null) details.open = true;
+  }
+  const refs = rows.map((row) => row.getAttribute("data-ref"));
+  const index = firstNewIndex(restore.shownRefs, refs);
+  const added = refs.filter((ref) => !new Set(restore.shownRefs ?? []).has(ref)).length;
+  if (index >= 0) {
+    drawn.roving.setCurrent(index);
+    drawn.roving.focus(index);
+  } else {
+    const heading = host.closest("section")?.querySelector("h2, h3") ?? host.querySelector("h3");
+    if (heading !== null && heading !== undefined) {
+      if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+      heading.focus();
+    }
+  }
+  announce(added > 0 ? `Showing ${added} new` : "The list is up to date.");
+}
+
 /** Needs you, All: Home's inbox. */
 export async function renderAttention(host, ctx = {}) {
   const fetchList = () => call("attention.list", { query: { limit: "500" } });
@@ -433,6 +594,7 @@ export async function renderAttention(host, ctx = {}) {
   const drawn = drawList(list, nowMs);
   host.appendChild(drawn.region);
   focusItem(drawn, ctx.route?.query?.item, status);
+  if (ctx.restore !== undefined) restoreAfterNew(host, drawn, ctx.restore);
   const shownRefs = items.map((i) => i.ref);
   // New items wait behind a button, so nothing moves under focus or under the reader.
   const recheck = () => {
@@ -449,7 +611,12 @@ export async function renderAttention(host, ctx = {}) {
               class: "btn",
               type: "button",
               text: label,
-              onClick: () => renderAttention(host, { ...ctx, route: { ...ctx.route, query: {} } }),
+              onClick: () =>
+                renderAttention(host, {
+                  ...ctx,
+                  route: { ...ctx.route, query: {} },
+                  restore: { shownRefs, openRefs: openBodyRefs(host) },
+                }),
             }),
           );
           announce(`${n} new item${s(n)} waiting. ${label} to see them.`);

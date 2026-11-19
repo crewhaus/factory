@@ -19,7 +19,7 @@ import { hrefFleet, hrefGlobal, hrefHarness } from "../router.js";
 import { activityHref, procRow } from "../supervision.js";
 import { emptyFor } from "../ui/empty.js";
 import { timeEl } from "../ui/time.js";
-import { dirTail, normalizeRows } from "../util.js";
+import { dirTail, normalizeRows, unreachableNames, unreachableNote } from "../util.js";
 import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 
 const DAY_MS = 86_400_000;
@@ -137,8 +137,9 @@ export function newestFirst(items, field, n = PANEL_ITEMS) {
  * What needs you, from the two inbox reads. Pure. A read that failed is
  * passed as `null` and is not zero: its count is `null` and its name is in
  * `failed`, so nothing downstream can print "0 waiting" or "nothing needs
- * you" for a list nobody could read.
- * `{ approvals: [...top], review: [...top], pending, open, failed }`.
+ * you" for a list nobody could read. A harness whose approvals could not be
+ * read is named in `unreachable`, so its approvals are unknown, never 0.
+ * `{ approvals: [...top], review: [...top], pending, open, failed, unreachable }`.
  */
 export function needsYouModel(approvalsPayload, reviewPayload) {
   const read = (payload) => payload !== null && typeof payload === "object";
@@ -157,13 +158,15 @@ export function needsYouModel(approvalsPayload, reviewPayload) {
     pending: a === null ? null : typeof a.pending === "number" ? a.pending : approvals.length,
     open: r === null ? null : typeof r.open === "number" ? r.open : review.length,
     failed,
+    unreachable: unreachableNames(a),
   };
 }
 
-/** True only when both inboxes answered and neither holds anything. Pure. */
+/** True only when both inboxes answered in full and neither holds anything. Pure. */
 export function nothingNeedsYou(model) {
   return (
     model.failed.length === 0 &&
+    (model.unreachable ?? []).length === 0 &&
     model.approvals.length === 0 &&
     model.review.length === 0 &&
     model.pending === 0 &&
@@ -174,7 +177,18 @@ export function nothingNeedsYou(model) {
 /** The summary line, from the inboxes that answered only. Pure; null when neither did. */
 export function needsYouSummary(model) {
   const parts = [];
-  if (model.pending !== null) {
+  const unreachable = model.unreachable ?? [];
+  const where =
+    unreachable.length <= 1
+      ? unreachable[0]
+      : `${unreachable.slice(0, -1).join(", ")} and ${unreachable[unreachable.length - 1]}`;
+  if (model.pending !== null && unreachable.length > 0) {
+    // Approvals some harness holds are unknown: the count is never said as complete.
+    if (model.pending > 0) {
+      parts.push(`${model.pending} approval${model.pending === 1 ? "" : "s"} waiting elsewhere`);
+    }
+    parts.push(`Approvals of ${where} unknown`);
+  } else if (model.pending !== null) {
     parts.push(`${model.pending} approval${model.pending === 1 ? "" : "s"} waiting`);
   }
   if (model.open !== null) {
@@ -226,6 +240,9 @@ export async function renderNeedsYouPanel(root, ctx = {}) {
   ];
   const summary = needsYouSummary(model);
   if (summary !== null) root.appendChild(el("p", { class: "muted home-summary", text: summary }));
+  if (model.unreachable.length > 0) {
+    root.appendChild(el("p", { class: "muted", text: unreachableNote(model.unreachable) }));
+  }
   if (items.length > 0) root.appendChild(itemList(items));
   for (const source of model.failed) {
     root.appendChild(

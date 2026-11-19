@@ -18,18 +18,22 @@ import {
   bandsOf,
   cardModel,
   causeLine,
+  choiceLines,
   classWord,
   deadlineLine,
   emptyOptsOf,
+  firstNewIndex,
   listNotes,
   moveOf,
   newCount,
   showTwin,
+  sinceLine,
   textOf,
   // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 } from "../assets/js/views/attention.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { needsYouSections } from "../assets/js/views/needs-you.js";
+const CSS = readFileSync(join(import.meta.dir, "..", "assets", "hangar.css"), "utf8");
 
 const VIEWS = join(import.meta.dir, "..", "assets", "js", "views");
 const SOURCE = readFileSync(join(VIEWS, "attention.js"), "utf8");
@@ -97,15 +101,22 @@ describe("bands and texts", () => {
     expect(classWord("owner")).toBe("Owner only");
   });
 
-  test("a deadline line only for a real deadline", () => {
+  test("a deadline line only for a real deadline, ahead or passed", () => {
     expect(deadlineLine(item(), NOW)).toBe("No deadline. It waits until someone decides.");
-    const at = new Date(NOW + 2 * 3_600_000).toISOString();
-    expect(deadlineLine(item({ deadline: { at, source: "agreement" } }), NOW)).toBe(
-      "Decide by in 2h, as agreed.",
-    );
-    expect(deadlineLine(item({ deadline: { at, source: "ttl" } }), NOW)).toBe(
-      "This request lapses in 2h.",
-    );
+    const ahead = new Date(NOW + 2 * 3_600_000).toISOString();
+    const passed = new Date(NOW - 2 * 3_600_000).toISOString();
+    const line = (at: string, source: string) =>
+      deadlineLine(item({ deadline: { at, source } }), NOW);
+    expect(line(ahead, "agreement")).toBe("Decide within 2h (agreed deadline).");
+    expect(line(passed, "agreement")).toBe("The agreed deadline passed 2h ago.");
+    expect(line(ahead, "ttl")).toBe("Lapses in 2h.");
+    expect(line(passed, "ttl")).toBe("Lapsed 2h ago.");
+  });
+
+  test("how long a request waited, or when a problem was first seen", () => {
+    expect(sinceLine(item(), NOW)).toBe("Waiting 1h");
+    expect(sinceLine(item({ band: "fix" }), NOW)).toBe("First seen 1h ago");
+    expect(sinceLine(item({ since: "not a time" }), NOW)).toBe("Waiting");
   });
 
   test("a group's cause names its runs and harnesses", () => {
@@ -132,7 +143,7 @@ describe("a card", () => {
     expect(model.title).toBe("Permission to use SendMessage");
     expect(model.whyNow).toBe("A run is waiting for this.");
     expect(model.harnesses).toEqual(["release-bot"]);
-    expect(model.since).toBe("Since 1h ago");
+    expect(model.since).toBe("Waiting 1h");
     expect(model.who).toBe("Needs an operator");
     expect(model.deadline).toBe("No deadline. It waits until someone decides.");
     expect(model.twin).toBe(`crewhaus inbox show att_${"0".repeat(26)}`);
@@ -163,7 +174,56 @@ describe("a card", () => {
       }),
     );
     expect(delegation?.href).toBe(`#/h/${A}/setup/delegations/new/merge/dec_x`);
-    expect(actOn(item({ kind: "credential", source: { kind: "runs", id: "x" } }))).toBeNull();
+    const credential = item({
+      kind: "credential",
+      band: "fix",
+      source: { kind: "runs", id: "x" },
+      title: { template: "credential.failing", params: { envName: "ANTHROPIC_API_KEY" } },
+    });
+    expect(actOn(credential)).toEqual({
+      label: "Fix the ANTHROPIC_API_KEY key",
+      href: `#/h/${A}/setup/credentials`,
+    });
+    expect(actOn({ ...credential, harness: undefined, harnesses: [A, B] })?.href).toBe(
+      "#/connections/credentials",
+    );
+    expect(actOn(item({ kind: "budget", band: "fix" }))?.href).toBe(`#/h/${A}/setup/budget`);
+  });
+
+  test("every decide or fix kind gives a place to act or at least one choice line", () => {
+    // The contract's own rows, read from its source: every kind and its band.
+    const rows = [...CONTRACT.matchAll(/\{ kind: "([a-z-]+)", band: "([a-z]+)" \}/g)]
+      .map((m) => ({ kind: m[1] as string, band: m[2] as string }))
+      .filter((r) => r.band !== "consider");
+    expect(rows.length).toBeGreaterThan(8);
+    // A `dec_` request with no screen of its own still carries its choices, each with a line.
+    const noScreen = ["standing-rule-proposal", "quality-adoption", "decision"];
+    for (const { kind, band } of rows) {
+      const choices = noScreen.includes(kind)
+        ? [{ id: "grant", needs: "owner", cliTwin: null, nullReason: "Not yet." }]
+        : [];
+      const m = cardModel(item({ kind, band, source: { kind: "runs", id: "x" }, choices }), {
+        nowMs: NOW,
+      });
+      expect(`${kind}:${m.act !== null || m.choices.length > 0}`).toBe(`${kind}:true`);
+    }
+  });
+
+  test("each choice shows its exact command, or why there is none", () => {
+    const lines = choiceLines(
+      item({
+        choices: [
+          { id: "grant", needs: "operator", cliTwin: "crewhaus approvals grant appr_1 --dir /h" },
+          { id: "deny", needs: "operator", cliTwin: null, nullReason: "Decide it in Home." },
+          { id: "adopt", needs: "owner", cliTwin: null },
+        ],
+      }),
+    );
+    expect(lines).toEqual([
+      { label: "Grant", twin: "crewhaus approvals grant appr_1 --dir /h", reason: null },
+      { label: "Deny", twin: null, reason: "Decide it in Home." },
+      { label: "Adopt", twin: null, reason: "There is no command for this." },
+    ]);
   });
 });
 
@@ -201,6 +261,20 @@ describe("the list", () => {
     expect(newCount(["a", "b"], [{ ref: "a" }, { ref: "b" }])).toBe(0);
     expect(newCount(["a"], [{ ref: "a" }, { ref: "c" }, { ref: "d" }])).toBe(2);
     expect(SOURCE).toContain("Show ${n} new");
+  });
+
+  test("after Show N new, focus goes to the first card that was not shown", () => {
+    expect(firstNewIndex(["a", "b"], ["c", "a", "b"])).toBe(0);
+    expect(firstNewIndex(["a", "b"], ["a", "d", "b"])).toBe(1);
+    expect(firstNewIndex(["a", "b"], ["a", "b"])).toBe(-1);
+    expect(SOURCE).toContain("restore: { shownRefs, openRefs: openBodyRefs(host) }");
+    expect(SOURCE).toContain("announce(added > 0 ? `Showing ${added} new`");
+  });
+
+  test("what a harness sent wraps inside its card", () => {
+    const rule = /\.attention-body pre \{([^}]*)\}/.exec(CSS)?.[1] ?? "";
+    expect(rule).toContain("white-space: pre-wrap");
+    expect(rule).toContain("overflow-wrap: anywhere");
   });
 
   test("j and k move only with single-key shortcuts on; the arrows always", () => {

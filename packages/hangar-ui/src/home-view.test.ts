@@ -23,6 +23,25 @@ describe("needsYouModel", () => {
     expect(needsYouSummary(model)).toBe("0 approvals waiting · 0 review items open");
   });
 
+  test("a harness whose approvals cannot be read: not 'nothing', and its approvals unknown, never 0", () => {
+    const unreachableHarnesses = [{ id: "hrn_000000000000000a", specName: "linked" }];
+    const model = needsYouModel(
+      { approvals: [], pending: 0, unreachableHarnesses },
+      { items: [], open: 0 },
+    );
+    expect(model.unreachable).toEqual(["linked"]);
+    expect(nothingNeedsYou(model)).toBe(false);
+    expect(needsYouSummary(model)).toBe("Approvals of linked unknown · 0 review items open");
+    expect(needsYouSummary(model)).not.toContain("0 approvals");
+    const more = needsYouModel(
+      { approvals: [approval], pending: 1, unreachableHarnesses },
+      { items: [], open: 0 },
+    );
+    expect(needsYouSummary(more)).toBe(
+      "1 approval waiting elsewhere · Approvals of linked unknown · 0 review items open",
+    );
+  });
+
   test("approvals unread and review empty: not 'nothing', and no approvals count", () => {
     const model = needsYouModel(null, { items: [], open: 0 });
     expect(model.failed).toEqual(["approvals"]);

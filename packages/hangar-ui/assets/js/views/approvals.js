@@ -19,8 +19,11 @@ import { hrefHarness } from "../router.js";
 import { APPROVAL_KEYS, approvalRow } from "../supervision.js";
 import { emptyFor } from "../ui/empty.js";
 import { toggleBtn } from "../ui/toggle.js";
+import { unreachableNames, unreachableNote } from "../util.js";
 import { actionTwin, gatedBtn } from "./control.js";
 import { mountTriage } from "./inbox.js";
+
+export { unreachableNames, unreachableNote };
 
 /** Said where an input is withheld from someone who may not read the harness's content. */
 const WITHHELD_INPUT =
@@ -132,35 +135,6 @@ async function draw(host, view) {
     prompt: (row, action) => `${action === "grant" ? "Grant" : "Deny"} ${row.toolName}?`,
     perform: decide,
   });
-}
-
-/** The names of the harnesses whose approvals could not be read. Pure. */
-export function unreachableNames(payload) {
-  const list =
-    payload && Array.isArray(payload.unreachableHarnesses) ? payload.unreachableHarnesses : [];
-  return list
-    .map((h) =>
-      typeof h === "string"
-        ? h
-        : h && typeof h.specName === "string" && h.specName !== ""
-          ? h.specName
-          : h && typeof h.id === "string"
-            ? h.id
-            : null,
-    )
-    .filter((name) => name !== null);
-}
-
-/** One sentence naming them, so the list never reads as complete. Pure. */
-export function unreachableNote(names) {
-  if (names.length === 0) return "";
-  const list =
-    names.length === 1
-      ? names[0]
-      : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-  return names.length === 1
-    ? `Couldn't read the approvals of ${list}: its sessions folder is outside its folder.`
-    : `Couldn't read the approvals of ${list}: each keeps its sessions folder outside its folder.`;
 }
 
 async function decide(row, action, reload) {
