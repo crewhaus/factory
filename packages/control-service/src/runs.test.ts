@@ -410,6 +410,35 @@ describe("starting a run", () => {
     expect(receiptsOf(r.harness)).toEqual([]);
   });
 
+  test("a used-up budget period refuses with budget_exceeded and its own words, never the pause's", async () => {
+    const r = rig();
+    const s = starter();
+    const dir = join(r.harness, ".crewhaus", "run", "control");
+    mkdirSync(dir, { recursive: true });
+    const renewsAt = new Date(Date.now() + 3_600_000).toISOString();
+    writeFileSync(
+      join(dir, "budget-state.json"),
+      `${JSON.stringify({ v: 1, periodId: "month-2026-11-01", exhaustedAt: new Date().toISOString(), renewsAt })}\n`,
+    );
+    const plan = await runAdapterFor("cli").createRun({
+      harnessDir: r.harness,
+      harness: HRN,
+      target: "cli",
+      runId: mintRunId(),
+      input: "x",
+      admission: "reject",
+      home: s.home,
+    });
+    expect(plan.ok).toBe(false);
+    if (plan.ok) return;
+    expect(plan.refusal.code).toBe("budget_exceeded");
+    expect(plan.refusal.message).toContain("used its budget for this period");
+    expect(plan.refusal.message).not.toContain("paused");
+    expect(plan.refusal.verb).toBe("crewhaus budget extend");
+    expect(plan.refusal.retryAfterMs).toBeGreaterThan(0);
+    expect(s.starts).toEqual([]);
+  });
+
   test("a managed run with no daemon: reject is unavailable and writes nothing; queue records it under the tenant home with the receipt", async () => {
     const r = rig();
     const offline = {

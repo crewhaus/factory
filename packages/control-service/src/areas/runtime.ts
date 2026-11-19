@@ -1,19 +1,24 @@
 /**
  * The runtime area's running code (#516, module brief 333), composed from one half per
- * file so each half lands on its own lines. The work half is here; a later half spreads its
- * executors and reconcilers on the line below the work half's.
+ * file so each half lands on its own lines. The work half and the budget half are here.
  *
  * Work commands run as inline effects, so recovery never acts again: each kind's executor
  * observes whether the work log (or, for `work.start`, the run ledger) has a line carrying
  * the receipt's id, and the kinds that are not safe to repeat have a reconciler that does
  * the same. Every work kind but `work.start` acts on records alone (`unsupervised`).
+ *
+ * `budget.extend` also runs as an inline effect: its executor and reconciler observe whether
+ * a period's ledger holds a topup carrying the receipt's id. It acts on records alone.
  */
 import type { CommandReceipt } from "@crewhaus/control-contract";
 import { runsLedger } from "@crewhaus/control-records";
 import { workLedger } from "@crewhaus/tool-work/work-items";
+import { budgetTopupWritten } from "../budget";
 import type { AreaRuntime, Executor, Reconciler } from "../executor";
 import { NEEDS_DECISION } from "../refusal";
 import { ledgerNames } from "./delegation";
+
+const BUDGET_KINDS = ["budget.extend"] as const;
 
 type Observe = (receipt: CommandReceipt, harnessDir: string) => boolean;
 
@@ -66,16 +71,20 @@ export const RUNTIME_RUNTIME: AreaRuntime = {
   executors: {
     ...WORK_EXECUTORS,
 
-    // ...BUDGET_EXECUTORS,
+    "budget.extend": async ({ receipt, harnessDir }) =>
+      budgetTopupWritten(harnessDir, receipt.id)
+        ? { state: "succeeded" }
+        : { state: "unknown", outcome: NEEDS_DECISION },
   },
   reconcilers: {
     ...WORK_RECONCILERS,
 
-    // ...BUDGET_RECONCILERS,
+    "budget.extend": (receipt, { harnessDir }) =>
+      harnessDir !== undefined && budgetTopupWritten(harnessDir, receipt.id) ? "done" : "unknown",
   },
   unsupervised: [
     ...WORK_UNSUPERVISED,
 
-    // ...BUDGET_UNSUPERVISED,
+    ...BUDGET_KINDS,
   ],
 };

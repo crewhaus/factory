@@ -32,6 +32,9 @@ describe("the layout", () => {
       subjectKeyFile: join(CONTROL, "keys", "subject.key"),
       delegationsFile: join(CONTROL, "delegations.jsonl"),
       delegationLogDir: join(CONTROL, "delegation-log"),
+      budgetDir: join(CONTROL, "budget"),
+      budgetLockFile: join(CONTROL, "budget", "lock"),
+      budgetStateFile: join(CONTROL, "budget-state.json"),
     });
     expect(readdirSync(root)).toEqual([]);
   });

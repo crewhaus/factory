@@ -22,6 +22,7 @@ import {
   renderTwin,
 } from "../index.js";
 import { SCHEMAS } from "../schemas/index.js";
+import { WORK_SCHEMAS } from "../schemas/runtime-work.js";
 import { RUNTIME_SCHEMAS } from "../schemas/runtime.js";
 import { AREA_MODULES } from "./index.js";
 
@@ -180,7 +181,7 @@ describe("the work schemas", () => {
     for (const [id, value] of Object.entries(EXAMPLES)) {
       expect(`${id}: ${parse(id, value)}`).toBe(`${id}: true`);
     }
-    expect(Object.keys(EXAMPLES).sort()).toEqual(Object.keys(RUNTIME_SCHEMAS).sort());
+    expect(Object.keys(EXAMPLES).sort()).toEqual(Object.keys(WORK_SCHEMAS).sort());
   });
 
   test("runs.create takes a work item, its ref or one to create, and never a proposal", () => {

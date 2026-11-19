@@ -50,12 +50,14 @@ import { _resetRunLedgerForTest, runLedgerAt } from "./run-ledger";
 import {
   CONTEXT_FINGERPRINT_LABEL,
   FINGERPRINT_UNAVAILABLE,
+  INTAKE_PAUSE_IGNORED_ENV,
   LEDGER_HEADER_DELEGATED,
   LEDGER_HEADER_LABELLED,
   LEDGER_HEADER_USER,
   RUN_STAMPS_ENV,
   WORKFLOW_STEP_PREFIX,
   _resetRunRecordsForTest,
+  buildRunStamp,
   createManifestRecorder,
   createRecordEvent,
   fingerprinter,
@@ -340,6 +342,59 @@ describe("run_stamp", () => {
     const [stamp2] = stampsOf(linesOf(dir, ctx2.sessionId));
     expect(stamp2?.revisions.spec).toEqual({ specHash: optHash, source: "interpreter" });
     expect(stamp2?.revisions.deployment).toBeUndefined();
+  });
+
+  test("intake: a stamp says --ignore-pause let the run in only when it did", async () => {
+    const input = {
+      run: "run_0000000000000001",
+      facts: { trigger: { kind: "cli" } } as Parameters<typeof buildRunStamp>[0]["facts"],
+      shape: "cli",
+      mode: "single-turn",
+      model: "m",
+      sessionTurnBase: 0,
+      spec: { state: "not-recorded" },
+      recording: { advisorEvents: false, costTracking: false, watchme: false, runLedger: true },
+    } as const;
+    const open = buildRunStamp(input);
+    expect("intake" in open).toBe(false);
+    const ignored = buildRunStamp({ ...input, intake: { pauseIgnored: true } });
+    expect(ignored.intake).toEqual({ pauseIgnored: true });
+    // Everything else is the open stamp, byte for byte.
+    const { intake: _dropped, ...rest } = ignored;
+    expect(JSON.stringify(rest)).toBe(JSON.stringify(open));
+
+    // Over the live loop: the option, then the spawn env, then neither.
+    const dir = tempDir();
+    const viaOption = createRunContext();
+    await runOn(viaOption, {
+      ...base(dir),
+      _adapter: scripted([[say("ok")]]),
+      intake: { pauseIgnored: true },
+    });
+    expect(stampsOf(linesOf(dir, viaOption.sessionId))[0]?.intake).toEqual({ pauseIgnored: true });
+
+    process.env[INTAKE_PAUSE_IGNORED_ENV] = "1";
+    try {
+      const viaEnv = createRunContext();
+      await runOn(viaEnv, { ...base(dir), _adapter: scripted([[say("ok")]]) });
+      expect(stampsOf(linesOf(dir, viaEnv.sessionId))[0]?.intake).toEqual({ pauseIgnored: true });
+      // The caller's own word wins over the environment.
+      const overridden = createRunContext();
+      await runOn(overridden, {
+        ...base(dir),
+        _adapter: scripted([[say("ok")]]),
+        intake: { pauseIgnored: false },
+      });
+      const [stamp] = stampsOf(linesOf(dir, overridden.sessionId));
+      expect(stamp !== undefined && "intake" in stamp).toBe(false);
+    } finally {
+      Reflect.deleteProperty(process.env, INTAKE_PAUSE_IGNORED_ENV);
+    }
+    const neither = createRunContext();
+    await runOn(neither, { ...base(dir), _adapter: scripted([[say("ok")]]) });
+    const [plain] = stampsOf(linesOf(dir, neither.sessionId));
+    expect(plain).toBeDefined();
+    expect(plain !== undefined && "intake" in plain).toBe(false);
   });
 
   test("triggers: a queue scope, a synthetic lane wake without its text, and a channel session", async () => {

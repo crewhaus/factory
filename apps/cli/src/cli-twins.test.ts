@@ -382,6 +382,8 @@ describe("the server's twins, by import", () => {
         ...WORK,
         declineReason: "not-now",
         correctionScope: "item",
+        usd: "50",
+        budgetReason: "planned-work",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -405,6 +407,8 @@ describe("the server's twins, by import", () => {
         ...WORK,
         declineReason: "needs-evidence",
         correctionScope: "all",
+        usd: "12.5",
+        budgetReason: "other",
       },
     ];
     const twins = [

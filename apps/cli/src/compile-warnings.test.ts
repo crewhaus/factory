@@ -40,7 +40,7 @@ describe("informational compile warnings", () => {
       (code) => !source.includes(`"${code}"`),
     );
     expect(stale).toEqual([]);
-    expect(INFORMATIONAL_COMPILE_WARNING_CODES.length).toBe(19);
+    expect(INFORMATIONAL_COMPILE_WARNING_CODES.length).toBe(20);
   });
 
   test("wrapCodes keeps each code whole and ends the list with a full stop", () => {

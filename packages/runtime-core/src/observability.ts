@@ -1,5 +1,10 @@
 import { join } from "node:path";
-import { type CostTracker, createCostTracker, formatUsdMicros } from "@crewhaus/cost-tracker";
+import {
+  type CostTracker,
+  type PricingTable,
+  createCostTracker,
+  formatUsdMicros,
+} from "@crewhaus/cost-tracker";
 import type { EventKind, EventLog } from "@crewhaus/event-log";
 import {
   type AttachedMetrics,
@@ -259,6 +264,11 @@ export type AttachDefaultSubscribersOptions = {
   readonly sloTargets?: SloTargets;
   /** Item 37 — injected SLO mitigation ladder delivery (see {@link SloMitigationSink}). */
   readonly sloSink?: SloMitigationSink;
+  /**
+   * The run's effective pricing table (declared prices over the installed
+   * table) for the env-attached cost tracker. Absent: `DEFAULT_PRICING`.
+   */
+  readonly pricing?: PricingTable;
 };
 
 export async function attachDefaultSubscribers(
@@ -276,6 +286,7 @@ export async function attachDefaultSubscribers(
           ...(env["CREWHAUS_TENANT_ID"] !== undefined
             ? { tenantId: env["CREWHAUS_TENANT_ID"] }
             : {}),
+          ...(options.pricing !== undefined ? { pricing: options.pricing } : {}),
         })
       : undefined;
   // CLI inline cost line — opt-in via CREWHAUS_COST_INLINE=1. Subscribes to

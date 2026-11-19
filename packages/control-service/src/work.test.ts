@@ -245,7 +245,9 @@ describe("each work command writes one receipt and one line naming it", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES).toContain(RUNTIME_RUNTIME);
     expect(RUNTIME_RUNTIME.unsupervised).not.toContain("work.start");
-    expect([...(RUNTIME_RUNTIME.unsupervised ?? [])].sort()).toEqual(
+    expect(
+      [...(RUNTIME_RUNTIME.unsupervised ?? [])].filter((kind) => kind.startsWith("work.")).sort(),
+    ).toEqual(
       [
         "work.accept",
         "work.adopt",

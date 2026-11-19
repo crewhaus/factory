@@ -5,5 +5,9 @@
     "outDir": "dist"
   },
   "include": ["src/**/*"],
-  "references": [{ "path": "../errors" }, { "path": "../tool-categories" }]
+  "references": [
+    { "path": "../cost-tracker" },
+    { "path": "../errors" },
+    { "path": "../tool-categories" }
+  ]
 }

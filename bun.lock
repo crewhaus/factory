@@ -318,6 +318,7 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/abort-controller": "workspace:*",
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/hooks-engine": "workspace:*",
@@ -1350,6 +1351,7 @@
       },
       "devDependencies": {
         "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
         "@crewhaus/eval-runner": "workspace:*",
         "@crewhaus/gateway-server": "workspace:*",
         "@crewhaus/quality-service": "workspace:*",
@@ -2186,6 +2188,7 @@
       "name": "@crewhaus/spec",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/cost-tracker": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
         "yaml": "^2.6.0",

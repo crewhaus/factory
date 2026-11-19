@@ -354,6 +354,7 @@ export {
   createHarnessSupervisor,
   DEFAULT_PUMP_INTERVAL_MS,
   DEPLOYMENT_ID_ENV,
+  INTAKE_PAUSE_IGNORED_ENV,
   SPEC_HASH_ENV,
 } from "./supervisor";
 

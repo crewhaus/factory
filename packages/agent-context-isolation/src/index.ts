@@ -23,6 +23,8 @@
  */
 import { randomBytes } from "node:crypto";
 import { type AbortTree, createAbortTree } from "@crewhaus/abort-controller";
+import type { PricingTable } from "@crewhaus/cost-tracker";
+import type { SpendMeter } from "@crewhaus/cost-tracker/spend";
 import type { FailureReport } from "@crewhaus/errors";
 import {
   type EventLog,
@@ -398,6 +400,20 @@ export type ParentRunHandle = {
    * parent records its runs. The spawner reports the sub-agent's span here.
    */
   readonly recordSpanClosed?: (payload: SpanClosedPayload) => Promise<void>;
+  /**
+   * The parent's spend meter, when its run is budgeted. A child spends from
+   * it live (`child()`, with a nested cap for a declared `budget_share`), so
+   * a sub-agent's in-flight calls count against the parent's cap at once.
+   * Present only when the parent has one.
+   */
+  readonly spend?: SpendMeter;
+  /**
+   * The parent's effective pricing table (declared `models.<name>.price`
+   * rows merged over the installed table), so a child prices its calls the
+   * way the parent does, budgeted or not. Present only when the parent was
+   * given one.
+   */
+  readonly pricing?: PricingTable;
 };
 
 /** An audit sink a child writes to: `@crewhaus/audit-log`'s `append`, narrowed to one kind. */
@@ -635,6 +651,8 @@ export function projectParentHandle(bridge: RuntimeBridge): ParentRunHandle {
     ...(bridge.egressAuditSink !== undefined ? { egressAuditSink: bridge.egressAuditSink } : {}),
     ...(bridge.parentSpanId !== undefined ? { parentSpanId: bridge.parentSpanId } : {}),
     ...(bridge.recordSpanClosed !== undefined ? { recordSpanClosed: bridge.recordSpanClosed } : {}),
+    ...(bridge.spend !== undefined ? { spend: bridge.spend } : {}),
+    ...(bridge.pricing !== undefined ? { pricing: bridge.pricing } : {}),
   };
 }
 

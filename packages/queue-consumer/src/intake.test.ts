@@ -123,6 +123,56 @@ describe("startConsumer — the operator record", () => {
     }
   });
 
+  test("by default a harness whose budget period is used up takes no job", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "queue-intake-"));
+    const realSetTimeout = globalThis.setTimeout;
+    let loopSleeps = 0;
+    let thirdSleep: () => void = () => undefined;
+    const sleptThrice = new Promise<void>((resolve) => {
+      thirdSleep = resolve;
+    });
+    const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+      fn: () => void,
+      ms?: number,
+    ) => {
+      if (ms === 1) {
+        loopSleeps += 1;
+        if (loopSleeps === 3) thirdSleep();
+      }
+      return realSetTimeout(fn, ms);
+    }) as typeof setTimeout);
+    try {
+      mkdirSync(join(dir, ".crewhaus", "run", "control"), { recursive: true });
+      // No operator record at all: the used-up period alone closes intake.
+      writeFileSync(
+        join(dir, ".crewhaus", "run", "control", "budget-state.json"),
+        `${JSON.stringify({
+          v: 1,
+          periodId: "month-2026-11-01",
+          exhaustedAt: "2026-11-18T00:00:00.000Z",
+          renewsAt: "2999-01-01T00:00:00.000Z",
+        })}\n`,
+      );
+      const counted = countedQueue(createInMemoryQueue<string>());
+      await counted.queue.enqueue("job");
+      const consumer = startConsumer<string, string>({
+        queue: counted.queue,
+        handler: async (input) => input,
+        concurrency: 1,
+        visibilityTimeoutMs: 5_000,
+        emptyQueuePollMs: 1,
+        harnessDir: dir,
+      });
+      await sleptThrice;
+      expect(counted.pulls()).toBe(0);
+      await consumer.drain();
+      expect((await counted.queue.stats()).pending).toBe(1);
+    } finally {
+      timer.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("a job whose loop was refused as paused is deferred, its attempt not counted, never dead-lettered", async () => {
     const queue = createInMemoryQueue<string>();
     await queue.enqueue("job");

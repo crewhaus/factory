@@ -278,6 +278,32 @@ export const FEATURE_PROBES: ReadonlyArray<FeatureProbe> = [
   ),
   setting("budget.scope", { budget: { scope: "session" } }, { base: { budget: { usd: 5 } } }),
   setting("budget.judge_share", { budget: { judge_share: 0.5 } }, { base: { budget: { usd: 5 } } }),
+  // A harness-wide period (#514), and each of its keys against a declared period.
+  setting(
+    "budget.period",
+    { budget: { period: { every: "month", usd: 50 } } },
+    { base: { budget: { usd: 5 } } },
+  ),
+  setting(
+    "budget.period.every",
+    { budget: { period: { every: "week" } } },
+    { base: { budget: { usd: 5, period: { every: "month", usd: 50 } } } },
+  ),
+  setting(
+    "budget.period.usd",
+    { budget: { period: { usd: 60 } } },
+    { base: { budget: { usd: 5, period: { every: "month", usd: 50 } } } },
+  ),
+  setting(
+    "budget.period.starts",
+    { budget: { period: { starts: "2026-01-05" } } },
+    { base: { budget: { usd: 5, period: { every: "month", usd: 50 } } } },
+  ),
+  setting(
+    "budget.period.timezone",
+    { budget: { period: { timezone: "Europe/Berlin" } } },
+    { base: { budget: { usd: 5, period: { every: "month", usd: 50 } } } },
+  ),
   chainBlockProbe("chains", [BASE_CHAIN], false),
   setting("cli", { cli: { banner: { taglines: ["Hello."] } } }),
   setting("concurrency", { concurrency: 3 }),
@@ -376,6 +402,15 @@ export const FEATURE_PROBES: ReadonlyArray<FeatureProbe> = [
         ...primaryModelAt(shape, "$main"),
       },
     }),
+  },
+  // A model's declared price (#514): the runtime prices every call of the
+  // harness with it, so it reaches each model-wiring block whether or not a
+  // slot names the profile.
+  {
+    feature: "models.*.price",
+    kind: "runtime",
+    snippet: { models: { local: { price: { input_per_1m: 1, output_per_1m: 2 } } } },
+    base: { models: { local: { model: "local/qwen3@http://127.0.0.1:11434/v1" } } },
   },
   // The sub-blocks other than `trace`, which has a probe of its own.
   setting(

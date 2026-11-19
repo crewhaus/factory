@@ -27,7 +27,13 @@
  */
 import { createHash } from "node:crypto";
 import { join } from "node:path";
-import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  type DeclaredPricing,
+  computeCostMicros,
+  mergeDeclaredPricing,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 import type { MatrixCell, MatrixPricingFn } from "@crewhaus/eval-report";
 import {
   type EvalRoutingMode,
@@ -276,12 +282,17 @@ export function assignCellSlugs(models: ReadonlyArray<string>): Map<string, stri
  * are 0 — eval aggregates don't track them). Any miss — unparseable model,
  * unknown provider row (e.g. a groq/ or local/ model billed elsewhere) —
  * returns `undefined`, which renders as "n/a" rather than crashing.
+ *
+ * `declared` is the spec's own prices (`models.<name>.price`), merged over the
+ * table, so a model the harness priced is metered and reported with that
+ * price, as every run of the harness prices it.
  */
-export function defaultMatrixPricing(): MatrixPricingFn {
+export function defaultMatrixPricing(declared?: DeclaredPricing): MatrixPricingFn {
+  const table = mergeDeclaredPricing(DEFAULT_PRICING, declared);
   return (model, tokens) => {
     try {
       const parsed = parseModelString(model);
-      const row = resolvePricing(DEFAULT_PRICING, parsed.providerId, parsed.modelId);
+      const row = resolvePricing(table, parsed.providerId, parsed.modelId);
       if (row === undefined) return undefined;
       return computeCostMicros(row, tokens.input, tokens.output, 0);
     } catch {

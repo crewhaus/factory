@@ -164,6 +164,7 @@ import {
   refusedDecisionMessage,
   resolveApproval,
 } from "./approvals";
+import { budgetUsedRatio } from "./budget";
 import { bundleFreshness } from "./bundle-freshness";
 import {
   DEFAULT_HANGAR_PORT,
@@ -208,7 +209,6 @@ import {
   type HealthResult,
   cadenceToMs,
   computeHealth,
-  declaredBudgetUsd,
   dreamOverdue,
 } from "./health";
 import { allowedHosts, hostAllowed, misdirected } from "./host-allowlist";
@@ -1384,12 +1384,6 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           }))
           .filter((d) => d.neverRan || (d.windows !== null && d.windows > 2))
           .map((d) => d.specName);
-        const budgetUsd = declaredBudgetUsd(yamlText);
-        // The CACHED rollup, not a fresh fold: this runs on every badge poll
-        // across the whole fleet, and re-reading every session log for a
-        // number the Library already caches would make the cheapest screen
-        // the most expensive request.
-        const spentUsd = cache.get(entry.id, dir, now()).costBreakdown.totalUsdMicros / 1_000_000;
         return {
           harnessId: entry.id,
           specName: view.specName,
@@ -1407,7 +1401,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
               exitCode: r.exitCode as number,
               endedAt: r.endedAt ?? null,
             })),
-          budgetUsedRatio: budgetUsd === null ? null : spentUsd / budgetUsd,
+          budgetUsedRatio: budgetUsedRatio(dir, yamlText, now()),
           credentialProbeFailed: view.envRefs.some((r) => !r.set),
         } satisfies HarnessSignal;
       });

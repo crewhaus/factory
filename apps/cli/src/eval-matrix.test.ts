@@ -255,6 +255,18 @@ describe("defaultMatrixPricing", () => {
     expect(pricing("groq/llama-3.3-70b", { input: 1000, output: 1000 })).toBeUndefined();
     expect(pricing("not-a-model", { input: 1, output: 1 })).toBeUndefined();
   });
+
+  test("a model the spec declares a price for is priced with it, so an eval is metered", () => {
+    const declared = defaultMatrixPricing({
+      "groq/llama-3.3-70b": { inputPer1M: 1, outputPer1M: 2 },
+      "local/qwen3@http://127.0.0.1:11434/v1": { inputPer1M: 0, outputPer1M: 0 },
+    });
+    expect(declared("groq/llama-3.3-70b", { input: 1000, output: 1000 })).toBe(1000 + 2000);
+    // A declared $0 is a known price, not a miss.
+    expect(declared("local/qwen3@http://127.0.0.1:11434/v1", { input: 5, output: 5 })).toBe(0);
+    // The table's own rows are untouched.
+    expect(declared("claude-sonnet-4-5", { input: 1000, output: 0 })).toBe(3000);
+  });
 });
 
 describe("classifyCellError", () => {

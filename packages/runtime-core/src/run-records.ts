@@ -274,7 +274,18 @@ export type RunStampInput = {
   readonly settings?: { readonly fingerprint: string; readonly rules: number };
   readonly poolPolicyVersion?: string;
   readonly recording: RunStampPayload["recording"];
+  /** Present only when `--ignore-pause` let the run past a paused intake. */
+  readonly intake?: RunStampPayload["intake"];
 };
+
+/**
+ * The one spawn-env boolean that says `--ignore-pause` let this run past a
+ * paused intake. The CLI sets it to `"1"` for its in-process runs after
+ * clearing any inherited value, and the harness supervisor sets it for a
+ * spawned bundle only from its own start option, so neither a shell export
+ * nor a `.env` line supplies it.
+ */
+export const INTAKE_PAUSE_IGNORED_ENV = "CREWHAUS_INTAKE_PAUSE_IGNORED";
 
 /** The `run_stamp` payload. Pure. */
 export function buildRunStamp(input: RunStampInput): RunStampPayload {
@@ -302,6 +313,7 @@ export function buildRunStamp(input: RunStampInput): RunStampPayload {
         : {}),
     },
     recording: input.recording,
+    ...(input.intake !== undefined ? { intake: { pauseIgnored: true } as const } : {}),
   };
 }
 
@@ -350,10 +362,16 @@ export async function recordRunStamp(args: {
   readonly poolPolicyVersion?: string;
   readonly recording: RunStampPayload["recording"];
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * The caller's own word that `--ignore-pause` admitted the run. Wins over
+   * {@link INTAKE_PAUSE_IGNORED_ENV} in `env`; absent, the env decides.
+   */
+  readonly intake?: { readonly pauseIgnored: boolean };
 }): Promise<void> {
   const { recorder } = args;
   if (!recorder.records || !claimRunStamp(recorder.runContext, args.sessionId)) return;
   const env = args.env ?? process.env;
+  const pauseIgnored = args.intake?.pauseIgnored ?? env[INTAKE_PAUSE_IGNORED_ENV] === "1";
   const fp = await recorder.fingerprints();
   const deployment = runRevisions(env).deploymentId;
   const settings =
@@ -379,6 +397,7 @@ export async function recordRunStamp(args: {
         ? { poolPolicyVersion: args.poolPolicyVersion }
         : {}),
       recording: args.recording,
+      ...(pauseIgnored ? { intake: { pauseIgnored: true } as const } : {}),
     }),
   );
 }

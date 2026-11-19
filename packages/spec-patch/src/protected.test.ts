@@ -1031,3 +1031,69 @@ describe("an unprotected block stays tunable both ways for every field", () => {
     ).toEqual([]);
   });
 });
+
+describe("a spending period that lets the harness spend more needs the security edit", () => {
+  const period = (p: unknown) => ({ budget: { usd: 5, period: p } });
+  const raises = (before: unknown, after: unknown): readonly string[] =>
+    escalationFor(before, after).find((e) => e.needs === "h.spec.edit.security")?.paths ?? [];
+
+  test("a higher period.usd, a shorter period and a removed period each raise", () => {
+    expect(
+      raises(period({ every: "month", usd: 50 }), period({ every: "month", usd: 80 })),
+    ).toEqual(["budget.period.usd"]);
+    expect(raises(period({ every: "month", usd: 50 }), period({ every: "week", usd: 50 }))).toEqual(
+      ["budget.period.every"],
+    );
+    expect(raises(period({ every: "week", usd: 50 }), period({ every: "day", usd: 50 }))).toEqual([
+      "budget.period.every",
+    ]);
+    expect(raises(period({ every: "month", usd: 50 }), { budget: { usd: 5 } })).toEqual([
+      "budget.period",
+    ]);
+  });
+
+  test("any change to every, starts or timezone opens a new period, so it raises", () => {
+    // Longer as well as shorter: the new period starts its spend at zero.
+    expect(raises(period({ every: "week", usd: 10 }), period({ every: "month", usd: 10 }))).toEqual(
+      ["budget.period.every"],
+    );
+    expect(raises(period({ every: "day", usd: 10 }), period({ every: "week", usd: 10 }))).toEqual([
+      "budget.period.every",
+    ]);
+    expect(
+      raises(
+        period({ every: "week", usd: 10 }),
+        period({ every: "week", usd: 10, timezone: "Europe/Berlin" }),
+      ),
+    ).toEqual(["budget.period.timezone"]);
+    expect(
+      raises(
+        period({ every: "week", usd: 10 }),
+        period({ every: "week", usd: 10, starts: "2026-11-19" }),
+      ),
+    ).toEqual(["budget.period.starts"]);
+    expect(
+      raises(
+        period({ every: "month", usd: 10, starts: "2026-11-01" }),
+        period({ every: "month", usd: 10, starts: "2026-11-02" }),
+      ),
+    ).toEqual(["budget.period.starts"]);
+    // An `every` that is an inherited name is still a change, never a lookup.
+    expect(
+      raises(period({ every: "month", usd: 10 }), period({ every: "constructor", usd: 10 })),
+    ).toEqual(["budget.period.every"]);
+  });
+
+  test("a first period, a lower one, and an explicit UTC zone raise nothing", () => {
+    expect(raises({ budget: { usd: 5 } }, period({ every: "month", usd: 50 }))).toEqual([]);
+    expect(
+      raises(period({ every: "month", usd: 50 }), period({ every: "month", usd: 20 })),
+    ).toEqual([]);
+    expect(
+      raises(
+        period({ every: "month", usd: 50 }),
+        period({ every: "month", usd: 50, timezone: "UTC" }),
+      ),
+    ).toEqual([]);
+  });
+});

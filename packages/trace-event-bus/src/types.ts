@@ -590,7 +590,31 @@ export type CostAccrualEvent = TraceEventEnvelope &
      * already folded. The two are told apart by `role` alone.
      */
     summary?: boolean;
+    /**
+     * On a role-bearing `summary: true` roll-up: how many of the nested
+     * run's calls nothing could price. Their cost is unknown, so the
+     * parent's totals carry the count instead of reading the roll-up as
+     * fully priced. Present only when at least one call was unpriced;
+     * `unpriced: true` still means every call of the roll-up was.
+     */
+    unpricedCalls?: number;
   };
+
+/**
+ * A budgeted run met a model it cannot price: published once per wire
+ * model per run, at that model's first unpriced response. The run goes on
+ * (an unknown cost never stops a budget gate), and its totals say
+ * "unknown" for that model's calls. A declared price
+ * (`models.<name>.price`) makes the model's cost known.
+ */
+export type BudgetUnpricedEvent = TraceEventEnvelope & {
+  kind: "budget_unpriced";
+  provider: ProviderId;
+  /** WIRE model id, as on `model_response`. */
+  modelId: string;
+  /** The call's role, when the response carried one. */
+  role?: ModelRole;
+};
 
 /**
  * Track F (Section 57) — runtime feedback channel: test verdict.
@@ -1292,7 +1316,8 @@ export type TraceEvent =
   | JudgeVerdictEvent
   | ProvabilityGradedEvent
   | ProofCheckedEvent
-  | ContextAssembledEvent;
+  | ContextAssembledEvent
+  | BudgetUnpricedEvent;
 
 export type TraceEventKind = TraceEvent["kind"];
 

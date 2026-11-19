@@ -93,6 +93,19 @@ export {
 export { AREA_MODULES } from "./areas/index.js";
 export { RUNTIME_MODULE } from "./areas/runtime.js";
 export {
+  BUDGET_CAPABILITY_KEYS,
+  BUDGET_EXTEND_REASONS,
+  BUDGET_PERIOD_EVERY,
+  type BudgetExtendAnswer,
+  type BudgetExtendReason,
+  type BudgetExtendRequest,
+  type BudgetFoldView,
+  type BudgetHistory,
+  type BudgetPeriodView,
+  type BudgetRead,
+  type BudgetRights,
+} from "./areas/runtime-budget.js";
+export {
   CORRECTION_SCOPES,
   type CorrectionScope,
   DECLINE_REASONS,

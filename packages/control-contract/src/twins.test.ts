@@ -71,6 +71,8 @@ const SAMPLES = [
     ...WORK,
     declineReason: "not-now",
     correctionScope: "item",
+    usd: "50",
+    budgetReason: "planned-work",
   },
   {
     hrn: HRN,
@@ -95,6 +97,8 @@ const SAMPLES = [
     ...WORK,
     declineReason: "needs-evidence",
     correctionScope: "all",
+    usd: "12.5",
+    budgetReason: "other",
   },
 ];
 
@@ -231,6 +235,8 @@ test("the placeholders, pinned, with empty flags", () => {
     "{declineReason}",
     "{correctionScope}",
     "{workSource}",
+    "{usd}",
+    "{budgetReason}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });

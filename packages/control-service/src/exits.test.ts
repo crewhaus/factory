@@ -15,6 +15,7 @@ describe("the control exit band", () => {
     expect(Object.fromEntries(outside)).toEqual({});
     expect(EXIT_FOR_ERROR.paused).toBe(EXIT_CODES.paused);
     expect(EXIT_FOR_ERROR.disabled).toBe(EXIT_CODES.disabled);
+    expect(EXIT_FOR_ERROR.budget_exceeded).toBe(EXIT_CODES.crewhaus_budget);
     expect(documented.has(EXIT_FOR_REJECTED_RECEIPT)).toBe(true);
   });
 

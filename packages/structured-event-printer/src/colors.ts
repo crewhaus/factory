@@ -76,6 +76,8 @@ const PALETTE: Record<TraceEventKind, string> = {
   proof_checked: "\x1b[32m", // green
   // What one model call was given, as counts: context bookkeeping, like curate.
   context_assembled: "\x1b[2m", // dim — one line per model call
+  // A budgeted run met a model with no price: its cost is unknown, never $0.
+  budget_unpriced: "\x1b[33m", // yellow
 };
 
 export function colorize(kind: TraceEventKind, text: string, useColor: boolean): string {

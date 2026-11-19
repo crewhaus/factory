@@ -89,6 +89,7 @@ export const INFORMATIONAL_COMPILE_WARNING_CODES: readonly string[] = [
   "compaction-curate-lexical",
   "compaction-curate-knobs-unused",
   "ask-mode-eval-entry-only",
+  "model-price-overrides-table",
 ];
 
 /** Lays codes out comma-separated, one help line per ~72 columns. */

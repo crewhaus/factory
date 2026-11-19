@@ -183,6 +183,8 @@ export type RoleDefinition = {
   readonly circuitBreaker?: RunChatLoopOptions["circuitBreaker"];
   readonly modelTiers?: RunChatLoopOptions["modelTiers"];
   readonly modelPool?: RoleModelPool;
+  /** Declared model prices (`models.<name>.price`): the role's turns price with them. */
+  readonly declaredPricing?: RunChatLoopOptions["declaredPricing"];
 };
 
 export type RouterArgs = {
@@ -1110,6 +1112,7 @@ export type LoopTuningFragment = Pick<
   | "modelFallbacks"
   | "circuitBreaker"
   | "modelTiers"
+  | "declaredPricing"
 > & {
   readonly deadlineMs?: number;
   readonly turnTimeoutMs?: number;
@@ -1205,6 +1208,7 @@ export function composeLoopTuning(
     // 0.6.0 (PR 7b, §7.7/§7.9) — the widened pool, per-candidate profiles
     // intact, scoped to this role when the spec pinned no scope.
     ...(def.modelPool !== undefined ? { modelPool: scopeRolePool(def.modelPool, roleName) } : {}),
+    ...(def.declaredPricing !== undefined ? { declaredPricing: def.declaredPricing } : {}),
   };
 }
 

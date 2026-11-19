@@ -54,6 +54,7 @@
   },
   "devDependencies": {
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
     "@crewhaus/eval-runner": "workspace:*",
     "@crewhaus/gateway-server": "workspace:*",
     "@crewhaus/quality-service": "workspace:*",

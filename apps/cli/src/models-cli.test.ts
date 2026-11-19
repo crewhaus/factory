@@ -22,6 +22,7 @@ import {
   auditionReadiness,
   buildProfileRows,
   buildSunsetProposal,
+  declaredPricingOfIr,
   describeStrategy,
   formatModelsAudit,
   formatModelsExplain,
@@ -159,6 +160,32 @@ describe("models list / explain", () => {
     expect(
       describeStrategy({ policy: "learned", candidates: [{ model: "m", tags: [] }] }),
     ).toContain("Quality does NOT reach the reward");
+  });
+});
+
+describe("models audit: a declared price", () => {
+  test("a model with a declared price passes the pricing check, labelled declared", () => {
+    const emptyPricing = { ...DEFAULT_PRICING, providers: {} } as unknown as PricingTable;
+    const slots = slotsOf(HYBRID);
+    const declared = Object.fromEntries(
+      slots.map((s) => [s.model, { inputPer1M: 1, outputPer1M: 2 }]),
+    );
+    const findings = auditModelSlots(slots, { pricing: emptyPricing, sunsets: {}, declared });
+    const pricing = findings.filter((f) => f.kind === "pricing");
+    expect(pricing.length).toBeGreaterThan(0);
+    for (const f of pricing) {
+      expect(f.severity).toBe("pass");
+      expect(f.detail.startsWith("declared: $1/1M in, $2/1M out")).toBe(true);
+    }
+    expect(modelsAuditExitCode(findings, "pricing")).toBe(0);
+  });
+
+  test("declaredPricingOfIr reads the record a model-wiring block carries", () => {
+    const priced = { "local/q@http://h/v1": { inputPer1M: 1, outputPer1M: 2 } };
+    expect(
+      declaredPricingOfIr({ target: "cli", agent: { declaredPricing: priced } } as never),
+    ).toBe(priced);
+    expect(declaredPricingOfIr({ target: "cli", agent: {} } as never)).toBeUndefined();
   });
 });
 

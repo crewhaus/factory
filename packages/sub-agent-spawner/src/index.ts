@@ -209,6 +209,8 @@ export type ChildLoopPlan = {
     | "modelTiers"
     | "modelPool"
     | "budget"
+    | "spendMeter"
+    | "pricing"
   >;
 };
 
@@ -229,6 +231,18 @@ export function resolveChildLoopPlan(
           },
         }
       : {};
+  // The child spends from the parent's meter live: through a nested meter
+  // capped at its share when one is declared, else directly. The parent's
+  // effective prices reach the child whether or not the run is budgeted.
+  const share = budget.budget?.usdMicros;
+  const spend: Pick<RunChatLoopOptions, "spendMeter" | "pricing"> = {
+    ...(parent.spend !== undefined
+      ? {
+          spendMeter: share !== undefined ? parent.spend.child({ capMicros: share }) : parent.spend,
+        }
+      : {}),
+    ...(parent.pricing !== undefined ? { pricing: parent.pricing } : {}),
+  };
   if (profile !== undefined) {
     const allowed = subAgentProfileAllowlist(def, parent.model);
     if (!allowed.includes(profile)) {
@@ -252,6 +266,7 @@ export function resolveChildLoopPlan(
           ...(option.modelFallbacks !== undefined ? { modelFallbacks: option.modelFallbacks } : {}),
           ...(option.circuitBreaker !== undefined ? { circuitBreaker: option.circuitBreaker } : {}),
           ...budget,
+          ...spend,
         },
       };
     }
@@ -274,6 +289,7 @@ export function resolveChildLoopPlan(
       ...(def.modelTiers !== undefined ? { modelTiers: def.modelTiers } : {}),
       ...(def.modelPool !== undefined ? { modelPool: def.modelPool } : {}),
       ...budget,
+      ...spend,
     },
   };
 }
@@ -491,9 +507,12 @@ export async function spawnSubAgent(
   // 0.6.0 §7.7 / §10.2 — PRICE the child's calls on its own bus (events
   // suppressed: the child loop's own observability publishes its per-call
   // accruals on the child bus already) so ONE roll-up can be re-published on
-  // the parent bus below. Priced with the same default table the parent's
-  // budget meter uses.
-  const childCostTracker = createCostTracker(child.runContext.eventBus, { suppressEvents: true });
+  // the parent bus below. Priced with the parent's effective table (declared
+  // prices included), the one its budget meter uses.
+  const childCostTracker = createCostTracker(child.runContext.eventBus, {
+    suppressEvents: true,
+    ...(parent.pricing !== undefined ? { pricing: parent.pricing } : {}),
+  });
 
   const t0SubAgent = performance.now();
   let finalMessage = "";
@@ -653,6 +672,9 @@ export async function spawnSubAgent(
       childSpend.totalUsdMicros === 0 &&
       childPricingMisses > 0 &&
       childInputTokens + childOutputTokens > 0;
+    // Every unknown-cost call of the child, not only an all-unpriced child:
+    // the parent's totals then say "unknown" for that part.
+    const unpricedCalls = childSpend.unpricedCalls ?? 0;
     const accrual: CostAccrualEvent = {
       ...parentBus.envelope(),
       spanId: subAgentEnvelope.spanId,
@@ -669,6 +691,7 @@ export async function spawnSubAgent(
       cacheCreationTokens: childCacheCreationTokens,
       costUsdMicros: childSpend.totalUsdMicros,
       ...(unpriced ? { unpriced: true } : {}),
+      ...(unpricedCalls > 0 ? { unpricedCalls } : {}),
     };
     parentBus.publish(accrual);
   }

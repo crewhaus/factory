@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../abort-controller" },
+    { "path": "../cost-tracker" },
     { "path": "../errors" },
     { "path": "../event-log" },
     { "path": "../hooks-engine" },

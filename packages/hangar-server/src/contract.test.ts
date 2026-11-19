@@ -457,6 +457,8 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["id", "string"],
     ["costs.totalUsdMicros", "number"],
     ["costs.calls", "number"],
+    // Calls nothing could price: the view reads "+ unknown" beside the total.
+    ["costs.unpricedCalls", "number"],
     ["costs.spend7dUsdMicros", "number"],
     ["costs.truncatedFiles", "number"],
     ["costs.byModel[].provider", "string"],

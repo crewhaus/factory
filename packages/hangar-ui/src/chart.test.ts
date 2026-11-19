@@ -95,3 +95,27 @@ describe("chartModel", () => {
     expect(m.rows[0].label).toBe("<img src=x>");
   });
 });
+
+describe("a value with an unknown part (#516)", () => {
+  test("keeps its bar, gains a dashed cap, and reads + unknown in the table and the summary", () => {
+    const m = chartModel({
+      kind: "bars",
+      title: "Spend per day",
+      rows: [
+        { label: "11-01", value: 0.001 },
+        { label: "11-02", value: 0.002, unknownPart: true },
+      ],
+      format: fmtUsd,
+      noun: "day",
+    });
+    expect(m.bars).toHaveLength(2);
+    expect(m.marks.map((b: { label: string }) => b.label)).toEqual(["11-02"]);
+    expect(m.rows[1].text).toBe("$0.0020 + unknown");
+    expect(m.summary).toContain("1 day partly unknown.");
+  });
+
+  test("no unknown part, no cap", () => {
+    const m = chartModel({ kind: "bars", title: "Spend", rows: DAYS, format: fmtUsd });
+    expect(m.marks).toEqual([]);
+  });
+});

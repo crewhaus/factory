@@ -73,7 +73,8 @@ import { auditSpecToolNames, collectToolNames } from "./scope-audit";
  * CLI wrapper owns file IO and process exit.
  */
 
-export type LintSeverity = "error" | "warning";
+/** `info` describes a valid choice worth knowing about: it never gates and is not a warning. */
+export type LintSeverity = "error" | "warning" | "info";
 
 /** One structured finding. `path` is a dot-joined spec/IR location (or a
  *  synthetic id for whole-spec failures); shaped for editor/CI consumption. */
@@ -259,6 +260,18 @@ export function runLint(
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
   findings.push(...auditProvability(ir, spec));
+
+  // Stage 9 — a spending period below the per-run cap (#514): valid, and worth
+  // knowing, since the period then ends a run before the run's own cap does.
+  const budget = "budget" in spec ? spec.budget : undefined;
+  if (budget?.period !== undefined && budget.period.usd < budget.usd) {
+    findings.push({
+      message: `budget.period.usd ($${budget.period.usd}) is below budget.usd ($${budget.usd}), so a run can use up the period's limit before it reaches its own cap.`,
+      path: "budget.period.usd",
+      severity: "info",
+      rule: "budget-period-below-run-cap",
+    });
+  }
 
   // Warnings inform; only errors gate (`ok` drives the CLI exit code).
   return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
@@ -1234,12 +1247,16 @@ export function formatLintText(result: LintResult): string {
   if (result.findings.length === 0) return "lint: clean — no findings.\n";
   const lines: string[] = [];
   for (const f of result.findings) {
-    const marker = f.severity === "error" ? "✗" : "~";
+    const marker = f.severity === "error" ? "✗" : f.severity === "info" ? "i" : "~";
     lines.push(`${marker} [${f.rule}] ${f.path}: ${f.message}`);
   }
   const errorCount = result.findings.filter((f) => f.severity === "error").length;
+  const noteCount = result.findings.filter((f) => f.severity === "info").length;
+  const warningCount = result.findings.length - errorCount - noteCount;
   lines.push("");
-  lines.push(`lint: ${errorCount} error(s), ${result.findings.length - errorCount} warning(s).`);
+  lines.push(
+    `lint: ${errorCount} error(s), ${warningCount} warning(s)${noteCount > 0 ? `, ${noteCount} note(s)` : ""}.`,
+  );
   return `${lines.join("\n")}\n`;
 }
 

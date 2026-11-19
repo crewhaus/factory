@@ -62,6 +62,7 @@ import {
 import { declaredCadences } from "../schedulers";
 import { readYamlLoose } from "../yaml-scan";
 import type { HomeAreaRuntime } from "./areas";
+import { BUDGET_HOME } from "./budget";
 import type { CapabilityProvider, RefResolver, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import type { EnvelopeFields, StreamSourceDecl } from "./event-map";
@@ -758,10 +759,11 @@ export const WORK_HOME = {
 /** The runtime area's slot in Home, one half per file. */
 export const HOME_RUNTIME: HomeAreaRuntime = {
   area: "runtime",
+  sweeps: [...BUDGET_HOME.sweeps],
   handlers: {
     ...WORK_HOME.handlers,
 
-    // ...BUDGET_HOME.handlers,
+    ...BUDGET_HOME.handlers,
   },
   refResolvers: {
     ...WORK_HOME.refResolvers,
@@ -771,7 +773,7 @@ export const HOME_RUNTIME: HomeAreaRuntime = {
   capabilityProviders: [
     ...WORK_HOME.capabilityProviders,
 
-    // ...BUDGET_HOME.capabilityProviders,
+    ...BUDGET_HOME.capabilityProviders,
   ],
   projections: [
     ...WORK_HOME.projections,

@@ -127,6 +127,7 @@ import {
   MANAGED_RUN_PLANE,
   type ManagedRunPlane,
 } from "./coded";
+import { estimateRunUsage } from "./estimate";
 import type { ResolveRunEvents, RunHandler, RunInputVerdict, UsageDelta } from "./index";
 import { classifyManagedInput } from "./managed-classify";
 
@@ -166,6 +167,14 @@ const REPLICA_ID_MAX = 253;
 const INPUT_MAX_BYTES = 8 * 1024 * 1024;
 
 const ZERO_USAGE: UsageDelta = Object.freeze({ input: 0, output: 0 });
+
+/**
+ * What a managed run reserves against its tenant's budget before it runs: its input at
+ * about four characters a token plus an output ceiling (`./estimate`). The queued-run
+ * follower reserves it for each run it claims, and the gateway uses it for a request
+ * when the bundle supplies no estimate of its own.
+ */
+export const estimateUsage = estimateRunUsage;
 
 /** What `sessions.list` and `sessions.fork` answer. */
 const SESSIONS_UNSUPPORTED =
@@ -1121,10 +1130,15 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         return;
       }
       const budget = opts.budgetStore;
+      // The run's estimate counts against the tenant's budget while it runs.
+      const estimate =
+        input === undefined
+          ? ZERO_USAGE
+          : estimateUsage({ method: "runs.create", params: { input: input.input } });
       const reservation =
         budget === undefined
           ? { ok: true }
-          : await budget.tryReserve(tenant.id, ZERO_USAGE, tenant.budget);
+          : await budget.tryReserve(tenant.id, estimate, tenant.budget);
       if (!reservation.ok) {
         await rows.end({ state: "failed", failureClass: "crewhaus_budget" }, subject);
         return;
@@ -1175,7 +1189,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
           }),
         );
       } finally {
-        if (budget !== undefined) await budget.release(tenant.id, ZERO_USAGE);
+        if (budget !== undefined) await budget.release(tenant.id, estimate);
       }
     } catch (err) {
       warnLine(`[managed] queued run ${runId} ended with an error: ${(err as Error).message}`);

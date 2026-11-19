@@ -2374,6 +2374,12 @@ figure.chart svg {
 .chart-bars rect {
   fill: var(--accent);
 }
+/* A bar whose value has an unknown part: a dashed cap, never a solid fill. */
+.chart-bars rect.chart-unknown {
+  fill: none;
+  stroke: var(--accent);
+  stroke-dasharray: 2 2;
+}
 .chart-line path {
   stroke: var(--accent);
   fill: none;

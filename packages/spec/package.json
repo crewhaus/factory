@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/cost-tracker": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-categories": "workspace:*",
     "yaml": "^2.6.0",
