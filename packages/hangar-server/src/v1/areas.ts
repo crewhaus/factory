@@ -41,6 +41,7 @@ import { HOME_INTEGRATIONS } from "./integrations";
 import { CORE_REF_RESOLVERS, META_HANDLERS } from "./meta";
 import { RULE_HANDLERS } from "./rules";
 import { RUN_HANDLERS } from "./runs";
+import { HOME_RUNTIME } from "./work";
 
 export type HomeAreaRuntime = {
   readonly area: string;
@@ -108,7 +109,7 @@ export const HOME_AREAS: readonly HomeAreaRuntime[] = [
 
   // HOME_QUALITY,
 
-  // HOME_RUNTIME,
+  HOME_RUNTIME,
 
   // HOME_VERIFICATION,
 ];

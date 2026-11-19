@@ -214,8 +214,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(57);
-    expect(pins).toBe(85);
+    expect(Object.keys(REQUIRED).length).toBe(60);
+    expect(pins).toBe(92);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -354,6 +354,11 @@ describe("the server's twins, by import", () => {
       cmd: mintId("cmd"),
       run: mintRunId(),
     };
+    const WORK = {
+      wi: mintId("wi"),
+      belowWi: mintId("wi"),
+      workSource: "continuity-goal:goal-0001",
+    };
     const SAMPLES = [
       {
         hrn: "hrn_0123456789abcdef",
@@ -374,6 +379,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "merge",
         ...INBOX,
+        ...WORK,
+        declineReason: "not-now",
+        correctionScope: "item",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -394,6 +402,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "rollout",
         ...INBOX,
+        ...WORK,
+        declineReason: "needs-evidence",
+        correctionScope: "all",
       },
     ];
     const twins = [

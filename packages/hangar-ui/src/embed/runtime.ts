@@ -1,8 +1,10 @@
 /**
- * The runtime area's console modules, keyed by serve path. Empty until the
- * area adds a screen: it imports each new file `with { type: "text" }` here
- * and adds its row, and `../index.ts` already spreads this map.
+ * The runtime area's console modules, keyed by serve path. Each is imported
+ * `with { type: "text" }` here, and `../index.ts` already spreads this map.
  */
-import type { HangarAsset } from "./asset";
+import workViewJs from "../../assets/js/views/work.js" with { type: "text" };
+import { type HangarAsset, asset } from "./asset";
 
-export const runtimeAssets: Readonly<Record<string, HangarAsset>> = {};
+export const runtimeAssets: Readonly<Record<string, HangarAsset>> = {
+  "/assets/js/views/work.js": asset(workViewJs, "/assets/js/views/work.js"),
+};

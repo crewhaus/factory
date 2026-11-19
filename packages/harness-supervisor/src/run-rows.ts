@@ -28,7 +28,7 @@
  */
 import { lstatSync, realpathSync, unlinkSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
-import { CANONICAL_RUN_ID_RE, type Trigger, canTransition } from "@crewhaus/control-contract";
+import { CANONICAL_RUN_ID_RE, type Trigger, canTransition, isId } from "@crewhaus/control-contract";
 import {
   type Ledger,
   append,
@@ -104,12 +104,15 @@ export async function openApiRoot(
     const fold = foldStates(ledger);
     if (!fold.ok) return { ok: false as const, reason: fold.reason };
     const current = fold.objects.get(run.id);
+    const workItem = current?.record["workItem"];
     const row = {
       id: run.id,
       state: "preparing",
       at: run.at,
       trigger: current?.record["trigger"] ?? API_TRIGGER,
       execution: run.execution,
+      // The run's own loop reads its newest row: a run for a work item resumes as the item.
+      ...(isId("wi", workItem) ? { workItem } : {}),
     };
     if (current?.state === "queued") {
       const claimed = publishClaim(ledger, `run/${run.id}`, { ...run.holder });

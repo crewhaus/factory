@@ -25,7 +25,7 @@ import {
   readPage,
 } from "@crewhaus/control-records";
 import type { ProcessOps, SpawnRequest } from "./process-ops";
-import { RUN_LEDGER_DIR, runLedgerFor } from "./run-rows";
+import { RUN_LEDGER_DIR, openApiRoot, runLedgerFor } from "./run-rows";
 import { writeRunfile } from "./runfiles";
 import { buildSpawnPlan } from "./spawn-contracts";
 import { type HarnessSupervisor, type StartResult, createHarnessSupervisor } from "./supervisor";
@@ -587,5 +587,75 @@ describe("a run the control API queued", () => {
       apiRun: { runId, stdinFile },
     });
     expect(crewPlan.stdinFile).toBe(stdinFile);
+  });
+});
+
+describe("an API root for a work item", () => {
+  const HOLDER = { pid: process.pid, host: "test-host" };
+  const AT = "2026-11-18T00:00:00.000Z";
+
+  test("the preparing row carries the queued row's work item, from queued and on resume", async () => {
+    const dir = tempHarness("workflow");
+    const workItem = mintId("wi");
+    const runId = mintRunId();
+    plant(dir, { id: runId, state: "queued", trigger: { kind: "api", workItem }, workItem });
+    const execution = `run_${"a".repeat(16)}`;
+    expect(await openApiRoot(dir, { id: runId, execution, at: AT, holder: HOLDER })).toEqual({
+      ok: true,
+    });
+    const preparing = rowsAt(dir)
+      .filter((row) => row["id"] === runId)
+      .at(-1);
+    expect(preparing).toEqual({
+      id: runId,
+      state: "preparing",
+      at: AT,
+      trigger: { kind: "api", workItem },
+      execution,
+      workItem,
+    });
+    // Parked, then resumed: the resume's preparing row carries it too.
+    plant(dir, { id: runId, state: "running", trigger: { kind: "api", workItem }, workItem });
+    plant(dir, {
+      id: runId,
+      state: "waiting-for-approval",
+      trigger: { kind: "api", workItem },
+      workItem,
+    });
+    const again = `run_${"b".repeat(16)}`;
+    expect(await openApiRoot(dir, { id: runId, execution: again, at: AT, holder: HOLDER })).toEqual(
+      { ok: true },
+    );
+    expect(
+      rowsAt(dir)
+        .filter((row) => row["id"] === runId)
+        .at(-1),
+    ).toMatchObject({
+      state: "preparing",
+      execution: again,
+      workItem,
+    });
+  });
+
+  test("a run for no item writes the same row as before: no key at all", async () => {
+    const dir = tempHarness("workflow");
+    const runId = mintRunId();
+    plant(dir, { id: runId, state: "queued", trigger: { kind: "api" } });
+    const execution = `run_${"c".repeat(16)}`;
+    expect(await openApiRoot(dir, { id: runId, execution, at: AT, holder: HOLDER })).toEqual({
+      ok: true,
+    });
+    const preparing = rowsAt(dir)
+      .filter((row) => row["id"] === runId)
+      .at(-1);
+    expect(JSON.stringify(preparing)).toBe(
+      JSON.stringify({
+        id: runId,
+        state: "preparing",
+        at: AT,
+        trigger: { kind: "api" },
+        execution,
+      }),
+    );
   });
 });

@@ -19,6 +19,8 @@ import {
   ERROR_CODES,
   EXECUTION_RUN_ID_RE,
   type ErrorCode,
+  type WorkCreateSpec,
+  isId,
   mintRunId,
   parseRef,
 } from "@crewhaus/control-contract";
@@ -265,7 +267,7 @@ function refusalError(refusal: RunRefusal): V1Error {
 }
 
 /** What Home lends a run command for one harness. */
-async function homeFor(ctx: V1Context, entry: HangarHarnessEntry): Promise<RunHome> {
+export async function homeFor(ctx: V1Context, entry: HangarHarnessEntry): Promise<RunHome> {
   const deps = ctx.deps;
   const target = deps.controlTarget === undefined ? undefined : await deps.controlTarget(entry);
   const startRunJob = deps.startRunJob;
@@ -506,14 +508,8 @@ const create: V1Handler = async (ctx) => {
       message: "Naming who a run serves needs h.subject.assert on this harness.",
     });
   }
-  if (ctx.body["work"] !== undefined) {
-    throw new V1Error({
-      status: 501,
-      code: "unsupported",
-      reason: "not_served",
-      message: "Starting a run for a work item is not served yet.",
-    });
-  }
+  // A work item of this harness, by its id or a ref that names this harness by id or slug.
+  const work = workOfBody(ctx, entry);
   // The harness is the target: a repeat under the same key fingerprints alike.
   const command = { target: `home/harness/${entry.id}`, ledger: { harness: dir } } as const;
   // A retry is answered with the run it started, whatever would be refused now.
@@ -528,6 +524,7 @@ const create: V1Handler = async (ctx) => {
     input,
     ...(subject !== undefined ? { subject } : {}),
     admission,
+    ...(work !== undefined ? { work } : {}),
     home: await homeFor(ctx, entry),
   });
   if (!plan.ok) throw refusalError(plan.refusal);
@@ -556,6 +553,30 @@ const create: V1Handler = async (ctx) => {
     scrubDir: dir,
   };
 };
+
+/**
+ * The work item a `runs.create` body names, as the run adapter takes it: a ref that names
+ * this harness by its slug is named by its id; anything else is passed as it came, and the
+ * adapter refuses another harness's item.
+ */
+function workOfBody(
+  ctx: V1Context,
+  entry: HangarHarnessEntry,
+): string | WorkCreateSpec | undefined {
+  const raw = ctx.body["work"];
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "string") return raw as WorkCreateSpec;
+  if (isId("wi", raw)) return raw;
+  const parsed = parseRef(raw);
+  if (
+    !("error" in parsed) &&
+    parsed.kind === "work" &&
+    entryOf(ctx.deps, parsed.scope)?.id === entry.id
+  ) {
+    return parsed.id;
+  }
+  return raw;
+}
 
 /** A replayed `runs.create`: 202 with the first run, as it is recorded now. */
 function createdReplay(

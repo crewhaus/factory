@@ -1,0 +1,49 @@
+{
+  "name": "@crewhaus/tool-work",
+  "version": "0.8.3",
+  "type": "module",
+  "description": "Work items: what a harness was asked to do, as a content-free log and immutable content revisions, with one proposal object, one ranker, and the WorkList, WorkGet, WorkPropose and WorkUpdate tools",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./work-items": "./src/work-items/index.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/boundary-classifier": "workspace:*",
+    "@crewhaus/continuity-store": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/tool-builder": "workspace:*",
+    "@crewhaus/tool-catalog": "workspace:*",
+    "@crewhaus/tool-categories": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
+    "zod": "^3.23.8"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/tool-work"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/tool-work#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

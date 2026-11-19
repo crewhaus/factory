@@ -10,12 +10,13 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { mintRunId } from "@crewhaus/control-contract";
+import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, runsLedger } from "@crewhaus/control-records";
 import { feedbackRecord, logLine, makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import { createSessionStore } from "@crewhaus/session-store";
+import { openWorkStore } from "@crewhaus/tool-work/work-items";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { loadConsoleGrammar } from "../console-routes";
 import { sandboxEnv } from "../system";
@@ -77,6 +78,8 @@ export type SeededHarness = {
   readonly approvalIds: readonly string[];
   /** The rich seed's open review item id, or null. */
   readonly reviewId: string | null;
+  /** A work item's id, deterministic; the rich seed writes it as a proposal through the work store. */
+  readonly workItem: string;
 };
 
 const DAY_MS = 86_400_000;
@@ -340,6 +343,45 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       throw new Error(`the memory store did not read back the seeded entry for ${specName}`);
     }
 
+    // A proposal with its case, so the Work view and an item page have something to show.
+    const workItem = mintId("wi", {
+      now: opts.now,
+      random: (bytes) =>
+        bytes.set(
+          createHash("sha256")
+            .update(`${opts.seed}:${target}:work`)
+            .digest()
+            .subarray(0, bytes.length),
+        ),
+    });
+    if (rich !== null) {
+      const proposed = await openWorkStore(harnessDir, {
+        now: () => opts.now,
+        mintId: () => workItem,
+      }).propose(
+        {
+          title: untrusted("Keep imported dates as dates"),
+          kind: "fix",
+          basis: "user-pain",
+          assessment: {
+            problem: untrusted("Imported dates arrive as text."),
+            evidence: [
+              {
+                label: "reported",
+                kind: "user-report",
+                ref: "seed-report-1",
+                note: untrusted("Two people said so."),
+              },
+            ],
+            counterEvidence: [],
+          },
+        },
+        { by: "sys:runtime", via: "tool", role: "harness" },
+      );
+      if (!proposed.ok)
+        throw new Error(`the work store did not take the seeded proposal: ${proposed.message}`);
+    }
+
     const entry = registry.upsert({ dir: harnessDir, specName, target });
     harnesses.push({
       id: entry.id,
@@ -351,6 +393,7 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
       runId,
       approvalIds: rich?.approvalIds ?? [],
       reviewId: rich?.reviewId ?? null,
+      workItem,
     });
   }
 

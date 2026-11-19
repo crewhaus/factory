@@ -22,7 +22,7 @@ import type { RegistryEntry } from "./types";
  * bundle compiled three releases ago carries whatever was stamped then, which
  * is exactly the skew an operator wants to see.
  */
-export const REGISTRY_VERSION = "0.8.2";
+export const REGISTRY_VERSION = "0.8.3";
 
 export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
   abiDecode: {
@@ -8748,6 +8748,66 @@ export const TOOL_REGISTRY: Readonly<Record<string, RegistryEntry>> = {
     categories: ["desktop", "operations"],
     package: "@crewhaus/tool-desktop",
     keywords: ["open windows", "list windows", "what is on screen"],
+  },
+  workGet: {
+    key: "workGet",
+    name: "WorkGet",
+    description:
+      "Read one work item: what was asked, when it is done, why (for a proposal: its evidence, each labelled observed, reported or hypothesis), its notes, deliveries, linked runs and revision. Text written by people or earlier runs is checked before you see it.",
+    readOnly: true,
+    destructive: false,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "work", kind: "id" }],
+    categories: ["work"],
+    package: "@crewhaus/tool-work",
+    keywords: ["work item", "read work", "acceptance criteria"],
+  },
+  workList: {
+    key: "workList",
+    name: "WorkList",
+    description:
+      "List this harness's work items: what it was asked to do, what it proposed, and what is done. Each row has the item id, its status, kind, basis, priority and place in the ranking. Text written by people or earlier runs is checked before you see it.",
+    readOnly: true,
+    destructive: false,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [],
+    categories: ["work"],
+    package: "@crewhaus/tool-work",
+    keywords: ["work items", "list work", "backlog", "what to do next"],
+  },
+  workPropose: {
+    key: "workPropose",
+    name: "WorkPropose",
+    description:
+      "Propose work for this harness. A person (or the owner's policy) decides whether it is accepted. Say why it matters (basis) and, for a feature, what happens if nothing is done. Label evidence honestly: observed, reported, or hypothesis — a guess or a simulated reaction is a hypothesis, never a request. Proposing the same source again returns the existing item.",
+    readOnly: false,
+    destructive: false,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [],
+    categories: ["work"],
+    package: "@crewhaus/tool-work",
+    keywords: ["propose work", "suggest work", "proposal", "feature request"],
+  },
+  workUpdate: {
+    key: "workUpdate",
+    name: "WorkUpdate",
+    description:
+      "Update a work item: add a note, link this run, record what you delivered, change your own proposal before it is accepted, or close an accepted item as done, failed or superseded with a reason code. You cannot accept, decline or cancel work.",
+    readOnly: false,
+    destructive: true,
+    scope: "internal",
+    requiresSandbox: false,
+    requireJustification: false,
+    operativeArgs: [{ field: "work", kind: "id" }],
+    categories: ["work"],
+    package: "@crewhaus/tool-work",
+    keywords: ["update work", "close work", "link run", "deliver"],
   },
   workflowRunLogs: {
     key: "workflowRunLogs",

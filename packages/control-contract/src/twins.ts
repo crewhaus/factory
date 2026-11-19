@@ -9,6 +9,7 @@ import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
+import { CORRECTION_SCOPES, DECLINE_REASONS } from "./areas/runtime-work.js";
 import type { CliTwin } from "./areas/types.js";
 import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
 import { deepFreeze } from "./util.js";
@@ -43,6 +44,19 @@ export const CLI_VERBS = deepFreeze({
   plugins: ["grants", "revoke"],
   delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
   inbox: ["list", "show", "stats"],
+  work: [
+    "list",
+    "show",
+    "add",
+    "edit",
+    "accept",
+    "decline",
+    "cancel",
+    "reopen",
+    "start",
+    "adopt",
+    "rank",
+  ],
 } as const);
 
 /**
@@ -72,6 +86,10 @@ export const CLI_VERBS = deepFreeze({
  * keys a run by; an execution's `run_<16 hex>` never fits it.
  *
  * `{att}` is an attention item's id, `att_` and 26 characters derived from what it is about.
+ * `{wi}` and `{belowWi}` are work items' ids. `{declineReason}` is one of the reasons a
+ * person may give to decline a proposal, and `{correctionScope}` how far a ranking
+ * correction reaches. `{workSource}` is a source the CLI can adopt, a continuity goal
+ * (`continuity-goal:goal-NNNN`) only: a Thredz task or an issue is adopted from Home, so neither renders a twin.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -104,6 +122,11 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
   "{run}": CANONICAL_RUN_ID_RE,
   "{att}": ATTENTION_ID_RE,
+  "{wi}": /^wi_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{belowWi}": /^wi_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{declineReason}": new RegExp(`^(?:${DECLINE_REASONS.join("|")})$`),
+  "{correctionScope}": new RegExp(`^(?:${CORRECTION_SCOPES.join("|")})$`),
+  "{workSource}": /^continuity-goal:goal-\d{4}$/,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;
