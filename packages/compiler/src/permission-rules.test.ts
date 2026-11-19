@@ -64,6 +64,7 @@ describe("permissionRuleFindings — what each finding says, and where", () => {
     ]);
     expect([...PERMISSION_RULE_NOTES].sort()).toEqual([
       "builtin-not-reached",
+      "order-not-checked",
       "shadowed-outside-plan",
       "tool-not-known",
     ]);
@@ -139,7 +140,7 @@ permissions:
     ]);
   });
 
-  test("a model profile's order finding is said on the edge too", () => {
+  test("a model profile's tool-key-not-name finding is said on the edge too", () => {
     const profile = `name: t
 target: cli
 models:
@@ -152,6 +153,13 @@ tools: [fetch]
     const local = said(findings(profile));
     expect(local).toEqual([["permission-rule", "models.fast.permissions.deny", "fetch"]]);
     expect(said(findings(profile, undefined, { edge: true }))).toEqual(local);
+    // A profile list holds no allow, so no order finding can arise there.
+    const spec = parseSpec(profile);
+    for (const opts of [{}, { edge: true }]) {
+      expect(
+        permissionRuleProblemsOf(spec, lower(spec), undefined, opts).map((p) => p.code),
+      ).toEqual(["tool-key-not-name"]);
+    }
   });
 
   test("in plan mode the order is a note locally and nothing on the edge", () => {
@@ -166,6 +174,27 @@ tools: [fetch]
     ]);
     expect(notes(true)).toEqual([]);
   });
+});
+
+describe("the rule-order check does a bounded amount of work", () => {
+  /** A cli spec whose `permissions.rules` holds 500 allow/deny pairs that shadow nothing. */
+  const longList = `${CLI}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+
+  test("a spec over the bound gets one note at the rule and list where the check stopped", () => {
+    const found = findings(longList);
+    expect(found.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    expect(found[0]?.message.startsWith('rule "alwaysDeny Read" in permissions.rules')).toBe(true);
+    const spec = parseSpec(longList);
+    expect(permissionRuleProblemsOf(spec, lower(spec)).map((p) => [p.code, p.path])).toEqual([
+      ["order-not-checked", "permissions.rules[alwaysDeny Read]"],
+    ]);
+  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+
+  test("a worker's build does not check the order of permissions.rules", () => {
+    expect(findings(longList, undefined, { edge: true })).toEqual([]);
+  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
 });
 
 describe("the names a rule can reach", () => {
@@ -213,19 +242,34 @@ describe("the names a rule can reach", () => {
 });
 
 describe("the module runs inside a Cloudflare Worker", () => {
-  test("it imports only the four specifiers a worker bundle can carry", () => {
+  /** Every static specifier: `import … from`, `export … from` and a bare `import "x";`. */
+  const specifiersOf = (source: string): Array<string | undefined> => [
+    ...[...source.matchAll(/^(?:import|export)\s[^;]*?\sfrom\s+"([^"]+)"/gm)].map((m) => m[1]),
+    ...[...source.matchAll(/^import\s+"([^"]+)"/gm)].map((m) => m[1]),
+  ];
+
+  test("the specifier scan reads every static import and re-export form", () => {
+    const sample = [
+      "import {",
+      "  a1,",
+      "  a2,",
+      '} from "a";',
+      'export { x } from "b";',
+      'export * from "c";',
+      'import "d";',
+      "",
+    ].join("\n");
+    expect(specifiersOf(sample)).toEqual(["a", "b", "c", "d"]);
+  });
+
+  test("it imports only modules a worker bundle can carry", () => {
     const source = readFileSync(join(import.meta.dir, "permission-rules.ts"), "utf8");
-    const specifiers = [...source.matchAll(/^import\s[\s\S]*?\sfrom\s+"([^"]+)";/gm)].map(
-      (m) => m[1],
-    );
-    const allowed = new Set([
+    const specifiers = specifiersOf(source);
+    expect(specifiers).toEqual([
       "@crewhaus/ir",
-      "@crewhaus/spec",
       "@crewhaus/tool-permission-matcher",
       "@crewhaus/tool-registry-manifest/flags",
     ]);
-    expect(specifiers.length).toBeGreaterThanOrEqual(2);
-    expect(specifiers.filter((s) => s === undefined || !allowed.has(s))).toEqual([]);
     expect(specifiers.some((s) => s?.startsWith(".") || s?.startsWith("node:"))).toBe(false);
     // No dynamic import or require reaches past the static list.
     expect(/\bimport\(|\brequire\(/.test(source)).toBe(false);

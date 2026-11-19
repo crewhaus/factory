@@ -1,8 +1,9 @@
 /**
- * `crewhaus runs list|show|create|cancel|resume`: a harness's runs, read from its run
- * ledger, and the run commands the control API serves, carried out here through the same
- * control service (each writes its receipt before it acts). `resume` re-drives a parked
- * cli session or run, as it always has.
+ * `crewhaus runs list|show|create|cancel|resume|inspect`: a harness's runs, read from its
+ * run ledger, and the run commands the control API serves, carried out here through the
+ * same control service (each writes its receipt before it acts). `resume` re-drives a
+ * parked cli session or run, as it always has. `inspect` explains a run from its records
+ * (`./runs-inspect`).
  */
 import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
@@ -33,6 +34,7 @@ import {
 } from "./daemon-cmd";
 import { parseFamilyArgs as parseArgs } from "./family-args";
 import { RunsError } from "./runs";
+import { runRunsInspect } from "./runs-inspect";
 import type { CliFamily } from "./verbs";
 
 export const CLI_FAMILY = {
@@ -63,11 +65,23 @@ export const CLI_FAMILY = {
         trace: "value",
         user: "value",
         "no-mcp-quarantine": "boolean",
+        "ignore-pause": "boolean",
         help: "boolean",
       },
     },
 
-    // A later change adds `inspect` here.
+    inspect: {
+      flags: {
+        harness: "value",
+        run: "value",
+        timeline: "value",
+        why: "value",
+        context: "value",
+        limit: "value",
+        before: "value",
+        json: "boolean",
+      },
+    },
 
     // A later change adds `retry` here.
   },
@@ -92,10 +106,13 @@ const USAGE = [
   "       crewhaus runs show <run> [--harness <h>] [--json]",
   "       crewhaus runs create <harness> --input-file <path> [--admission reject|queue] [--json]",
   "       crewhaus runs cancel <run> [--harness <h>] [--json]",
-  "       crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] …",
+  "       crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--ignore-pause] …",
+  "       crewhaus runs inspect <run|session> [--run <run>] [--timeline key|full | --why <step> |",
+  "                             --context <n>|all] [--limit n] [--before <entry>] [--harness <h>] [--json]",
   "  A harness's runs, newest first, and the run commands. <h> is a harness id or its",
   "  directory; without it, the current directory. `create` reads the input from a plain",
   "  text file. `cancel` of a run parked on a decision withdraws what it waits on.",
+  "  `inspect` explains a run from its records and writes nothing.",
 ];
 
 /** The most bytes `runs create` reads from its input file: the API's body cap. */
@@ -286,6 +303,7 @@ export async function runRunsCommand(
   if (argv.includes("--help") || argv.includes("-h")) return { lines: USAGE, exitCode: 0 };
   const verb = sub as Sub;
   const args = flagsOf(verb, argv.slice(1));
+  if (verb === "inspect") return runRunsInspect(args, deps);
   const opts = optionsOf(deps);
   const control = (): ControlService => deps.control?.() ?? directControl(opts);
   const home = deps.home ?? cliRunHome(opts, deps.now);

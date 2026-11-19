@@ -1251,7 +1251,9 @@ export {
   APPROVALS_DIRNAME,
   APPROVALS_LOCK_FILE,
   DECISION_LOG_DIR,
+  type DecisionLogEntry,
   type DecisionLogLine,
+  type DecisionLogRead,
   LOCAL_ACTOR_LABEL,
   PLACES_DIGEST_LABEL,
   approvalsDigestKey,
@@ -1259,6 +1261,7 @@ export {
   bindingDigestOf,
   inputDigestOf,
   placesDigestOf,
+  readDecisionLog,
   sealBinding,
   storedLocalActor,
 } from "./approvals/log";

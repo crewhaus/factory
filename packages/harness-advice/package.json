@@ -11,7 +11,9 @@
     "./shadow-lane": "./src/shadow-lane.ts",
     "./doctor-fix": "./src/doctor-fix.ts",
     "./doctor-checks": "./src/doctor-checks.ts",
-    "./permissions-suggest": "./src/permissions-suggest.ts"
+    "./permissions-suggest": "./src/permissions-suggest.ts",
+    "./advisor": "./src/advisor.ts",
+    "./failure-clusters": "./src/failure-clusters.ts"
   },
   "scripts": {
     "test": "bun test src"

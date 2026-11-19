@@ -312,6 +312,8 @@ export type HarnessOverview = {
   readonly deployedSpecHash?: string;
   readonly activeDeployment?: string;
   readonly openDecisions?: number;
+  /** Its approvals could not be read here, so `openDecisions` is left out rather than counted as 0. */
+  readonly approvalsUnreachable?: true;
   readonly lastVerifiedContactAt?: string;
   readonly asOf?: string;
   readonly stale?: boolean;

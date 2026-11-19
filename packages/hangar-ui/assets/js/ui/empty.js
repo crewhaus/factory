@@ -1,6 +1,6 @@
 /**
  * Empty states that say WHY. A list with nothing in it is a fact about the
- * world, and there are six different facts behind "nothing to show"; each
+ * world, and there are seven different facts behind "nothing to show"; each
  * has its own words and its own way forward:
  *
  *   no-data            nothing exists yet          → the verb or button that creates it
@@ -9,6 +9,7 @@
  *   unsupported        this harness cannot have it → the CLI verb, if one exists
  *   filtered           your filters hide it        → Clear filters
  *   not-indexed        search is still being built → nothing to do
+ *   unreachable        its source cannot be read   → what to move, in words
  *
  * `emptyState` in `dom.js` stays for the screens that have not moved here.
  * The decisions are {@link emptyModel}, pure; {@link emptyFor} draws one.
@@ -16,7 +17,7 @@
 
 import { el } from "../dom.js";
 
-/** The six causes, with their copy and their default action. */
+/** The seven causes, with their copy and their default action. */
 export const EMPTY_CAUSES = Object.freeze({
   "no-data": { message: "Nothing here yet.", action: null },
   "no-access": {
@@ -27,6 +28,7 @@ export const EMPTY_CAUSES = Object.freeze({
   unsupported: { message: "Not available for this harness: {subject}.", action: null },
   filtered: { message: "Your filters hide everything here.", action: "Clear filters" },
   "not-indexed": { message: "Search is still being built.", action: null },
+  unreachable: { message: "Couldn't read {subject}.", action: null },
 });
 
 /**

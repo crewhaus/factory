@@ -357,6 +357,52 @@ function stepIn(automaton: Automaton, set: ReadonlyArray<number>, c: number): nu
 }
 
 /**
+ * {@link closureIn} with its work charged to `budget`: one step per state it
+ * visits. `scratch` is a zeroed array as long as the automaton's states,
+ * reused across calls and left zeroed again, so the work follows the states
+ * the closure reaches rather than the automaton's size.
+ */
+function closureWithin(
+  automaton: Automaton,
+  from: ReadonlyArray<number>,
+  scratch: Uint8Array,
+  budget: InclusionBudget,
+): number[] {
+  const { states } = automaton;
+  const visited: number[] = [];
+  const out: number[] = [];
+  const stack = [...from];
+  while (stack.length > 0) {
+    const s = stack.pop() as number;
+    if (scratch[s] === 1) continue;
+    scratch[s] = 1;
+    visited.push(s);
+    const st = states[s] as GlobState;
+    if (st.t === "split") stack.push(st.b, st.a);
+    else out.push(s);
+  }
+  for (const s of visited) scratch[s] = 0;
+  budget.steps -= visited.length;
+  return out.sort((a, b) => a - b);
+}
+
+/** {@link stepIn} with its closure charged to `budget` ({@link closureWithin}). */
+function stepWithin(
+  automaton: Automaton,
+  set: ReadonlyArray<number>,
+  c: number,
+  scratch: Uint8Array,
+  budget: InclusionBudget,
+): number[] {
+  const next: number[] = [];
+  for (const s of set) {
+    const st = automaton.states[s] as GlobState;
+    if (reads(st, c)) next.push((st as { out: number }).out);
+  }
+  return next.length === 0 ? next : closureWithin(automaton, next, scratch, budget);
+}
+
+/**
  * Does `st`, a state of a Glob tool pattern, read a `.` that starts a name?
  * Only a literal the pattern writes first in its segment does: the tool's
  * wildcards never read one (Bun.Glob with `dot: false`).
@@ -419,13 +465,16 @@ const OTHER = 0x61;
  * one character class at a time, and a set of `inner`'s states that accepts
  * beside a set of `outer`'s that does not is a path `outer` misses. `false`
  * when working that out would take more than a bounded amount of work: an
- * allow that cannot be shown to cover every path grants nothing.
+ * allow that cannot be shown to cover every path grants nothing. With a
+ * `budget` ({@link InclusionBudget}), the work is charged to it as that type
+ * counts it, and the answer is `false` once it is spent.
  */
 function automatonIncludedIn(
   inner: Automaton,
   outer: Automaton,
   visible: boolean,
   startsSegment = true,
+  budget?: InclusionBudget,
 ): boolean {
   const alphabet = new Set<number>([SLASH, DOT]);
   for (const auto of [inner, outer]) {
@@ -434,11 +483,25 @@ function automatonIncludedIn(
   let other = OTHER;
   while (alphabet.has(other)) other++;
   alphabet.add(other);
-  const first: readonly [number[], number[], boolean] = [
-    closureIn(inner, [inner.start]),
-    closureIn(outer, [outer.start]),
-    startsSegment,
-  ];
+  // With a budget, closures are worked out by `closureWithin`, which visits
+  // only the states it reaches and charges each one to the budget.
+  const counted =
+    budget === undefined
+      ? undefined
+      : {
+          budget,
+          inner: new Uint8Array(inner.states.length),
+          outer: new Uint8Array(outer.states.length),
+        };
+  const first: readonly [number[], number[], boolean] =
+    counted === undefined
+      ? [closureIn(inner, [inner.start]), closureIn(outer, [outer.start]), startsSegment]
+      : [
+          closureWithin(inner, [inner.start], counted.inner, counted.budget),
+          closureWithin(outer, [outer.start], counted.outer, counted.budget),
+          startsSegment,
+        ];
+  if (budget !== undefined && budget.steps <= 0) return false;
   if (first[0].includes(0) && !first[1].includes(0)) return false;
   const keyOf = (i: ReadonlyArray<number>, o: ReadonlyArray<number>, atStart: boolean) =>
     `${atStart ? 1 : 0}|${i.join(",")}|${o.join(",")}`;
@@ -453,9 +516,21 @@ function automatonIncludedIn(
         visible && atStart && c === DOT
           ? i.filter((s) => readsLeadingDot(inner.states[s] as GlobState))
           : i;
-      const ni = stepIn(inner, from, c);
+      if (budget !== undefined) {
+        budget.steps -= 1 + i.length + o.length;
+        if (budget.steps <= 0) return false;
+      }
+      const ni =
+        counted === undefined
+          ? stepIn(inner, from, c)
+          : stepWithin(inner, from, c, counted.inner, counted.budget);
+      if (budget !== undefined && budget.steps <= 0) return false;
       if (ni.length === 0) continue;
-      const no = stepIn(outer, o, c);
+      const no =
+        counted === undefined
+          ? stepIn(outer, o, c)
+          : stepWithin(outer, o, c, counted.outer, counted.budget);
+      if (budget !== undefined && budget.steps <= 0) return false;
       if (ni.includes(0) && !no.includes(0)) return false;
       const key = keyOf(ni, no, c === SLASH);
       if (seen.has(key)) continue;
@@ -468,16 +543,42 @@ function automatonIncludedIn(
 }
 
 /**
+ * Work a caller lets {@link globIncludedIn} do, shared across calls: each
+ * call spends `steps` and leaves what is left. One step is one automaton
+ * state touched once. Building a glob's automaton spends one step per state
+ * (which also pays for reading its alphabet and for its working arrays).
+ * Each character read from a pair of state sets spends one step plus one
+ * per state in either set, and each closure worked out after it spends one
+ * step per state it visits. Every other part of a call is bounded by what
+ * these charges count, so the call's work grows with the steps it spends.
+ */
+export type InclusionBudget = { steps: number };
+
+/**
  * Does `outer` match every string `inner` matches? Both are globs in this
  * module's grammar. `false` when that cannot be shown within a bounded
  * amount of work, so a caller that acts on `true` acts only on a proof.
+ *
+ * With a `budget`, the call also stops once the budget is spent, and builds
+ * nothing when it starts spent. A `false` that leaves `budget.steps <= 0`
+ * proves nothing either way, so a caller reads the budget after the call.
  */
-export function globIncludedIn(inner: string, outer: string): boolean {
-  return automatonIncludedIn(
-    buildAutomaton(tokenizeGlob(inner)),
-    buildAutomaton(tokenizeGlob(outer)),
-    false,
-  );
+export function globIncludedIn(inner: string, outer: string, budget?: InclusionBudget): boolean {
+  if (budget === undefined) {
+    return automatonIncludedIn(
+      buildAutomaton(tokenizeGlob(inner)),
+      buildAutomaton(tokenizeGlob(outer)),
+      false,
+    );
+  }
+  if (budget.steps <= 0) return false;
+  const innerAutomaton = buildAutomaton(tokenizeGlob(inner));
+  budget.steps -= innerAutomaton.states.length;
+  if (budget.steps <= 0) return false;
+  const outerAutomaton = buildAutomaton(tokenizeGlob(outer));
+  budget.steps -= outerAutomaton.states.length;
+  if (budget.steps <= 0) return false;
+  return automatonIncludedIn(innerAutomaton, outerAutomaton, false, true, budget);
 }
 
 /**
@@ -1980,7 +2081,9 @@ export {
   type PermissionRuleProblem,
   type PermissionRuleProblemCode,
   type PermissionRuleProblemsInput,
+  RULE_ORDER_LIMITS,
   type RuleToolDescriptor,
+  type ShadowedRuleOptions,
   type ShadowedRuleProblem,
   argGlobCanMatchUrl,
   mcpServersReachedBy,

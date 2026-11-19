@@ -1,0 +1,16 @@
+/**
+ * Holds each attention schema to its type in the main entry, at compile time, with the
+ * helpers `type-checks.ts` defines and proves.
+ */
+import type { z } from "zod";
+import type * as T from "../index.js";
+import type * as S from "./attention.js";
+import type { Expect, Same } from "./type-checks.js";
+
+export type AttentionSchemaTypeChecks = [
+  Expect<Same<z.infer<typeof S.attentionItem>, T.AttentionItem>>,
+  Expect<Same<z.infer<typeof S.attentionList>, T.AttentionList>>,
+  Expect<Same<z.input<typeof S.attentionListQuery>, T.AttentionListQuery>>,
+  Expect<Same<z.infer<typeof S.attentionMetrics>, T.AttentionMetrics>>,
+  Expect<Same<z.infer<typeof S.attentionMetricsQuery>, T.AttentionMetricsQuery>>,
+];

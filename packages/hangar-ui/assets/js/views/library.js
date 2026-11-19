@@ -31,6 +31,7 @@ import { libraryChip } from "../ui/badges.js";
 import { confirmAction } from "../ui/dialog.js";
 import { reconcile } from "../ui/keyed.js";
 import {
+  APPROVALS_UNKNOWN,
   deriveSmartGroups,
   dirTail,
   evalHealth,
@@ -725,13 +726,19 @@ function harnessRow(ctl) {
         : el("a", { class: "state-link", href: hrefHarness(row.id, "runs") }, [
             dot(procStatePill(row.supervision).dot, procStatePill(row.supervision).label),
           ]),
-      row.pendingApprovals > 0
-        ? el("a", {
+      row.approvalsUnreachable
+        ? el("span", {
             class: "chip chip-warn",
-            href: hrefGlobal("approvals"),
-            text: `${row.pendingApprovals} waiting`,
+            title: "Its sessions folder is outside its folder, so its approvals can't be read.",
+            text: APPROVALS_UNKNOWN,
           })
-        : null,
+        : row.pendingApprovals > 0
+          ? el("a", {
+              class: "chip chip-warn",
+              href: hrefGlobal("approvals"),
+              text: `${row.pendingApprovals} waiting`,
+            })
+          : null,
     ]),
     el("td", null, [
       dot(

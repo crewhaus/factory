@@ -4,10 +4,10 @@
  * stamps included, or preflight checks an environment the daemon never sees.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mergedSpawnEnv, readHarnessEnvFiles } from "./env-file";
+import { envNameSource, harnessEnvFacts, mergedSpawnEnv, readHarnessEnvFiles } from "./env-file";
 import { buildSpawnPlan } from "./spawn-contracts";
 
 const scratch: string[] = [];
@@ -74,5 +74,46 @@ describe("readHarnessEnvFiles", () => {
       "../absent.env:shared:false",
       ".env:harness:true",
     ]);
+  });
+});
+
+describe("envNameSource", () => {
+  function shared(dir: string, lines: readonly string[]): string {
+    const file = join(dir, "..", "fleet.env");
+    writeFileSync(file, `${lines.join("\n")}\n`);
+    mkdirSync(join(dir, ".crewhaus"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "settings.json"),
+      JSON.stringify({ manager: { envFiles: ["../fleet.env"] } }),
+    );
+    return realpathSync(file);
+  }
+
+  test("names the real path of the last chain file that assigns the name, never a value", () => {
+    const dir = harness(["LOCAL_ONLY=x"], ["OVERRIDE=local"]);
+    const fleet = shared(dir, ["API_TOKEN_NAME=fleet-value", "OVERRIDE=fleet"]);
+    expect(envNameSource(dir, "API_TOKEN_NAME", {})).toEqual({ file: fleet });
+    expect(envNameSource(dir, "OVERRIDE", {})).toEqual({
+      file: realpathSync(join(dir, ".env.local")),
+    });
+    expect(envNameSource(dir, "LOCAL_ONLY", {})).toEqual({ file: realpathSync(join(dir, ".env")) });
+    expect(JSON.stringify(envNameSource(dir, "API_TOKEN_NAME", {}))).not.toContain("fleet-value");
+  });
+
+  test("the process environment wins, whatever its value, and an unset name has no source", () => {
+    const dir = harness(["SET_IN_FILE=x"]);
+    expect(envNameSource(dir, "SET_IN_FILE", { SET_IN_FILE: "" })).toBe("process");
+    expect(envNameSource(dir, "SET_IN_FILE", { SET_IN_FILE: "y" })).toBe("process");
+    expect(envNameSource(dir, "NOWHERE", {})).toBeUndefined();
+  });
+
+  test("harnessEnvFacts answers the folded chain and the same sources", () => {
+    const dir = harness(["A=1"], ["A=2"]);
+    const facts = harnessEnvFacts({});
+    expect(facts.envVars(dir)).toEqual({ A: "2" });
+    expect(facts.envNameSource(dir, "A")).toEqual({
+      file: realpathSync(join(dir, ".env.local")),
+    });
+    expect(harnessEnvFacts({ A: "p" }).envNameSource(dir, "A")).toBe("process");
   });
 });

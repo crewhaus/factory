@@ -821,8 +821,10 @@ export type VerdictGate =
 /**
  * Every outcome a gate writes, closed per gate. `approval` also types
  * `expired` and `superseded`, which happen in the approvals store; a reader
- * finds them in the decision log by its `inputDigest`, which is a tool
- * verdict's `actionDigest`.
+ * finds them in the decision log by the approval id in the verdict's
+ * `refs.approval`, which is the decision log's `decision`. Never by the
+ * action digest alone: a moved call's superseded approval and its
+ * replacement share one.
  */
 export type VerdictOutcomes = {
   readonly permission: "allow" | "deny" | "ask:approved" | "ask:denied" | "ask:parked";

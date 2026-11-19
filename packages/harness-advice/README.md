@@ -9,6 +9,8 @@ What a harness's own logs say it should change.
 | `doctor-checks` | whether this spec can run here: model credentials, channel env |
 | `doctor-fix` | a doctor finding turned into the edit that closes it |
 | `permissions-suggest` | permission rules drawn from the asks a human already answered |
+| `advisor` | which of a harness's signals need a person, ranked, and which an operator already dismissed or acted on |
+| `failure-clusters` | which failed runs failed the same way: one class, similar messages |
 
 Nothing here calls a model, and nothing here writes. Every rule is arithmetic
 over what was persisted, so the same logs always produce the same findings —
