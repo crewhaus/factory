@@ -402,7 +402,41 @@ export type RunOptions = {
    * hand the next command to an enclosing repository.
    */
   readonly discoverAboveRoot?: boolean;
+  /**
+   * Spawn git with an environment nothing inherited can steer: the harness's
+   * credentials are left out (as for a read), and so is every inherited
+   * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` pair (a
+   * non-credential one too), `GIT_CONFIG_PARAMETERS`, `GIT_ASKPASS`,
+   * `SSH_ASKPASS` and each name in `dropNames`, so only the caller's own `env`
+   * entries configure the run. Existing callers leave it unset and run as before.
+   */
+  readonly isolatedEnv?: { readonly dropNames?: readonly string[] };
 };
+
+/** The inherited variables an isolated run never passes on: git configuration and askpass. */
+const ISOLATED_DROPPED: ReadonlySet<string> = new Set([
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_ASKPASS",
+  "SSH_ASKPASS",
+]);
+const ISOLATED_CONFIG_PAIR_RE = /^GIT_CONFIG_(?:KEY|VALUE)_\d+$/;
+
+/** `inherited` without git configuration pairs, askpass, and the names a caller drops. */
+function isolatedInherited(
+  inherited: Readonly<Record<string, string | undefined>>,
+  dropNames: readonly string[],
+): Record<string, string | undefined> {
+  const drop = new Set(dropNames);
+  const out: Record<string, string | undefined> = {};
+  for (const [name, value] of Object.entries(inherited)) {
+    if (ISOLATED_DROPPED.has(name) || ISOLATED_CONFIG_PAIR_RE.test(name) || drop.has(name)) {
+      continue;
+    }
+    out[name] = value;
+  }
+  return out;
+}
 
 /**
  * Flags applied to every invocation, before the subcommand.
@@ -578,10 +612,15 @@ export async function runGit(args: readonly string[], opts: RunOptions): Promise
   // from a git hook inherits both).
   const inherited = withoutRepositoryLocators(process.env);
   // A write keeps the full environment: a commit may sign through an agent,
-  // and its hooks are the repository's, approved with the write.
-  const env: Record<string, string | undefined> = readOnly
-    ? withoutCredentials(inherited, pinned).env
-    : { ...inherited, ...pinned };
+  // and its hooks are the repository's, approved with the write. An isolated
+  // run keeps nothing that could configure git but what the caller pins.
+  const env: Record<string, string | undefined> =
+    opts.isolatedEnv !== undefined
+      ? withoutCredentials(isolatedInherited(inherited, opts.isolatedEnv.dropNames ?? []), pinned)
+          .env
+      : readOnly
+        ? withoutCredentials(inherited, pinned).env
+        : { ...inherited, ...pinned };
 
   let proc: ReturnType<typeof Bun.spawn>;
   try {
