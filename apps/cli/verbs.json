@@ -5895,6 +5895,64 @@
       "flags": null
     },
     {
+      "verb": "inbox",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "bare": "list",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "kind",
+              "takesValue": true
+            },
+            {
+              "name": "band",
+              "takesValue": true
+            },
+            {
+              "name": "all",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "stats": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "since",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
       "verb": "incident",
       "kind": "legacy",
       "since": "0.8.0",

@@ -10,7 +10,7 @@ import { deepFreeze } from "../util.js";
 import { CORE_MODULE } from "./core.js";
 import type { AreaModule } from "./types.js";
 
-// import { ATTENTION_MODULE } from "./attention.js";
+import { ATTENTION_MODULE } from "./attention.js";
 
 import { COMPILER_MODULE } from "./compiler.js";
 
@@ -37,7 +37,7 @@ import { QUALITY_MODULE } from "./quality.js";
 export const AREA_MODULES = [
   CORE_MODULE,
 
-  // ATTENTION_MODULE,
+  ATTENTION_MODULE,
 
   COMPILER_MODULE,
 

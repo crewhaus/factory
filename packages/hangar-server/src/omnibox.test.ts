@@ -12,6 +12,7 @@ import { describe, expect, test } from "bun:test";
 import { appendFileSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { approvalItemRef } from "@crewhaus/attention";
 import { makeFixtureHarness } from "./fixture";
 import {
   type IndexHarness,
@@ -232,7 +233,7 @@ describe("where an entry comes from", () => {
 });
 
 describe("the approvals the menu finds", () => {
-  test("pending ones, at the resolved session root, linking to where they are decided", () => {
+  test("waiting ones and ones decided within their time to live, each opening its inbox item", () => {
     const root = mkdtempSync(join(tmpdir(), "hangar-omni-approvals-"));
     try {
       const dir = join(root, "h");
@@ -241,26 +242,35 @@ describe("the approvals the menu finds", () => {
         approvals: [
           approvalLine("appr_000000000000000a", { toolName: "Bash" }),
           approvalLine("appr_000000000000000b", {
+            toolName: "Fetch",
             decision: "grant",
             decidedBy: "max",
             decidedAt: new Date(NOW).toISOString(),
           }),
           approvalLine("appr_000000000000000c", {
+            toolName: "Glob",
+            createdAt: new Date(NOW - 60 * DAY).toISOString(),
             decision: "deny",
             decidedBy: "max",
-            decidedAt: new Date(NOW).toISOString(),
+            decidedAt: new Date(NOW - 59 * DAY).toISOString(),
           }),
-          approvalLine("appr_000000000000000d", { supersededBy: "appr_000000000000000e" }),
-          approvalLine("appr_000000000000000e", { toolName: "Fetch" }),
         ],
       });
       const harness: IndexHarness = { id: "hrn_1", specName: "asks", dir, groups: [], tags: [] };
       const approvals = buildHarnessEntries(harness, NOW).filter((e) => e.kind === "approval");
-      expect(approvals.map((e) => [e.id, e.title])).toEqual([
-        ["appr_000000000000000a", "Bash"],
-        ["appr_000000000000000e", "Fetch"],
+      const id = (fact: { id: string }) => {
+        const ref = approvalItemRef("hrn_1", { ...fact, kind: "tool" });
+        return ref.slice(ref.lastIndexOf("/") + 1);
+      };
+      const waiting = id({ id: "appr_000000000000000a" });
+      const decided = id({ id: "appr_000000000000000b" });
+      expect(
+        approvals.map((e) => [e.id, e.title, e.subtitle]).sort((x, y) => (x[1] < y[1] ? -1 : 1)),
+      ).toEqual([
+        [waiting, "Bash", "waiting for a decision · asks"],
+        [decided, "Fetch", "decided · asks"],
       ]);
-      for (const e of approvals) expect(e.href).toBe("#/home/needs-you?type=approvals");
+      for (const e of approvals) expect(e.href).toBe(`#/home/needs-you?item=${e.id}`);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -6,6 +6,7 @@
   },
   "references": [
     { "path": "../access-control" },
+    { "path": "../attention" },
     { "path": "../boundary-classifier" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },
@@ -24,6 +25,7 @@
     { "path": "../feedback-distill" },
     { "path": "../gateway-protocol" },
     { "path": "../gateway-server" },
+    { "path": "../harness-advice" },
     { "path": "../harness-inventory" },
     { "path": "../harness-registry" },
     { "path": "../harness-supervisor" },

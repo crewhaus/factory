@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readPage, runsLedger } from "@crewhaus/control-records";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { createMemoryStore } from "@crewhaus/memory-store";
 import { createSessionStore } from "@crewhaus/session-store";
@@ -175,7 +176,7 @@ describe("with rich: true", () => {
     expect(plain["cli"]).not.toBe(first["cli"]);
   });
 
-  test("carries three pending approvals, an open review item, an eval history and a spec version", async () => {
+  test("carries three pending approvals, an open review item, an eval history, a failed run and a spec version", async () => {
     const fleet = await seedFleet(tempDir(), { seed: "s", now: NOW, shapes: ["cli"], rich: true });
     const [harness] = fleet.harnesses;
     if (harness === undefined) throw new Error("no harness");
@@ -206,6 +207,12 @@ describe("with rich: true", () => {
       readFileSync(join(crewhaus, "specs", harness.specName, "manifest.json"), "utf8"),
     ) as { versions: string[] };
     expect(manifest.versions).toEqual([RICH_SPEC_VERSION]);
+    // A run that failed signing in, for the inbox's Fix band.
+    const ran = readPage(runsLedger(harness.dir), { limit: 10 }).items.map((i) => i.record);
+    expect(ran.map((r) => `${r["state"]}:${r["failureClass"] ?? "-"}`).sort()).toEqual([
+      "failed:auth",
+      "running:-",
+    ]);
     // A start can be planned without a CLI on PATH.
     expect(readFileSync(join(harness.dir, "dist", "agent.ts"), "utf8")).toContain("stand-in");
   });

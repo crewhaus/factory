@@ -10,6 +10,7 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadAccessSnapshot, openAccess } from "@crewhaus/access-control";
+import { buildSuggestionsFile } from "@crewhaus/harness-advice/advise-rules";
 import { acceptInvite, signInFromBootLink } from "./__test__/browser";
 import {
   ADVISOR_JOB_ARGV,
@@ -48,9 +49,9 @@ const CLEAN: AdvisorInputs = {
       verb: "crewhaus optimize crewhaus.yaml --dataset eval/dataset.jsonl --graders eval/graders.yaml",
     },
   },
-  openIncidents: 0,
+  openIncidents: [],
   procState: "running",
-  pendingApprovals: 0,
+  pendingApprovals: { count: 0, newestId: "", newestAt: "" },
   budget: { declaredUsd: 10, spentUsd: 1 },
   adviceProposals: 0,
   overdueDreams: [],
@@ -168,8 +169,10 @@ describe("deriveAdvisorItems (pure)", () => {
     const at = (spentUsd: number) =>
       deriveAdvisorItems({ ...CLEAN, budget: { declaredUsd: 10, spentUsd } });
     expect(at(5)).toEqual([]);
-    expect(at(8.5).map((i) => i.id)).toEqual(["budget-near-limit"]);
-    expect(at(12).map((i) => i.id)).toEqual(["budget-exceeded"]);
+    // Keyed by the decile and the period, so a dismissal at 80% does not hide 90%.
+    expect(at(8.5).map((i) => i.id)).toEqual(["budget-near-8-total"]);
+    expect(at(9.5).map((i) => i.id)).toEqual(["budget-near-9-total"]);
+    expect(at(12).map((i) => i.id)).toEqual(["budget-exceeded-total"]);
     // …and spending with NO ceiling at all is a suggestion, not silence.
     const unbudgeted = deriveAdvisorItems({
       ...CLEAN,
@@ -968,6 +971,74 @@ describe("acting on an item needs the permission of what it queues", () => {
         body: "{}",
       });
       expect(owned.status).toBe(200);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+});
+
+describe("the advisor reads what the harness records", () => {
+  test("mined suggestions waiting raise advice-waiting, read as the advise pass writes them", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "advised-mined"), {
+        specName: "advised-mined",
+      });
+      const file = buildSuggestionsFile(
+        [
+          {
+            id: "routing-cheaper-model",
+            severity: "info",
+            summary: "route easy turns to a cheaper model",
+            suggestion: {
+              kind: "spec-patch",
+              patch: { path: "agent.temperature", op: "set", value: 0.2 },
+            },
+          } as never,
+        ],
+        ["sess_0123456789abcdef"],
+        iso(NOW),
+      );
+      expect(file.suggestions).toHaveLength(1);
+      mkdirSync(join(dir, ".crewhaus", "advice"), { recursive: true });
+      writeFileSync(join(dir, ".crewhaus", "advice", "suggestions.json"), JSON.stringify(file));
+      const { body } = await t.api("/api/harnesses", {
+        method: "POST",
+        body: JSON.stringify({ dir }),
+      });
+      const id = (body["entry"] as { id: string }).id;
+      const feed = (await t.api(`/api/h/${id}/advisor`)).body;
+      const ids = (feed["items"] as Array<{ id: string }>).map((i) => i.id);
+      expect(ids).toContain("advice-waiting");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("each open incident is its own item, and a resolved one is none", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = makeFixtureHarness(join(t.harnessesRoot, "advised-incidents"), {
+        specName: "advised-incidents",
+      });
+      const incidents = join(dir, ".crewhaus", "incidents");
+      mkdirSync(incidents, { recursive: true });
+      writeFileSync(join(incidents, "2026-08-01-guard.json"), "{}");
+      writeFileSync(join(incidents, "2026-08-02-guard.json"), "{}");
+      writeFileSync(join(incidents, "2026-07-30-guard.resolved.json"), "{}");
+      const { body } = await t.api("/api/harnesses", {
+        method: "POST",
+        body: JSON.stringify({ dir }),
+      });
+      const id = (body["entry"] as { id: string }).id;
+      const feed = (await t.api(`/api/h/${id}/advisor`)).body;
+      const items = feed["items"] as Array<{ id: string; evidenceAt?: string }>;
+      const found = items.filter((i) => i.id.startsWith("incident-"));
+      expect(found.map((i) => i.id).sort()).toEqual([
+        "incident-2026-08-01-guard",
+        "incident-2026-08-02-guard",
+      ]);
+      for (const item of found) expect(typeof item.evidenceAt).toBe("string");
     } finally {
       await t.stop();
     }

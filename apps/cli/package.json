@@ -31,6 +31,7 @@
     "@crewhaus/access-control": "workspace:*",
     "@crewhaus/adapter-anthropic": "workspace:*",
     "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/attention": "workspace:*",
     "@crewhaus/audit-log": "workspace:*",
     "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/eval-optimizer-orchestrator": "workspace:*",

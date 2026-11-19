@@ -477,8 +477,11 @@ function ruleCommand(deps: ApprovalsDeps, harnessDir: string) {
   };
 }
 
-/** A tool input as the preview shows it: a value under a credential's key, and a token in text, hidden. */
-function masked(value: unknown, underKey = false): unknown {
+/**
+ * A tool input as the preview shows it: a value under a credential's key, and a token in
+ * text, hidden. `crewhaus inbox` shows a request's input the same way.
+ */
+export function masked(value: unknown, underKey = false): unknown {
   if (typeof value === "string") return underKey ? REDACTED_VALUE : maskCredentialTokens(value);
   if (Array.isArray(value)) return value.map((item) => masked(item, underKey));
   if (typeof value === "object" && value !== null) {

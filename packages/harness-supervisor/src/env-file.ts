@@ -8,7 +8,13 @@
  * `@crewhaus/hangar-server`, which still re-exports it for one release, so
  * that `crewhaus daemon` reaches it without depending on the HTTP server.
  */
-import { type EnvFileRef, buildSpawnEnv, loadEnvChain } from "./spawn-contracts";
+import { readFileSync, realpathSync } from "node:fs";
+import {
+  type EnvFileRef,
+  buildSpawnEnv,
+  dotenvAssignedNames,
+  loadEnvChain,
+} from "./spawn-contracts";
 
 export type HarnessEnvFiles = {
   /** Folded key → value map across the chain (later files win). */
@@ -60,4 +66,55 @@ export function mergedSpawnEnv(
     processEnv: baseEnv,
   });
   return { env, envFiles, envFileRefs };
+}
+
+/**
+ * Where a harness's spawn would take `name` from: `process` when the process environment
+ * sets it (any value, empty included: it wins over the chain in a spawn), else the real
+ * path of the last present chain file that assigns it (later files win), else
+ * `undefined`. Names only: a value is never returned, and a file is read only for the
+ * names it assigns.
+ */
+export function envNameSource(
+  harnessDir: string,
+  name: string,
+  processEnv: Readonly<Record<string, string | undefined>> = process.env,
+): { readonly file: string } | "process" | undefined {
+  if (typeof processEnv[name] === "string") return "process";
+  const refs = readHarnessEnvFiles(harnessDir).refs;
+  for (let i = refs.length - 1; i >= 0; i--) {
+    const ref = refs[i] as EnvFileRef;
+    if (!ref.present) continue;
+    let text: string;
+    try {
+      text = readFileSync(ref.path, "utf8");
+    } catch {
+      continue;
+    }
+    if (!dotenvAssignedNames(text).has(name)) continue;
+    try {
+      return { file: realpathSync(ref.path) };
+    } catch {
+      return { file: ref.path };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * What a reader of a harness's records asks of its env chain, as one object: the folded
+ * names and values (the sessions folder may be relocated there) and where a name is set.
+ * Home and `crewhaus inbox` both build the attention fold's facts with it, so the two
+ * group failed runs by the same credential source.
+ */
+export function harnessEnvFacts(
+  processEnv: Readonly<Record<string, string | undefined>> = process.env,
+): {
+  envVars(dir: string): Readonly<Record<string, string | undefined>>;
+  envNameSource(dir: string, name: string): { readonly file: string } | "process" | undefined;
+} {
+  return {
+    envVars: (dir) => readHarnessEnvFiles(dir).vars,
+    envNameSource: (dir, name) => envNameSource(dir, name, processEnv),
+  };
 }

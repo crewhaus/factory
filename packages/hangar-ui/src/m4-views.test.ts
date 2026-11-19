@@ -14,6 +14,7 @@ import {
   INBOX_BINDINGS,
   bindingSheet,
   globalKey,
+  inboxKindOf,
   initialKeyState,
   isCharacterKey,
   keyShape,
@@ -246,6 +247,28 @@ describe("globalKey — HM-190 ownership", () => {
     expect(sections).toHaveLength(2);
     expect(sections.every((s) => s.bindings.length > 0)).toBe(true);
     expect((bindingSheet(true) as Array<{ section: string }>)[1]?.section).toBe("This inbox");
+  });
+
+  test("Needs you, All lists only the keys its list answers to", () => {
+    const route = (type?: string) => ({
+      view: "home",
+      sub: "needs-you",
+      query: type === undefined ? {} : { type },
+    });
+    expect(inboxKindOf(route())).toBe("attention");
+    expect(inboxKindOf(route("approvals"))).toBe("triage");
+    expect(inboxKindOf(route("review"))).toBe("triage");
+    expect(inboxKindOf(route("advice"))).toBe(false);
+    expect(inboxKindOf({ view: "home", sub: "working", query: {} })).toBe(false);
+    const sheet = bindingSheet("attention") as Array<{
+      section: string;
+      bindings: Array<{ keys: string }>;
+    }>;
+    expect(sheet.map((g) => g.section)).toEqual(["Anywhere", "This list"]);
+    const keys = sheet[1]?.bindings.map((b) => b.keys) ?? [];
+    expect(keys).toEqual(["j / ↓", "k / ↑", "Home / End"]);
+    for (const absent of ["g / d", "u / d / p / f", "Enter", "."])
+      expect(keys).not.toContain(absent);
   });
 
   test("the sheet tells the truth: a letter chooses a verdict and Enter confirms it", () => {

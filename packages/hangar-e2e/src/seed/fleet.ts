@@ -10,6 +10,8 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { mintRunId } from "@crewhaus/control-contract";
+import { append, runsLedger } from "@crewhaus/control-records";
 import { feedbackRecord, logLine, makeFixtureHarness } from "@crewhaus/hangar-server";
 import { openHangarRegistry } from "@crewhaus/harness-registry";
 import { createMemoryStore } from "@crewhaus/memory-store";
@@ -43,7 +45,8 @@ export type SeedFleetOptions = {
    * approvals (a keyboard tour spends two grants and needs one left to hold
    * focus), an open review item, an eval history below its pinned baseline
    * (the charts, the trend, an Advisor item to explain), a spec registry
-   * with one archived version (the version dialogs open from its row), and,
+   * with one archived version (the version dialogs open from its row), a run
+   * that failed signing in (a problem for the inbox to group), and,
    * for the cli shape, a stand-in compiled bundle, so a start can be planned
    * on a machine with no `crewhaus` CLI installed (a journey answers the
    * start itself; nothing is ever spawned). Off by default, so every other
@@ -54,6 +57,11 @@ export type SeedFleetOptions = {
 
 /** The tools the rich seed's approvals ask for, in order. */
 export const RICH_APPROVAL_TOOLS = ["Bash", "SendMessage", "Fetch"] as const;
+/**
+ * The rich seed's Fetch input: one long line with no break in it, as real URLs and shell
+ * commands are, so the reflow check sees a request's input wrap inside its card.
+ */
+export const LONG_FETCH_URL = `https://example.invalid/status/${"region-eu-west-1/".repeat(12)}health?verbose=true`;
 /** The archived spec version the rich seed registers. */
 export const RICH_SPEC_VERSION = "1.0.0";
 
@@ -96,7 +104,7 @@ function richRecords(
         ? { command: "ls -la" }
         : toolName === "SendMessage"
           ? { channel: "ops", text: "ship it" }
-          : { url: "https://example.invalid/status" },
+          : { url: LONG_FETCH_URL },
     runId,
     sessionId,
     surface: "daemon",
@@ -265,6 +273,34 @@ export async function seedFleet(dir: string, opts: SeedFleetOptions): Promise<Fl
     });
 
     if (rich !== null) {
+      // One run that failed signing in, through the run ledger's own writer, so the
+      // inbox has a problem to show beside the requests. Its id is minted from the seed.
+      const failedRun = mintRunId({
+        now: opts.now - 120_000,
+        random: (bytes) => {
+          const digest = createHash("sha256").update(`${opts.seed}\0${target}\0failed-run`);
+          bytes.set(digest.digest().subarray(0, bytes.length));
+        },
+      });
+      const trigger = { kind: "api" };
+      for (const row of [
+        {
+          id: failedRun,
+          state: "running",
+          at: new Date(opts.now - 180_000).toISOString(),
+          trigger,
+        },
+        {
+          id: failedRun,
+          state: "failed",
+          at: new Date(opts.now - 120_000).toISOString(),
+          trigger,
+          failureClass: "auth",
+        },
+      ]) {
+        const written = append(runsLedger(harnessDir), row);
+        if (!written.ok) throw new Error(`the run ledger of ${specName}: ${written.reason}`);
+      }
       // The Advisor's eval action can only queue what the harness can run.
       mkdirSync(join(harnessDir, "eval"), { recursive: true });
       writeFileSync(join(harnessDir, "eval", "dataset.jsonl"), '{"id":"a","input":"x"}\n');
