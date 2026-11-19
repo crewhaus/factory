@@ -6,6 +6,16 @@
  * repository, so a clone and a push run the real protocol against the real
  * server half. REST state lives in memory and dies with `stop()`. Installation
  * tokens here are a plain issuer: nothing checks who asked.
+ *
+ * With `requireToken`, every REST request and every git request needs that token
+ * (`Authorization: Bearer <token>` or `token <token>` on REST, HTTP basic with the
+ * token as the password on git) and gets a 401 without it. A pull request's head SHA
+ * is read from the bare repository; a second create for an open head is a 422; a
+ * read of one pull request carries an ETag and answers 304 to a matching
+ * `If-None-Match`. `interruptNextCreate` makes the next create land and then fail
+ * its answer, by an error in the body or by never finishing it. `mergePull`,
+ * `closePull`, `reopenPull` and `commitOnBranch` move the repository the way a
+ * maintainer would.
  */
 import { createHmac, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -19,6 +29,8 @@ export type FakeGitHubOptions = {
   readonly repos?: readonly string[];
   /** The webhook signing secret; generated at runtime when absent. */
   readonly webhookSecret?: string;
+  /** The token every REST and git request must carry; absent, nothing is checked. */
+  readonly requireToken?: string;
 };
 
 export type FakeGitHub = FakeService & {
@@ -29,6 +41,34 @@ export type FakeGitHub = FakeService & {
   gitUrl(fullName: string): string;
   /** Every mutating request: REST writes and pushes. Credentials masked. */
   writes(): readonly RecordedRequest[];
+  /** Every request's method and path, reads included, in order. */
+  requests(): readonly string[];
+  /** The SHA a branch points at, or `undefined` when it does not exist. */
+  branchSha(fullName: string, branch: string): string | undefined;
+  /**
+   * The next pull request create lands, and then its answer fails: `error` sends the
+   * 201 with its body cut off; `hang` never finishes the body until `stop()`.
+   */
+  interruptNextCreate(mode: "error" | "hang"): void;
+  /**
+   * Merge a pull request as a maintainer would: a merge commit on its base. With
+   * `changeFirst`, a commit is added to its head first (merged with changes).
+   */
+  mergePull(
+    fullName: string,
+    number: number,
+    opts?: { readonly changeFirst?: boolean },
+  ): { readonly mergeSha: string; readonly headSha: string };
+  closePull(fullName: string, number: number): void;
+  reopenPull(fullName: string, number: number): void;
+  /** Add an empty commit with `message` on a branch, and answer its SHA. */
+  commitOnBranch(fullName: string, branch: string, message: string): string;
+  /** Set a pull request's reviews, as `GET …/reviews` lists them. */
+  setReviews(
+    fullName: string,
+    number: number,
+    reviews: readonly { readonly login: string; readonly state: string }[],
+  ): void;
   deliverWebhook(
     receiverUrl: string,
     event: string,
@@ -44,6 +84,7 @@ type Repo = {
   readonly issues: Map<number, Json>;
   readonly comments: Map<number, Json[]>;
   readonly checks: Json[];
+  readonly reviews: Map<number, Json[]>;
   nextNumber: number;
   bareReady: boolean;
 };
@@ -98,6 +139,7 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
       issues: new Map(),
       comments: new Map(),
       checks: [],
+      reviews: new Map(),
       nextNumber: 1,
       bareReady: false,
     };
@@ -113,6 +155,83 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: "/dev/null",
   });
+
+  const bareDir = (repo: Repo): string => join(gitRoot, repo.owner, `${repo.name}.git`);
+
+  /** Run git in a repository's bare directory; its trimmed stdout, or `undefined` on failure. */
+  const bareGit = (
+    repo: Repo,
+    args: readonly string[],
+    env: Record<string, string> = {},
+  ): string | undefined => {
+    ensureBare(repo);
+    const result = Bun.spawnSync(["git", "--git-dir", bareDir(repo), ...args], {
+      env: {
+        ...gitEnv(),
+        GIT_AUTHOR_NAME: "Maintainer",
+        GIT_AUTHOR_EMAIL: "maintainer@example.invalid",
+        GIT_COMMITTER_NAME: "Maintainer",
+        GIT_COMMITTER_EMAIL: "maintainer@example.invalid",
+        ...env,
+      },
+      stderr: "pipe",
+    });
+    return result.exitCode === 0 ? result.stdout.toString().trim() : undefined;
+  };
+
+  const shaOf = (repo: Repo, branch: string): string | undefined => {
+    const sha = bareGit(repo, ["rev-parse", "--verify", "--quiet", `refs/heads/${branch}`]);
+    return sha === undefined || sha === "" ? undefined : sha;
+  };
+
+  /** An empty commit on top of `parents`, and the branch moved to it. */
+  const commitOn = (
+    repo: Repo,
+    branch: string,
+    message: string,
+    parents: readonly string[],
+  ): string => {
+    const tree = bareGit(repo, ["mktree"], {}) ?? "";
+    const sha = bareGit(repo, [
+      "commit-tree",
+      parents.length > 0 ? `${parents[0]}^{tree}` : tree,
+      ...parents.flatMap((p) => ["-p", p]),
+      "-m",
+      message,
+    ]);
+    if (sha === undefined) throw new Error(`a commit on ${branch} could not be made`);
+    if (bareGit(repo, ["update-ref", `refs/heads/${branch}`, sha]) === undefined) {
+      throw new Error(`${branch} could not be moved`);
+    }
+    return sha;
+  };
+
+  /** The pull request as the API shows it: its head SHA read from the repository while open. */
+  const pullView = (repo: Repo, pull: Json): Json => {
+    const head = pull["head"] as Json;
+    if (pull["merged"] === true || pull["state"] !== "open") return pull;
+    const sha = shaOf(repo, String(head["ref"]));
+    return sha === undefined ? pull : { ...pull, head: { ...head, sha } };
+  };
+
+  let interrupt: "error" | "hang" | undefined;
+  const hanging: Array<ReadableStreamDefaultController<Uint8Array>> = [];
+
+  /** Whether a request carries the token, on REST or on git. */
+  const authorized = (req: Request): boolean => {
+    const want = opts.requireToken;
+    if (want === undefined) return true;
+    const header = req.headers.get("authorization") ?? "";
+    const [scheme, value = ""] = header.split(/\s+/, 2);
+    const lower = (scheme ?? "").toLowerCase();
+    if (lower === "bearer" || lower === "token") return value === want;
+    if (lower === "basic") {
+      const decoded = Buffer.from(value, "base64").toString("utf8");
+      return decoded.slice(decoded.indexOf(":") + 1) === want;
+    }
+    return false;
+  };
+  const allRequests: string[] = [];
 
   const ensureBare = (repo: Repo): void => {
     if (repo.bareReady) return;
@@ -205,33 +324,95 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
               (wantState === "all" || pull["state"] === wantState)
             );
           });
-          return jsonResponse(200, rows);
+          return jsonResponse(
+            200,
+            rows.map((pull) => pullView(repo, pull)),
+          );
         }
         if (method === "POST") {
-          const number = repo.nextNumber++;
           const ref = String(body["head"] ?? "");
+          const label = ref.includes(":") ? ref : `${repo.owner}:${ref}`;
+          const open = [...repo.pulls.values()].some(
+            (pull) => pull["state"] === "open" && (pull["head"] as Json)["label"] === label,
+          );
+          if (open) {
+            return jsonResponse(422, {
+              message: "Validation Failed",
+              errors: [
+                {
+                  resource: "PullRequest",
+                  code: "custom",
+                  message: `A pull request already exists for ${label}.`,
+                },
+              ],
+            });
+          }
+          const number = repo.nextNumber++;
           const pull: Json = {
             id: ++nextId,
             number,
             state: "open",
+            draft: body["draft"] === true,
             title: body["title"] ?? "",
             body: body["body"] ?? null,
+            html_url: `${`http://127.0.0.1:${server.port}`}/${repo.owner}/${repo.name}/pull/${number}`,
             head: {
               ref: ref.includes(":") ? ref.slice(ref.indexOf(":") + 1) : ref,
-              label: ref.includes(":") ? ref : `${repo.owner}:${ref}`,
+              label,
             },
             base: { ref: body["base"] ?? "main" },
             merged: false,
             merged_at: null,
           };
           repo.pulls.set(number, pull);
-          return jsonResponse(201, pull);
+          const view = pullView(repo, pull);
+          const mode = interrupt;
+          interrupt = undefined;
+          if (mode === "error") {
+            // The 201 with its body cut off: the client cannot read what was made.
+            return new Response(`{"number":${number},`, {
+              status: 201,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          if (mode === "hang") {
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                hanging.push(controller);
+              },
+            });
+            return new Response(stream, {
+              status: 201,
+              headers: { "content-type": "application/json" },
+            });
+          }
+          return jsonResponse(201, view);
         }
         return notFound();
       }
       const pull = repo.pulls.get(Number(second));
       if (pull === undefined) return notFound();
-      if (third === undefined && method === "GET") return jsonResponse(200, pull);
+      if (third === undefined && method === "GET") {
+        const view = pullView(repo, pull);
+        const etag = `"${createHmac("sha256", "etag").update(JSON.stringify(view)).digest("hex").slice(0, 16)}"`;
+        if (req.headers.get("if-none-match") === etag) {
+          return new Response(null, { status: 304, headers: { etag } });
+        }
+        return jsonResponse(200, view, { etag });
+      }
+      if (third === undefined && method === "PATCH") {
+        for (const key of ["title", "body"] as const) {
+          if (typeof body[key] === "string") pull[key] = body[key];
+        }
+        if (typeof body["base"] === "string") pull["base"] = { ref: body["base"] };
+        if (body["state"] === "closed" || body["state"] === "open") {
+          if (pull["merged"] !== true) pull["state"] = body["state"];
+        }
+        return jsonResponse(200, pullView(repo, pull));
+      }
+      if (third === "reviews" && method === "GET") {
+        return jsonResponse(200, repo.reviews.get(Number(second)) ?? []);
+      }
       if (third === "merge" && method === "PUT") {
         if (pull["merged"] === true) {
           return jsonResponse(405, { message: "Pull Request is not mergeable" });
@@ -299,6 +480,26 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
       repo.checks.push(check);
       return jsonResponse(201, check);
     }
+    if (head === "commits" && second === undefined && method === "GET") {
+      const branch = url.searchParams.get("sha") ?? "main";
+      const since = url.searchParams.get("since");
+      if (shaOf(repo, branch) === undefined) return jsonResponse(200, []);
+      const out = bareGit(repo, [
+        "log",
+        "--format=%H%x1f%cI%x1f%B%x1e",
+        ...(since !== null ? [`--since=${since}`] : []),
+        `refs/heads/${branch}`,
+      ]);
+      const rows = (out ?? "")
+        .split("\x1e")
+        .map((entry) => entry.trim())
+        .filter((entry) => entry !== "")
+        .map((entry) => {
+          const [sha, date, message] = entry.split("\x1f");
+          return { sha, commit: { message: (message ?? "").trim(), committer: { date } } };
+        });
+      return jsonResponse(200, rows);
+    }
     if (head === "commits" && second !== undefined && third === "check-runs" && method === "GET") {
       const rows = repo.checks.filter((check) => check["head_sha"] === second);
       return jsonResponse(200, { total_count: rows.length, check_runs: rows });
@@ -308,6 +509,16 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
 
   const server = serveLoopback(async (req) => {
     const url = new URL(req.url);
+    allRequests.push(`${req.method} ${url.pathname}`);
+    if (!authorized(req)) {
+      return new Response(JSON.stringify({ message: "Bad credentials" }), {
+        status: 401,
+        headers: {
+          "content-type": "application/json",
+          "www-authenticate": 'Basic realm="fake-github"',
+        },
+      });
+    }
     const { recorded, parsed } = await recordRequest(req);
     const smart = /^\/([^/]+)\/([^/]+)\.git(\/.*)$/.exec(url.pathname);
     if (smart !== null) {
@@ -356,6 +567,65 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
     },
     gitUrl,
     writes: () => [...writes],
+    requests: () => [...allRequests],
+    branchSha: (fullName, branch) => {
+      const repo = repos.get(fullName);
+      return repo === undefined ? undefined : shaOf(repo, branch);
+    },
+    interruptNextCreate: (mode) => {
+      interrupt = mode;
+    },
+    mergePull: (fullName, number, mergeOpts = {}) => {
+      const repo = repos.get(fullName);
+      const pull = repo?.pulls.get(number);
+      if (repo === undefined || pull === undefined)
+        throw new Error(`no pull ${fullName}#${number}`);
+      const head = pull["head"] as Json;
+      const headRef = String(head["ref"]);
+      const baseRef = String((pull["base"] as Json)["ref"]);
+      if (mergeOpts.changeFirst === true) {
+        const parent = shaOf(repo, headRef);
+        commitOn(repo, headRef, "A maintainer's change", parent === undefined ? [] : [parent]);
+      }
+      const headSha = shaOf(repo, headRef) ?? "";
+      const baseSha = shaOf(repo, baseRef);
+      const mergeSha = commitOn(
+        repo,
+        baseRef,
+        `Merge pull request #${number}`,
+        baseSha === undefined ? [headSha] : [baseSha, headSha],
+      );
+      pull["head"] = { ...head, sha: headSha };
+      pull["merged"] = true;
+      pull["state"] = "closed";
+      pull["merged_at"] = new Date().toISOString();
+      pull["merge_commit_sha"] = mergeSha;
+      return { mergeSha, headSha };
+    },
+    closePull: (fullName, number) => {
+      const pull = repos.get(fullName)?.pulls.get(number);
+      if (pull === undefined) throw new Error(`no pull ${fullName}#${number}`);
+      pull["state"] = "closed";
+    },
+    reopenPull: (fullName, number) => {
+      const pull = repos.get(fullName)?.pulls.get(number);
+      if (pull === undefined) throw new Error(`no pull ${fullName}#${number}`);
+      if (pull["merged"] !== true) pull["state"] = "open";
+    },
+    commitOnBranch: (fullName, branch, message) => {
+      const repo = repos.get(fullName);
+      if (repo === undefined) throw new Error(`no repository ${fullName}`);
+      const parent = shaOf(repo, branch);
+      return commitOn(repo, branch, message, parent === undefined ? [] : [parent]);
+    },
+    setReviews: (fullName, number, reviews) => {
+      const repo = repos.get(fullName);
+      if (repo === undefined) throw new Error(`no repository ${fullName}`);
+      repo.reviews.set(
+        number,
+        reviews.map((r) => ({ user: { login: r.login }, state: r.state })),
+      );
+    },
     deliverWebhook: async (receiverUrl, event, payload) => {
       assertLoopbackUrl(receiverUrl);
       const body = JSON.stringify(payload);
@@ -374,7 +644,14 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
       return { status: res.status, body: await res.text(), delivery };
     },
     stop: async () => {
-      await server.stop();
+      for (const controller of hanging.splice(0)) {
+        try {
+          controller.close();
+        } catch {
+          // Already closed by the client going away.
+        }
+      }
+      await server.stop(true);
       rmSync(gitRoot, { recursive: true, force: true });
     },
   };
