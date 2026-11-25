@@ -834,8 +834,8 @@ these on: they reach every harness that uses what each one names.
   `strategy.cascade` on pipeline, crew, research, batch and browser, where no
   gate escalates to it. A Cloudflare Worker build also warns for `chains`,
   `contracts`, `wallets`, `transaction_policy` and `failure_taxonomy` on cli,
-  workflow and graph specs; for `mcp_servers` on cli and workflow; for
-  `parallel` on graph; and on cli for `continuity`, `cli`, `expose`,
+  workflow and graph specs; for `mcp_servers` and `repositories` on cli and
+  workflow; for `parallel` on graph; and on cli for `continuity`, `cli`, `expose`,
   `feedback`, `knowledge`, `learning`, `memory`, `observability` (every
   sub-block but `trace`), `plugins`, `thredz` and `watchme`. A build without
   `--emit-as cf-worker` warns for `cf_worker.public_chat` on cli, workflow and

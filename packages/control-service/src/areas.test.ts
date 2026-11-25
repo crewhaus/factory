@@ -92,9 +92,12 @@ describe("the composition", () => {
     expect(activationGates(AREA_RUNTIMES).map((gate) => gate.name)).toEqual([
       "protected-environment",
     ]);
-    // The delegation area's revoker ends every rule with the harness; the next area to
-    // register one changes this on purpose.
-    expect(retireRevokers(AREA_RUNTIMES).map((revoker) => revoker.name)).toEqual(["delegations"]);
+    // The delegation area's revoker ends every rule with the harness, and the runtime area's
+    // closes its worktrees; the next area to register one changes this on purpose.
+    expect(retireRevokers(AREA_RUNTIMES).map((revoker) => revoker.name)).toEqual([
+      "delegations",
+      "workspaces",
+    ]);
     // Nothing is delegable until an area registers an action.
     expect(delegatedActions(AREA_RUNTIMES)).toEqual([]);
     expect(wireWith(AREA_RUNTIMES)).not.toThrow();

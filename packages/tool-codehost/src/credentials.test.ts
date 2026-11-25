@@ -16,7 +16,10 @@ describe("tokenEnvProvider", () => {
   const ask = { origin: "https://api.github.com", repo: "acme/app" };
 
   test("answers the named variable's value", async () => {
-    const provider = tokenEnvProvider({ tokenEnv: "DELIVERY_TOKEN", env: { DELIVERY_TOKEN: TOKEN } });
+    const provider = tokenEnvProvider({
+      tokenEnv: "DELIVERY_TOKEN",
+      env: { DELIVERY_TOKEN: TOKEN },
+    });
     expect(await provider(ask)).toEqual({ ok: true, token: TOKEN });
   });
 
