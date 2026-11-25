@@ -1,6 +1,6 @@
 # @crewhaus/tool-work
 
-Work items: what a harness was asked to do. Module brief:
+Work items: what a harness was asked to do, and their delivery as pull requests. Module brief:
 [333-tool-work](https://github.com/crewhaus/docs/blob/main/module-briefs/333-tool-work.md).
 
 A work item (`wi_…`) is a content-free log line per event under `.crewhaus/run/control/work/`
@@ -53,6 +53,66 @@ a GitHub issue (`wi_…`). A label alone never counts, and neither does a refere
 proposing run, the run it continues, or their sessions. Without
 `ranking.weights`, items rank by priority, then age. Every leaf under `tool_config` is out of
 the optimizer's reach.
+
+## Delivering work as pull requests
+
+| Tool | readOnly | destructive | scope · io | What |
+|---|---|---|---|---|
+| `WorkspaceOpen` | no | no | external · network | a worktree for an accepted item, on its own branch |
+| `WorkspaceCheck` | no | yes | external · process | the repository's declared checks, in the sandbox |
+| `WorkspacePublish` | no | yes | external · network | the change as one pull request, after every check |
+
+A spec lists them by name on `cli`, `workflow`, `channel`, `managed` or `batch` and declares
+where they deliver:
+
+```yaml
+repositories:
+  app:
+    host: github
+    repo: acme/budget-app
+    checks: [[bun, install, --frozen-lockfile], [bun, test]]   # argv, never a shell
+    pull_requests: { draft: true, max_files: 20, max_lines: 800, require: [checks, acceptance] }
+tool_config:
+  codehost:
+    token_env: GITHUB_TOKEN     # the variable that holds the token: a name, never a value
+```
+
+- **One managed clone per repository**, `.crewhaus/workspaces/<binding>/repo`, and a worktree
+  per item (`…/wt/<name>`) on a branch minted once from the item. The harness keeps working
+  from its own directory; the tools point at the worktree. Each binding's git directory is on
+  the runtime-state floor, so an agent's file tools cannot write it.
+- **The token reaches one git process.** Every fetch and push gets it as one
+  `http.<origin>/.extraheader` entry in that process's environment, for the code host's origin
+  only: never in argv, a URL or a file. Nothing inherited configures git, no hook runs, and a
+  clone whose own configuration holds a key git did not write gets no token.
+- **Checks run in the sandbox** (`CREWHAUS_SANDBOX`), with the worktree mounted and no network.
+  Without a sandbox `WorkspaceCheck` is refused and runs nothing, and a publish that requires
+  checks is not made.
+- **Before a pull request opens**, in order: the size limits (a larger change waits for a
+  person's decision, with the counts), the base (rebased onto, and checked again), the checks
+  for that exact commit, what leaves (a credential of the harness, a credential-shaped token,
+  or text from a source whose words do not leave in a commit refuses it, naming the file and
+  the line), and the acceptance check: deterministic criteria first (`check: <name>`), then a
+  judge over the item's criteria and, when the spec declares one, its `intent:`. The judge's
+  reasons stay in a private file beside the check logs; the pull request and the agent get the
+  verdict as a word.
+- **One pull request per item.** The branch is pushed under a lease, and the pull request is
+  found by its branch before one is made, so a retry updates it. An attempt whose answer was
+  lost is `unknown` until it is looked up; it is never made a second time.
+- **The tracker** (`syncOutcomes`, run by Home every ten minutes) reads each delivered pull
+  request: merged closes an open item as done, closed without merging declines it, reopened
+  reopens an item the tracker declined, and a revert of the merge is recorded. An item a person
+  moved stays where they put it.
+
+`work.publish` (Home's API, `crewhaus work publish <wi>`) publishes only a change a run of the
+harness judged and passed for the same commit, with the harness's own environment files.
+`crewhaus workspace list|show` reads the records.
+
+## `./workspace`
+
+The engine (`createWorkspaceEngine`), the boot registrar (`bindWorkspaceRepositories`), the
+acceptance check, what may leave, the tracker (`syncOutcomes`, `applyPullEvent`), the views
+Home and the CLI read, and `networkGitEnv`, the one way a token is handed to git.
 
 ## `./work-items`
 

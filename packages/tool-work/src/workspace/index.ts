@@ -32,6 +32,7 @@ export {
   bindingsFileOf,
   parseWorkspaceConfig,
   readBindings,
+  writeBindings,
 } from "./bindings";
 export {
   type CheckAnswer as CheckRunAnswer,
