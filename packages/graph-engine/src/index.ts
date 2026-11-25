@@ -36,6 +36,7 @@
  * codegen.
  */
 
+import { boundaryRuleIds, classifyBoundary } from "@crewhaus/boundary-classifier";
 import {
   type Checkpoint,
   type CheckpointId,
@@ -44,7 +45,7 @@ import {
   newGraphRunId,
 } from "@crewhaus/checkpoint-store";
 import { CrewhausError, EXIT_CODES, type FailureReport, RunFailedError } from "@crewhaus/errors";
-import { type RunContext, type RunHoldOutcome, retainRun } from "@crewhaus/run-context";
+import { type RunContext, type RunHoldOutcome, retainRun, tagContent } from "@crewhaus/run-context";
 import type { RunFailedEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 
 export type NodeName = string;
@@ -375,6 +376,32 @@ type CompiledOptions<Input, State> = {
   readonly checkpointStore?: CheckpointStore;
 };
 
+/**
+ * Check a pause's decision at TrustOrigin `api` before the paused node reads it, and tag
+ * kept text in the run's lineage. A decision the check refuses fails the resume; one kept
+ * with a warning is reported on the run's event bus, without its text.
+ */
+async function admitDecision(decision: string, runContext: RunContext): Promise<void> {
+  const boundary = await classifyBoundary(decision, { origin: "api" });
+  if (boundary.action === "redact") {
+    throw new GraphRunError("the decision was refused by the security check");
+  }
+  tagContent(runContext, decision, "api");
+  if (boundary.action !== "warn") return;
+  // A context injected by an embedder may carry no bus.
+  const bus: TraceEventBus | undefined = runContext.eventBus;
+  bus?.publish({
+    ...bus.envelope(),
+    kind: "permission_decision",
+    toolName: "graph.resume",
+    decision: "allow",
+    mode: "inbound",
+    outcome: "warned",
+    rules: boundaryRuleIds(boundary.verdict),
+    reason: "input from origin api kept with a warning",
+  });
+}
+
 class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
   readonly nodes: ReadonlyArray<NodeName>;
   readonly entry: NodeName;
@@ -414,6 +441,23 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
       if (checkpoint === undefined) {
         throw new GraphRunError(`checkpoint ${checkpointId} not found in run ${graphRunId}`);
       }
+      // A run that says where it waits is resumed there and nowhere else.
+      const waiting = (await store.meta(graphRunId))?.pendingHitl;
+      if (waiting !== undefined && waiting.checkpointId !== checkpointId) {
+        throw new GraphRunError(
+          `run ${graphRunId} is not waiting at ${checkpointId}; it waits at ${waiting.checkpointId}`,
+        );
+      }
+      // Whoever decided, the decision is text the paused node reads: it is checked at `api`
+      // first, and a refused one takes nothing, so the pause still waits.
+      const runContext = opts.runContext ?? (await self.lazyRunContext());
+      await admitDecision(decision, runContext);
+      if ((await store.claimResume(graphRunId, checkpointId)) === "taken") {
+        throw new GraphRunError(
+          `the pause at ${checkpointId} in run ${graphRunId} was already decided`,
+        );
+      }
+      await store.markWaiting(graphRunId, undefined);
       // The state stored is the state AT THE PAUSE — the paused node never
       // committed its own output. Replay starts at that node with the
       // decision threaded in via the `approvals` map.
@@ -423,7 +467,7 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
         state: checkpoint.state as State,
         startNode: checkpoint.nodeName,
         approvals,
-        runContext: opts.runContext,
+        runContext,
         resumedFromCheckpointId: checkpointId,
       });
     })();
@@ -578,6 +622,12 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
               nodeName,
               state,
               ...(parentCheckpointId !== undefined ? { parentCheckpointId } : {}),
+            });
+            // Say so in the run's own records, so a person can find it later.
+            await this.o.checkpointStore.markWaiting(graphRunId, {
+              checkpointId: cp.id,
+              nodeName,
+              prompt: err.prompt,
             });
             yield {
               kind: "hitl_pause",

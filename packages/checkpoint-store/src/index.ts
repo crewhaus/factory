@@ -20,6 +20,12 @@
  * `RuntimeError` before the filesystem is touched, mirroring
  * `session-store`'s pattern.
  *
+ * A pause: a run waiting for a person's decision says so in its
+ * `_meta.json` (`pendingHitl`: the checkpoint, the node and the prompt its
+ * spec gives), and a new checkpoint or a resume clears it. A pause is
+ * resumed once: `claimResume` publishes `_resume-<checkpointId>.claim`
+ * exclusively, so of two resumes one gets it.
+ *
  * Pluggable adapter: callers can substitute a different
  * `CheckpointStoreAdapter` (SQLite, Postgres, S3) and the
  * `createCheckpointStore({ adapter })` factory wires it through. The
@@ -29,14 +35,17 @@
  */
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { CrewhausError, RuntimeError } from "@crewhaus/errors";
@@ -66,11 +75,32 @@ export type BranchInfo = {
   readonly checkpointId: CheckpointId;
 };
 
+/** A graph run waiting for a person's decision: where, and what its node asks. */
+export type PendingHitl = {
+  /** The checkpoint the pause saved: what a resume names. */
+  readonly checkpointId: CheckpointId;
+  readonly nodeName: string;
+  /** The question, as the spec's author wrote it (`hitl:`). */
+  readonly prompt: string;
+  readonly at: string;
+};
+
+/**
+ * The file that says a pause was resumed, in its run's folder. The file-backed adapter
+ * creates it exclusively; a reader that only looks for it changes nothing.
+ */
+export function resumeClaimName(checkpointId: CheckpointId): string {
+  validateCheckpointId(checkpointId);
+  return `_resume-${checkpointId}.claim`;
+}
+
 export type GraphRunMeta = {
   readonly version: 1;
   readonly graphRunId: GraphRunId;
   /** Most recently saved checkpoint id; absent on a freshly-branched run with no new commits. */
   head?: CheckpointId;
+  /** The run is waiting for a decision. A reader that does not know the key ignores it. */
+  pendingHitl?: PendingHitl;
   readonly createdAt: string;
   /** Set when this run was branched from a sibling. */
   readonly branchedFrom?: BranchInfo;
@@ -91,6 +121,12 @@ export interface CheckpointStoreAdapter {
   saveMeta(meta: GraphRunMeta): Promise<void>;
   /** Delete the entire graph run (best-effort; idempotent). */
   drop(graphRunId: GraphRunId): Promise<void>;
+  /**
+   * Take the one resume of a pause: `claimed` for the first caller, `taken` for
+   * every later one, decided by an exclusive create. An adapter without it can't
+   * say whether a pause was resumed, so nothing resumes on it.
+   */
+  claimResume?(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<"claimed" | "taken">;
 }
 
 export interface CheckpointStore {
@@ -117,6 +153,13 @@ export interface CheckpointStore {
   ): Promise<{ newGraphRunId: GraphRunId; head: Checkpoint }>;
   /** Read the `_meta.json` for `graphRunId`. */
   meta(graphRunId: GraphRunId): Promise<GraphRunMeta | undefined>;
+  /** Record that the run waits for a decision, or (`undefined`) that it no longer does. */
+  markWaiting(graphRunId: GraphRunId, pending: Omit<PendingHitl, "at"> | undefined): Promise<void>;
+  /**
+   * Take the one resume of the pause at `checkpointId`: `claimed` once, `taken` ever
+   * after (and on an adapter that cannot claim, so nothing resumes twice).
+   */
+  claimResume(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<"claimed" | "taken">;
   /** Delete a graph run's directory tree. Idempotent. */
   drop(graphRunId: GraphRunId): Promise<void>;
 }
@@ -297,6 +340,29 @@ class FileSystemAdapter implements CheckpointStoreAdapter {
     renameSync(tmp, this.metaPath(meta.graphRunId));
   }
 
+  async claimResume(
+    graphRunId: GraphRunId,
+    checkpointId: CheckpointId,
+  ): Promise<"claimed" | "taken"> {
+    validateCheckpointId(checkpointId);
+    const dir = this.dir(graphRunId);
+    mkdirSync(dir, { recursive: true });
+    let fd: number;
+    try {
+      // `wx`: the create is exclusive, and never through a link planted at the name.
+      fd = openSync(join(dir, resumeClaimName(checkpointId)), "wx", 0o600);
+    } catch (err) {
+      if ((err as { code?: unknown }).code === "EEXIST") return "taken";
+      throw err;
+    }
+    try {
+      writeSync(fd, `${JSON.stringify({ v: 1, checkpointId })}\n`);
+    } finally {
+      closeSync(fd);
+    }
+    return "claimed";
+  }
+
   async drop(graphRunId: GraphRunId): Promise<void> {
     const dir = this.dir(graphRunId);
     if (!existsSync(dir)) return;
@@ -347,7 +413,8 @@ export function createCheckpointStore(opts: CreateCheckpointStoreOptions = {}): 
         createdAt: now().toISOString(),
       };
       await adapter.save(cp);
-      const prevMeta = await ensureMeta(req.graphRunId);
+      // A new checkpoint means the run has moved: it waits only once it says so again.
+      const { pendingHitl: _waited, ...prevMeta } = await ensureMeta(req.graphRunId);
       const meta: GraphRunMeta = { ...prevMeta, head: id };
       await adapter.saveMeta(meta);
       return cp;
@@ -405,6 +472,31 @@ export function createCheckpointStore(opts: CreateCheckpointStoreOptions = {}): 
     async meta(graphRunId): Promise<GraphRunMeta | undefined> {
       validateGraphRunId(graphRunId);
       return adapter.loadMeta(graphRunId);
+    },
+    async markWaiting(graphRunId, pending): Promise<void> {
+      validateGraphRunId(graphRunId);
+      if (pending !== undefined) validateCheckpointId(pending.checkpointId);
+      const { pendingHitl: _waited, ...rest } = await ensureMeta(graphRunId);
+      await adapter.saveMeta(
+        pending === undefined
+          ? rest
+          : {
+              ...rest,
+              pendingHitl: {
+                checkpointId: pending.checkpointId,
+                nodeName: pending.nodeName,
+                prompt: pending.prompt,
+                at: now().toISOString(),
+              },
+            },
+      );
+    },
+    async claimResume(graphRunId, checkpointId): Promise<"claimed" | "taken"> {
+      validateGraphRunId(graphRunId);
+      validateCheckpointId(checkpointId);
+      return adapter.claimResume === undefined
+        ? "taken"
+        : adapter.claimResume(graphRunId, checkpointId);
     },
     async drop(graphRunId): Promise<void> {
       validateGraphRunId(graphRunId);

@@ -388,6 +388,78 @@ describe("pluggable adapter", () => {
   });
 });
 
+describe("a run waiting for a decision", () => {
+  test("says where and what it asks; a new checkpoint or a resume clears it", async () => {
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "ship", state: 1 });
+    expect((await store.meta(grun))?.pendingHitl).toBeUndefined();
+    await store.markWaiting(grun, { checkpointId: cp.id, nodeName: "ship", prompt: "ship it?" });
+    const waiting = await store.meta(grun);
+    expect(waiting?.head).toBe(cp.id);
+    expect(waiting?.pendingHitl).toEqual({
+      checkpointId: cp.id,
+      nodeName: "ship",
+      prompt: "ship it?",
+      at: expect.any(String),
+    });
+    await store.markWaiting(grun, undefined);
+    expect(Object.keys((await store.meta(grun)) ?? {})).not.toContain("pendingHitl");
+    await store.markWaiting(grun, { checkpointId: cp.id, nodeName: "ship", prompt: "ship it?" });
+    await store.save({ graphRunId: grun, nodeName: "next", state: 2, parentCheckpointId: cp.id });
+    expect(Object.keys((await store.meta(grun)) ?? {})).not.toContain("pendingHitl");
+  });
+
+  test("a branch of a waiting run does not wait", async () => {
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "ship", state: 1 });
+    await store.markWaiting(grun, { checkpointId: cp.id, nodeName: "ship", prompt: "ship it?" });
+    const { newGraphRunId: branched } = await store.branch(grun, cp.id);
+    expect((await store.meta(branched))?.pendingHitl).toBeUndefined();
+    expect((await store.meta(grun))?.pendingHitl?.checkpointId).toBe(cp.id);
+  });
+
+  test("a pause is claimed once, across stores over one folder, and not listed as a checkpoint", async () => {
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "ship", state: 1 });
+    const other = createCheckpointStore({ rootDir: tmp });
+    const answers = await Promise.all([
+      store.claimResume(grun, cp.id),
+      other.claimResume(grun, cp.id),
+    ]);
+    expect(answers.sort()).toEqual(["claimed", "taken"]);
+    expect(await store.claimResume(grun, cp.id)).toBe("taken");
+    expect((await store.list(grun)).map((c) => c.id)).toEqual([cp.id]);
+    const another = await store.save({ graphRunId: grun, nodeName: "next", state: 2 });
+    expect(await store.claimResume(grun, another.id)).toBe("claimed");
+  });
+
+  test("ids outside their grammar are refused before anything is written", async () => {
+    const grun = newGraphRunId();
+    await expect(store.claimResume(grun, "../../x")).rejects.toThrow(/invalid checkpointId/);
+    await expect(store.claimResume("../x", newCheckpointId())).rejects.toThrow(
+      /invalid graphRunId/,
+    );
+    await expect(
+      store.markWaiting(grun, { checkpointId: "ckpt_x", nodeName: "n", prompt: "p" }),
+    ).rejects.toThrow(/invalid checkpointId/);
+    expect(await store.meta(grun)).toBeUndefined();
+  });
+
+  test("an adapter that cannot claim answers taken, so nothing resumes twice", async () => {
+    const custom = createCheckpointStore({
+      adapter: {
+        save: async () => undefined,
+        load: async () => undefined,
+        list: async () => [],
+        loadMeta: async () => undefined,
+        saveMeta: async () => undefined,
+        drop: async () => undefined,
+      },
+    });
+    expect(await custom.claimResume(newGraphRunId(), newCheckpointId())).toBe("taken");
+  });
+});
+
 describe("CheckpointStoreError", () => {
   test("carries the config code and serializes its cause chain", () => {
     const root = new Error("disk gone");
