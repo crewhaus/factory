@@ -221,10 +221,11 @@ export type WorkspaceView = WorkspaceSummaryView & {
 
 export type WorkspaceAnswer = { readonly workspace: WorkspaceView };
 
-/** `work.publish`'s answer: its receipt and the attempt it made. */
+/** `work.publish`'s answer: its receipt, the attempt it made, and why one was refused. */
 export type WorkPublishAnswer = {
   readonly receipt: CommandReceipt;
   readonly attempt?: WorkPublishView;
+  readonly problem?: string;
 };
 
 // ---------------------------------------------------------------------------

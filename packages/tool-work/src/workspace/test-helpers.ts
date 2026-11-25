@@ -133,9 +133,9 @@ export async function commitFiles(
   }
 }
 
-/** A harness directory and a fake host with one seeded repository. */
-export async function bench(): Promise<Bench> {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "tool-work-workspace-")));
+/** A harness directory (its own, or the one given) and a fake host with one seeded repository. */
+export async function bench(given?: string): Promise<Bench> {
+  const dir = realpathSync(given ?? mkdtempSync(join(tmpdir(), "tool-work-workspace-")));
   const token = fakeToken();
   const fake = fakeGitHub({ repos: [REPO], requireToken: token });
   await commitFiles(
@@ -215,7 +215,7 @@ export async function bench(): Promise<Bench> {
       }),
     stop: async () => {
       await fake.stop();
-      rmSync(dir, { recursive: true, force: true });
+      if (given === undefined) rmSync(dir, { recursive: true, force: true });
     },
   };
   return self;

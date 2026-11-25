@@ -250,6 +250,15 @@ export type WorkspaceEngine = {
     attempt: number,
     opts: { readonly actor: EngineActor; readonly signal?: AbortSignal },
   ): Promise<FoldedAttempt | undefined>;
+  /**
+   * Settle an item's newest attempt when nobody is making it any more: one left `started` or
+   * `pushed` by a process that stopped becomes `unknown`, and an `unknown` one is looked up.
+   * A publish that is running is left alone.
+   */
+  settle(
+    wi: string,
+    opts: { readonly actor: EngineActor; readonly signal?: AbortSignal },
+  ): Promise<FoldedAttempt | undefined>;
   close(
     wi: string,
     opts: { readonly actor: EngineActor; readonly signal?: AbortSignal },
@@ -936,6 +945,27 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       });
     } else if (last.state !== "unknown") return;
     await reconcile(wi, last.attempt, { actor, ...(signal !== undefined ? { signal } : {}) });
+  }
+
+  async function settle(
+    wi: string,
+    opts: { actor: EngineActor; signal?: AbortSignal },
+  ): Promise<FoldedAttempt | undefined> {
+    assertHarnessCwd(harnessDir);
+    const newest = (): FoldedAttempt | undefined => readAttempts(harnessDir).get(wi)?.at(-1);
+    const last = newest();
+    if (last === undefined) return undefined;
+    if (last.state !== "started" && last.state !== "pushed" && last.state !== "unknown") {
+      return last;
+    }
+    const hold = await takePublishHold(harnessDir, wi, now, deps.probe);
+    if (hold === undefined) return last;
+    try {
+      await settleAbandoned(wi, opts.actor, opts.signal);
+    } finally {
+      await hold.release();
+    }
+    return newest();
   }
 
   async function publishHeld(
@@ -1631,5 +1661,5 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     }
   }
 
-  return { open, check, publish, reconcile, close };
+  return { open, check, publish, reconcile, settle, close };
 }

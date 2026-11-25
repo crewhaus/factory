@@ -97,7 +97,11 @@ export const workspaceList = listEnvelope.extend({ items: z.array(workspaceSumma
 export const workspaceAnswer = z.object({ workspace: workspaceView }).passthrough();
 
 export const workPublishAnswer = z
-  .object({ receipt: commandReceipt, attempt: workPublishView.optional() })
+  .object({
+    receipt: commandReceipt,
+    attempt: workPublishView.optional(),
+    problem: z.string().optional(),
+  })
   .passthrough();
 
 export const WORKSPACE_SCHEMAS: Readonly<Record<string, z.ZodTypeAny>> = {
