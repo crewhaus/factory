@@ -65,6 +65,8 @@ export type FakeGitHub = FakeService & {
   commitOnBranch(fullName: string, branch: string, message: string): string;
   /** The next `count` REST requests are answered 429, with a wait when one is given. */
   rateLimitNext(count: number, retryAfterSeconds?: number): void;
+  /** The next REST request whose path ends with `pathEnd` is answered `status`, once. */
+  refuseNext(pathEnd: string, status: number): void;
   /** Set a pull request's reviews, as `GET …/reviews` lists them; its own record moves too. */
   setReviews(
     fullName: string,
@@ -218,6 +220,7 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
 
   let limited = 0;
   let limitedWait: number | undefined;
+  let refused: { readonly pathEnd: string; readonly status: number } | undefined;
   let interrupt: "error" | "hang" | undefined;
   const hanging: Array<ReadableStreamDefaultController<Uint8Array>> = [];
 
@@ -543,6 +546,11 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
         limitedWait !== undefined ? { "retry-after": String(limitedWait) } : {},
       );
     }
+    if (refused !== undefined && url.pathname.endsWith(refused.pathEnd)) {
+      const { status } = refused;
+      refused = undefined;
+      return jsonResponse(status, { message: "refused by the test" });
+    }
     if (WRITE_METHODS.has(req.method)) writes.push(recorded);
     const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as Json;
     const parts = url.pathname.split("/").filter((part) => part !== "");
@@ -643,6 +651,9 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
     rateLimitNext: (count, retryAfterSeconds) => {
       limited = count;
       limitedWait = retryAfterSeconds;
+    },
+    refuseNext: (pathEnd, status) => {
+      refused = { pathEnd, status };
     },
     deliverWebhook: async (receiverUrl, event, payload) => {
       assertLoopbackUrl(receiverUrl);

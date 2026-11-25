@@ -316,6 +316,41 @@ describe("the credential", () => {
     SLOW,
   );
 
+  test(
+    "goes to no git call while the clone's own configuration holds a key git did not write",
+    async () => {
+      const b = await fresh();
+      const spy = spyGit();
+      const engine = b.engine({ git: spy.run });
+      const { wi, worktree } = await opened(b, engine);
+      b.write(worktree, "src/dates.ts", "export const parse = 2;\n");
+      const config = join(b.dir, ".crewhaus/workspaces/app/repo/config");
+      const before = readFileSync(config, "utf8");
+      const others = [
+        '[url "http://127.0.0.1:9/"]\n\tinsteadOf = https://\n',
+        "[http]\n\tproxy = http://127.0.0.1:9\n",
+        `[remote "${b.fake.url}/${REPO}.git"]\n\turl = http://127.0.0.1:9/\n`,
+        "[include]\n\tpath = elsewhere\n",
+      ];
+      for (const other of others) {
+        writeFileSync(config, `${before}${other}`);
+        const asked = b.fake.requests().length;
+        const calls = spy.calls.length;
+        const answer = await b.publish(engine, wi);
+        expect(answer).toMatchObject({ ok: false, code: "unsupported_host" });
+        if (!answer.ok) expect(answer.message).not.toContain("127.0.0.1");
+        expect(b.fake.requests().length).toBe(asked);
+        const held = spy.calls
+          .slice(calls)
+          .filter((c) => c.env["GIT_CONFIG_VALUE_0"] !== undefined);
+        expect(held).toEqual([]);
+      }
+      writeFileSync(config, before);
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: true, state: "done" });
+    },
+    SLOW,
+  );
+
   test("is one header entry for one origin", () => {
     const made = networkGitEnv("https://github.com", "t");
     expect(Object.keys(made).sort()).toEqual([
@@ -698,6 +733,39 @@ describe("one pull request", () => {
       expect(await b.publish(engine, wi)).toMatchObject({ ok: true, state: "done", pr: 1 });
       expect(posts(b).length).toBe(1);
       expect((readAttempts(b.dir).get(wi) ?? []).map((a) => a.state)).toEqual(["done", "done"]);
+    },
+    SLOW,
+  );
+
+  test(
+    "a push that never landed is not done, whatever pull request the branch had before",
+    async () => {
+      for (const ended of ["open", "closed"] as const) {
+        const b = await fresh();
+        const { wi, engine, worktree } = await opened(b);
+        b.write(worktree, "src/dates.ts", "export const parse = 2;\n");
+        expect(await b.publish(engine, wi)).toMatchObject({ state: "done", pr: 1 });
+        if (ended === "closed") b.fake.closePull(REPO, 1);
+        // The push's own answer is lost, and the host never got it.
+        const lost: GitPort = async (args, opts) =>
+          args.includes("push")
+            ? {
+                ...(await runGit(["--version"], { cwd: b.dir })),
+                code: 128,
+                stdout: "",
+                stderr: "",
+                timedOut: true,
+              }
+            : runGit(args, opts);
+        b.write(worktree, "src/dates.ts", "export const parse = 3;\n");
+        expect(await b.publish(b.engine({ git: lost }), wi)).toMatchObject({ state: "unknown" });
+        expect(await engine.reconcile(wi, 2, { actor: HARNESS })).toMatchObject({
+          state: "not-done",
+        });
+        const item = openWorkStore(b.dir).get(wi);
+        if ("ok" in item) throw new Error(item.message);
+        expect(item.item.history.filter((l) => l.event === "delivered").length).toBe(1);
+      }
     },
     SLOW,
   );

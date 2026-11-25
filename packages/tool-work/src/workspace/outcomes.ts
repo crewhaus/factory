@@ -350,12 +350,17 @@ export async function syncOutcomes(harnessDir: string, deps: SyncDeps = {}): Pro
       if ("notModified" in answer) continue;
       const facts = factsOfPull(answer.pull);
       let review: PullFacts["review"];
+      let whole = true;
       if (facts.state === "open") {
         const reviews = await withPullsCall(call, (c) => pullReview(c, repo, pr));
-        if (!reviews.ok) {
-          if (reviews.rateLimited === true) return backOff(reviews.retryAfterMs);
-        } else {
+        if (reviews.ok) {
           review = reviews.review;
+        } else {
+          if (reviews.rateLimited === true) return backOff(reviews.retryAfterMs);
+          // Not read is not "no review": keep what is known, and ask for all of it next time.
+          problem = reviews.message;
+          review = known?.review;
+          whole = false;
         }
       }
       const done = await applyFacts(
@@ -367,7 +372,7 @@ export async function syncOutcomes(harnessDir: string, deps: SyncDeps = {}): Pro
       );
       if (done.wrote) wrote += 1;
       if (done.moved) moved += 1;
-      if (answer.etag !== undefined) etags[key] = answer.etag;
+      if (whole && answer.etag !== undefined) etags[key] = answer.etag;
       else Reflect.deleteProperty(etags, key);
     } catch (err) {
       problem = (err as Error).message;

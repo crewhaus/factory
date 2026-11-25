@@ -13,6 +13,8 @@
  * - **No program the repository supplies.** Hooks are off on every call, no transport is
  *   allowed but https (http for an admitted loopback host), redirects are refused, and
  *   submodules and external diff drivers are off.
+ * - **The clone's own configuration is git's.** Before a call that carries the token, the
+ *   managed clone's config file is read: a key `git init` did not write refuses the call.
  * - **The repository is named.** The bare clone by `--git-dir`, a worktree by its own
  *   administrative directory and `--work-tree`, so a `.git` file inside a worktree is never
  *   what git reads.
@@ -158,6 +160,37 @@ export function gitIsRecent(version: string): boolean {
   const major = Number(m[1]);
   const minor = Number(m[2]);
   return major > 2 || (major === 2 && minor >= 38);
+}
+
+/**
+ * The keys a managed clone's own configuration may hold: the ones `git init --bare` writes,
+ * and the hooks path, which every call here overrides.
+ */
+const CLONE_CONFIG_KEYS: ReadonlySet<string> = new Set([
+  "core.repositoryformatversion",
+  "core.filemode",
+  "core.bare",
+  "core.ignorecase",
+  "core.precomposeunicode",
+  "core.symlinks",
+  "core.logallrefupdates",
+  "core.hookspath",
+  "extensions.objectformat",
+  "extensions.compatobjectformat",
+  "extensions.refstorage",
+]);
+
+/** The other keys in a `git config --null --name-only --list`, plain and bounded. */
+export function strangeConfigKeys(out: string): string[] {
+  const keys = new Set<string>();
+  for (const name of out.split("\0")) {
+    if (name === "" || CLONE_CONFIG_KEYS.has(name.toLowerCase())) continue;
+    // A key's section and its last word: what is between them can be a URL, and is not repeated.
+    const parts = name.split(".");
+    const plain = `${parts[0] ?? ""}.${parts.length > 1 ? (parts.at(-1) ?? "") : ""}`;
+    keys.add(plain.replace(/[^A-Za-z0-9.-]/g, "").slice(0, 60));
+  }
+  return [...keys].sort();
 }
 
 /** Why a network step failed, read from git's own words: the token, the host, or neither. */

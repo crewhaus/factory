@@ -95,6 +95,7 @@ import {
   networkFailure,
   parseAddedLines,
   parseNumstat,
+  strangeConfigKeys,
 } from "./git";
 import { type PublishText, pullBody, pullTitle } from "./pr-body";
 import {
@@ -532,6 +533,27 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     }
   }
 
+  /**
+   * Whether the managed clone's own configuration still holds only what git writes when it
+   * makes one. Anything else could send a network call somewhere else or through something
+   * else, so no credential is handed to it.
+   */
+  async function cloneSteered(
+    paths: Paths,
+    binding: RepositoryBinding,
+  ): Promise<WorkspaceRefusal | undefined> {
+    const done = await step({
+      repoDir: paths.repoDir,
+      args: ["config", "--local", "--no-includes", "--null", "--name-only", "--list"],
+    });
+    const strange = done.code === 0 ? strangeConfigKeys(done.stdout) : ["unreadable"];
+    if (strange.length === 0) return undefined;
+    return refuse(
+      "unsupported_host",
+      `The managed clone of ${binding.repo} has git settings this harness did not make (${strange.slice(0, 5).join(", ")}), so it talks to no code host. A person removes them from ${join(bindingDirOf(binding.name), "repo", "config")}.`,
+    );
+  }
+
   /** Make the bare clone once, and bring its copy of the base up to date. */
   async function fetchBase(
     binding: RepositoryBinding,
@@ -550,6 +572,8 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         "Making the managed clone",
       );
     }
+    const steered = await cloneSteered(paths, binding);
+    if (steered !== undefined) return steered;
     for (let tries = 0; ; tries += 1) {
       const done = await step({
         repoDir: paths.repoDir,
@@ -869,14 +893,12 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
 
   /** The first hit in the pull request's own text, named as such. */
   async function textHit(
-    text: PublishText,
+    whole: string,
     values: readonly string[],
     rc: RunContext | undefined,
     sinkId: string,
     own: readonly string[],
   ): Promise<WorkspaceRefusal | undefined> {
-    const parts = [text.title, text.summary, ...(text.concerns ?? [])];
-    const whole = parts.join("\n");
     for (const part of whole.split("\n")) {
       if (secretIn(part, values) !== undefined) {
         return refuse(
@@ -1296,7 +1318,8 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
           { ...(file !== undefined ? { file } : {}), ...(hit.line > 0 ? { line: hit.line } : {}) },
         );
       }
-      const inText = await textHit(text, values, input.rc, sinkId, own);
+      const said = [text.title, text.summary, ...(text.concerns ?? [])].join("\n");
+      const inText = await textHit(said, values, input.rc, sinkId, own);
       if (inText !== undefined) return await fail(inText);
 
       if (mode === "harness") {
@@ -1355,7 +1378,29 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       }
       if (signal?.aborted === true) throw new WorkspaceError("The publish was stopped.");
 
+      // The whole text that goes out, read once more: nothing it was rendered from adds a secret.
+      const link = deps.homeLink?.(wi);
+      const body = pullBody({
+        text,
+        wi,
+        ...(link !== undefined ? { homeLink: link } : {}),
+        ...(revision.parent !== undefined ? { parent: revision.parent } : {}),
+        ...(revision.source?.kind === "continuity-goal" && revision.source.ref !== undefined
+          ? { plan: [revision.source.ref] }
+          : {}),
+        runs: accepted.item.runs,
+        ...(input.decisions !== undefined ? { decisions: input.decisions } : {}),
+        ...(checks !== undefined ? { checks } : {}),
+        verdict,
+        ...(rebased ? { rebasedOnto: base } : {}),
+      });
+      // Its words were checked against the run's lineage above; the rest are the records' own.
+      const inBody = await textHit(body, values, undefined, sinkId, own);
+      if (inBody !== undefined) return await fail(inBody);
+
       // The branch this harness last pushed is the only one it replaces.
+      const steered = await cloneSteered(paths, binding);
+      if (steered !== undefined) return await fail(steered);
       const remote = await step({
         repoDir: paths.repoDir,
         network: host,
@@ -1413,20 +1458,6 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       }
       await record({ state: "pushed" });
 
-      const body = pullBody({
-        text,
-        wi,
-        ...(deps.homeLink?.(wi) !== undefined ? { homeLink: deps.homeLink(wi) as string } : {}),
-        ...(revision.parent !== undefined ? { parent: revision.parent } : {}),
-        ...(revision.source?.kind === "continuity-goal" && revision.source.ref !== undefined
-          ? { plan: [redact(revision.source.ref, values)] }
-          : {}),
-        runs: accepted.item.runs,
-        ...(input.decisions !== undefined ? { decisions: input.decisions } : {}),
-        ...(checks !== undefined ? { checks } : {}),
-        verdict,
-        ...(rebased ? { rebasedOnto: base } : {}),
-      });
       const opened2 = await openPull(host, binding, ws.branch, pullTitle(text.title), body, signal);
       if (opened2.kind === "unknown") return await unknown(record, n, verdict, rebased);
       if (opened2.kind === "refused") return await fail(opened2.refusal);
@@ -1595,10 +1626,19 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       await appendAttempt(harnessDir, next);
       return next;
     };
-    // A pull request from this branch is this attempt's work: one branch per item.
-    if (found.pull !== undefined) {
-      const done = await settle({ state: "done", pr: found.pull.number });
-      await deliverOnce(wi, binding.repo, found.pull.number, opts.actor);
+    // One branch per item, so a pull request from it that no earlier attempt opened is this
+    // attempt's. One an earlier attempt opened is this attempt's only while it is open at the
+    // commit this attempt pushed.
+    const { pull } = found;
+    const earlier =
+      pull !== undefined &&
+      (readAttempts(harnessDir).get(wi) ?? []).some((a) => a.attempt < n && a.pr === pull.number);
+    const landed =
+      pull !== undefined &&
+      (!earlier || (pull.state === "open" && pull.headSha === attempt.headSha));
+    if (pull !== undefined && landed) {
+      const done = await settle({ state: "done", pr: pull.number });
+      await deliverOnce(wi, binding.repo, pull.number, opts.actor);
       return done;
     }
     return settle({ state: "not-done" });

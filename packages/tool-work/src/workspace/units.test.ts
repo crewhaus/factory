@@ -28,7 +28,7 @@ import {
 } from "./bindings";
 import { type CheckResult, checkImageFor, runDeclaredChecks, sandboxCheckRunner } from "./checks";
 import { credentialValues, scanSecrets, secretIn } from "./egress";
-import { gitIsRecent, parseAddedLines, parseNumstat } from "./git";
+import { gitIsRecent, parseAddedLines, parseNumstat, strangeConfigKeys } from "./git";
 import { pullBody, pullTitle } from "./pr-body";
 import { appendAttempt, takePublishHold, worktreeNameOf, writeCheckFile } from "./records";
 import { PLANTED, judgeThat, plantedClassifier } from "./test-helpers";
@@ -176,6 +176,16 @@ describe("reading a change", () => {
   test("counts read off numstat; a binary file is a file and no lines", () => {
     expect(parseNumstat("3\t1\ta.ts\0-\t-\tlogo.png\0")).toEqual({ files: 2, lines: 4 });
     expect(parseNumstat("")).toEqual({ files: 0, lines: 0 });
+  });
+
+  test("a clone's own keys are git's; another is named without what it points at", () => {
+    const plain = ["core.repositoryformatversion", "core.bare", "core.hooksPath"].join("\0");
+    expect(strangeConfigKeys(`${plain}\0`)).toEqual([]);
+    expect(
+      strangeConfigKeys(
+        `${plain}\0url.http://evil.example/.insteadof\0http.proxy\0filter.x.clean\0`,
+      ),
+    ).toEqual(["filter.clean", "http.proxy", "url.insteadof"]);
   });
 
   test("git older than 2.38 is not recent", () => {

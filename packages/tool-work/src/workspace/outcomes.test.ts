@@ -106,6 +106,28 @@ describe("the pull request tracker", () => {
   );
 
   test(
+    "reviews that could not be read keep what is known, and are asked for again",
+    async () => {
+      const t = await delivered();
+      t.b.fake.setReviews(REPO, t.pr, [{ login: "max", state: "APPROVED" }]);
+      await t.sync();
+      expect(readOutcomes(t.b.dir).get(t.wi)).toMatchObject({ review: "approved" });
+      const lines = t.lines().length;
+      t.later();
+      t.b.fake.setReviews(REPO, t.pr, [{ login: "max", state: "CHANGES_REQUESTED" }]);
+      t.b.fake.refuseNext("/reviews", 503);
+      const refused = await t.sync();
+      expect(refused).toMatchObject({ checked: 1, wrote: 0 });
+      expect(refused.problem).toContain("503");
+      expect(t.lines().length).toBe(lines);
+      t.later();
+      expect(await t.sync()).toMatchObject({ checked: 1, wrote: 1 });
+      expect(readOutcomes(t.b.dir).get(t.wi)).toMatchObject({ review: "changes-requested" });
+    },
+    SLOW,
+  );
+
+  test(
     "closed without merging declines the item, and reopened reopens it",
     async () => {
       const t = await delivered();

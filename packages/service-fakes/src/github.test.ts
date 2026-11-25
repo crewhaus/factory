@@ -416,5 +416,10 @@ describe("what a publisher and a tracker need", () => {
     expect(limited.status).toBe(429);
     expect(limited.headers.get("retry-after")).toBe("7");
     expect((await authed(fake, "GET", path)).status).toBe(200);
+
+    fake.refuseNext("/reviews", 503);
+    expect((await authed(fake, "GET", path)).status).toBe(200);
+    expect((await authed(fake, "GET", `${path}/reviews`)).status).toBe(503);
+    expect((await authed(fake, "GET", `${path}/reviews`)).status).toBe(200);
   }, 20_000); // several real git children
 });
