@@ -7,8 +7,9 @@
  *   judged and passed, through the same engine, with that run's words. Its binding is the one
  *   the harness's last boot wrote, and its token comes from the harness's own environment
  *   files, never from this process's environment.
- * - {@link settleWorkspaces} and {@link syncHarnessOutcomes} are the passes Home's tick makes:
- *   attempts a stopped process left, worktrees of closed items, and the pull request tracker.
+ * - {@link trackHarnessOutcomes} and {@link closeFinishedWorkspaces} are the passes Home's tick
+ *   makes: attempts a stopped process left and the pull request tracker, then worktrees of
+ *   closed items.
  * - {@link WORKSPACE_REVOKER} closes a retired harness's worktrees, keeping uncommitted work
  *   as a commit on its branch.
  */
@@ -265,62 +266,79 @@ export async function reconcilePublish(
 export type SettleAnswer = {
   /** Attempts a stopped process left that were settled. */
   readonly settled: number;
-  /** Worktrees of closed items that were closed. */
-  readonly closed: number;
   readonly problem?: string;
 };
 
-/**
- * One harness's workspaces, tidied: each attempt nobody is making is settled, and each closed
- * item's worktree is closed. Nothing is fetched for a harness with neither.
- */
-export async function settleWorkspaces(
+/** Settle each attempt nobody is making. Nothing is asked for a harness that has none. */
+export async function settleAttempts(
   harnessDir: string,
   deps: WorkspaceHomeDeps = {},
 ): Promise<SettleAnswer> {
   let settled = 0;
-  let closed = 0;
   let problem: string | undefined;
-  const attempts = readAttempts(harnessDir);
-  const workspaces = readWorkspaces(harnessDir);
-  if (attempts.size === 0 && workspaces.size === 0) return { settled, closed };
-  const engine = homeWorkspaceEngine(harnessDir, deps);
-  for (const [wi, list] of attempts) {
+  let engine: WorkspaceEngine | undefined;
+  for (const [wi, list] of readAttempts(harnessDir)) {
     const last = list.at(-1);
     if (last?.state !== "started" && last?.state !== "pushed" && last?.state !== "unknown") {
       continue;
     }
     try {
+      engine ??= homeWorkspaceEngine(harnessDir, deps);
       const after = await engine.settle(wi, { actor: TRACKER_ACTOR });
       if (after !== undefined && after.state !== last.state) settled += 1;
     } catch (err) {
       problem = (err as Error).message;
     }
   }
+  return { settled, ...(problem !== undefined ? { problem } : {}) };
+}
+
+export type TrackAnswer = SyncAnswer & { readonly settled: number };
+
+/**
+ * One harness's publishes, read from the code host and recorded: an attempt a stopped process
+ * left is settled first, then each delivered pull request is looked at.
+ */
+export async function trackHarnessOutcomes(
+  harnessDir: string,
+  deps: WorkspaceHomeDeps = {},
+): Promise<TrackAnswer> {
+  const { settled, problem } = await settleAttempts(harnessDir, deps);
+  const synced = await syncOutcomes(harnessDir, {
+    env: loadEnvChain(harnessDir).vars,
+    ...(deps.now !== undefined ? { now: deps.now } : {}),
+    ...(deps.engine?.provider !== undefined ? { provider: deps.engine.provider } : {}),
+  });
+  return { ...(problem !== undefined ? { problem } : {}), ...synced, settled };
+}
+
+export type CloseAnswer = {
+  /** Worktrees of closed items that were closed. */
+  readonly closed: number;
+  readonly problem?: string;
+};
+
+/** Close the worktrees of closed items, keeping uncommitted work on each branch. */
+export async function closeFinishedWorkspaces(
+  harnessDir: string,
+  deps: WorkspaceHomeDeps = {},
+): Promise<CloseAnswer> {
+  let closed = 0;
+  let problem: string | undefined;
+  let engine: WorkspaceEngine | undefined;
   const store = openWorkStore(harnessDir);
-  for (const ws of workspaces.values()) {
+  for (const ws of readWorkspaces(harnessDir).values()) {
     if (ws.state !== "open") continue;
     const read = store.get(ws.id);
     if ("ok" in read || read.item.state !== "closed") continue;
     try {
+      engine ??= homeWorkspaceEngine(harnessDir, deps);
       if ((await engine.close(ws.id, { actor: TRACKER_ACTOR })).closed) closed += 1;
     } catch (err) {
       problem = (err as Error).message;
     }
   }
-  return { settled, closed, ...(problem !== undefined ? { problem } : {}) };
-}
-
-/** One harness's delivered pull requests, read from the code host and recorded. */
-export function syncHarnessOutcomes(
-  harnessDir: string,
-  deps: WorkspaceHomeDeps = {},
-): Promise<SyncAnswer> {
-  return syncOutcomes(harnessDir, {
-    env: loadEnvChain(harnessDir).vars,
-    ...(deps.now !== undefined ? { now: deps.now } : {}),
-    ...(deps.engine?.provider !== undefined ? { provider: deps.engine.provider } : {}),
-  });
+  return { closed, ...(problem !== undefined ? { problem } : {}) };
 }
 
 /** Closes a retired harness's worktrees. The managed clone stays, with every branch. */

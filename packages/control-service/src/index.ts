@@ -106,16 +106,19 @@ export {
   workRefOf,
 } from "./work";
 export {
+  type CloseAnswer as WorkspaceCloseAnswer,
   type SettleAnswer as WorkspaceSettleAnswer,
+  type TrackAnswer as WorkspaceTrackAnswer,
   WORKSPACE_REVOKER,
   type WorkspaceCommands,
   type WorkspaceHomeDeps,
   type WorkspacePublishPlan,
   type WorkspacePublishValue,
+  closeFinishedWorkspaces,
   homeWorkspaceEngine,
   reconcilePublish,
-  settleWorkspaces,
-  syncHarnessOutcomes,
+  settleAttempts,
+  trackHarnessOutcomes,
   workspaceCommands,
 } from "./workspaces";
 export {

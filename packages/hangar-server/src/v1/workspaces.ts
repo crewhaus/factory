@@ -7,16 +7,16 @@
  * Check logs and the acceptance check's reasons are content: a caller without
  * `h.read.content` gets the branch, the SHAs, the checks' words and the pull request's state.
  *
- * Its sweeps run in Home's tick: `work-outcomes` reads each delivered pull request from the
- * code host, and `work-cleanup` settles attempts a stopped process left and closes the
+ * Its sweeps run in Home's tick: `work-outcomes` settles attempts a stopped process left and
+ * reads each delivered pull request from the code host, and `work-cleanup` closes the
  * worktrees of closed items.
  */
 import { EVENT_TAXONOMY, type EventType } from "@crewhaus/control-contract";
 import { readPage } from "@crewhaus/control-records";
 import {
   type WorkspaceHomeDeps,
-  settleWorkspaces,
-  syncHarnessOutcomes,
+  closeFinishedWorkspaces,
+  trackHarnessOutcomes,
   workRefOf,
   workspaceCommands,
 } from "@crewhaus/control-service";
@@ -259,7 +259,7 @@ export function workspaceSweeps(
       everyMs: OUTCOMES_EVERY_MS,
       run: (ctx) =>
         each(ctx, "the pull requests", (dir) =>
-          syncHarnessOutcomes(dir, { now: () => ctx.now, ...deps }),
+          trackHarnessOutcomes(dir, { now: () => ctx.now, ...deps }),
         ),
     },
     {
@@ -267,7 +267,7 @@ export function workspaceSweeps(
       everyMs: CLEANUP_EVERY_MS,
       run: (ctx) =>
         each(ctx, "the workspaces", (dir) =>
-          settleWorkspaces(dir, { now: () => ctx.now, ...deps }),
+          closeFinishedWorkspaces(dir, { now: () => ctx.now, ...deps }),
         ),
     },
   ];

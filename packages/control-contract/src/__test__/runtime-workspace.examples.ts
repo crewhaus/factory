@@ -32,6 +32,7 @@ const SUMMARY = {
   publish: "done",
   pr: 12,
   prState: "open",
+  outcome: PR,
 } as const;
 
 const WORKSPACE = {
@@ -39,7 +40,6 @@ const WORKSPACE = {
   headSha: HEAD,
   checks: [{ name: "bun test", exit: 0, passed: true }],
   attempts: [ATTEMPT],
-  outcome: PR,
 } as const;
 
 export const EXAMPLES = {

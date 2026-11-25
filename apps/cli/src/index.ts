@@ -24618,6 +24618,20 @@ switch (subcommand) {
     }
     break;
   }
+  case "workspace": {
+    // A harness's isolated checkouts (./workspace-cmd): reads only, with Home running or not.
+    try {
+      const { runWorkspaceCommand } = await import("./workspace-cmd");
+      const out = await runWorkspaceCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
   case "budget": {
     // A harness's spending period (./budget-cmd): read, and raised through the control service.
     try {

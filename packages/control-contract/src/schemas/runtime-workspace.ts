@@ -76,6 +76,7 @@ export const workspaceSummary = z
     publish: oneOf(WORK_PUBLISH_STATES).optional(),
     pr: z.number().int().positive().optional(),
     prState: oneOf(WORK_PR_STATES).optional(),
+    outcome: workPrView.optional(),
   })
   .passthrough();
 
@@ -85,7 +86,6 @@ export const workspaceView = workspaceSummary
     wip: z.boolean().optional(),
     checks: z.array(workspaceCheckView).optional(),
     attempts: z.array(workPublishView),
-    outcome: workPrView.optional(),
     reasons: z.string().optional(),
     logs: z.array(z.object({ name: z.string(), text: z.string() }).passthrough()).optional(),
     hidden: z.array(z.literal("content")).optional(),

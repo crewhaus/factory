@@ -27,9 +27,10 @@ import { RUNTIME_RUNTIME } from "./areas/runtime";
 import type { WorkHead } from "./work";
 import {
   WORKSPACE_REVOKER,
+  closeFinishedWorkspaces,
   reconcilePublish,
-  settleWorkspaces,
-  syncHarnessOutcomes,
+  settleAttempts,
+  trackHarnessOutcomes,
   workspaceCommands,
 } from "./workspaces";
 
@@ -182,9 +183,9 @@ describe("between runs", () => {
       t.b.fake.interruptNextCreate("error");
       await t.b.publish(t.engine, t.wi);
       expect(readAttempts(t.b.dir).get(t.wi)?.at(-1)?.state).toBe("unknown");
-      expect(await settleWorkspaces(t.b.dir)).toEqual({ settled: 1, closed: 0 });
+      expect(await settleAttempts(t.b.dir)).toEqual({ settled: 1 });
       expect(readAttempts(t.b.dir).get(t.wi)?.at(-1)).toMatchObject({ state: "done", pr: 1 });
-      expect(await settleWorkspaces(t.b.dir)).toEqual({ settled: 0, closed: 0 });
+      expect(await settleAttempts(t.b.dir)).toEqual({ settled: 0 });
     },
     SLOW,
   );
@@ -194,7 +195,8 @@ describe("between runs", () => {
     async () => {
       const t = await stewarded();
       await openWorkStore(t.b.dir).transition(t.wi, "closed", { outcome: "cancelled" }, PERSON);
-      expect(await settleWorkspaces(t.b.dir)).toEqual({ settled: 0, closed: 1 });
+      expect(await closeFinishedWorkspaces(t.b.dir)).toEqual({ closed: 1 });
+      expect(await closeFinishedWorkspaces(t.b.dir)).toEqual({ closed: 0 });
       expect(existsSync(join(t.b.dir, t.opened.worktree))).toBe(false);
       expect(readWorkspaces(t.b.dir).get(t.wi)).toMatchObject({ state: "closed", wip: true });
     },
@@ -207,7 +209,7 @@ describe("between runs", () => {
       const t = await stewarded();
       expect(await t.b.publish(t.engine, t.wi)).toMatchObject({ ok: true, state: "done" });
       t.b.fake.mergePull(REPO, 1);
-      expect(await syncHarnessOutcomes(t.b.dir)).toMatchObject({ checked: 1, wrote: 1, moved: 1 });
+      expect(await trackHarnessOutcomes(t.b.dir)).toMatchObject({ checked: 1, wrote: 1, moved: 1 });
       expect(readOutcomes(t.b.dir).get(t.wi)).toMatchObject({ state: "merged" });
     },
     SLOW,
@@ -218,8 +220,13 @@ describe("between runs", () => {
     async () => {
       const b = await bench();
       benches.push(b);
-      expect(await settleWorkspaces(b.dir)).toEqual({ settled: 0, closed: 0 });
-      expect(await syncHarnessOutcomes(b.dir)).toEqual({ checked: 0, wrote: 0, moved: 0 });
+      expect(await closeFinishedWorkspaces(b.dir)).toEqual({ closed: 0 });
+      expect(await trackHarnessOutcomes(b.dir)).toEqual({
+        settled: 0,
+        checked: 0,
+        wrote: 0,
+        moved: 0,
+      });
       expect(await WORKSPACE_REVOKER.plan({ harnessDir: b.dir, actor: "x", now: 0 })).toEqual([]);
       expect(await WORKSPACE_REVOKER.revoke({ harnessDir: b.dir, actor: "x", now: 0 })).toEqual([]);
     },

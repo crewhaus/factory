@@ -139,6 +139,7 @@ describe("the inventory is the dispatch", () => {
       "people",
       "runs",
       "work",
+      "workspace",
     ]);
     expect(LEGACY_VERBS.length, "a new verb is a `<verb>-cmd.ts` module exporting CLI_FAMILY").toBe(
       LEGACY_COUNT,

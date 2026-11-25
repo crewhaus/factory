@@ -203,6 +203,8 @@ export type WorkspaceSummaryView = {
   readonly publish?: WorkPublishState;
   readonly pr?: number;
   readonly prState?: WorkPrState;
+  /** The pull request, as the tracker last saw it. */
+  readonly outcome?: WorkPrView;
 };
 
 /** One item's workspace in full. Check logs and the judge's reasons need content access. */
@@ -211,7 +213,6 @@ export type WorkspaceView = WorkspaceSummaryView & {
   readonly wip?: boolean;
   readonly checks?: readonly WorkspaceCheckView[];
   readonly attempts: readonly WorkPublishView[];
-  readonly outcome?: WorkPrView;
   /** The acceptance check's reasons for the newest attempt, for a reader with content access. */
   readonly reasons?: string;
   /** Each check's log, for a reader with content access, newest attempt's head only. */

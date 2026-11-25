@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { IDEMPOTENCY_HEADER, mintId } from "@crewhaus/control-contract";
+import { IDEMPOTENCY_HEADER } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import {
   openWorkStore,
@@ -333,7 +333,7 @@ describe("the stream and the sweeps", () => {
         warn: (m: string) => warned.push(m),
       };
       const [outcomes, cleanup] = workspaceSweeps();
-      await cleanup.run(ctx);
+      await outcomes.run(ctx);
       const pr = readAttempts(h.dir).get(wi)?.at(-1)?.pr;
       expect(pr).toBeDefined();
       b.fake.mergePull("acme/app", pr as number);
@@ -344,9 +344,23 @@ describe("the stream and the sweeps", () => {
       await cleanup.run({ ...ctx, now: ctx.now + 2000 });
       expect(readWorkspaces(h.dir).get(wi)?.state).toBe("closed");
       expect(warned).toEqual([]);
-      // A harness that cannot be read is warned about and stops no other.
-      const gone = mintId("wi");
-      expect(readWorkspaces(h.dir).get(gone)).toBeUndefined();
+      // A harness that cannot be read is warned about by its id, and stops no other.
+      const broken = await home.harness("steward-broken", { specExtra: TOOLS });
+      writeBindings(broken.dir, b.bindings);
+      writeFileSync(join(broken.dir, ".crewhaus/run/control/work/bindings.json"), "not json");
+      const { wi: next } = await judged("After a broken one");
+      await outcomes.run({
+        ...ctx,
+        home: {
+          liveHarnesses: () => [
+            { id: broken.id, dir: broken.dir },
+            { id: h.id, dir: h.dir },
+          ],
+        } as never,
+      });
+      expect(warned.length).toBe(1);
+      expect(warned[0]).toContain(broken.id);
+      expect(readAttempts(h.dir).get(next)?.at(-1)?.state).toBe("done");
     },
     SLOW,
   );

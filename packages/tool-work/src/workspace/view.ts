@@ -80,7 +80,7 @@ function summaryOf(
     state: ws.state,
     ...(ws.baseSha !== undefined ? { baseSha: ws.baseSha } : {}),
     ...(newest !== undefined ? { publish: newest.state } : {}),
-    ...(pull !== undefined ? { pr: pull.pr, prState: pull.state } : {}),
+    ...(pull !== undefined ? { pr: pull.pr, prState: pull.state, outcome: pull } : {}),
   };
 }
 
@@ -119,7 +119,6 @@ export function workspaceView(
       passed: r.exit === 0,
     };
   });
-  const pull = pullOf(attempts, outcome);
   const attemptNumber = newest?.attempt ?? 1;
   const logs = !opts.content
     ? undefined
@@ -141,7 +140,6 @@ export function workspaceView(
     ...(ws.wip !== undefined ? { wip: ws.wip } : {}),
     ...(checks !== undefined ? { checks } : {}),
     attempts: attempts.map(attemptView),
-    ...(pull !== undefined ? { outcome: pull } : {}),
     ...(reasons !== undefined ? { reasons: tail(reasons) } : {}),
     ...(logs !== undefined && logs.length > 0 ? { logs } : {}),
     ...(opts.content ? {} : { hidden: ["content" as const] }),
