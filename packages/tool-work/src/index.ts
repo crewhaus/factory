@@ -11,6 +11,9 @@
  * | `WorkPropose` | no | no | a proposal, with its assessment; the same source is one item |
  * | `WorkUpdate` | no | yes | a note, a linked run, a delivery, an edit of its own proposal, or a close with a reason |
  *
+ * The workspace tools beside them (`./workspace-tools`) deliver an accepted item as one pull
+ * request.
+ *
  * The tools propose, add notes, link runs and close with a reason. They never accept,
  * decline or cancel, never rewrite an accepted item, and never claim an operator's or an
  * API caller's source: the store refuses each (`WORK_ACTOR_RULES`). Only the owner's
@@ -67,8 +70,15 @@ import {
   parseWorkConfig,
   viewContext,
 } from "./work-items/index";
+import { createWorkspaceTools } from "./workspace-tools";
 
 export { WorkConfigError } from "./work-items/index";
+export { bindWorkspaceRepositories } from "./workspace/bindings";
+export {
+  WorkspaceToolError,
+  type WorkspaceToolsDeps,
+  createWorkspaceTools,
+} from "./workspace-tools";
 
 let workConfig: WorkConfig = {};
 
@@ -650,3 +660,12 @@ export const workGet: RegisteredTool = DEFAULT_TOOLS.workGet;
 export const workPropose: RegisteredTool = DEFAULT_TOOLS.workPropose;
 /** `WorkUpdate`: a note, a link, a delivery, an edit of its own proposal, or a close. */
 export const workUpdate: RegisteredTool = DEFAULT_TOOLS.workUpdate;
+
+const DEFAULT_WORKSPACE_TOOLS = createWorkspaceTools();
+
+/** `WorkspaceOpen`: a worktree for an accepted item, on its own branch. */
+export const workspaceOpen: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspaceOpen;
+/** `WorkspaceCheck`: the declared checks on an item's worktree, in the sandbox. */
+export const workspaceCheck: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspaceCheck;
+/** `WorkspacePublish`: an item's change as one pull request, after every gate. */
+export const workspacePublish: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspacePublish;

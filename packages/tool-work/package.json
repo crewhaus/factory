@@ -2,12 +2,13 @@
   "name": "@crewhaus/tool-work",
   "version": "0.8.3",
   "type": "module",
-  "description": "Work items: what a harness was asked to do, as a content-free log and immutable content revisions, with one proposal object, one ranker, and the WorkList, WorkGet, WorkPropose and WorkUpdate tools",
+  "description": "Work items and their delivery: what a harness was asked to do, as a content-free log and immutable content revisions, with one proposal object, one ranker, the Work tools, and the Workspace tools that deliver an accepted item as one checked pull request",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./work-items": "./src/work-items/index.ts"
+    "./work-items": "./src/work-items/index.ts",
+    "./workspace": "./src/workspace/index.ts"
   },
   "scripts": {
     "test": "bun test src"
@@ -17,13 +18,28 @@
     "@crewhaus/continuity-store": "workspace:*",
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/egress-classifier": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/eval-judge": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
     "@crewhaus/run-context": "workspace:*",
+    "@crewhaus/sandbox": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
     "@crewhaus/tenancy": "workspace:*",
     "@crewhaus/tool-builder": "workspace:*",
     "@crewhaus/tool-catalog": "workspace:*",
     "@crewhaus/tool-categories": "workspace:*",
+    "@crewhaus/tool-codehost": "workspace:*",
+    "@crewhaus/tool-git": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*",
     "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@crewhaus/agent-context-isolation": "workspace:*",
+    "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*",
+    "@crewhaus/tool-fs": "workspace:*",
+    "service-fakes": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

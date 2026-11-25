@@ -64,9 +64,18 @@ export const WORK_PUBLISH_CODES = deepFreeze([
 ] as const);
 export type WorkPublishCode = (typeof WORK_PUBLISH_CODES)[number];
 
-/** A verdict's parts: the declared checks, and the acceptance check. */
-export const WORK_CHECK_VERDICTS = deepFreeze(["pass", "fail", "skipped"] as const);
-export const WORK_ACCEPTANCE_VERDICTS = deepFreeze(["pass", "fail", "not-required"] as const);
+/**
+ * A verdict's parts: the declared checks, and the acceptance check. `not-run` says a
+ * required part gave no answer (the checks had no sandbox to run in, or an earlier part
+ * refused the change first): only `pass` passes.
+ */
+export const WORK_CHECK_VERDICTS = deepFreeze(["pass", "fail", "skipped", "not-run"] as const);
+export const WORK_ACCEPTANCE_VERDICTS = deepFreeze([
+  "pass",
+  "fail",
+  "not-required",
+  "not-run",
+] as const);
 
 /** What a publish needs before it opens a pull request: `pull_requests.require`. */
 export const WORK_PUBLISH_REQUIREMENTS = deepFreeze(["checks", "acceptance"] as const);

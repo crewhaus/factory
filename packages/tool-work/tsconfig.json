@@ -5,15 +5,28 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../agent-context-isolation" },
     { "path": "../boundary-classifier" },
     { "path": "../continuity-store" },
     { "path": "../control-contract" },
     { "path": "../control-records" },
+    { "path": "../egress-classifier" },
+    { "path": "../errors" },
+    { "path": "../eval-judge" },
+    { "path": "../ir" },
+    { "path": "../permission-engine" },
     { "path": "../run-context" },
+    { "path": "../runtime-core" },
+    { "path": "../sandbox" },
+    { "path": "../service-fakes" },
+    { "path": "../session-store" },
     { "path": "../tenancy" },
     { "path": "../tool-builder" },
     { "path": "../tool-catalog" },
     { "path": "../tool-categories" },
+    { "path": "../tool-codehost" },
+    { "path": "../tool-fs" },
+    { "path": "../tool-git" },
     { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]

@@ -29,6 +29,21 @@ export {
   parseAssessment,
 } from "./assessment";
 export { type WorkConfig, WorkConfigError, parseWorkConfig } from "./config";
+export {
+  type DeliveryFacts,
+  type FoldedAttempt,
+  type FoldedWorkspace,
+  type OutcomeLine,
+  type PublishLine,
+  type WorkspaceLine,
+  outcomesLedger,
+  publishLedger,
+  readAttempts,
+  readDeliveryFacts,
+  readOutcomes,
+  readWorkspaces,
+  workspacesLedger,
+} from "./delivery";
 export { type EvidenceContext, verifiedObservedEvidence } from "./evidence";
 export {
   FEED_SECTION_MAX,

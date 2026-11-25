@@ -52,6 +52,7 @@ import {
 
 export {
   HARDENED_CONFIG_ARGS,
+  NO_HOOKS_PATH,
   hardenReadArgs,
   neutraliseRepositoryFilters,
   neutralisedNote,
