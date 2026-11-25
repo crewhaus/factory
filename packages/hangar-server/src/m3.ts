@@ -153,6 +153,13 @@ export type M3Context = {
    */
   readonly principal: string;
   /**
+   * This request's caller as the harness's own records store one: a member's id, or a keyed
+   * digest of the local user while no access records exist. `undefined` on a fleet-wide
+   * route, and where the harness's digest key cannot be read. Makes the key when there is
+   * none, so only a write asks.
+   */
+  readonly storedActor?: () => Promise<string | undefined>;
+  /**
    * Whether this request's caller holds `permission` on a harness (this route's when none
    * is named) or on the whole Home. The rule the choke point uses, bound to the request.
    */

@@ -3,6 +3,7 @@
  * evidence, and the few words every surface shares (a shell-safe command, a class order).
  */
 import {
+  ATTENTION_TWINS,
   type AttentionChoice,
   type AttentionEvidence,
   type AttentionFreshness,
@@ -13,7 +14,6 @@ import {
   type CliTwin,
   type DecisionClass,
   RECEIPT_VIA,
-  TWIN_PLACEHOLDERS,
   type TwinParams,
   attentionBandOf,
   renderTwin,
@@ -38,6 +38,7 @@ type ItemExtras = Partial<
     | "body"
     | "bodyWithheld"
     | "sensitivity"
+    | "deferral"
   >
 >;
 
@@ -91,6 +92,7 @@ export function draftItem(spec: ItemSpec): Drafted {
     ...pick("cause"),
     ...pick("binding"),
     ...pick("sensitivity"),
+    ...pick("deferral"),
     evidenceRev: evidenceRevOf(spec.revision),
     since: spec.since,
     ...pick("asks"),
@@ -135,9 +137,20 @@ export function twinOf(twin: CliTwin, params: TwinParams): string | undefined {
   return ["crewhaus", ...rendered.argv].map(shellWord).join(" ");
 }
 
-/** Whether a directory fits a command's `{dir}`: no control character, no leading `-`. */
-export function dirFits(dir: string): boolean {
-  return TWIN_PLACEHOLDERS["{dir}"].test(dir);
+/** A choice carried out by `attention.resolve`, with the command that does it. */
+export function decideChoice(
+  att: string,
+  id: string,
+  needs: DecisionClass,
+  permission?: string,
+): AttentionChoice {
+  const cliTwin = twinOf(ATTENTION_TWINS.decide, { att, attChoice: id });
+  return {
+    id,
+    needs,
+    ...(cliTwin !== undefined ? { cliTwin } : { cliTwin: null, nullReason: "Decide it in Home." }),
+    ...(permission !== undefined ? { permission } : {}),
+  };
 }
 
 /** A time in ms, or `undefined` for one that does not parse. */

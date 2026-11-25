@@ -25,8 +25,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ensureAccessSetUp, ensureToken, localActorOf } from "@crewhaus/access-control";
-import { mintId, mintRunId } from "@crewhaus/control-contract";
-import { extractFeedbackRecords } from "@crewhaus/feedback-distill";
+import { isStoredActor, mintId, mintRunId } from "@crewhaus/control-contract";
+import { claimReviewEntry, extractFeedbackRecords } from "@crewhaus/feedback-distill";
 import { createPendingApprovalStore, foldReadOnly } from "@crewhaus/session-store";
 import { pendingApprovalCount } from "./approvals";
 import { makeFixtureHarness } from "./fixture";
@@ -36,6 +36,7 @@ import { type TestServer, bootTestServer } from "./testkit";
 const NOW = Date.parse("2026-08-03T00:00:00.000Z");
 const iso = (ms: number): string => new Date(ms).toISOString();
 const DAY = 86_400_000;
+const CLI_ACTOR = { by: `local:#${"0123456789abcdef".repeat(4)}`, via: "cli" };
 
 async function register(t: TestServer, dir: string): Promise<string> {
   const res = await t.api("/api/harnesses", { method: "POST", body: JSON.stringify({ dir }) });
@@ -440,6 +441,50 @@ describe("review queue", () => {
       expect(
         queue.find((i) => i.id === "rev_rater_disagreement_sess_00000000000000aa_t1")?.status,
       ).toBe("resolved");
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("a verdict on an item another surface took first writes no rating and no line", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inboxHarness(t, "review-race");
+      const id = await register(t, dir);
+      const item = "rev_rater_disagreement_sess_00000000000000aa_t1";
+      const nowIso = new Date(NOW).toISOString();
+      expect(claimReviewEntry(dir, item, { at: nowIso, actor: CLI_ACTOR }).outcome).toBe("claimed");
+      const session = join(dir, ".crewhaus", "sessions", "sess_00000000000000aa.jsonl");
+      const queue = join(dir, ".crewhaus", "review", "queue.jsonl");
+      const before = [readFileSync(session, "utf8"), readFileSync(queue, "utf8")];
+      const res = await t.api(`/api/h/${id}/review/${item}`, {
+        method: "POST",
+        body: JSON.stringify({ verdict: "up" }),
+      });
+      expect(res.status).toBe(200);
+      expect(res.body["alreadyResolved"]).toBe(true);
+      expect([readFileSync(session, "utf8"), readFileSync(queue, "utf8")]).toEqual(before);
+    } finally {
+      await t.stop();
+    }
+  }, 20_000);
+
+  test("the resolved line records who resolved it and through which door", async () => {
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inboxHarness(t, "review-actor");
+      const id = await register(t, dir);
+      await t.api(`/api/h/${id}/review/rev_quarantine_smoke_s9`, {
+        method: "POST",
+        body: JSON.stringify({ verdict: "pass" }),
+      });
+      const lines = readFileSync(join(dir, ".crewhaus", "review", "queue.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l) as Record<string, unknown>);
+      const last = lines.at(-1);
+      expect(last?.["via"]).toBe("home");
+      expect(isStoredActor(last?.["resolvedBy"])).toBe(true);
     } finally {
       await t.stop();
     }

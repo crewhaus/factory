@@ -97,6 +97,19 @@ export function foldRunLine(
   return state;
 }
 
+/** A kept fact held to the grammars a fresh read holds it to, or `undefined`. */
+export function closedRunFact(fact: RunFact): RunFact | undefined {
+  const { failureClass: cls, specHash: hash, ...rest } = fact;
+  if (!CANONICAL_RUN_ID_RE.test(fact.id) || timeOf(fact.at) === undefined) return undefined;
+  const failureClass = matching(cls, FAILURE_CLASS_RE);
+  const specHash = matching(hash, SPEC_HASH_RE);
+  return {
+    ...rest,
+    ...(failureClass !== undefined ? { failureClass } : {}),
+    ...(specHash !== undefined ? { specHash } : {}),
+  };
+}
+
 /**
  * The sessions whose failed runs carry no structured cause, the newest runs' first, at
  * most {@link FAILURE_SESSIONS_MAX}: their messages group them. `capped` when more were

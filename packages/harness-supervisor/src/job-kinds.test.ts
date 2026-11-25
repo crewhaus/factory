@@ -9,9 +9,11 @@ import {
   EXPORT_JOB_KIND,
   JOB_KINDS,
   JobArgumentError,
+  RUNS_RESUME_JOB_KIND,
   exportHarnessArgv,
   isJobKind,
   jobArgv,
+  runsResumeArgv,
 } from "./job-kinds";
 
 describe("job kinds", () => {
@@ -96,5 +98,34 @@ describe("the harness export job", () => {
       expect(() => exportHarnessArgv(bad)).toThrow(JobArgumentError);
     }
     expect(() => exportHarnessArgv(`${join(tmpdir(), "x")}\u001b[201~`)).toThrow("control");
+  });
+});
+
+describe("the job that settles a graph run's pause", () => {
+  const GRUN = "grun_0123456789abcdef";
+
+  test("runs `runs resume` with a graph run id and one of two words, and is not a kind the job route takes", () => {
+    expect(runsResumeArgv(GRUN, "approve")).toEqual([
+      "runs",
+      "resume",
+      GRUN,
+      "--decision",
+      "approve",
+    ]);
+    expect(runsResumeArgv(GRUN, "reject").at(-1)).toBe("reject");
+    expect(isJobKind(RUNS_RESUME_JOB_KIND)).toBe(false);
+    expect((JOB_KINDS as readonly string[]).includes(RUNS_RESUME_JOB_KIND)).toBe(false);
+    expect([...JOB_KINDS]).toEqual(["doctor", "compile", "eval", "dream-run"]);
+  });
+
+  test("refuses any other decision and any other run id", () => {
+    for (const decision of ["", "Approve", "approve ", "ship it", "--force", "approve\n"]) {
+      expect(() => runsResumeArgv(GRUN, decision)).toThrow(JobArgumentError);
+      expect(() => runsResumeArgv(GRUN, decision)).toThrow("approve or reject");
+    }
+    for (const grun of ["", "grun_x", "run_0123456789abcdef", `${GRUN};id`, "--decision"]) {
+      expect(() => runsResumeArgv(grun, "approve")).toThrow(JobArgumentError);
+      expect(() => runsResumeArgv(grun, "approve")).toThrow("graph run id");
+    }
   });
 });

@@ -9,7 +9,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { mintId, mintRunId } from "@crewhaus/control-contract";
+import { type AttentionItem, mintId, mintRunId } from "@crewhaus/control-contract";
 import { type Ledger, append, decisionsLedger, runsLedger } from "@crewhaus/control-records";
 import {
   DAY,
@@ -32,6 +32,7 @@ import { assembleInbox, foldHarness } from "./fold";
 import { KEY_SHAPE_RE, attIdOf } from "./ids";
 import { twinOf } from "./items";
 import { metricsOf } from "./metrics";
+import { idOfItem } from "./overlays";
 import { sentenceOf } from "./sentences";
 
 const HRN = "hrn_0123456789abcdef";
@@ -58,7 +59,7 @@ function plantLike(file: string, over: Record<string, unknown>): void {
   appendFileSync(file, `${JSON.stringify({ ...last, ...over })}\n`);
 }
 
-/** Append a row to a ledger's newest segment as an agent's own write would. */
+/** Append a hand-written row to a ledger's newest segment. */
 function appendLine(ledger: Ledger, row: Record<string, unknown>): void {
   if (!("dir" in ledger.records)) throw new TypeError("a segmented ledger");
   const dir = join(ledger.root, ledger.records.dir);
@@ -135,6 +136,11 @@ describe("planted ids", () => {
         needs: "owner",
         cliTwin: null,
         nullReason: "This request names no action a rule may cover, so nothing can preview it.",
+      },
+      {
+        id: "deny",
+        needs: "owner",
+        cliTwin: `crewhaus inbox decide ${idOfItem(forgedItem as AttentionItem)} deny`,
       },
     ]);
     const realDelegation = items.find((i) => i.source.id === delegation);

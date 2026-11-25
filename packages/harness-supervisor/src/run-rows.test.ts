@@ -588,6 +588,44 @@ describe("a run the control API queued", () => {
     });
     expect(crewPlan.stdinFile).toBe(stdinFile);
   });
+
+  test("a graph resume: the bundle's own `--resume`, the run and the decision as arguments, no input", () => {
+    const dir = tempHarness("graph");
+    const runId = mintRunId();
+    const grun = "grun_0123456789abcdef";
+    const bundle = {
+      bundleDir: join(dir, "dist"),
+      entry: "agent.ts",
+      entryPath: join(dir, "x.ts"),
+    };
+    const planned = (graphResume: { grun: string; decision: string }, target = "graph") =>
+      buildSpawnPlan({
+        harnessDir: dir,
+        target,
+        processEnv: {},
+        bundle: bundle as never,
+        apiRun: { runId, graphResume },
+      });
+    const decision = "approve; $(id) `whoami`";
+    const plan = planned({ grun, decision });
+    expect(plan.argv).toEqual([
+      "bun",
+      "--no-env-file",
+      bundle.entryPath,
+      "--resume",
+      grun,
+      decision,
+    ]);
+    expect(plan.stdinFile).toBeUndefined();
+    expect(plan.env["CREWHAUS_RUN_ID"]).toBe(runId);
+    // It carries no input of its own, so none is declared.
+    expect(plan.env["CREWHAUS_INPUT_ORIGIN"]).toBeUndefined();
+    expect(plan.apiRun).toEqual({ runId });
+    expect(() => planned({ grun: "run_x", decision: "approve" })).toThrow("graph run id");
+    expect(() => planned({ grun, decision: "" })).toThrow("needs a decision");
+    expect(() => planned({ grun, decision: "--branch-from" })).toThrow("needs a decision");
+    expect(() => planned({ grun, decision: "approve" }, "workflow")).toThrow("no graph pause");
+  });
 });
 
 describe("an API root for a work item", () => {

@@ -6,8 +6,12 @@
 import type {
   AttentionFreshness,
   AttentionItem,
+  AttentionResolution,
+  AttentionState,
   CauseKind,
   DecisionClass,
+  DeferReason,
+  DeployQuorumSubject,
 } from "@crewhaus/control-contract";
 import type { AdvisorItem } from "@crewhaus/harness-advice/advisor";
 
@@ -100,6 +104,8 @@ export type DecisionFact = {
   readonly delegationAction?: string;
   /** A change adoption's change. */
   readonly chg?: string;
+  /** A protected environment's quorum: the version it is about. */
+  readonly quorum?: DeployQuorumSubject;
 };
 
 /** One review-queue entry, its newest line. */
@@ -109,6 +115,35 @@ export type ReviewFact = {
   readonly ts: string;
   readonly status: "open" | "resolved";
   readonly resolvedTs?: string;
+  /** It points at a session's turn, so a rating can settle it at its source. */
+  readonly adjudicable?: true;
+};
+
+/** One graph run paused for a decision: where it waits, and its node's name when it is one. */
+export type CheckpointFact = {
+  readonly grun: string;
+  readonly ckpt: string;
+  readonly node?: string;
+  readonly at: string;
+};
+
+/**
+ * What people did about one item, folded from the actions ledger in order through the
+ * `attention` machine. A line its lifecycle does not allow is counted and leaves it open.
+ */
+export type ItemOverlay = {
+  readonly state: AttentionState;
+  /** The evidence the newest state-changing line was about. */
+  readonly evidenceRev: string;
+  readonly at: string;
+  readonly via?: string;
+  readonly how?: AttentionResolution;
+  readonly assignee?: string;
+  readonly deferredUntil?: string;
+  readonly deferReason?: DeferReason;
+  /** Until when each member hid it from themselves. */
+  readonly snoozes?: Readonly<Record<string, string>>;
+  readonly anomalies?: number;
 };
 
 /** One run, its newest row, with the session its first row named. */
@@ -137,7 +172,7 @@ export type Section<T> = {
 };
 
 export type AttentionModel = {
-  readonly v: 1;
+  readonly v: 2;
   /** `dec_` decisions by id: their newest row. */
   decisions: Record<string, DecisionFact>;
   /** Runs by id, oldest-seen first, at most {@link RUNS_KEPT}. */
@@ -150,7 +185,14 @@ export type AttentionModel = {
   };
   review: Section<ReviewFact>;
   failures: Section<FailureSignature> & { readonly unreadable?: true };
+  /** Graph runs paused for a decision, newest folders first. */
+  checkpoints: Section<CheckpointFact>;
+  /** What people did about items, by item id, oldest-seen first. */
+  overlays: Record<string, ItemOverlay>;
 };
+
+/** At most this many items keep what people did about them; past it the oldest-seen go first. */
+export const OVERLAYS_KEPT = 5_000;
 
 /** At most this many runs are kept by a model; past it the oldest-seen go first. */
 export const RUNS_KEPT = 2_000;
@@ -204,6 +246,10 @@ export type HarnessAttention = {
   readonly advisorUnchecked?: true;
   readonly decisions: readonly MetricDecision[];
   readonly freshness: AttentionFreshness;
+  /** What people did about its items, for the groups several harnesses share. */
+  readonly overlays: Readonly<Record<string, ItemOverlay>>;
+  /** The member reading, whose own snoozes hide an item. */
+  readonly viewer?: string;
 };
 
 /** How one harness is read for a list. */
@@ -214,4 +260,6 @@ export type ItemContext = {
   /** Bodies (tool input, review excerpts) only for a caller who may read the content. */
   readonly content: boolean;
   readonly freshness: AttentionFreshness;
+  /** The member reading, as a stored actor: their own snoozes hide an item from them. */
+  readonly viewer?: string;
 };

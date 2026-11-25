@@ -6,13 +6,14 @@
  * the harnesses the caller may read, so a group never names or counts another.
  */
 import {
+  type AttentionChoice,
   type AttentionFreshness,
   type AttentionKind,
   CROSS_HARNESS_CAUSES,
 } from "@crewhaus/control-contract";
 import { newestEpisode } from "./adapters/runs";
 import { attRefOf } from "./ids";
-import { draftItem, msOf, showTwin } from "./items";
+import { decideChoice, draftItem, msOf, showTwin } from "./items";
 import { effectiveAttentionState } from "./lifecycle";
 import type { Drafted, GroupDraft, GroupRun } from "./types";
 
@@ -39,6 +40,35 @@ function combined(list: readonly AttentionFreshness[]): AttentionFreshness {
     if (f.stale === true) stale = true;
   }
   return { asOf, mode, ...(stale ? { stale: true } : {}) };
+}
+
+/** Said where an amount is the person's to choose, so no command is made for it. */
+const EXTEND_REASON = "The amount and reason are yours to choose: `crewhaus budget extend`.";
+
+/** What may be done about failing runs: look, say it is known, or, for a budget, raise it or wait. */
+function choicesOf(kind: AttentionKind, ref: string): AttentionChoice[] {
+  const att = ref.slice(ref.lastIndexOf("/") + 1);
+  const inspect: AttentionChoice = { id: "inspect", needs: "operator", cliTwin: showTwin(ref) };
+  const acknowledge = decideChoice(att, "acknowledge", "operator");
+  if (kind !== "budget") return [inspect, acknowledge];
+  return [
+    {
+      id: "raise-spec",
+      needs: "maintainer",
+      cliTwin: null,
+      nullReason: "The limit is in the spec: change it in Home's budget setup.",
+      permission: "h.spec.edit",
+    },
+    {
+      id: "raise-period",
+      needs: "maintainer",
+      cliTwin: null,
+      nullReason: EXTEND_REASON,
+      permission: "h.budget.extend",
+    },
+    decideChoice(att, "wait-for-renewal", "operator"),
+    acknowledge,
+  ];
 }
 
 function itemOfGroup(
@@ -86,10 +116,7 @@ function itemOfGroup(
       label: run.id,
     })),
     revision: sorted.map((run) => ({ id: `${run.harness}/${run.id}`, state: "failed" })),
-    choices:
-      effective.state === "open"
-        ? [{ id: "inspect", needs: "operator", cliTwin: showTwin(ref) }]
-        : [],
+    choices: effective.state === "open" ? choicesOf(kind, ref) : [],
     requiredClass: "operator",
     state: effective.state,
     ...(effective.resolution !== undefined ? { resolution: effective.resolution } : {}),

@@ -16,6 +16,7 @@ import {
   casAppend,
   controlPaths,
   deploymentsLedger,
+  readDeployQuorums,
   readDeployments,
   readDigestKey,
   readHarnessIdentity,
@@ -147,6 +148,62 @@ describe("activateDeployment", () => {
     expect(answer).toMatchObject({ ok: false, code: "conflict" });
     expect(!answer.ok && answer.message).toContain("protected environment");
     expect(stateOf(dir, dep)).toBe("prepared");
+  });
+
+  test("a refused activation asks for the approval once, and the activation it allows settles it", async () => {
+    const dir = harness();
+    const dep = await prepare(dir);
+    put(
+      dir,
+      ".crewhaus/environments.json",
+      JSON.stringify({ environments: { prod: { requireApproval: true } } }),
+    );
+    const activate = () =>
+      activateDeployment({
+        harnessDir: dir,
+        dep,
+        actor: ACTOR,
+        cmd: CMD,
+        gates,
+        environment: "prod",
+      });
+    const waiting = () => {
+      const read = readDeployQuorums(dir);
+      if (read.state !== "present") throw new Error(read.state);
+      return read.rows.map((row) => [row.state, row.subject] as const);
+    };
+    const subject = {
+      spec: "demo",
+      environment: "prod",
+      version: dep,
+      specHash: `sha256:${"b".repeat(64)}`,
+    };
+    expect(await activate()).toMatchObject({ ok: false, code: "conflict" });
+    expect(await activate()).toMatchObject({ ok: false, code: "conflict" });
+    expect(waiting()).toEqual([["pending", subject]]);
+
+    put(
+      dir,
+      ".crewhaus/approvals/demo__prod.json",
+      JSON.stringify([{ approver: "a", ts: "t", specHash: subject.specHash }]),
+    );
+    expect(await activate()).toMatchObject({ ok: true });
+    expect(waiting()).toEqual([["superseded", subject]]);
+  });
+
+  test("an activation into an environment nobody protects asks for nothing", async () => {
+    const dir = harness();
+    const dep = await prepare(dir);
+    const answer = await activateDeployment({
+      harnessDir: dir,
+      dep,
+      actor: ACTOR,
+      cmd: CMD,
+      gates,
+      environment: "staging",
+    });
+    expect(answer).toMatchObject({ ok: true });
+    expect(readDeployQuorums(dir).state).toBe("absent");
   });
 
   test("a service principal cannot activate", async () => {

@@ -8,7 +8,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
-import { isId, parseRef } from "@crewhaus/control-contract";
+import { type AttentionItem, isId, mintId, parseRef } from "@crewhaus/control-contract";
+import { append, decisionsLedger } from "@crewhaus/control-records";
 import type { AdvisorItem } from "@crewhaus/harness-advice/advisor";
 import {
   DAY,
@@ -26,6 +27,7 @@ import {
   treeState,
 } from "./__test__/fleet";
 import { assembleInbox, foldHarness } from "./fold";
+import { idOfItem } from "./overlays";
 
 const HRN = "hrn_0123456789abcdef";
 const OTHER = "hrn_fedcba9876543210";
@@ -60,14 +62,27 @@ describe("tool approvals and questions", () => {
       [`${HRN}/decision/${a}`, `${HRN}/decision/${b}`].sort(),
     );
     expect(folded?.affected.count).toBe(2);
-    expect(folded?.choices.every((choice) => choice.cliTwin === null)).toBe(true);
-    expect(folded?.choices[0]?.nullReason).toContain("crewhaus approvals list");
-    const single = items.find((i) => i.evidence.length === 1);
-    expect(single?.evidence[0]?.ref).toBe(`${HRN}/decision/${c}`);
-    expect(single?.choices.map((choice) => choice.cliTwin)).toEqual([
-      `crewhaus approvals grant ${c} --dir ${dir}`,
-      `crewhaus approvals deny ${c} --dir ${dir}`,
+    // Every choice has its command, and one verdict decides every request it folds.
+    expect(folded?.choices.map((choice) => choice.cliTwin)).toEqual([
+      `crewhaus inbox decide ${idOfItem(folded as AttentionItem)} grant`,
+      `crewhaus inbox decide ${idOfItem(folded as AttentionItem)} deny`,
     ]);
+    const single = items.find((i) => i.evidence.length === 1) as AttentionItem;
+    expect(single.evidence[0]?.ref).toBe(`${HRN}/decision/${c}`);
+    expect(single.choices.map((choice) => [choice.id, choice.needs, choice.cliTwin])).toEqual([
+      ["grant", "operator", `crewhaus inbox decide ${idOfItem(single)} grant`],
+      ["deny", "operator", `crewhaus inbox decide ${idOfItem(single)} deny`],
+      ["grant-always", "owner", `crewhaus inbox decide ${idOfItem(single)} grant-always`],
+      ["grant-propose", "operator", `crewhaus inbox decide ${idOfItem(single)} grant-propose`],
+    ]);
+  });
+
+  test("a question offers no verdict: it is answered, never allowed or refused", async () => {
+    const dir = harnessDir(root(), "question");
+    await park(dir, { kind: "input" });
+    const [item] = inboxOf(dir).items;
+    expect(item?.kind).toBe("question");
+    expect(item?.choices).toEqual([]);
   });
 
   test("a request without an ask is its own item, and every id it gets parses", async () => {
@@ -173,12 +188,71 @@ describe("decisions, review entries and Advisor findings", () => {
     expect(item?.requiredClass).toBe("owner");
     expect(item?.source).toEqual({ kind: "decision", id });
     expect(item?.choices.map((c) => c.cliTwin)).toEqual([
-      `crewhaus approvals grant ${id} --dir ${dir}`,
-      `crewhaus approvals deny ${id} --dir ${dir}`,
+      `crewhaus inbox decide ${idOfItem(item as AttentionItem)} grant`,
+      `crewhaus inbox decide ${idOfItem(item as AttentionItem)} deny`,
     ]);
   });
 
-  test("a delegation request opens its consequences, through the preview command", () => {
+  test("a protected environment's quorum is a maintainer's, and waits for its move once approved", () => {
+    const dir = harnessDir(root(), "quorum");
+    const subject = {
+      spec: "support-bot",
+      environment: "prod",
+      version: "v2",
+      specHash: `sha256:${"ab".repeat(32)}`,
+    };
+    const row = (over: Record<string, unknown>) => ({
+      id: mintId("dec", { now: NOW - HOUR }),
+      kind: "deploy-quorum",
+      createdAt: iso(NOW - HOUR),
+      expiresAt: iso(NOW + DAY),
+      requiredClass: "maintainer",
+      subject,
+      state: "pending",
+      ...over,
+    });
+    const pending = row({});
+    const approved = row({ subject: { ...subject, version: "v3" } });
+    const used = row({ subject: { ...subject, version: "v4" } });
+    const build = row({ subject: { ...subject, version: mintId("dep") } });
+    for (const r of [pending, approved, used, build]) append(decisionsLedger(dir), r);
+    const granted = (r: Record<string, unknown>) => ({ ...r, state: "granted", decision: "grant" });
+    for (const r of [approved, used, build]) append(decisionsLedger(dir), granted(r));
+    append(decisionsLedger(dir), { ...granted(used), state: "consumed", consumedAt: iso(NOW) });
+    const items = inboxOf(dir).items;
+    expect(items.map((i) => i.kind)).toEqual([
+      "deploy-approval",
+      "deploy-approval",
+      "deploy-approval",
+    ]);
+    const of = (version: string) => items.find((i) => i.title.params["version"] === version);
+    expect(of("v2")?.title.template).toBe("deploy-approval.pending");
+    expect(of("v2")?.requiredClass).toBe("maintainer");
+    expect(of("v2")?.choices.map((c) => c.id)).toEqual(["approve", "deny"]);
+    expect(of("v3")?.title.template).toBe("deploy-approval.ready");
+    expect(of("v3")?.choices).toEqual([
+      {
+        id: "promote",
+        needs: "maintainer",
+        permission: "h.deploy",
+        cliTwin: "crewhaus spec pin support-bot prod v3",
+      },
+    ]);
+    expect(of(build.subject.version)?.choices[0]?.cliTwin).toBe(
+      `crewhaus deploy activate ${build.subject.version} --environment prod`,
+    );
+    // Once the move used it, it is settled.
+    expect(of("v4")).toBeUndefined();
+    expect(inboxOf(dir, { state: "all" }).items).toHaveLength(4);
+    // An approval that ran out waits for nothing.
+    const late = assembleInbox(
+      [foldHarness(dir, testFacts(), NOW + 2 * DAY, { harness: HRN })],
+      NOW + 2 * DAY,
+    );
+    expect(late.items).toEqual([]);
+  });
+
+  test("a delegation request opens its consequences, through the preview command, and may be refused", () => {
     const dir = harnessDir(root(), "delegate");
     proposal(dir, { delegate: "merge" });
     const [item] = inboxOf(dir).items;
@@ -186,7 +260,10 @@ describe("decisions, review entries and Advisor findings", () => {
       template: "delegation-proposal.pending",
       params: { delegationAction: "merge" },
     });
-    expect(item?.choices[0]?.cliTwin).toBe(`crewhaus delegations preview merge --harness ${HRN}`);
+    expect(item?.choices.map((c) => [c.id, c.cliTwin])).toEqual([
+      ["review", `crewhaus delegations preview merge --harness ${HRN}`],
+      ["deny", `crewhaus inbox decide ${idOfItem(item as AttentionItem)} deny`],
+    ]);
   });
 
   test("an open review entry is a review item; its excerpt reaches only a content reader", () => {

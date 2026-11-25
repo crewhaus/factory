@@ -5,9 +5,11 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-contract" },
     { "path": "../control-records" },
     { "path": "../dataset-registry" },
     { "path": "../eval-dataset" },
+    { "path": "../event-log" },
     { "path": "../pii-redactor" }
   ],
   "include": ["src/**/*"]

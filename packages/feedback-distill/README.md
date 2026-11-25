@@ -19,7 +19,12 @@ toolchain and a **compiled daemon bundle** can run it.
 - `review-queue.ts` — the B20 persistent human-review queue
   (`.crewhaus/review/queue.jsonl`) and its feeders. Lives here so the DAEMON
   step can enqueue B19 rater disagreements; `apps/cli/src/review-queue.ts`
-  re-exports it unchanged.
+  re-exports it unchanged. An entry is resolved once: its claim is taken first,
+  and the resolved line says who and through which door.
+- `adjudicate.ts` (the `./adjudicate` subpath, outside the main entry) — a
+  person's verdict on one entry, the same from Home, the inbox and the CLI: a
+  rating on a session's turn goes on that session's log before the entry is
+  resolved, and a verdict on an entry with no turn is recorded on the entry.
 - `janitor-step.ts` — `createDistillJanitorStep()`: a `@crewhaus/runtime-core`
   janitor step (same seam as the dream step) that distills accumulated ratings
   into a new version of the `<spec>-ratings` registry dataset on the daemon's

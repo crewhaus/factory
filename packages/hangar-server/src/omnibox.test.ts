@@ -275,6 +275,30 @@ describe("the approvals the menu finds", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("a request put off still waits, and is still found", () => {
+    const root = mkdtempSync(join(tmpdir(), "hangar-omni-deferred-"));
+    try {
+      const dir = join(root, "h");
+      makeFixtureHarness(dir, {
+        specName: "asks",
+        approvals: [
+          approvalLine("appr_000000000000000a", {
+            toolName: "Bash",
+            expiresAt: new Date(NOW + DAY).toISOString(),
+            deferredUntil: new Date(NOW + 2 * DAY).toISOString(),
+            deferredAt: new Date(NOW).toISOString(),
+            deferReason: "awaiting-information",
+          }),
+        ],
+      });
+      const harness: IndexHarness = { id: "hrn_1", specName: "asks", dir, groups: [], tags: [] };
+      const found = buildHarnessEntries(harness, NOW).filter((e) => e.kind === "approval");
+      expect(found.map((e) => e.subtitle)).toEqual(["deferred · asks"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createOmniIndex", () => {

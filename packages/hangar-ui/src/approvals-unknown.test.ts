@@ -1,15 +1,18 @@
 /**
  * A harness whose approvals cannot be read: its fleet row keeps `null` and says
- * "Approvals unknown" in words, and the approvals inbox names it, so the inbox never
- * reads as complete.
+ * "Approvals unknown" in words, and Home's Needs-you panel names it, so it never reads
+ * as complete.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { APPROVALS_UNKNOWN, normalizeRows } from "../assets/js/util.js";
-// @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { unreachableNames, unreachableNote } from "../assets/js/views/approvals.js";
+import {
+  APPROVALS_UNKNOWN,
+  normalizeRows,
+  unreachableNames,
+  unreachableNote,
+} from "../assets/js/util.js";
 
 const VIEWS = join(import.meta.dir, "..", "assets", "js", "views");
 
@@ -44,7 +47,7 @@ describe("a fleet row whose approvals are unknown", () => {
   });
 });
 
-describe("the approvals inbox names what it could not read", () => {
+describe("the Needs-you panel names what it could not read", () => {
   test("by spec name, falling back to the id", () => {
     expect(
       unreachableNames({

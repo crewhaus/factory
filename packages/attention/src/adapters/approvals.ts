@@ -31,16 +31,15 @@ import {
   containedSessionRoot,
   foldWithClaims,
 } from "@crewhaus/session-store";
-import { attRefOf, digestPrefix } from "../ids";
+import { attIdOf, attRefOf, digestPrefix } from "../ids";
 import {
   classOf,
-  dirFits,
+  decideChoice,
   draftItem,
   higherClass,
   isoOf,
   msOf,
   timeOf,
-  twinOf,
   viaOf,
 } from "../items";
 import { effectiveAttentionState } from "../lifecycle";
@@ -131,6 +130,12 @@ export function approvalFactOf(record: PendingApproval): ApprovalFact {
   } as ApprovalFact;
 }
 
+/** A kept fact held to the grammars a fresh read holds it to, or `undefined`. */
+export function closedApprovalFact(fact: ApprovalFact): ApprovalFact | undefined {
+  const record = fact as unknown as PendingApproval;
+  return isApprovalRecord(record) ? approvalFactOf(record) : undefined;
+}
+
 /**
  * The approvals section, re-read only when the session root or its file changed. Answers
  * `prev` itself when nothing did.
@@ -214,41 +219,23 @@ function stateOf(fact: ApprovalFact, now: number) {
   );
 }
 
-/** The command that answers one request: the approvals area's own template. */
-const APPROVALS_CHOICE = { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] } as const;
-
-/** Said where a request's id or folder fits no command. */
-const UNRECOGNISED = "This request's id or folder fits no command; decide it in Home.";
-
+/**
+ * What may be done about a request: allow or refuse it, and for one request alone, allow
+ * it from now on (an owner's narrow rule) or allow it once and ask the owner for that. A
+ * question is answered, never allowed or refused.
+ */
 function choicesOf(
-  records: readonly ApprovalFact[],
-  dir: string,
-  relocated: boolean,
+  kind: AttentionKind,
+  att: string,
+  count: number,
   needs: DecisionClass,
 ): AttentionChoice[] {
-  const one = records.length === 1 ? records[0] : undefined;
-  return (["grant", "deny"] as const).map((choice) => {
-    if (one === undefined) {
-      return {
-        id: choice,
-        needs,
-        cliTwin: null,
-        nullReason: "Decide each request: `crewhaus approvals list`.",
-      };
-    }
-    if (relocated) {
-      return {
-        id: choice,
-        needs,
-        cliTwin: null,
-        nullReason: "This harness keeps its sessions folder elsewhere; decide it in Home.",
-      };
-    }
-    const cliTwin = twinOf(APPROVALS_CHOICE, { choice, appr: one.id, dir });
-    return cliTwin !== undefined && dirFits(dir)
-      ? { id: choice, needs, cliTwin }
-      : { id: choice, needs, cliTwin: null, nullReason: UNRECOGNISED };
-  });
+  if (kind === "question") return [];
+  const ids =
+    count === 1
+      ? (["grant", "deny", "grant-always", "grant-propose"] as const)
+      : (["grant", "deny"] as const);
+  return ids.map((id) => decideChoice(att, id, id === "grant-always" ? "owner" : needs));
 }
 
 /**
@@ -327,6 +314,12 @@ export function approvalItems(
         : ttl !== undefined && open
           ? { at: isoOf(ttl), source: "ttl" as const }
           : undefined;
+    const deferredUntil = open
+      ? shown
+          .map((fact) => fact.deferredUntil)
+          .filter((at): at is string => (msOf(at) ?? 0) > now)
+          .sort((a, b) => (msOf(a) ?? 0) - (msOf(b) ?? 0))[0]
+      : undefined;
     const fallback = shown.find((fact) => fact.ifUnanswered !== undefined)?.ifUnanswered;
     const binding = shown.length === 1 ? first.bindingDigest : undefined;
     // An ask about people carries the mark Home's exit withholds such items by.
@@ -364,8 +357,10 @@ export function approvalItems(
           id: fact.id,
           state: stateOf(fact, now).state,
         })),
-        choices: open ? choicesOf(shown, ctx.dir, section.relocated === true, needs) : [],
-        ...(open && refused !== undefined && needs !== "owner"
+        choices: open
+          ? choicesOf(kind, attIdOf(harness, kind, approvalKeyOf(first)), shown.length, needs)
+          : [],
+        ...(open && kind === "permission" && refused !== undefined && needs !== "owner"
           ? {
               recommendation: {
                 choiceId: "deny",
@@ -378,7 +373,15 @@ export function approvalItems(
           ? { ifUnanswered: { template: `if-unanswered.${fallback}` } }
           : {}),
         requiredClass: needs,
-        state: open ? "open" : (settled?.state ?? "expired"),
+        // Put off: its own deadline moved with it, so it stays in the list.
+        ...(deferredUntil !== undefined
+          ? { deferral: { until: deferredUntil, deadlineMoved: true } }
+          : {}),
+        state: open
+          ? deferredUntil !== undefined
+            ? "deferred"
+            : "open"
+          : (settled?.state ?? "expired"),
         ...(settled?.resolution !== undefined ? { resolution: settled.resolution } : {}),
         ...(binding !== undefined ? { binding: { digestPrefix: binding.slice(0, 12) } } : {}),
         ...(people ? { sensitivity: "people" as const } : {}),

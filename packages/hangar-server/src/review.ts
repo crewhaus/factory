@@ -2,50 +2,38 @@
  * The fleet review queue — `.crewhaus/review/queue.jsonl` folded across every
  * registered harness, and the one write that closes an item.
  *
- * Both halves go through `@crewhaus/feedback-distill`'s own module
- * (`readReviewQueue` / `resolveReviewEntry`), which is append-only and folds
- * later-line-wins, so the manager and `crewhaus review` are literally the
- * same reader and the same writer.
+ * Both halves go through `@crewhaus/feedback-distill`'s own modules
+ * (`readReviewQueue`, and `adjudicateReviewEntry` from its `./adjudicate`
+ * subpath), which are append-only and fold later-line-wins, so the manager,
+ * the inbox and `crewhaus review` are literally the same reader and the same
+ * writer.
  *
  * ADJUDICATION IS NOT JUST A QUEUE CLOSE. When the item points at a session
- * TURN — a B19 rater disagreement — closing it in the queue alone would
- * leave the disagreement unsettled at the feedback source, and the next
- * `crewhaus distill` would re-open it. So a verdict on such an item takes the
- * SAME path `crewhaus rate --adjudicate` takes: a `FeedbackRecord` built by
- * `buildFeedbackRecord({ adjudicate: true })`, appended as a `user_feedback`
- * event on the session's own log, and only then the queue entry resolved.
- * Items with no session turn (eval abstentions, quarantine pointers) record
- * the human's pass/fail on the item itself, exactly as the CLI's `next` does.
- *
- * Whoever resolves an item takes its claim first, before a rating or a line is
- * written: of two verdicts on one item one is recorded, whichever surface each
- * came from, and it says who and where.
+ * TURN — a B19 rater disagreement — a verdict takes the SAME path
+ * `crewhaus rate --adjudicate` takes: an adjudicating `FeedbackRecord` on the
+ * session's own log, and only then the queue entry resolved. Items with no
+ * session turn record the human's pass/fail on the item itself. Whoever
+ * resolves an item takes its claim first, so of two verdicts on one item one is
+ * recorded, and it says who and where.
  */
-import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
-import { openEventLog } from "@crewhaus/event-log";
+import { type ReviewQueueEntry, readReviewQueue } from "@crewhaus/feedback-distill";
 import {
-  FEEDBACK_EVENT_KIND,
-  type ReviewActor,
-  type ReviewQueueEntry,
-  buildFeedbackRecord,
-  claimReviewEntry,
-  readReviewQueue,
-  resolveReviewEntry,
-} from "@crewhaus/feedback-distill";
-import { SESSION_ID_RE } from "./constants";
+  type AdjudicateRequest,
+  type AdjudicateResult,
+  REVIEW_VERDICTS,
+  type ReviewVerdict,
+  adjudicateReviewEntry,
+  isAdjudicable,
+  isReviewVerdict,
+} from "@crewhaus/feedback-distill/adjudicate";
 import { maskText } from "./mask";
 import { resolveInside } from "./safety";
 import { reachableSessionRoot } from "./sessions";
 
 /** Verdicts the review route accepts. `up`/`down` adjudicate a rated turn;
  *  `pass`/`fail` record a verdict on the item itself. */
-export const REVIEW_VERDICTS = ["up", "down", "pass", "fail"] as const;
-export type ReviewVerdict = (typeof REVIEW_VERDICTS)[number];
-
-export function isReviewVerdict(value: string): value is ReviewVerdict {
-  return (REVIEW_VERDICTS as readonly string[]).includes(value);
-}
+export { REVIEW_VERDICTS, type ReviewVerdict, isReviewVerdict };
 
 export type ReviewRow = Omit<ReviewQueueEntry, "context"> & {
   /** The quoted context, masked; `null` when the reader may not read this harness's content. */
@@ -74,10 +62,6 @@ export type ReviewHarness = {
 function hasQueue(harnessDir: string): boolean {
   const path = resolveInside(harnessDir, [".crewhaus", "review", "queue.jsonl"]);
   return path !== undefined && existsSync(path);
-}
-
-function adjudicable(entry: ReviewQueueEntry): boolean {
-  return typeof entry.sourceRef.sessionId === "string" && typeof entry.sourceRef.turn === "number";
 }
 
 /** Fold every registered harness's review queue, oldest open first. */
@@ -113,7 +97,7 @@ export function reviewInbox(
         harnessId: harness.id,
         harnessDir: harness.dir,
         specName: harness.specName,
-        adjudicable: adjudicable(entry),
+        adjudicable: isAdjudicable(entry),
       });
     }
   }
@@ -121,111 +105,23 @@ export function reviewInbox(
   return { items, open: items.filter((i) => i.status === "open").length };
 }
 
-export type AdjudicateResult =
-  | {
-      readonly outcome: "resolved";
-      readonly entry: ReviewQueueEntry;
-      /** True when the verdict also landed as an adjudicating FeedbackRecord. */
-      readonly adjudicated: boolean;
-      readonly resolution: string;
-    }
-  | { readonly outcome: "already-resolved"; readonly entry: ReviewQueueEntry }
-  | { readonly outcome: "not-found" }
-  | { readonly outcome: "rejected"; readonly reason: string };
+export type { AdjudicateResult };
 
 /**
- * Close one review item. `up`/`down` on a session-turn item routes through
- * the capture path `crewhaus rate --adjudicate` uses; every other
- * combination records the verdict on the item.
+ * Close one review item, through the writer every surface shares
+ * (`@crewhaus/feedback-distill/adjudicate`): `up`/`down` on a session-turn item routes
+ * through the capture path `crewhaus rate --adjudicate` uses; every other combination
+ * records the verdict on the item. The sessions folder is the one Home reads, inside the
+ * harness.
  */
-export async function adjudicateReview(args: {
-  readonly harnessDir: string;
-  readonly itemId: string;
-  readonly verdict: ReviewVerdict;
-  readonly note?: string;
-  readonly by: string;
-  /** Who resolves it as the resolved line records it: a stored actor and a door. */
-  readonly actor?: ReviewActor;
-  /** Where the rating was captured: Home's own screen, or the command line. */
-  readonly source?: "ui" | "cli";
-  readonly nowIso: string;
-}): Promise<AdjudicateResult> {
-  const entry = readReviewQueue(args.harnessDir).find((e) => e.id === args.itemId);
-  if (entry === undefined) return { outcome: "not-found" };
-  if (entry.status === "resolved") return { outcome: "already-resolved", entry };
-
-  const isThumbs = args.verdict === "up" || args.verdict === "down";
-  if (isThumbs && !adjudicable(entry)) {
-    return {
-      outcome: "rejected",
-      reason:
-        "this item points at no session turn — record pass/fail on the item instead of a thumbs adjudication",
-    };
-  }
-
-  let rating: { record: ReturnType<typeof buildFeedbackRecord>; root: string } | undefined;
-  if (isThumbs) {
-    const sessionId = entry.sourceRef.sessionId as string;
-    const turnNumber = entry.sourceRef.turn as number;
-    if (!SESSION_ID_RE.test(sessionId)) {
-      return { outcome: "rejected", reason: "queue entry names an invalid session id" };
-    }
-    const reach = reachableSessionRoot(args.harnessDir);
-    if (!reach.reachable) return { outcome: "rejected", reason: reach.note };
-    const root = reach.root;
-    let record: ReturnType<typeof buildFeedbackRecord>;
-    try {
-      record = buildFeedbackRecord({
-        id: `fb_${randomBytes(6).toString("hex")}`,
-        sessionId,
-        turnNumber,
-        ts: args.nowIso,
-        source: args.source ?? "ui",
-        thumbs: args.verdict,
-        rater: args.by,
-        adjudicate: true,
-      });
-    } catch (err) {
-      return { outcome: "rejected", reason: err instanceof Error ? err.message : String(err) };
-    }
-    rating = { record, root };
-  }
-
-  // Claimed before anything is written: a loser appends no rating and no line.
-  const claim = claimReviewEntry(args.harnessDir, args.itemId, {
-    at: args.nowIso,
-    ...(args.actor !== undefined ? { actor: args.actor } : {}),
+export function adjudicateReview(
+  args: Omit<AdjudicateRequest, "sessionRoot">,
+): Promise<AdjudicateResult> {
+  return adjudicateReviewEntry({
+    ...args,
+    sessionRoot: (dir) => {
+      const reach = reachableSessionRoot(dir);
+      return reach.reachable ? { root: reach.root } : { note: reach.note };
+    },
   });
-  if (claim.outcome === "unavailable") return { outcome: "rejected", reason: claim.reason };
-  if (claim.outcome === "taken") return { outcome: "already-resolved", entry };
-  const adjudicated = rating !== undefined;
-  if (rating !== undefined) {
-    const log = await openEventLog(rating.record.sessionId, { rootDir: rating.root });
-    try {
-      await log.append({ kind: FEEDBACK_EVENT_KIND, payload: rating.record });
-    } finally {
-      await log.close();
-    }
-  }
-
-  const resolution =
-    args.note !== undefined && args.note !== ""
-      ? args.note
-      : adjudicated
-        ? `adjudicated: thumbs ${args.verdict}`
-        : args.verdict;
-  const result = resolveReviewEntry(
-    args.harnessDir,
-    args.itemId,
-    resolution,
-    args.nowIso,
-    args.actor,
-    { claimed: true },
-  );
-  if (result.outcome === "not-found") return { outcome: "not-found" };
-  if (result.outcome === "unavailable") return { outcome: "rejected", reason: result.reason };
-  if (result.outcome === "already-resolved") {
-    return { outcome: "already-resolved", entry: result.entry };
-  }
-  return { outcome: "resolved", entry: result.entry, adjudicated, resolution };
 }

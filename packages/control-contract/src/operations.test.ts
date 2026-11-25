@@ -571,7 +571,7 @@ describe("the table holds together", () => {
   );
 
   test("every twin verb and placeholder is used, by a row or by a kind the CLI submits first", () => {
-    expect(cliFirst.length).toBe(9);
+    expect(cliFirst.length).toBe(11);
     expect(unusedTwinVocabulary([...OPERATIONS, ...cliFirst], ENV, ["grant", "deny"])).toEqual([]);
     // Without them the quality vocabulary would be unused.
     expect(unusedTwinVocabulary(OPERATIONS, ENV, ["grant", "deny"])).toContain("{chg}");

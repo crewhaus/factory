@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { ensureAccessSetUp, openAccess } from "@crewhaus/access-control";
 import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, decisionsLedger, runsLedger } from "@crewhaus/control-records";
 import {
@@ -123,7 +124,7 @@ export function proposal(
     createdAt: iso(at),
     expiresAt: iso(at + 7 * DAY),
     requiredClass: "owner",
-    proposedBy: "local:#0123456789abcdef",
+    proposedBy: `local:#${"0123456789abcdef".repeat(4)}`,
     ...(opts.delegate === undefined ? { derivedFrom: `appr_${"b".repeat(16)}` } : {}),
     terms,
   });
@@ -246,4 +247,44 @@ export function treeState(root: string): Map<string, string> {
   };
   walk(root);
   return out;
+}
+
+/** Who a Home's access records say may decide on a harness, set up through their own writer. */
+export type Members = {
+  readonly owner: string;
+  readonly maintainer: string;
+  readonly operator: string;
+  readonly viewer: string;
+};
+
+/**
+ * A Home whose owner is this computer's `sam`, with a maintainer, an operator and a viewer
+ * of the whole Home; the harness's own list of who may approve is written with them.
+ */
+export async function withMembers(
+  hangarRoot: string,
+  harness: { readonly id: string; readonly dir: string },
+): Promise<Members> {
+  const now = () => NOW - DAY;
+  const set = await ensureAccessSetUp(hangarRoot, { localActor: "local:sam@laptop", now });
+  if (!set.ok) throw new Error(set.reason);
+  const access = openAccess(hangarRoot, {
+    now,
+    harnesses: () => [{ ...harness, groups: [] }],
+  });
+  const owner = set.result.owner;
+  const add = async (member: string, role: string): Promise<string> => {
+    const done = await access.grant(
+      { principal: owner },
+      { member, create: true, role, scope: "home" },
+    );
+    if (!done.ok) throw new Error(done.reason);
+    return done.result.principal;
+  };
+  return {
+    owner,
+    maintainer: await add("Mel", "maintainer"),
+    operator: await add("Olly", "operator"),
+    viewer: await add("Vic", "viewer"),
+  };
 }

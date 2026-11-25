@@ -11,6 +11,7 @@
  * one release.
  */
 import { isAbsolute } from "node:path";
+import { GRAPH_RUN_ID_RE } from "@crewhaus/control-contract";
 
 /** Job kinds the M2 action faces submit. Anything else is a 400. */
 export const JOB_KINDS = ["doctor", "compile", "eval", "dream-run"] as const;
@@ -88,4 +89,27 @@ export function exportHarnessArgv(out: string): string[] {
     throw new JobArgumentError("export: the archive path holds a control character");
   }
   return ["state", "backup", "--out", out];
+}
+
+/**
+ * The job that settles a graph run's pause: `crewhaus runs resume <grun> --decision
+ * approve|reject`. Like the export, it is not one of {@link JOB_KINDS}: only the inbox
+ * queues it, for a decision a person made on that pause.
+ */
+export const RUNS_RESUME_JOB_KIND = "runs-resume";
+
+/** The decisions a job may carry. Free text is the command line's own. */
+export const GRAPH_JOB_DECISIONS = ["approve", "reject"] as const;
+
+export type GraphJobDecision = (typeof GRAPH_JOB_DECISIONS)[number];
+
+/** The argv that resumes a paused graph run: a minted run id and one of two words. */
+export function runsResumeArgv(grun: string, decision: string): string[] {
+  if (typeof grun !== "string" || !GRAPH_RUN_ID_RE.test(grun)) {
+    throw new JobArgumentError("runs resume: the run must be a graph run id, grun_ and 16 hex");
+  }
+  if (!(GRAPH_JOB_DECISIONS as readonly string[]).includes(decision)) {
+    throw new JobArgumentError("runs resume: the decision is approve or reject");
+  }
+  return ["runs", "resume", grun, "--decision", decision];
 }

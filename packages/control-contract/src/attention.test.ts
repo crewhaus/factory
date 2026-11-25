@@ -1,33 +1,42 @@
 /**
  * The attention module: its ids round-trip through the core's grammar and ref parser, its
- * field names survive Home's masker, its vocabularies are closed and consistent, and its
- * rows read with a home permission and a real twin.
+ * field names survive Home's masker, its vocabularies are closed and consistent, its reads
+ * take a home permission, and its writes name their harness, with a real twin each.
  */
 import { describe, expect, test } from "bun:test";
 import { isCredentialKey } from "@crewhaus/spec-patch";
 import type { z } from "zod";
 import { walkFieldNames } from "./__test__/checkers.js";
 import {
+  ATTENTION_ACTION_EVENTS,
+  ATTENTION_ACT_CHOICES,
   ATTENTION_BANDS,
+  ATTENTION_CHOICE_ROWS,
   ATTENTION_ID_RE,
   ATTENTION_KINDS,
   ATTENTION_KIND_ROWS,
   ATTENTION_MODULE,
   CAUSE_KINDS,
   CROSS_HARNESS_CAUSES,
+  DEPLOY_QUORUM_KIND,
+  EVENT_TAXONOMY,
   MACHINES,
   OPERATIONS,
   TITLE_TEMPLATES,
   attIdFromDigest,
   attentionBandOf,
+  attentionChoiceDoes,
   attentionKey,
   attentionRef,
   canTransition,
+  encodeCursor,
   isId,
+  mintId,
   parseRef,
   renderTwin,
 } from "./index.js";
 import { ATTENTION_SCHEMAS } from "./schemas/attention.js";
+import { decision, eventEnvelope } from "./schemas/core.js";
 
 const digest = (seed: number) => new Uint8Array(32).map((_, i) => (i * 31 + seed) % 256);
 
@@ -99,17 +108,21 @@ describe("field names survive the masker", () => {
 });
 
 describe("the module", () => {
-  test("three reads, each on a home permission with its own twin", () => {
-    const rows = OPERATIONS.filter((op) => op.id.startsWith("attention."));
-    expect(rows.map((op) => op.id).sort()).toEqual([
+  const rows = OPERATIONS.filter((op) => op.id.startsWith("attention."));
+
+  test("three reads on a home permission, each with its own twin, and the discussion on content", () => {
+    const reads = rows.filter((op) => op.method === "GET");
+    expect(reads.map((op) => op.id).sort()).toEqual([
       "attention.get",
       "attention.list",
+      "attention.messages.list",
       "attention.metrics",
     ]);
-    for (const row of rows) {
-      expect(row.permission).toBe("home.read");
+    for (const row of reads) {
+      expect(row.permission).toBe(
+        row.id === "attention.messages.list" ? "h.read.content" : "home.read",
+      );
       expect(row.receipt).toBe("none");
-      expect(row.method).toBe("GET");
       expect(row.cliTwin?.argv[0]).toBe("inbox");
     }
     const show = ATTENTION_MODULE.operations.find((op) => op.id === "attention.get");
@@ -120,6 +133,119 @@ describe("the module", () => {
     expect(renderTwin(show?.cliTwin as never, { att: "appr_0123456789abcdef" })).toEqual({
       invalid: ["att"],
     });
+  });
+
+  test("every write names its harness in the path, is receipted there, and has a twin or says why not", () => {
+    const writes = rows.filter((op) => op.method !== "GET");
+    expect(writes.map((op) => op.id).sort()).toEqual([
+      "attention.acknowledge",
+      "attention.assign",
+      "attention.defer",
+      "attention.dismiss",
+      "attention.messages.add",
+      "attention.reopen",
+      "attention.resolve",
+      "attention.snooze",
+      "attention.unassign",
+      "attention.undefer",
+    ]);
+    for (const row of writes) {
+      expect(row.method).toBe("POST");
+      expect(row.receipt).toBe("harness");
+      const snooze = row.id === "attention.snooze";
+      expect(`${row.id}: ${row.path.startsWith("/api/v1/harnesses/{h}/attention/{ref}/")}`).toBe(
+        `${row.id}: ${!snooze}`,
+      );
+      expect(row.permission).toBe(snooze ? "self.preferences" : "h.decision.resolve");
+      if (row.cliTwin === null) expect(row.noTwinReason).toContain("crewhaus inbox discuss");
+      else expect(row.cliTwin.argv[0]).toBe("inbox");
+    }
+    // What the caller may decide is checked against the item's class as well.
+    const classed = writes.filter((op) => (op.qualifiers as readonly string[]).includes("class"));
+    expect(classed.map((op) => op.id).sort()).toEqual([
+      "attention.defer",
+      "attention.resolve",
+      "attention.undefer",
+    ]);
+  });
+
+  test("each choice belongs to a kind, once, and resolve carries out only the ones that do something", () => {
+    const seen = new Set<string>();
+    for (const row of ATTENTION_CHOICE_ROWS) {
+      expect(ATTENTION_KINDS).toContain(row.kind);
+      expect(seen.has(`${row.kind}.${row.choice}`)).toBe(false);
+      seen.add(`${row.kind}.${row.choice}`);
+    }
+    // A question is answered, never allowed or refused: it offers no choice.
+    expect(ATTENTION_CHOICE_ROWS.some((row) => (row.kind as string) === "question")).toBe(false);
+    for (const row of ATTENTION_CHOICE_ROWS) {
+      expect(attentionChoiceDoes(row.kind, row.choice)).toBe(row.does);
+    }
+    expect(attentionChoiceDoes("permission", "promote")).toBeUndefined();
+    expect(attentionChoiceDoes("question", "grant")).toBeUndefined();
+    for (const open of ["inspect", "open", "adopt", "review", "raise-spec", "raise-period"]) {
+      expect(ATTENTION_ACT_CHOICES).not.toContain(open);
+    }
+    expect(ATTENTION_SCHEMAS.attentionResolveRequest.safeParse({ choice: "grant" }).success).toBe(
+      true,
+    );
+    expect(ATTENTION_SCHEMAS.attentionResolveRequest.safeParse({ choice: "inspect" }).success).toBe(
+      false,
+    );
+  });
+
+  test("an action's event is a type of the attention family, and a snooze is its member's own", () => {
+    const [family] = ATTENTION_MODULE.eventFamilies;
+    expect(family.family).toBe("attention");
+    expect(family.types.map((row) => row.type) as string[]).toEqual(
+      ATTENTION_ACTION_EVENTS.map((event) => `attention.${event}`),
+    );
+    for (const row of family.types) {
+      expect(EVENT_TAXONOMY[row.type]).toEqual({
+        family: "attention",
+        sensitivity: row.type === "attention.snoozed" ? "restricted" : "internal",
+      });
+    }
+  });
+
+  test("an event names the item by its ref, and nothing else fits there", () => {
+    const base = {
+      v: 1,
+      id: encodeCursor({ v: 1, kind: "fleet", epoch: 1, seq: 2 }),
+      type: "attention.resolved",
+      at: "2026-11-19T00:00:00.000Z",
+      ingestedAt: "2026-11-19T00:00:00.000Z",
+      harness: "hrn_0123456789abcdef",
+      sensitivity: "internal",
+    };
+    const ref = attentionRef(attIdFromDigest(digest(5)));
+    expect(eventEnvelope.safeParse({ ...base, attention: ref }).success).toBe(true);
+    expect(eventEnvelope.safeParse({ ...base, attention: "call jane" }).success).toBe(false);
+  });
+
+  test("a protected environment's quorum parses as a decision, bound to one version", () => {
+    const subject = {
+      spec: "support-bot",
+      environment: "prod",
+      version: "v1",
+      specHash: `sha256:${"0".repeat(64)}`,
+    };
+    const row = {
+      id: mintId("dec"),
+      kind: DEPLOY_QUORUM_KIND,
+      createdAt: "2026-11-19T00:00:00.000Z",
+      state: "pending",
+      requiredClass: "maintainer",
+      subject,
+    };
+    expect(decision.safeParse(row).success).toBe(true);
+    for (const bad of [
+      { ...subject, environment: "--prod" },
+      { ...subject, spec: "call jane" },
+      { ...subject, specHash: "0".repeat(64) },
+    ]) {
+      expect(decision.safeParse({ ...row, subject: bad }).success).toBe(false);
+    }
   });
 
   test("the lifecycle: open first, three ends, and no way back from one", () => {

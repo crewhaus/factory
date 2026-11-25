@@ -214,8 +214,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(60);
-    expect(pins).toBe(92);
+    expect(Object.keys(REQUIRED).length).toBe(71);
+    expect(pins).toBe(111);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -345,6 +345,11 @@ describe("the server's twins, by import", () => {
     };
     const INBOX = {
       att: attIdFromDigest(new Uint8Array(32).fill(7)),
+      prn: mintId("prn"),
+      grun: "grun_0123456789abcdef",
+      specName: "poly",
+      env: "prod",
+      version: "1.2.0",
     };
     const ACCESS = {
       grt: mintId("grt"),
@@ -379,6 +384,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "merge",
         ...INBOX,
+        attChoice: "grant",
+        dismissReason: "known",
+        graphDecision: "approve",
         ...WORK,
         declineReason: "not-now",
         correctionScope: "item",
@@ -404,6 +412,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "rollout",
         ...INBOX,
+        attChoice: "wait-for-renewal",
+        dismissReason: "not-a-problem",
+        graphDecision: "reject",
         ...WORK,
         declineReason: "needs-evidence",
         correctionScope: "all",

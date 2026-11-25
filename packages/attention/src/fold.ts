@@ -1,7 +1,8 @@
 /**
  * One fold, two ways to reach it. The read model folds the harness's decision and run
- * ledgers line by line and refreshes what no ledger holds (its approvals, its review
- * queue and its failure messages) only when their files changed. {@link harnessAttention}
+ * ledgers, and the actions people took on its items, line by line, and refreshes what no
+ * ledger holds (its approvals, its review queue, its paused graph runs and its failure
+ * messages) only when their files changed. {@link harnessAttention}
  * turns a model into the harness's items; {@link foldHarness} folds the model from the
  * start on the spot, so a harness with no saved projection reads the same items Home's
  * projection gives. {@link assembleInbox} puts several harnesses into one list: groups
@@ -18,17 +19,21 @@ import {
 import {
   type ResumeItem,
   type ResumeSources,
+  attentionActionsLedger,
   decisionsLedger,
+  readHarnessIdentity,
   resume,
   runsLedger,
 } from "@crewhaus/control-records";
 import { advisorItems } from "./adapters/advisor";
 import { approvalBodies, approvalItems, readApprovalsSection } from "./adapters/approvals";
+import { checkpointBodies, checkpointItems, readCheckpointsSection } from "./adapters/checkpoints";
 import { decisionItems, foldDecisionLine } from "./adapters/decisions";
 import { readReviewSection, reviewBodies, reviewItems } from "./adapters/review";
 import { foldRunLine, readFailuresSection, runGroups, signaturesOf } from "./adapters/runs";
 import { credentialFactsOf } from "./causes";
 import { groupAcross } from "./groups";
+import { foldActionLine, hiddenNow, idOfItem, overlaid, overlaidGroup } from "./overlays";
 import { producedItems } from "./producers";
 import { type AttentionReader, DEFAULT_READER, READ_CAPS } from "./read";
 import type {
@@ -40,30 +45,39 @@ import type {
   ItemContext,
   MetricDecision,
 } from "./types";
+import { upgraded } from "./upgrade";
 
 /** A model with nothing folded or read. */
 export function emptyModel(): AttentionModel {
   return {
-    v: 1,
+    v: 2,
     decisions: {},
     runs: {},
     approvals: { stamp: "", facts: [] },
     review: { stamp: "", facts: [] },
     failures: { stamp: "", facts: [] },
+    checkpoints: { stamp: "", facts: [] },
+    overlays: {},
   };
 }
 
 /** The ledgers the model follows. */
 export function modelSources(harnessDir: string): ResumeSources {
-  return { decisions: decisionsLedger(harnessDir), runs: runsLedger(harnessDir) };
+  return {
+    decisions: decisionsLedger(harnessDir),
+    runs: runsLedger(harnessDir),
+    attention: attentionActionsLedger(harnessDir),
+  };
 }
 
 /** Fold one ledger line into the model, in place. */
 export function foldModelLine(state: AttentionModel, item: ResumeItem): AttentionModel {
   if (item.kind !== "line") return state;
-  if (item.source === "decisions") return foldDecisionLine(state, item.record);
-  if (item.source === "runs") return foldRunLine(state, item.record);
-  return state;
+  const model = upgraded(state);
+  if (item.source === "decisions") return foldDecisionLine(model, item.record);
+  if (item.source === "runs") return foldRunLine(model, item.record);
+  if (item.source === "attention") return foldActionLine(model, item.record);
+  return model;
 }
 
 /**
@@ -71,18 +85,25 @@ export function foldModelLine(state: AttentionModel, item: ResumeItem): Attentio
  * nothing did, so a projector writes nothing for a harness that did not move.
  */
 export function refreshModel(
-  state: AttentionModel,
+  saved: AttentionModel,
   harnessDir: string,
   facts: HarnessFacts,
   reader: AttentionReader = DEFAULT_READER,
 ): AttentionModel {
+  const state = upgraded(saved);
   const approvals = readApprovalsSection(harnessDir, facts, reader, state.approvals);
   const review = readReviewSection(harnessDir, reader, state.review);
   const failures = readFailuresSection(harnessDir, state, facts, reader, state.failures);
-  if (approvals === state.approvals && review === state.review && failures === state.failures) {
+  const checkpoints = readCheckpointsSection(harnessDir, reader, state.checkpoints);
+  if (
+    approvals === state.approvals &&
+    review === state.review &&
+    failures === state.failures &&
+    checkpoints === state.checkpoints
+  ) {
     return state;
   }
-  return { ...state, approvals, review, failures };
+  return { ...state, approvals, review, failures, checkpoints };
 }
 
 export type HarnessReadOptions = {
@@ -94,10 +115,11 @@ export type HarnessReadOptions = {
 
 /** One harness's items from its model. Reads only bodies, and only for a content reader. */
 export function harnessAttention(
-  model: AttentionModel,
+  saved: AttentionModel,
   ctx: ItemContext,
   options: HarnessReadOptions,
 ): HarnessAttention {
+  const model = upgraded(saved);
   const reader = options.reader ?? DEFAULT_READER;
   const items: Drafted[] = [];
   const decisions: MetricDecision[] = [];
@@ -123,6 +145,9 @@ export function harnessAttention(
   const reviews = ctx.content && hasOpenReview ? reviewBodies(ctx.dir, reader) : undefined;
   items.push(...reviewItems(model.review, ctx, reviews));
 
+  const prompts = ctx.content ? checkpointBodies(ctx.dir, reader, model.checkpoints) : undefined;
+  items.push(...checkpointItems(model.checkpoints, ctx, prompts));
+
   if (options.advisor !== undefined) items.push(...advisorItems(options.advisor, ctx));
 
   items.push(...producedItems(options.facts, ctx));
@@ -139,16 +164,21 @@ export function harnessAttention(
     model.runsTruncated === true ||
     model.approvals.truncated === true ||
     model.review.truncated === true ||
-    model.failures.truncated === true;
+    model.failures.truncated === true ||
+    model.checkpoints.truncated === true;
   return {
     harness: ctx.harness,
-    items,
+    items: items.map((drafted) =>
+      overlaid(drafted, model.overlays[idOfItem(drafted.item)], ctx.now, ctx.viewer),
+    ),
     groups,
     ...(model.approvals.unreachable === true ? { unreachable: true as const } : {}),
     ...(truncated ? { truncated: true as const } : {}),
     ...(options.advisor === undefined ? { advisorUnchecked: true as const } : {}),
     decisions,
     freshness: ctx.freshness,
+    overlays: model.overlays,
+    ...(ctx.viewer !== undefined ? { viewer: ctx.viewer } : {}),
   };
 }
 
@@ -176,6 +206,8 @@ export type FoldHarnessOptions = {
   readonly harness: string;
   readonly content?: boolean;
   readonly reader?: AttentionReader;
+  /** The member reading, as a stored actor. */
+  readonly viewer?: string;
 };
 
 /**
@@ -205,16 +237,22 @@ export function foldHarness(
       now,
       content: options.content ?? false,
       freshness,
+      ...(options.viewer !== undefined ? { viewer: options.viewer } : {}),
     },
     { facts, reader, ...(advisor !== undefined ? { advisor } : {}) },
   );
 }
 
 export type InboxFilter = {
-  /** `open` (the default) keeps what still needs a person; `all` keeps everything. */
+  /**
+   * `open` (the default) keeps what still needs a person now: what is put off or hidden
+   * from the viewer waits until its time. `all` keeps everything.
+   */
   readonly state?: "open" | "all";
   readonly kind?: string;
   readonly band?: string;
+  /** Only what is assigned to this member. */
+  readonly assignee?: string;
 };
 
 export type Inbox = {
@@ -242,7 +280,7 @@ export function assembleInbox(
   filter: InboxFilter = {},
 ): Inbox {
   const drafted: Drafted[] = perHarness.flatMap((h) => h.items);
-  drafted.push(...groupAcross(perHarness, now));
+  drafted.push(...groupAcross(perHarness, now).map((d) => overlaidGroup(d, perHarness, now)));
   const band = new Map<string, number>(ATTENTION_BANDS.map((b, i) => [b, i]));
   drafted.sort(
     (a, b) =>
@@ -253,7 +291,8 @@ export function assembleInbox(
   const all = drafted.map((d) => d.item);
   const items = all.filter(
     (item) =>
-      (filter.state === "all" || OPEN_STATES.has(item.state)) &&
+      (filter.state === "all" || (OPEN_STATES.has(item.state) && !hiddenNow(item))) &&
+      (filter.assignee === undefined || item.assignee === filter.assignee) &&
       (filter.kind === undefined || item.kind === filter.kind) &&
       (filter.band === undefined || item.band === filter.band),
   );
@@ -267,8 +306,17 @@ export function assembleInbox(
   };
 }
 
-/** A placeholder harness id for counts that name no harness. */
+/** A placeholder harness id, for counts in a harness that has none of its own yet. */
 const COUNTING_HARNESS = "hrn_0000000000000000";
+
+/**
+ * The harness's own id, which its items' ids (and so what people did about them) derive
+ * from; the placeholder where it has none, so nothing was ever done about its items.
+ */
+function countingHarnessOf(harnessDir: string): string {
+  const read = readHarnessIdentity(harnessDir);
+  return read.state === "present" ? read.identity.id : COUNTING_HARNESS;
+}
 
 /** How many open items a harness's model holds, by band: its overview row's counts. */
 export function overviewOf(
@@ -280,7 +328,7 @@ export function overviewOf(
   const freshness: AttentionFreshness = { asOf: new Date(now).toISOString(), mode: "projection" };
   const one = harnessAttention(
     model,
-    { harness: COUNTING_HARNESS, dir: harnessDir, now, content: false, freshness },
+    { harness: countingHarnessOf(harnessDir), dir: harnessDir, now, content: false, freshness },
     options,
   );
   const inbox = assembleInbox([one], now);

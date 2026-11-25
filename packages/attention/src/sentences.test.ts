@@ -3,10 +3,17 @@
  * envelope a list answers says why it is empty, and names only the harnesses it mentions.
  */
 import { describe, expect, test } from "bun:test";
-import { TITLE_TEMPLATES } from "@crewhaus/control-contract";
+import { ATTENTION_CHOICE_ROWS, TITLE_TEMPLATES } from "@crewhaus/control-contract";
 import { assembleInbox } from "./fold";
 import { UNREACHABLE_REMEDY, attentionListBody, emptyReasonOf } from "./list-body";
-import { ATTENTION_SENTENCES, UNKNOWN_SENTENCE, classWordOf, sentenceOf } from "./sentences";
+import {
+  ATTENTION_SENTENCES,
+  CHOICE_EFFECTS,
+  UNKNOWN_SENTENCE,
+  choiceEffectOf,
+  classWordOf,
+  sentenceOf,
+} from "./sentences";
 
 describe("sentences", () => {
   test("every declared id has one, and an unknown id says so", () => {
@@ -38,6 +45,24 @@ describe("sentences", () => {
       "A merge decision is waiting",
     );
     expect(classWordOf("owner")).toBe("Owner only");
+  });
+});
+
+describe("what each choice does", () => {
+  test("every choice of every kind has an effect, and no other line does", () => {
+    const ids = ATTENTION_CHOICE_ROWS.map((row) => `${row.kind}.${row.choice}`);
+    expect(ids.length).toBeGreaterThan(30);
+    expect(Object.keys(CHOICE_EFFECTS).sort()).toEqual([...ids].sort());
+    for (const effect of Object.values(CHOICE_EFFECTS)) {
+      expect(effect.endsWith(".")).toBe(true);
+      expect(effect.length).toBeLessThanOrEqual(80);
+    }
+    expect(choiceEffectOf("permission", "grant")).toBe(
+      "Allows this one call, and the run goes on.",
+    );
+    expect(choiceEffectOf("permission", "toString")).toBe("");
+    // The two budget raises are told apart.
+    expect(CHOICE_EFFECTS["budget.raise-spec"]).not.toBe(CHOICE_EFFECTS["budget.raise-period"]);
   });
 });
 

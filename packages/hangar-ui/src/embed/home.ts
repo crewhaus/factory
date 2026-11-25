@@ -64,7 +64,6 @@ import utilJs from "../../assets/js/util.js" with { type: "text" };
 import v1Js from "../../assets/js/v1.js" with { type: "text" };
 import activityViewJs from "../../assets/js/views/activity.js" with { type: "text" };
 import advisorViewJs from "../../assets/js/views/advisor.js" with { type: "text" };
-import approvalsViewJs from "../../assets/js/views/approvals.js" with { type: "text" };
 import channelsViewJs from "../../assets/js/views/channels.js" with { type: "text" };
 import connectionsViewJs from "../../assets/js/views/connections.js" with { type: "text" };
 import controlViewJs from "../../assets/js/views/control.js" with { type: "text" };
@@ -78,7 +77,6 @@ import evalsViewJs from "../../assets/js/views/evals.js" with { type: "text" };
 import feedbackViewJs from "../../assets/js/views/feedback.js" with { type: "text" };
 import healthViewJs from "../../assets/js/views/health.js" with { type: "text" };
 import homeViewJs from "../../assets/js/views/home.js" with { type: "text" };
-import inboxViewJs from "../../assets/js/views/inbox.js" with { type: "text" };
 import inspectViewJs from "../../assets/js/views/inspect.js" with { type: "text" };
 import jobsViewJs from "../../assets/js/views/jobs.js" with { type: "text" };
 import libraryViewJs from "../../assets/js/views/library.js" with { type: "text" };
@@ -91,7 +89,6 @@ import overviewViewJs from "../../assets/js/views/overview.js" with { type: "tex
 import panesViewJs from "../../assets/js/views/panes.js" with { type: "text" };
 import peopleViewJs from "../../assets/js/views/people.js" with { type: "text" };
 import procViewJs from "../../assets/js/views/proc.js" with { type: "text" };
-import reviewViewJs from "../../assets/js/views/review.js" with { type: "text" };
 import runsViewJs from "../../assets/js/views/runs.js" with { type: "text" };
 import runtimeViewJs from "../../assets/js/views/runtime.js" with { type: "text" };
 import schedulersViewJs from "../../assets/js/views/schedulers.js" with { type: "text" };
@@ -163,7 +160,6 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/util.js": asset(utilJs, "util.js"),
   "/assets/js/views/activity.js": asset(activityViewJs, "activity.js"),
   "/assets/js/views/advisor.js": asset(advisorViewJs, "advisor.js"),
-  "/assets/js/views/approvals.js": asset(approvalsViewJs, "approvals.js"),
   "/assets/js/views/channels.js": asset(channelsViewJs, "channels.js"),
   "/assets/js/views/connections.js": asset(connectionsViewJs, "connections.js"),
   "/assets/js/views/control.js": asset(controlViewJs, "control.js"),
@@ -177,7 +173,6 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/feedback.js": asset(feedbackViewJs, "feedback.js"),
   "/assets/js/views/health.js": asset(healthViewJs, "health.js"),
   "/assets/js/views/home.js": asset(homeViewJs, "home.js"),
-  "/assets/js/views/inbox.js": asset(inboxViewJs, "inbox.js"),
   "/assets/js/views/inspect.js": asset(inspectViewJs, "inspect.js"),
   "/assets/js/views/jobs.js": asset(jobsViewJs, "jobs.js"),
   "/assets/js/views/library.js": asset(libraryViewJs, "library.js"),
@@ -190,7 +185,6 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/views/panes.js": asset(panesViewJs, "panes.js"),
   "/assets/js/views/people.js": asset(peopleViewJs, "people.js"),
   "/assets/js/views/proc.js": asset(procViewJs, "proc.js"),
-  "/assets/js/views/review.js": asset(reviewViewJs, "review.js"),
   "/assets/js/views/runs.js": asset(runsViewJs, "runs.js"),
   "/assets/js/views/runtime.js": asset(runtimeViewJs, "runtime.js"),
   "/assets/js/views/schedulers.js": asset(schedulersViewJs, "schedulers.js"),

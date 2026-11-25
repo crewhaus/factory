@@ -1179,9 +1179,11 @@
       "name": "@crewhaus/feedback-distill",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },

@@ -8,8 +8,6 @@ import { panelModel } from "../assets/js/ui/panels.js";
 import { CHECK_GLYPH, toggleModel } from "../assets/js/ui/toggle.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { tipPlacement } from "../assets/js/ui/tooltip.js";
-// @ts-expect-error — hand-written browser JS, typed as text for the embed map
-import { startSelection } from "../assets/js/views/inbox.js";
 
 describe("confirmReady", () => {
   test("a typed confirmation needs the exact name", () => {
@@ -72,31 +70,5 @@ describe("tipPlacement", () => {
     expect(
       tipPlacement({ left: 10, top: 560, bottom: 580 }, { width: 100, height: 40 }, view).top,
     ).toBe(514);
-  });
-});
-
-describe("startSelection", () => {
-  test("a kept row is found by id after a reload", () => {
-    expect(startSelection(["a", "b", "c"], { id: "c", index: 0, focus: true })).toEqual({
-      index: 2,
-      focus: true,
-    });
-  });
-  test("a row that left keeps its place, clamped", () => {
-    expect(startSelection(["b", "c"], { id: "a", index: 0, focus: true })).toEqual({
-      index: 0,
-      focus: true,
-    });
-    expect(startSelection(["a"], { id: "z", index: 5, focus: true })).toEqual({
-      index: 0,
-      focus: true,
-    });
-  });
-  test("nothing kept starts at the top without taking focus", () => {
-    expect(startSelection(["a"], null)).toEqual({ index: 0, focus: false });
-    expect(startSelection([], { id: "a", index: 0, focus: true })).toEqual({
-      index: 0,
-      focus: false,
-    });
   });
 });

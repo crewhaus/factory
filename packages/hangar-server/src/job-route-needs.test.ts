@@ -939,6 +939,8 @@ describe("every job route carries what it checked into the job's start-time chec
         "access.ts requestAllows",
         "server.ts startHangarServer",
         "v1/access-ops.ts manages",
+        "v1/attention-acts.ts requireOn",
+        "v1/attention.ts youOf",
         "v1/budget.ts get",
         "v1/decisions.ts decisionCommand",
         "v1/delegations.ts list",

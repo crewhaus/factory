@@ -32,7 +32,7 @@
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { CANONICAL_RUN_ID_RE } from "@crewhaus/control-contract";
+import { CANONICAL_RUN_ID_RE, GRAPH_RUN_ID_RE } from "@crewhaus/control-contract";
 import { readDeployments } from "@crewhaus/control-records";
 import { readManagerSettings } from "./manager-settings";
 import type { EnvOverride, RunClass, RunKind } from "./types";
@@ -832,6 +832,11 @@ export type ApiRunInput = {
   readonly inputFile?: string;
   /** crew, workflow, graph: the input text the bundle reads on stdin. */
   readonly stdinFile?: string;
+  /**
+   * graph: the pause this run settles, in place of an input: the paused graph run and the
+   * decision its node reads, two arguments of the bundle's own `--resume`.
+   */
+  readonly graphResume?: { readonly grun: string; readonly decision: string };
 };
 
 /** The shapes the control API starts a run of, and how each takes its input. */
@@ -936,13 +941,33 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
         "compile",
       );
     }
-    if (apiRun[takes] === undefined) {
+    const resume = apiRun.graphResume;
+    if (resume !== undefined) {
+      if (input.target !== "graph") {
+        throw new SpawnPlanError(
+          `a ${input.target} harness has no graph pause to settle`,
+          "compile",
+        );
+      }
+      if (!GRAPH_RUN_ID_RE.test(resume.grun)) {
+        throw new SpawnPlanError(
+          "a graph resume needs a graph run id: grun_ and 16 hex",
+          "compile",
+        );
+      }
+      // The bundle reads the decision by position: an empty one, or one that reads as a
+      // flag, would not be the decision.
+      if (resume.decision === "" || resume.decision.startsWith("-")) {
+        throw new SpawnPlanError("a graph resume needs a decision", "compile");
+      }
+    } else if (apiRun[takes] === undefined) {
       throw new SpawnPlanError(
         `an API run of a ${input.target} harness needs its ${takes}`,
         "compile",
       );
     }
-    extra["CREWHAUS_INPUT_ORIGIN"] = "api";
+    // A resume brings no input of its own: graph-engine checks its decision at `api`.
+    if (resume === undefined) extra["CREWHAUS_INPUT_ORIGIN"] = "api";
     extra["CREWHAUS_RUN_ID"] = apiRun.runId;
   }
   const { env, envFiles, envFileRefs, overrides } = buildSpawnEnv({
@@ -1065,7 +1090,14 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     ...base,
     // The daemon reads no env file itself: the filtered chain in `env` is all it gets
     // from the harness's files, and what it starts inherits only that.
-    argv: [bunBin, "--no-env-file", bundle.entryPath],
+    argv: [
+      bunBin,
+      "--no-env-file",
+      bundle.entryPath,
+      ...(apiRun?.graphResume !== undefined
+        ? ["--resume", apiRun.graphResume.grun, apiRun.graphResume.decision]
+        : []),
+    ],
     detached,
     ...(stdinFile !== undefined ? { stdinFile } : {}),
     ...(apiRun !== undefined ? { apiRun: { runId: apiRun.runId } } : {}),
