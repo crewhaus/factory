@@ -369,6 +369,11 @@ describe("a list says what it could not list", () => {
       expect(`${said}: ${text.includes(said)}`).toBe(`${said}: false`);
     }
     expect(stores.has("wiki")).toBe(true);
+    // What the link points at is not read, so a change there is no change to the store.
+    const before = sourceMarks(readOf(dir));
+    write(dir, "LESSONS.md.moved", "# LESSONS\n");
+    write(dir, join(".crewhaus", "run", "knowledge", "corpus.json.moved"), "{}\n");
+    expect(sourceMarks(readOf(dir))).toEqual(before);
   });
 
   test("a document row that is not one is passed over, and the rows beside it are listed", async () => {
