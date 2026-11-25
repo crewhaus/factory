@@ -12,6 +12,7 @@ import {
   type AttentionText,
   type CliTwin,
   type DecisionClass,
+  RECEIPT_VIA,
   TWIN_PLACEHOLDERS,
   type TwinParams,
   attentionBandOf,
@@ -144,6 +145,26 @@ export function msOf(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * The grammar a record's writer gives a time: an ISO date and time with `Z` or an offset.
+ * A parser takes more than this (words in brackets, a month by name), so a time is kept
+ * only when the whole value is one.
+ */
+const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/** A recorded time, or `undefined` for anything that is not one. */
+export function timeOf(value: unknown): string | undefined {
+  return typeof value === "string" && TIME_RE.test(value) && msOf(value) !== undefined
+    ? value
+    : undefined;
+}
+
+/** The door a decision came through, `unknown` for a word that is not one. */
+export function viaOf(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  return (RECEIPT_VIA as readonly unknown[]).includes(value) ? (value as string) : "unknown";
 }
 
 /** The ISO form of a time in ms. */

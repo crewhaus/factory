@@ -6,7 +6,7 @@
  */
 import { join } from "node:path";
 import { REVIEW_KINDS, isReviewQueueEntry } from "@crewhaus/feedback-distill";
-import { dirFits, draftItem, msOf, shellWord } from "../items";
+import { dirFits, draftItem, msOf, shellWord, timeOf } from "../items";
 import { type AttentionReader, READ_CAPS } from "../read";
 import type { AttentionModel, Drafted, ItemContext, ReviewFact } from "../types";
 
@@ -29,8 +29,13 @@ export const REVIEW_ENTRY_ID_RE = new RegExp(
 function latestById(records: readonly unknown[]) {
   const byId = new Map<string, Record<string, unknown>>();
   for (const record of records) {
-    if (isReviewQueueEntry(record) && REVIEW_ENTRY_ID_RE.test(record.id))
+    if (
+      isReviewQueueEntry(record) &&
+      REVIEW_ENTRY_ID_RE.test(record.id) &&
+      timeOf(record.ts) !== undefined
+    ) {
       byId.set(record.id, record as unknown as Record<string, unknown>);
+    }
   }
   return byId;
 }
@@ -53,12 +58,13 @@ export function readReviewSection(
   if (read.state !== "read") return { stamp, facts: [] };
   const facts: ReviewFact[] = [];
   for (const entry of latestById(read.records).values()) {
+    const resolvedTs = timeOf(entry["resolvedTs"]);
     facts.push({
       id: entry["id"] as string,
       reviewKind: entry["kind"] as string,
       ts: entry["ts"] as string,
       status: entry["status"] === "resolved" ? "resolved" : "open",
-      ...(typeof entry["resolvedTs"] === "string" ? { resolvedTs: entry["resolvedTs"] } : {}),
+      ...(resolvedTs !== undefined ? { resolvedTs } : {}),
     });
   }
   return { stamp, facts, ...(read.truncated ? { truncated: true as const } : {}) };

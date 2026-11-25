@@ -9,13 +9,14 @@ import {
   type AttentionChoice,
   type AttentionKind,
   type AttentionText,
+  DELEGABLE_DECISION_KINDS,
   DELEGATION_ACTIONS,
   type DecisionClass,
   type DecisionRecordView,
   IF_UNANSWERED,
   isId,
 } from "@crewhaus/control-contract";
-import { classOf, dirFits, draftItem, msOf, shellWord, twinOf } from "../items";
+import { classOf, dirFits, draftItem, msOf, shellWord, timeOf, twinOf, viaOf } from "../items";
 import { effectiveAttentionState } from "../lifecycle";
 import type { AttentionModel, DecisionFact, Drafted, ItemContext, MetricDecision } from "../types";
 
@@ -33,12 +34,30 @@ const obj = (value: unknown): Readonly<Record<string, unknown>> | undefined =>
 /** What a decision's kind may be: a lowercase word, so no message or path fits. */
 const DECISION_KIND_RE = /^[a-z][a-z0-9-]{0,63}$/;
 
+/**
+ * The kinds the decision ledger's writers mint. A row of any other kind is a decision of
+ * kind `other`: it is listed, and its own word reaches no item and no metric.
+ */
+export const MINTED_DECISION_KINDS: readonly string[] = Object.freeze([
+  "standing-rule-proposal",
+  "change-adoption",
+  ...DELEGABLE_DECISION_KINDS,
+  "deploy-quorum",
+]);
+
+/** A ledger row's kind as the inbox keeps it. */
+export function mintedKindOf(kind: string): string {
+  return MINTED_DECISION_KINDS.includes(kind) ? kind : "other";
+}
+
 const oneOf = (list: readonly string[], value: unknown): string | undefined =>
   typeof value === "string" && list.includes(value) ? value : undefined;
 
 /**
- * A decisions-ledger row as the inbox keeps it, or `undefined` when it is not one. A rule
- * kind, a delegation action or a fallback outside its closed list is left out.
+ * A decisions-ledger row as the inbox keeps it, or `undefined` when it is not one (its
+ * creation time included). A kind no writer mints reads `other`; a rule kind, a delegation
+ * action or a fallback outside its closed list, and a time that is not one, is left out;
+ * a door outside the closed list reads `unknown`.
  */
 export function decisionFactOf(
   record: Readonly<Record<string, unknown>>,
@@ -46,7 +65,7 @@ export function decisionFactOf(
   const id = record["id"];
   const kind = str(record["kind"]);
   const state = str(record["state"]);
-  const createdAt = str(record["createdAt"]);
+  const createdAt = timeOf(record["createdAt"]);
   if (
     !isId("dec", id) ||
     kind === undefined ||
@@ -58,30 +77,34 @@ export function decisionFactOf(
   }
   const terms = obj(record["terms"]);
   const subject = obj(record["subject"]);
-  const pick = (name: string) => (str(record[name]) === undefined ? {} : { [name]: record[name] });
+  const time = (name: string) =>
+    timeOf(record[name]) === undefined ? {} : { [name]: record[name] };
+  const via = viaOf(record["decidedVia"]);
   const ruleKind = oneOf(["allow", "delegate"], terms?.["ruleKind"]);
   const action = oneOf(DELEGATION_ACTIONS, terms?.["action"]);
   const ifUnanswered = oneOf(IF_UNANSWERED, record["ifUnanswered"]);
   const chg = str(subject?.["chg"]);
   return {
     id: id as string,
-    kind,
+    kind: mintedKindOf(kind),
     state,
     createdAt,
-    ...pick("expiresAt"),
+    ...time("expiresAt"),
     ...(record["requiredClass"] !== undefined
       ? { requiredClass: classOf(record["requiredClass"]) }
       : {}),
     ...(record["decision"] === "grant" || record["decision"] === "deny"
       ? { decision: record["decision"] }
       : {}),
-    ...pick("decidedAt"),
-    ...pick("decidedVia"),
-    ...pick("resolvedBy"),
-    ...pick("consumedAt"),
-    ...pick("supersededAt"),
-    ...pick("expiredAt"),
-    ...pick("deferredUntil"),
+    ...time("decidedAt"),
+    ...(via !== undefined ? { decidedVia: via } : {}),
+    ...(record["resolvedBy"] === "policy" || record["resolvedBy"] === "delegation"
+      ? { resolvedBy: record["resolvedBy"] }
+      : {}),
+    ...time("consumedAt"),
+    ...time("supersededAt"),
+    ...time("expiredAt"),
+    ...time("deferredUntil"),
     ...(ifUnanswered !== undefined ? { ifUnanswered } : {}),
     ...(ruleKind !== undefined ? { ruleKind } : {}),
     ...(ruleKind === "delegate" && action !== undefined ? { delegationAction: action } : {}),
@@ -230,7 +253,10 @@ export function decisionItems(
         ? delegation
           ? {
               template: "delegation-proposal.pending",
-              params: { delegationAction: fact.delegationAction ?? "unknown" },
+              params:
+                fact.delegationAction !== undefined
+                  ? { delegationAction: fact.delegationAction }
+                  : {},
             }
           : {
               template: "standing-rule-proposal.pending",

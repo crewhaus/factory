@@ -43,6 +43,7 @@ export {
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export { type IoTap, _setIoTapForTest } from "./io";
 export { openRecordFd, readAt, readRecordFile } from "./io";
+export { CHUNK_BYTES } from "./lines";
 export { _setRollBytesForTest } from "./segments";
 export {
   CACHE_INDEX_DIR,

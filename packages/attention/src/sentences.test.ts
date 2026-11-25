@@ -22,6 +22,21 @@ describe("sentences", () => {
       "1 run failed this way.",
     );
     expect(sentenceOf({ template: "nope" })).toBe(UNKNOWN_SENTENCE);
+    expect(sentenceOf({ template: "delegation-proposal.pending", params: {} })).toBe(
+      "Letting it act on its own is proposed",
+    );
+    expect(
+      sentenceOf({
+        template: "delegation-proposal.pending",
+        params: { delegationAction: "merge" },
+      }),
+    ).toBe("Letting it merge on its own is proposed");
+    for (const params of [{}, { decisionKind: "other" }]) {
+      expect(sentenceOf({ template: "decision.pending", params })).toBe("A decision is waiting");
+    }
+    expect(sentenceOf({ template: "decision.pending", params: { decisionKind: "merge" } })).toBe(
+      "A merge decision is waiting",
+    );
     expect(classWordOf("owner")).toBe("Owner only");
   });
 });

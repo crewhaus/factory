@@ -91,6 +91,15 @@ describe("bands and texts", () => {
     expect(textOf({ template: "permission.ask", params: { tool: "Bash" } })).toBe(
       "Permission to use Bash",
     );
+    expect(textOf({ template: "delegation-proposal.pending", params: {} })).toBe(
+      "Letting it act on its own is proposed",
+    );
+    for (const params of [{}, { decisionKind: "other" }]) {
+      expect(textOf({ template: "decision.pending", params })).toBe("A decision is waiting");
+    }
+    expect(textOf({ template: "decision.pending", params: { decisionKind: "merge" } })).toBe(
+      "A merge decision is waiting",
+    );
     expect(textOf({ template: "no.such-text", params: {} })).toBe(UNKNOWN_TEXT);
     expect(textOf(undefined)).toBe("Something needs a look");
   });

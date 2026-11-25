@@ -88,6 +88,8 @@ export {
 } from "./metrics";
 export {
   type AttentionProducer,
+  type ProducedChoice,
+  type ProducedItem,
   _resetProducersForTest,
   producers,
   registerProducer,

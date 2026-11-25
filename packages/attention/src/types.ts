@@ -54,10 +54,12 @@ export type ApprovalFact = {
   readonly id: string;
   /** `tool` or `input`. */
   readonly kind: string;
-  readonly toolName: string;
+  /** Absent when the record's name is not shaped like a tool's. */
+  readonly toolName?: string;
   readonly createdAt: string;
-  readonly runId: string;
-  readonly sessionId: string;
+  /** Absent when the record's id is not one a run's minter gives. */
+  readonly runId?: string;
+  readonly sessionId?: string;
   readonly askDigest?: string;
   readonly requiredClass?: DecisionClass;
   readonly expiresAt?: string;

@@ -20,7 +20,10 @@ export const ATTENTION_SENTENCES: Readonly<Record<string, (p: Params) => string>
   "delegation-proposal.pending": (p) =>
     `Letting it ${word(p["delegationAction"], "act")} on its own is proposed`,
   "quality-adoption.pending": () => "A change is ready to adopt",
-  "decision.pending": (p) => `A ${word(p["decisionKind"], "pending")} decision is waiting`,
+  "decision.pending": (p) => {
+    const kind = word(p["decisionKind"], "other");
+    return kind === "other" ? "A decision is waiting" : `A ${kind} decision is waiting`;
+  },
   "credential.failing": (p) =>
     `Runs can't sign in to ${word(p["provider"], "the model provider")} (${word(p["envName"], "its key")})`,
   "provider-limit.hit": (p) => `${word(p["provider"], "The model provider")} is limiting requests`,

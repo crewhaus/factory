@@ -54,7 +54,14 @@ anything is listed), each mentioned harness's name, and why an empty list is emp
 ## Producers
 
 Another area adds items of its own kinds with `registerProducer(kind, producer)`. The kind
-must be in the closed vocabulary and not one of this package's own.
+must be in the closed vocabulary and not registered already.
+
+`producer.fold` answers `{ key, item }` rows. The inbox serves what the registration may
+add and no more: an item of the producer's own kind, about the harness that was read,
+under a title the producer registered. The rest is dropped. Its ref is derived from its
+kind and `key` (ids, names and digests only), a body reaches only a reader of the
+harness's content, and a choice gives its command as `twin: { template, params }`, a
+closed template the inbox fills in and quotes. A ready command string is never served.
 
 ## Testing
 

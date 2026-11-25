@@ -29,8 +29,7 @@ import { readReviewSection, reviewBodies, reviewItems } from "./adapters/review"
 import { foldRunLine, readFailuresSection, runGroups, signaturesOf } from "./adapters/runs";
 import { credentialFactsOf } from "./causes";
 import { groupAcross } from "./groups";
-import { msOf } from "./items";
-import { producers } from "./producers";
+import { producedItems } from "./producers";
 import { type AttentionReader, DEFAULT_READER, READ_CAPS } from "./read";
 import type {
   AdvisorSnapshot,
@@ -126,11 +125,7 @@ export function harnessAttention(
 
   if (options.advisor !== undefined) items.push(...advisorItems(options.advisor, ctx));
 
-  for (const producer of producers()) {
-    for (const item of producer.fold(ctx.dir, options.facts, ctx)) {
-      items.push({ item, latestAt: msOf(item.since) ?? 0 });
-    }
-  }
+  items.push(...producedItems(options.facts, ctx));
 
   const failing = Object.values(model.runs).some((row) => row.state === "failed");
   const groups = failing
