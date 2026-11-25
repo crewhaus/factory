@@ -35,10 +35,8 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
-    "@crewhaus/agent-context-isolation": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
     "@crewhaus/runtime-core": "workspace:*",
-    "@crewhaus/tool-fs": "workspace:*",
     "service-fakes": "workspace:*"
   },
   "license": "Apache-2.0",

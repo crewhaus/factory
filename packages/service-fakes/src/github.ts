@@ -63,7 +63,9 @@ export type FakeGitHub = FakeService & {
   reopenPull(fullName: string, number: number): void;
   /** Add an empty commit with `message` on a branch, and answer its SHA. */
   commitOnBranch(fullName: string, branch: string, message: string): string;
-  /** Set a pull request's reviews, as `GET …/reviews` lists them. */
+  /** The next `count` REST requests are answered 429, with a wait when one is given. */
+  rateLimitNext(count: number, retryAfterSeconds?: number): void;
+  /** Set a pull request's reviews, as `GET …/reviews` lists them; its own record moves too. */
   setReviews(
     fullName: string,
     number: number,
@@ -206,14 +208,16 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
     return sha;
   };
 
-  /** The pull request as the API shows it: its head SHA read from the repository while open. */
+  /** The pull request as the API shows it: its head SHA read from the repository until it merges. */
   const pullView = (repo: Repo, pull: Json): Json => {
     const head = pull["head"] as Json;
-    if (pull["merged"] === true || pull["state"] !== "open") return pull;
+    if (pull["merged"] === true || typeof head["sha"] === "string") return pull;
     const sha = shaOf(repo, String(head["ref"]));
     return sha === undefined ? pull : { ...pull, head: { ...head, sha } };
   };
 
+  let limited = 0;
+  let limitedWait: number | undefined;
   let interrupt: "error" | "hang" | undefined;
   const hanging: Array<ReadableStreamDefaultController<Uint8Array>> = [];
 
@@ -531,6 +535,14 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
       return smartHttp(req, url, repo, tail);
     }
 
+    if (limited > 0) {
+      limited -= 1;
+      return jsonResponse(
+        429,
+        { message: "API rate limit exceeded" },
+        limitedWait !== undefined ? { "retry-after": String(limitedWait) } : {},
+      );
+    }
     if (WRITE_METHODS.has(req.method)) writes.push(recorded);
     const body = (parsed !== null && typeof parsed === "object" ? parsed : {}) as Json;
     const parts = url.pathname.split("/").filter((part) => part !== "");
@@ -625,6 +637,12 @@ export function fakeGitHub(opts: FakeGitHubOptions = {}): FakeGitHub {
         number,
         reviews.map((r) => ({ user: { login: r.login }, state: r.state })),
       );
+      const pull = repo.pulls.get(number);
+      if (pull !== undefined) pull["updated_at"] = new Date(++nextId * 1000).toISOString();
+    },
+    rateLimitNext: (count, retryAfterSeconds) => {
+      limited = count;
+      limitedWait = retryAfterSeconds;
     },
     deliverWebhook: async (receiverUrl, event, payload) => {
       assertLoopbackUrl(receiverUrl);

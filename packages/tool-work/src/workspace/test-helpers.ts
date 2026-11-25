@@ -47,6 +47,8 @@ export type Bench = {
   readonly env: Record<string, string | undefined>;
   binding(over?: Partial<RepositoryBinding>): RepositoryBinding;
   bindings: BindingsFile;
+  /** What the host was asked to change since it was seeded. */
+  hostWrites(): ReturnType<FakeGitHub["writes"]>;
   engine(over?: Partial<EngineDeps>): WorkspaceEngine;
   item(input?: Partial<WorkInput>): Promise<string>;
   write(worktree: string, path: string, text: string): void;
@@ -142,6 +144,7 @@ export async function bench(): Promise<Bench> {
     { "README.md": "# App\n", "src/dates.ts": "export const parse = 1;\n" },
     "First",
   );
+  const seeded = fake.writes().length;
   const env: Record<string, string | undefined> = {
     PATH: process.env["PATH"],
     [TOKEN_VARIABLE]: token,
@@ -173,6 +176,7 @@ export async function bench(): Promise<Bench> {
     env,
     binding,
     bindings: { v: 1, repositories: [binding()], tokenEnv: TOKEN_VARIABLE },
+    hostWrites: () => fake.writes().slice(seeded),
     engine: (over = {}) =>
       createWorkspaceEngine({
         harnessDir: dir,

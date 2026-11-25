@@ -5,7 +5,6 @@
     "outDir": "dist"
   },
   "references": [
-    { "path": "../agent-context-isolation" },
     { "path": "../boundary-classifier" },
     { "path": "../continuity-store" },
     { "path": "../control-contract" },
@@ -25,7 +24,6 @@
     { "path": "../tool-catalog" },
     { "path": "../tool-categories" },
     { "path": "../tool-codehost" },
-    { "path": "../tool-fs" },
     { "path": "../tool-git" },
     { "path": "../tool-safety" }
   ],

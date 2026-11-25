@@ -22,10 +22,10 @@ import { isId, parseRef } from "@crewhaus/control-contract";
 import { readApproverProjection, readHarnessIdentity } from "@crewhaus/control-records";
 import { EXIT_CODES, RunFailedError } from "@crewhaus/errors";
 import type { RunContext } from "@crewhaus/run-context";
-import { currentTenantContext } from "@crewhaus/tenancy";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { inManagedTenant } from "./tenant";
 import { workDirOf } from "./work-items/index";
 import type { AcceptanceJudge } from "./workspace/acceptance";
 import {
@@ -55,12 +55,8 @@ export class WorkspaceToolError extends Error {
   override readonly name = "WorkspaceToolError";
 }
 
-/** The tenant Home's own runs serve on a managed daemon. The only one the workspaces are for. */
-const HOME_TENANT = "home";
-
 function assertHarnessTenant(): void {
-  const ctx = currentTenantContext();
-  if (ctx !== undefined && ctx.tenant.id !== HOME_TENANT) {
+  if (inManagedTenant()) {
     throw new WorkspaceToolError("Workspaces are not available to a managed tenant's runs.");
   }
 }
@@ -215,10 +211,7 @@ export function createWorkspaceTools(deps: WorkspaceToolsDeps = {}): {
     destructive: false,
     scope: "external",
     ioCapability: "network",
-    operativeArgs: [
-      { field: "work", kind: "id" },
-      { field: "repository", kind: "id" },
-    ],
+    operativeArgs: [{ field: "work", kind: "id" }],
     execute: async (input, ctx) => {
       const { engine } = engineOf();
       const wi = workIdOf(input.work);

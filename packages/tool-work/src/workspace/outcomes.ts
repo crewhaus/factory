@@ -316,7 +316,7 @@ export async function syncOutcomes(harnessDir: string, deps: SyncDeps = {}): Pro
         const mergeSha = known.mergeSha;
         if (mergeSha === undefined) continue;
         const commits = await withPullsCall(call, (c) =>
-          listBaseCommits(c, repo, { sha: binding.base, since: known.at }),
+          listBaseCommits(c, repo, { sha: binding.base, since: opened.at }),
         );
         if (!commits.ok) {
           if (commits.rateLimited === true) return backOff(commits.retryAfterMs);

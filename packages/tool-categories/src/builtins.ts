@@ -2788,5 +2788,33 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     chainSymbol: "bindEvmTxChains",
     shapes: ["graph", "workflow", "crew"],
   },
+  workspaceOpen: {
+    package: "@crewhaus/tool-work",
+    export: "workspaceOpen",
+    name: "WorkspaceOpen",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "draft",
+    io: "network",
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
+  workspaceCheck: {
+    package: "@crewhaus/tool-work",
+    export: "workspaceCheck",
+    name: "WorkspaceCheck",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "draft",
+    io: "process",
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
+  workspacePublish: {
+    package: "@crewhaus/tool-work",
+    export: "workspacePublish",
+    name: "WorkspacePublish",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "publish",
+    io: "network",
+    justify: true,
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
   // ---- scripts/wire-tool-package.ts inserts new shape-specific builtins above this line ----
 });

@@ -1823,6 +1823,13 @@ const CF_WORKER_UNREAD: ReadonlyArray<CfWorkerUnread> = [
         ).some((profile) => profile.price !== undefined),
       ),
   },
+  {
+    shapes: ["cli", "workflow"],
+    path: "repositories",
+    detail: "the worker has no checkout, so it runs no workspace tool",
+    declaredAt: (ir) =>
+      at("repositories", nonEmpty(irField(ir, "repositories") as readonly unknown[] | undefined)),
+  },
 ];
 
 /** The settings a Cloudflare Worker build of `shape` does not read, as table rows. */

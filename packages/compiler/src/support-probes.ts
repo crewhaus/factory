@@ -12,7 +12,8 @@
  *   - `place(shape)` puts the setting where a shape's structure nests it (a
  *     model pool under `agent`, a workflow step, a graph node or a crew role),
  *     or answers `undefined` for the default placement at the feature's path;
- *   - `kind: "authoring"` records a decision and must change no compiled byte;
+ *   - `kind: "authoring"` records a decision and must change no compiled byte (on every
+ *     variant its `effectiveOn` does not name);
  *     `kind: "toolchain"` is read by a CLI verb from `crewhaus.yaml` rather
  *     than by the bundle, and names that verb's file in `readBy` (a test
  *     checks the file reads the key);
@@ -52,7 +53,14 @@ export type FeatureProbe = {
   readonly kind: "runtime" | "authoring" | "toolchain";
   readonly snippet: SpecFragment;
   readonly base?: SpecFragment;
-  readonly place?: (shape: string) => ProbePlacement | undefined;
+  /** `variant` is the shape itself, or `<shape>@cf-worker` for a Worker build. */
+  readonly place?: (shape: string, variant: string) => ProbePlacement | undefined;
+  /**
+   * For `kind: "authoring"`: the variants where the key takes effect after all, beside the
+   * base its `place` adds there. It is judged as a runtime setting on those, and must change
+   * no byte on every other.
+   */
+  readonly effectiveOn?: ReadonlyArray<string>;
   /** For `kind: "toolchain"`: the repo file whose code reads the key. */
   readonly readBy?: string;
   /** For `kind: "toolchain"`: the shapes that file reads it for (all, when absent). */
@@ -237,12 +245,42 @@ function chainBlockProbe(feature: string, value: unknown, withChain: boolean): F
   };
 }
 
+/** The shapes whose harness delivers work to a repository. */
+const REPOSITORY_SHAPES = ["cli", "workflow", "channel", "managed", "batch"] as const;
+const REPOSITORIES = { app: { host: "github", repo: "acme/budget-app" } };
+const INTENT = { intent: { purpose: "Keep the budgeting app reliable and fast." } };
+
 export const FEATURE_PROBES: ReadonlyArray<FeatureProbe> = [
   // The 0.9.0 keys (`DELTA_090_KEYS`).
   {
+    // Read by the acceptance judge alone, on the shapes that deliver work and beside the
+    // repositories it is delivered to; a recorded decision everywhere else.
     feature: "intent",
     kind: "authoring",
-    snippet: { intent: { purpose: "Keep the budgeting app reliable and fast." } },
+    snippet: INTENT,
+    effectiveOn: REPOSITORY_SHAPES,
+    place: (shape, variant) =>
+      (REPOSITORY_SHAPES as readonly string[]).includes(variant)
+        ? {
+            path: "intent",
+            snippet: INTENT,
+            base: { ...toolsAt(shape, ["workspaceOpen"]), repositories: REPOSITORIES },
+          }
+        : undefined,
+  },
+  {
+    // Read by the workspace tools, so it is probed with one in both compiles.
+    feature: "repositories",
+    kind: "runtime",
+    snippet: { repositories: REPOSITORIES },
+    place: (shape) =>
+      (REPOSITORY_SHAPES as readonly string[]).includes(shape)
+        ? {
+            path: "repositories",
+            snippet: { repositories: REPOSITORIES },
+            base: toolsAt(shape, ["workspaceOpen"]),
+          }
+        : undefined,
   },
   {
     feature: "evaluation.protected",

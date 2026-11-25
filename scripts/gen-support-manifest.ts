@@ -17,7 +17,8 @@
  *      safety setting the edge allow-list (`CF_WORKER_ENFORCED_KEYS`) says the
  *      worker meets by how it runs (one tool call at a time, every ask
  *      refused), so its build is the same with or without it;
- *   5. otherwise `authoring` for an authoring probe, `wired` via `toolchain`
+ *   5. otherwise `authoring` for an authoring probe (one that names this variant in its
+ *      `effectiveOn` is judged as a runtime setting instead), `wired` via `toolchain`
  *      for a toolchain probe, and for any other probe the generator FAILS: the
  *      setting changes nothing and says nothing.
  * An authoring probe that changes a byte or warns fails too. The cli, workflow
@@ -411,7 +412,7 @@ export function deriveCell(
   );
   const interpreter =
     baseline.interpreter !== undefined && baseline.interpreter !== probed.interpreter;
-  if (probe.kind === "authoring") {
+  if (probe.kind === "authoring" && probe.effectiveOn?.includes(variant) !== true) {
     if (changed || interpreter || added.length > 0) {
       throw new Error(
         `${probe.feature} on ${variant} is an authoring probe but changes the build${
@@ -542,9 +543,9 @@ function corpusObject(shape: Spec["target"]): SpecFragment {
 }
 
 /** Where the probe sits on a shape, and what each compile carries. */
-function placementFor(probe: FeatureProbe, shape: string): ProbePlacement {
+function placementFor(probe: FeatureProbe, shape: string, variant: string): ProbePlacement {
   return (
-    probe.place?.(shape) ?? {
+    probe.place?.(shape, variant) ?? {
       path: probe.feature,
       snippet: probe.snippet,
       ...(probe.base !== undefined ? { base: probe.base } : {}),
@@ -607,12 +608,12 @@ export function shapeCells(
       }
       continue;
     }
-    const placement = placementFor(probe, shape);
-    const baseSpec = (
-      placement.base !== undefined ? mergeFragment(corpus, placement.base) : corpus
-    ) as SpecFragment;
-    const probeSpec = mergeFragment(baseSpec, placement.snippet) as SpecFragment;
     for (const variant of variantsOf(shape)) {
+      const placement = placementFor(probe, shape, variant);
+      const baseSpec = (
+        placement.base !== undefined ? mergeFragment(corpus, placement.base) : corpus
+      ) as SpecFragment;
+      const probeSpec = mergeFragment(baseSpec, placement.snippet) as SpecFragment;
       let derived: DerivedCell;
       try {
         derived = deriveCell(

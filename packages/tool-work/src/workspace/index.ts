@@ -66,7 +66,6 @@ export {
   type WorkspaceEngine,
   WorkspaceError,
   type WorkspaceRefusal,
-  _resetGitVersionCheck,
   createWorkspaceEngine,
 } from "./engine";
 export {

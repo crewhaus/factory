@@ -53,10 +53,10 @@ import {
   parseRef,
 } from "@crewhaus/control-contract";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
-import { currentTenantContext } from "@crewhaus/tenancy";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { inManagedTenant } from "./tenant";
 import {
   type FoldedWorkItem,
   type WorkActor,
@@ -72,6 +72,7 @@ import {
 } from "./work-items/index";
 import { createWorkspaceTools } from "./workspace-tools";
 
+export { WORK_HOME_TENANT } from "./tenant";
 export { WorkConfigError } from "./work-items/index";
 export { bindWorkspaceRepositories } from "./workspace/bindings";
 export {
@@ -100,16 +101,9 @@ export class WorkToolError extends Error {
   override readonly name = "WorkToolError";
 }
 
-/**
- * The tenant Home's own runs serve on a managed daemon (the gateway's `HOME_RUN_TENANT`;
- * a control-service test pins the two equal). The only tenant whose runs reach the store.
- */
-export const WORK_HOME_TENANT = "home";
-
 /** Refuse inside any tenant context but Home's own: the store is the harness's, not a tenant's. */
 function assertHarnessTenant(): void {
-  const ctx = currentTenantContext();
-  if (ctx !== undefined && ctx.tenant.id !== WORK_HOME_TENANT) {
+  if (inManagedTenant()) {
     throw new WorkToolError("Work items are not available to a managed tenant's runs.");
   }
 }

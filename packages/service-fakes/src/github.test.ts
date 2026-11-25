@@ -395,4 +395,26 @@ describe("what a publisher and a tracker need", () => {
     ).json()) as unknown[];
     expect(listed).toHaveLength(1);
   }, 20_000); // several real git children
+
+  test("a review moves a pull request's validator, and a rate limit is a 429 that passes", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    const path = "/repos/acme/widgets/pulls/1";
+    const etag = (await authed(fake, "GET", path)).headers.get("etag");
+    fake.setReviews("acme/widgets", 1, [{ login: "max", state: "APPROVED" }]);
+    expect((await authed(fake, "GET", path)).headers.get("etag")).not.toBe(etag);
+    fake.closePull("acme/widgets", 1);
+    const closed = (await (await authed(fake, "GET", path)).json()) as { head: { sha?: string } };
+    expect(closed.head.sha).toBe(fake.branchSha("acme/widgets", "b"));
+    fake.rateLimitNext(1, 7);
+    const limited = await authed(fake, "GET", path);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("7");
+    expect((await authed(fake, "GET", path)).status).toBe(200);
+  }, 20_000); // several real git children
 });

@@ -256,12 +256,8 @@ export type WorkspaceEngine = {
   ): Promise<{ readonly closed: boolean; readonly wip: boolean }>;
 };
 
-let recentGit: boolean | undefined;
-
-/** Test seam: ask git its version again. */
-export function _resetGitVersionCheck(): void {
-  recentGit = undefined;
-}
+/** Which runners found a git new enough, so its version is read once per process. */
+const recentGit = new WeakSet<GitPort>();
 
 const SLUG_MAX = 40;
 
@@ -357,19 +353,17 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
   }
 
   async function gitReady(): Promise<WorkspaceRefusal | undefined> {
-    if (recentGit === undefined) {
-      const done = await run(["--version"], { cwd: harnessDir, timeoutMs: 10_000 });
-      recentGit = done.code === 0 && gitIsRecent(done.stdout);
-      if (!recentGit) {
-        const found = done.stdout.trim() === "" ? "no git" : done.stdout.trim();
-        recentGit = undefined;
-        return refuse(
-          "unsupported_host",
-          `Workspaces need git 2.38 or newer on this computer; it has ${found}.`,
-        );
-      }
+    if (recentGit.has(run)) return undefined;
+    const done = await run(["--version"], { cwd: harnessDir, timeoutMs: 10_000 });
+    if (done.code === 0 && gitIsRecent(done.stdout)) {
+      recentGit.add(run);
+      return undefined;
     }
-    return undefined;
+    const found = done.stdout.trim() === "" ? "no git" : done.stdout.trim();
+    return refuse(
+      "unsupported_host",
+      `Workspaces need git 2.38 or newer on this computer; it has ${found}.`,
+    );
   }
 
   /** The item, when it may be worked on. */

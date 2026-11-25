@@ -459,6 +459,8 @@ const SHAPE_SPECIFIC_NETWORK_BUILTINS = [
   "evmSendTransaction",
   "evmSimulate",
   "sendMessage",
+  "workspaceOpen",
+  "workspacePublish",
 ];
 
 describe("the network roll-up and the io column agree", () => {
@@ -484,7 +486,8 @@ describe("the network roll-up and the io column agree", () => {
     const outside = categorized.filter((k) => !inRollup.has(k));
     expect(outside.length).toBeGreaterThan(40);
     // The shape-specific network builtins, named: the channel send, and the
-    // EVM tools the graph, workflow and crew shapes carry.
+    // EVM tools the graph, workflow and crew shapes carry, and the workspace tools the
+    // shapes that deliver work carry.
     expect(networkBuiltins.filter((k) => !categorized.includes(k)).sort()).toEqual([
       ...SHAPE_SPECIFIC_NETWORK_BUILTINS,
     ]);
