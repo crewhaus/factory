@@ -17,19 +17,30 @@
  * time come from the caller. No new dependency.
  */
 import { createHash } from "node:crypto";
-import { closeSync, lstatSync, readdirSync, rmSync, rmdirSync, unlinkSync } from "node:fs";
+import {
+  closeSync,
+  lstatSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  rmdirSync,
+  unlinkSync,
+} from "node:fs";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import {
   appendContained,
+  chainUnchanged,
   ensureDirContained,
+  recordChain,
   resolveContained,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
 import { decodeStrict, openRecordFd, parseObject, readAt, readRecordFile } from "./io";
-import { type LeaseProbe, defaultLeaseProbe, holderProvablyDead } from "./lease";
+import { type LeaseProbe, holderProvablyDead } from "./lease";
 import { append, withLedgerLock } from "./ledger";
 import { type Ledger, controlPaths } from "./paths";
+import { systemLeaseProbe } from "./process-start";
 import { retainedSegments, segmentRel } from "./segments";
 
 // ---------------------------------------------------------------------------
@@ -515,7 +526,7 @@ export function foldBudget(
     period,
     state,
     nowMs,
-    options.probe ?? defaultLeaseProbe,
+    options.probe ?? systemLeaseProbe,
     options.host ?? hostname(),
   );
 }
@@ -657,7 +668,18 @@ export type BudgetAdmission =
    * reservations past their lease whose holders are not provably dead: they
    * still count, but no settle can be waited for, so the answer is final.
    */
-  | { readonly admit: false; readonly on: "spent"; readonly held?: true }
+  /**
+   * `inFlight` says it is reached only counting the reservations of calls the
+   * caller runs inside (its `ancestors`): they settle only after the caller
+   * returns, so the answer is final, and it writes no exhaustion record (only
+   * real spend closes intake).
+   */
+  | {
+      readonly admit: false;
+      readonly on: "spent";
+      readonly held?: true;
+      readonly inFlight?: true;
+    }
   | { readonly admit: false; readonly on: "others"; readonly settled: Promise<void> };
 
 /** What a reservation names, content-free. */
@@ -689,10 +711,15 @@ export type BudgetLedgerOptions = {
 export type BudgetLedgerPort = {
   /** The period a reserve made now lands in. */
   readonly periodId: string;
+  /**
+   * `ancestors`: reservations of calls this one runs inside (a call made from
+   * a tool of a call still in progress). They count, but are never waited on.
+   */
   reserve(entry: {
     readonly id: string;
     readonly usdMicros: number;
     readonly meta?: BudgetReserveMeta;
+    readonly ancestors?: readonly string[];
   }): Promise<BudgetAdmission>;
   settle(entry: {
     readonly id: string;
@@ -721,10 +748,18 @@ type OpenPeriod = {
  * writes `budget-state.json`.
  *
  * A reservation records its holder's pid, host and (when the probe can tell)
- * start time, so a recycled pid is provably another process. A refusal that
+ * start time, so a recycled pid is provably another process. The default
+ * probe, `systemLeaseProbe`, always knows this process's own start time, so
+ * every line this process writes carries `startedAt`; it reads another
+ * process's start time on Linux only, and on macOS and Windows a recorded
+ * holder is never judged a recycled pid by its start time. A refusal that
  * only reservations past their lease stand in the way of is final
  * (`on: "spent"`, `held: true`): nothing would ever settle them, so waiting
- * could not end.
+ * could not end. A reservation this port still holds open counts as live
+ * whatever its lease, so a call longer than the lease is never read as held
+ * by its own process. A reserve that names `ancestors` never waits on them:
+ * when spend plus their reservations reach the cap, the answer is final
+ * (`inFlight: true`).
  *
  * First consumers: runtime-core's spend meter and the optimizer's mutation calls.
  */
@@ -734,7 +769,7 @@ export function openBudgetLedger(
   options: BudgetLedgerOptions = {},
 ): BudgetLedgerPort {
   const now = options.now ?? Date.now;
-  const probe = options.probe ?? defaultLeaseProbe;
+  const probe = options.probe ?? systemLeaseProbe;
   const host = options.host ?? hostname();
   const pid = options.pid ?? process.pid;
   const startedAt = probe.startTimeMs(pid);
@@ -789,7 +824,7 @@ export function openBudgetLedger(
     get periodId() {
       return periodAt(now()).period.periodId;
     },
-    async reserve({ id, usdMicros, meta }) {
+    async reserve({ id, usdMicros, meta, ancestors }) {
       const target = periodAt(now());
       const { period, ledger, reader } = target;
       const answer = await withLedgerLock(ledger, (lockedAppend): BudgetAdmission => {
@@ -807,15 +842,28 @@ export function openBudgetLedger(
           });
           return { admit: false, on: "spent" };
         }
+        // A call this one runs inside settles only after it returns: it counts, and
+        // is never waited on.
+        const ancestorIds = new Set(ancestors ?? []);
+        ancestorIds.delete(id);
+        let anc = 0;
+        for (const rid of ancestorIds) {
+          const r = state.active.get(rid);
+          if (r !== undefined && stillCounts(r, nowMs, probe, host)) anc += r.usdMicros;
+        }
+        if (fold.spentUsdMicros + anc >= cap) {
+          return { admit: false, on: "spent", inFlight: true };
+        }
         let live = 0;
         let held = 0;
         for (const [rid, r] of state.active) {
-          if (rid === id) continue;
-          const where = standing(r, nowMs, probe, host);
+          if (rid === id || ancestorIds.has(rid)) continue;
+          // One this port holds open is in progress here, whatever its lease.
+          const where = reservedIn.has(rid) ? "live" : standing(r, nowMs, probe, host);
           if (where === "live") live += r.usdMicros;
           else if (where === "held") held += r.usdMicros;
         }
-        if (fold.spentUsdMicros + live + held >= cap) {
+        if (fold.spentUsdMicros + anc + live + held >= cap) {
           // A reservation inside its lease settles, releases or passes its lease, so
           // the wait is bounded by the leases; past them only `held` ones are left.
           if (live > 0) {
@@ -1036,10 +1084,30 @@ function isPlainDirectory(abs: string): boolean {
   }
 }
 
+/** Why a period's removal stopped, for the test seam. */
+export type BudgetSweepStop = "not-a-directory" | "outside" | "chain-changed" | "failed";
+
+type BudgetSweepSeams = {
+  /** After the directory's identity is recorded, before anything in it is removed. */
+  readonly beforeRemove?: (dir: string) => void;
+  /** Why a removal stopped. */
+  readonly onStop?: (reason: BudgetSweepStop) => void;
+};
+
+let sweepSeams: BudgetSweepSeams = {};
+
+/** Test seam: act between the sweep's checks and its removals, and hear why one stopped. `undefined` restores. */
+export function _setBudgetSweepSeamsForTest(next: BudgetSweepSeams | undefined): void {
+  sweepSeams = next ?? {};
+}
+
 /**
  * Remove one closed period's directory: only when it is a real directory that
  * resolves inside the harness, and only its regular files, each judged without
- * following it. Anything else is left, and so is the directory.
+ * following it. Every directory from the harness down to the period's keeps
+ * the identity it had when the checks passed, before and after each removal;
+ * on any change the sweep stops, removes nothing more, and leaves the period
+ * for the next sweep. Anything else is left, and so is the directory.
  */
 function removePeriodDir(
   harnessDir: string,
@@ -1047,20 +1115,32 @@ function removePeriodDir(
   budgetReal: string,
   name: string,
 ): boolean {
+  const stop = (reason: BudgetSweepStop): false => {
+    sweepSeams.onStop?.(reason);
+    return false;
+  };
   const lexical = join(budgetReal, name);
-  if (!isPlainDirectory(lexical)) return false;
+  if (!isPlainDirectory(lexical)) return stop("not-a-directory");
   const followed = resolveContained(harnessDir, join(budgetRel, name));
-  if (!followed.ok || followed.real !== lexical) return false;
+  if (!followed.ok || followed.real !== lexical) return stop("outside");
   try {
+    const chain = recordChain(realpathSync(harnessDir), lexical);
+    if (chain === undefined) return stop("not-a-directory");
+    sweepSeams.beforeRemove?.(lexical);
+    if (!chainUnchanged(chain)) return stop("chain-changed");
     for (const file of readdirSync(lexical)) {
       const entry = join(lexical, file);
+      if (!chainUnchanged(chain)) return stop("chain-changed");
       if (!lstatSync(entry).isFile()) continue;
+      if (!chainUnchanged(chain)) return stop("chain-changed");
       unlinkSync(entry);
+      if (!chainUnchanged(chain)) return stop("chain-changed");
     }
+    if (!chainUnchanged(chain)) return stop("chain-changed");
     rmdirSync(lexical);
     return true;
   } catch {
     // Left for the next sweep.
-    return false;
+    return stop("failed");
   }
 }

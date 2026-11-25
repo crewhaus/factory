@@ -7072,6 +7072,18 @@ describe("0.9.0 — spend is never a guessed $0", () => {
     expect(reserve).toBeGreaterThan(-1);
     expect(stream).toBeGreaterThan(reserve);
     expect(later().some((b) => b.includes("reserves its worst case first"))).toBe(true);
+    // A call is counted from the moment it is sent: the loop marks it sent just before the
+    // stream call, and its catch settles a sent call rather than releasing it.
+    const sent = loop.indexOf("spendSent = true;");
+    expect(sent).toBeGreaterThan(reserve);
+    expect(stream).toBeGreaterThan(sent);
+    expect(loop.includes("await spendMeter.settleUnreported(id, meta);")).toBe(true);
+    expect(
+      later().some(
+        (b) =>
+          b.includes("reserves its worst case first") && b.includes("counts the usage it reported"),
+      ),
+    ).toBe(true);
   });
 
   test("managed tenant budgets reserve an estimate, and a bullet names `estimateUsage`", () => {

@@ -38,10 +38,11 @@ async function runCli(
   args: ReadonlyArray<string>,
   cwd: string,
   home: string,
+  env: Record<string, string> = {},
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   const proc = Bun.spawn([process.execPath, CLI_PATH, ...args], {
     cwd,
-    env: { PATH: process.env["PATH"] ?? "", HOME: home },
+    env: { PATH: process.env["PATH"] ?? "", HOME: home, ...env },
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -325,6 +326,111 @@ describe("crewhaus watchme (design/watch-me.md §11)", () => {
     );
     expect([...obsIds]).toEqual([SESSION_ID]);
   }, 120_000);
+
+  test("a judge under a declared budget period reserves and settles each call on the spec directory's ledger", async () => {
+    const sse = (event: string, data: unknown): string =>
+      `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+    const body = [
+      sse("message_start", {
+        type: "message_start",
+        message: {
+          id: "msg_stub",
+          type: "message",
+          role: "assistant",
+          model: "claude-haiku-4-5",
+          content: [],
+          stop_reason: null,
+          usage: { input_tokens: 3, output_tokens: 0 },
+        },
+      }),
+      sse("content_block_start", {
+        type: "content_block_start",
+        index: 0,
+        content_block: { type: "text", text: "" },
+      }),
+      sse("content_block_delta", {
+        type: "content_block_delta",
+        index: 0,
+        delta: { type: "text_delta", text: "ok" },
+      }),
+      sse("content_block_stop", { type: "content_block_stop", index: 0 }),
+      sse("message_delta", {
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { output_tokens: 2 },
+      }),
+      sse("message_stop", { type: "message_stop" }),
+    ].join("");
+    // A loopback stand-in for the provider, so the priced judge model answers offline.
+    const stub = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch: (req) =>
+        req.method === "POST" && new URL(req.url).pathname.endsWith("/messages")
+          ? new Response(body, { headers: { "content-type": "text/event-stream" } })
+          : new Response("not found", { status: 404 }),
+    });
+    // A placeholder the stub never checks, built from parts.
+    const env = {
+      ANTHROPIC_API_KEY: ["placeholder", "not", "a", "key"].join("-"),
+      ANTHROPIC_BASE_URL: `http://127.0.0.1:${stub.port}`,
+    };
+    try {
+      const specFor = (period: boolean): string =>
+        [
+          "name: watched",
+          "target: cli",
+          "watchme:",
+          "  enabled: true",
+          "  judge:",
+          "    model: claude-haiku-4-5",
+          "    sample_rate: 1",
+          "    budget_usd: 1",
+          "agent:",
+          "  model: claude-sonnet-4-6",
+          "  instructions: |",
+          "    You are a helpful assistant.",
+          "budget:",
+          "  usd: 5",
+          ...(period ? ["  period: {every: month, usd: 100}"] : []),
+          "",
+        ].join("\n");
+      const reportOn = async (period: boolean): Promise<string> => {
+        const harness = newTempDir(period ? "judge-period" : "judge-no-period");
+        writeHarness(harness);
+        writeFileSync(join(harness, "crewhaus.yaml"), specFor(period));
+        const out = await runCli(
+          ["watchme", "report", "--root", newTempDir("root"), "--json"],
+          harness,
+          newTempDir("home"),
+          env,
+        );
+        expect([out.exitCode, out.stderr]).toEqual([0, out.stderr]);
+        return harness;
+      };
+
+      const harness = await reportOn(true);
+      const budget = join(harness, ".crewhaus", "run", "control", "budget");
+      const lines: Array<{ op?: string; id?: string; model?: string }> = [];
+      for (const period of readdirSync(budget).filter((p) => p.startsWith("month-"))) {
+        for (const seg of readdirSync(join(budget, period))) {
+          for (const line of readFileSync(join(budget, period, seg), "utf8").split("\n")) {
+            if (line !== "") lines.push(JSON.parse(line));
+          }
+        }
+      }
+      const reserves = lines.filter((l) => l.op === "reserve");
+      expect(reserves.length).toBeGreaterThan(0);
+      expect(reserves.every((l) => l.model === "claude-haiku-4-5")).toBe(true);
+      const settled = new Set(lines.filter((l) => l.op === "settle").map((l) => l.id));
+      expect(reserves.every((l) => settled.has(l.id))).toBe(true);
+
+      const plain = await reportOn(false);
+      expect(existsSync(join(plain, ".crewhaus", "run", "control", "budget"))).toBe(false);
+    } finally {
+      stub.stop(true);
+    }
+  }, 20_000); // two CLI subprocesses, each loading the whole entry file
 
   test("report --all recalls co-learning findings ONLY from peers that opted into sharing", async () => {
     const alpha = newTempDir("alpha");

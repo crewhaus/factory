@@ -912,10 +912,13 @@ these on: they reach every harness that uses what each one names.
   a call is sent, its worst case (its request at about four characters a
   token, plus its `max_tokens`) is reserved against the run's cap: it is
   admitted while the spend so far plus the other calls in flight stays under
-  the cap, and it settles to its real cost when it answers. Sub-agents spend
-  from their parent's budget as they go, so calls made at the same time pass
-  the cap by at most one call. A call that is not admitted ends the run with
-  exit 33, as reaching the cap does, and nothing of it is logged.
+  the cap, and it settles to its real cost when it answers. A call that fails
+  after it was sent counts the usage it reported, or its worst case when it
+  reported none, and a call made inside a tool never waits on the call running
+  that tool. Sub-agents spend from their parent's budget as they go, so calls
+  made at the same time pass the cap by at most one call. A call that is not
+  admitted ends the run with exit 33, as reaching the cap does, and nothing of
+  it is logged.
 
 - **Managed tenant budgets reserve an estimate of each request instead of
   zero.** A `runs.create` or `runs.continue` request, and a queued run,

@@ -329,8 +329,10 @@ import {
 } from "./run-spans";
 import type { SloMitigationSink, SloTargets } from "./slo-monitor";
 import {
+  type StreamReport,
   attachSpendMeter,
   estimateRequestMicros,
+  notingUsage,
   reserveModelCall,
   settleModelCall,
 } from "./spend-wiring";
@@ -1455,6 +1457,11 @@ export type EvaluationTurn = {
    * (bounded by `budget.judge_share`). Deterministic graders ignore it.
    */
   readonly bus: TraceEventBus;
+  /**
+   * The run's spend meter, when it is budgeted: the judge reserves its call's
+   * worst case on it and settles on its usage, as the run's own calls do.
+   */
+  readonly spend?: SpendMeter;
   /** 0.6.0 §7.3 — the WIRE model id that produced `finalText` (this attempt's
    *  last main-turn response), when known. */
   readonly servedModel?: string;
@@ -1960,6 +1967,8 @@ export type RouteClassifierFn = (input: {
   readonly labels: readonly string[];
   readonly bus: TraceEventBus;
   readonly signal: AbortSignal;
+  /** The run's spend meter, when it is budgeted: the label call reserves on it. */
+  readonly spend?: SpendMeter;
 }) => Promise<PreRouteClassifierVerdict>;
 
 export type RunChatLoopOptions = {
@@ -2892,6 +2901,13 @@ export type RunChatLoopOptions = {
    * reserves nothing.
    */
   spendMeter?: SpendMeter;
+  /**
+   * The harness directory a declared `budget.period`'s ledger lives in when
+   * loop admission names none (`crewhaus run` sets the spec's directory, the
+   * one its gate checks). A served bundle's admission root wins over it.
+   * Absent: the working directory.
+   */
+  spendLedgerRoot?: string;
   /**
    * 0.6.0 §7.2.3 — the `policy: classifier` label call (see
    * {@link RouteClassifierFn}). Wired by `@crewhaus/model-service` when the
@@ -5182,6 +5198,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       ? createCostTracker(bus, { suppressEvents: !budgetSessionPersist, pricing: effectivePricing })
       : undefined;
   const budgetMeter: CostTracker | undefined = opts.budgetMeter ?? ownBudgetMeter;
+  // The reservation of this loop's model call in progress, while it is held: a
+  // loop nested inside that call (a tool's sub-agent, a side call) names it as
+  // an ancestor, so it never waits on the call running it.
+  let inFlightReservation: string | undefined;
   // The run tree's spend meter (`./spend-wiring`): each model call reserves its worst case first.
   const spendMeter = attachSpendMeter({
     runContext,
@@ -5191,6 +5211,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     seedMicros: resumedCostUsdMicros,
     pricing: effectivePricing,
     trigger: runContext.trigger?.kind,
+    inFlight: () => inFlightReservation,
+    ...(opts.spendLedgerRoot !== undefined ? { ledgerRoot: opts.spendLedgerRoot } : {}),
   });
   // 0.6.0 §6.2 — `budget.judge_share`: the sub-cap on AUXILIARY-role spend
   // (judge, compaction, guide, classifier, consult, committee, shadow) inside
@@ -8291,8 +8313,10 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         ? { justificationAuditSink: opts.justificationAuditSink }
         : {}),
       ...(opts.egressAuditSink !== undefined ? { egressAuditSink: opts.egressAuditSink } : {}),
-      // A child spends from this run's meter live, and prices as this run does.
-      ...(spendMeter !== undefined ? { spend: spendMeter } : {}),
+      // A child spends from this run's meter live, and prices as this run does. It
+      // names the call that dispatched this tool as an ancestor: that call settles
+      // only after the tool returns, so the child never waits on it.
+      ...(spendMeter !== undefined ? { spend: spendMeter.within(inFlightReservation) } : {}),
       ...(opts.pricing !== undefined || opts.declaredPricing !== undefined
         ? { pricing: effectivePricing }
         : {}),
@@ -8852,24 +8876,43 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
   const budgetStopReport = (
     where: string,
     scope: "run" | "share" | "period" | "period_held" = "run",
+    /**
+     * A refusal by the spend meter (else the per-call cap check). `inFlight`: the
+     * cap is reached counting the call still in progress that this loop runs inside.
+     */
+    meter?: { readonly inFlight?: boolean },
   ): FailureReport => {
-    const spentMicros =
-      resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
+    const usd = (micros: number): string => `$${(micros / 1_000_000).toFixed(4)}`;
+    const counting = meter?.inFlight === true ? ", counting the call still in progress," : "";
+    const runDetail = (): string => {
+      if (meter === undefined) {
+        const spentMicros =
+          resumedCostUsdMicros + (budgetMeter?.getRunCost(bus.runId).totalUsdMicros ?? 0);
+        return `${usd(spentMicros)} spent ≥ ${usd(opts.budget?.usdMicros ?? 0)} cap before ${where}${
+          budgetDegraded ? " (degraded rung also reached the cap)" : ""
+        }`;
+      }
+      // A loop on a meter it was handed (a sub-agent's) holds no figure of the run's cap.
+      if (opts.spendMeter !== undefined || spendMeter === undefined) {
+        return `the run's budget is used up${counting} before ${where}`;
+      }
+      const capText = usd(opts.budget?.usdMicros ?? 0);
+      if (meter.inFlight === true) {
+        return `the run's ${capText} budget is used up${counting} before ${where}`;
+      }
+      return `${usd(spendMeter.snapshot().spentMicros)} spent ≥ ${capText} cap before ${where}`;
+    };
     return {
       class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
       title: BUILTIN_FAILURE_CLASSES.crewhaus_budget.title,
       detail:
         scope === "period"
-          ? `the harness's budget for this period is used up before ${where}`
+          ? `the harness's budget for this period is used up${counting} before ${where}`
           : scope === "period_held"
             ? `the harness's budget for this period is held by calls that never finished before ${where}`
             : scope === "share"
-              ? `this sub-agent's share of the budget is used up before ${where}`
-              : `$${(spentMicros / 1_000_000).toFixed(4)} spent ≥ $${(
-                  (opts.budget?.usdMicros ?? 0) / 1_000_000
-                ).toFixed(4)} cap before ${where}${
-                  budgetDegraded ? " (degraded rung also reached the cap)" : ""
-                }`,
+              ? `this sub-agent's share of the budget is used up${counting} before ${where}`
+              : runDetail(),
       remediation: BUILTIN_FAILURE_CLASSES.crewhaus_budget.remediation,
       exitCode: BUILTIN_FAILURE_CLASSES.crewhaus_budget.exitCode,
     };
@@ -9301,6 +9344,11 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           let modelSpanId: string | undefined;
           // The call's spend reservation until it settles, so the catch can let it go.
           let spendHeld: string | undefined;
+          // Whether the call was handed to the provider: from then on it is counted.
+          let spendSent = false;
+          // What the call was reserved as, and the usage its stream reported in full.
+          let spendHeldAs: { provider: ProviderId; model: string } | undefined;
+          const spendReport: StreamReport = {};
           let modelCallStartMs = performance.now();
           try {
             // Section 27 — rate-limit the model call before opening the
@@ -9551,6 +9599,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                           labels: classifierLabels,
                           bus,
                           signal: turnAbort.signal,
+                          ...(spendMeter !== undefined ? { spend: spendMeter } : {}),
                         });
                         turnClassifierVerdict = { message: humanMessage, verdict };
                         return verdict;
@@ -9973,13 +10022,19 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   budgetStopReport(
                     `model call ${toolIterations + 1} of turn ${runContext.turnNumber}`,
                     held.held === true ? "period_held" : held.scope,
+                    { inFlight: held.inFlight === true },
                   ),
                 );
               }
               spendHeld = reservation;
+              spendHeldAs = { provider: reqProviderId, model: reqWireModelId };
+              inFlightReservation = reservation;
             }
             armModelCallTimer();
+            spendSent = true;
             const reqStream = turnAdapter.stream(req);
+            const callStream =
+              spendMeter !== undefined ? notingUsage(reqStream, spendReport) : reqStream;
 
             if (opts.streaming) {
               // Streaming path: dispatch tools mid-stream via the
@@ -10003,7 +10058,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 );
               };
               const { finalContent, toolResults, stopReason, usage } = await executeStreaming(
-                reqStream,
+                callStream,
                 {
                   // 0.6.0 §4.4 — the serving candidate's advertised tools; a
                   // name outside them still reaches `runTool`, where the
@@ -10105,9 +10160,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 ...planAttribution(plan),
               });
               if (spendMeter !== undefined && spendHeld !== undefined) {
+                const id = spendHeld;
+                spendHeld = undefined;
+                inFlightReservation = undefined;
                 await settleModelCall({
                   meter: spendMeter,
-                  id: spendHeld,
+                  id,
                   runContext,
                   bus,
                   budgeted: opts.budget !== undefined,
@@ -10117,7 +10175,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   usage,
                   meta: { run: runContext.runId, model: respModelIdS },
                 });
-                spendHeld = undefined;
               }
               await spans.closeModel(modelStartEnv.spanId);
               await recordServedModel(respModelIdS);
@@ -10214,7 +10271,7 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
 
             // Non-streaming path: drain the AsyncIterable into a final
             // `ProviderMessage` while emitting text deltas to stdout.
-            const final = await consumeStream(reqStream, {
+            const final = await consumeStream(callStream, {
               onTextDelta: (chunk) => {
                 writeText(chunk);
                 bus.publish(
@@ -10266,9 +10323,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
               ...planAttribution(plan),
             });
             if (spendMeter !== undefined && spendHeld !== undefined) {
+              const id = spendHeld;
+              spendHeld = undefined;
+              inFlightReservation = undefined;
               await settleModelCall({
                 meter: spendMeter,
-                id: spendHeld,
+                id,
                 runContext,
                 bus,
                 budgeted: opts.budget !== undefined,
@@ -10278,7 +10338,6 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 usage: final.usage,
                 meta: { run: runContext.runId, model: respWireModelId },
               });
-              spendHeld = undefined;
             }
             await spans.closeModel(modelStartEnv.spanId);
             await recordServedModel(respWireModelId);
@@ -10396,10 +10455,39 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           } catch (err) {
             // G10 — the watchdog must not outlive the call it watched.
             clearModelCallTimer();
-            // A call that failed spends nothing: its reservation is let go.
+            // A call that was never sent spends nothing. A call that was sent is
+            // counted: at the usage its stream reported, else at its reserved worst
+            // case (each recovery attempt holds and settles its own).
             if (spendMeter !== undefined && spendHeld !== undefined) {
-              await spendMeter.release(spendHeld);
+              const id = spendHeld;
               spendHeld = undefined;
+              inFlightReservation = undefined;
+              if (!spendSent || spendHeldAs === undefined) {
+                await spendMeter.release(id);
+              } else {
+                const served =
+                  poolTurn !== undefined
+                    ? poolTurn.candidate.lastServed?.()
+                    : failoverChain?.lastServed();
+                const model = served?.modelId ?? spendHeldAs.model;
+                const meta = { run: runContext.runId, model };
+                if (spendReport.usage === undefined) {
+                  await spendMeter.settleUnreported(id, meta);
+                } else {
+                  await settleModelCall({
+                    meter: spendMeter,
+                    id,
+                    runContext,
+                    bus,
+                    budgeted: opts.budget !== undefined,
+                    provider: served?.providerId ?? spendHeldAs.provider,
+                    wireModelId: model,
+                    role: opts.modelRole,
+                    usage: spendReport.usage,
+                    meta,
+                  });
+                }
+              }
             }
             // A call that failed is the one recovery retries next.
             if (modelSpanId !== undefined) await spans.closeModel(modelSpanId, err);
@@ -11192,6 +11280,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
           // the budget meter above (and any attached cost-tracker) sees them.
           bus,
+          // The judge's call reserves on this run's spend meter, as a model call does.
+          ...(spendMeter !== undefined ? { spend: spendMeter } : {}),
           ...(attempt.servedModel !== undefined ? { servedModel: attempt.servedModel } : {}),
           ...(attempt.profile !== undefined ? { profile: attempt.profile } : {}),
           ...(current !== undefined ? { stage: current.stage } : {}),

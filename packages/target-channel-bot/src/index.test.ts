@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1627,6 +1628,35 @@ describe("emitChannelBot — dream janitor step (v0.3.0 PR 14, §6.3)", () => {
       expect(content).not.toContain("__DREAM_FRAGMENT");
       expect(content).not.toContain("steps:");
     }
+  });
+});
+
+describe("emitChannelBot — the dream session and the harness's budget period", () => {
+  const DREAM_BUDGET_IR: IrChannelV0 = {
+    ...MIN_IR,
+    memory: { dream: { everyMs: 86_400_000, mode: "full", budgetUsd: 0.5 } },
+    budget: { usdMicros: 5_000_000, onExceed: { kind: "stop" } },
+  };
+  const dreamBlock = (agent: string): string => {
+    const start = agent.indexOf("export function createDreamStep()");
+    expect(start).toBeGreaterThan(-1);
+    return agent.slice(start);
+  };
+
+  test("a declared period rides the dream session's budget", () => {
+    const period = { every: "month" as const, usdMicros: 100_000_000, timezone: "Europe/Berlin" };
+    const budget = { usdMicros: 5_000_000, onExceed: { kind: "stop" as const }, period };
+    const agent = fileMap({ ...DREAM_BUDGET_IR, budget }).get("agent.ts") ?? "";
+    expect(dreamBlock(agent)).toContain(`period: ${JSON.stringify(period)},`);
+  });
+
+  test("without a period the dream runner is emitted exactly as before", () => {
+    const agent = fileMap(DREAM_BUDGET_IR).get("agent.ts") ?? "";
+    expect(dreamBlock(agent)).not.toContain("period");
+    // The agent.ts this spec compiled to before the period was carried.
+    expect(createHash("sha256").update(agent).digest("hex")).toBe(
+      "6efa259a2b4192c5dc3bb8af726534e6e683113a949233d385cd9ddfa0ab05ff",
+    );
   });
 });
 

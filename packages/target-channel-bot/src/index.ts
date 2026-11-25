@@ -1058,7 +1058,11 @@ export function createDreamStep(): DreamJanitorStep | null {
             maxToolIterations: input.maxToolIterations,
             budget: {
               usdMicros: Math.round(input.budgetUsd * 1_000_000),
-              onExceed: { kind: "stop" },
+              onExceed: { kind: "stop" },${
+                ir.budget?.period !== undefined
+                  ? `\n              period: ${JSON.stringify(ir.budget.period)},`
+                  : ""
+              }
             },
             spinner: false,
           });

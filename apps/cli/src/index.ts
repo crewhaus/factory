@@ -5152,6 +5152,10 @@ async function runRunCli(
         : {}),
       // Item 27 — run-level spend cap (--budget-usd flag > spec `budget`).
       ...(runBudget !== undefined ? { budget: runBudget } : {}),
+      // A declared period's ledger lives in the spec's directory, wherever the run starts.
+      ...(runBudget?.period !== undefined
+        ? { spendLedgerRoot: runSpecDirOf(resolve(specPath)) }
+        : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
@@ -8208,7 +8212,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
           traceBus,
           ...(stageMutator !== undefined ? { mutator: stageMutator } : {}),
           ...(stageBudget !== undefined ? { budgetUsd: stageBudget } : {}),
-          ...optimizeSpendLedger(optimizeSpecPath),
+          ...optimizeSpendLedger(absSpec),
         });
         process.stdout.write(
           `[optimize] stage ${stage.name} score: ${r.scoreBefore.toFixed(3)} → ${r.scoreAfter.toFixed(3)} ` +
@@ -8318,7 +8322,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
         // The harness's spending period, when its spec declares one.
-        ...optimizeSpendLedger(optimizeSpecPath),
+        ...optimizeSpendLedger(absSpec),
       }),
     );
 
@@ -22941,6 +22945,12 @@ function buildWatchmeJudgePhase(
    *  `runChatLoop` call so the profile means the same thing here as on a
    *  serving slot. Absent → the loop's defaults, byte-identical. */
   params?: NonNullable<WatchmeIrView["watchme"]>["judgeParams"],
+  /** The harness's spending period and the spec's directory its ledger lives in:
+   *  each judge call reserves on it. Absent → no period, no ledger. */
+  spend?: {
+    readonly period: NonNullable<NonNullable<WatchmeIrView["budget"]>["period"]>;
+    readonly ledgerRoot: string;
+  },
 ): WatchmeJudgePhase {
   // Judge sessions live in an ISOLATED root the report NEVER enumerates
   // (enumeration is scoped to `<crewhausDir>/sessions`). This keeps judged-turn
@@ -23028,7 +23038,9 @@ function buildWatchmeJudgePhase(
           budget: {
             usdMicros: Math.max(0, Math.round(input.budgetRemainingUsd * 1_000_000)),
             onExceed: { kind: "stop" },
+            ...(spend !== undefined ? { period: spend.period } : {}),
           },
+          ...(spend !== undefined ? { spendLedgerRoot: spend.ledgerRoot } : {}),
           spinner: false,
         });
         if (verdict === undefined) {
@@ -23053,6 +23065,8 @@ function buildWatchmeJudgePhase(
 type WatchmeIrView = {
   readonly name: string;
   readonly target: string;
+  /** The harness's spending period, when the spec declares one. */
+  readonly budget?: { readonly period?: NonNullable<IrBudget["period"]> };
   readonly watchme?: {
     readonly enabled: boolean;
     readonly capture: "full" | "mirrors";
@@ -23102,6 +23116,8 @@ function watchmeSessionRows(
 /** One-harness phase-1(+2) report with the real seams wired (watch-me §11). */
 async function runWatchmeHarnessReport(opts: {
   readonly ir: WatchmeIrView;
+  /** The watched harness's spec file: its directory holds the period ledger. */
+  readonly specPath: string;
   readonly crewhausDir: string;
   readonly sessionId?: string;
   readonly outDir?: string;
@@ -23138,6 +23154,9 @@ async function runWatchmeHarnessReport(opts: {
             opts.ir.name,
             opts.crewhausDir,
             opts.ir.watchme?.judgeParams,
+            opts.ir.budget?.period !== undefined
+              ? { period: opts.ir.budget.period, ledgerRoot: runSpecDirOf(opts.specPath) }
+              : undefined,
           ),
         }
       : {}),
@@ -23359,7 +23378,7 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
 
   switch (action) {
     case "start": {
-      const { ir } = loadWatchmeIr(args);
+      const { ir, specPath } = loadWatchmeIr(args);
       const store = openWatchmeStore(crewhausDir, { specName: ir.name });
       const registry = openHarnessRegistry(globalRoot);
       const capture = ir.watchme?.capture ?? "full";
@@ -23372,7 +23391,7 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
           target: ir.target,
           share: ir.watchme?.share === true,
         },
-        runBackfill: () => runWatchmeHarnessReport({ ir, crewhausDir, noModel: true }),
+        runBackfill: () => runWatchmeHarnessReport({ ir, specPath, crewhausDir, noModel: true }),
       });
       process.stdout.write(
         `[watchme] ${result.alreadyWatching ? "already watching" : "watching"} ${ir.name} (capture: ${capture})\n`,
@@ -23495,10 +23514,11 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
         }
         return;
       }
-      const { ir } = loadWatchmeIr(args);
+      const { ir, specPath } = loadWatchmeIr(args);
       const sessionFlag = strFlag(args, "session");
       const result = await runWatchmeHarnessReport({
         ir,
+        specPath,
         crewhausDir,
         ...(sessionFlag !== undefined ? { sessionId: sessionFlag } : {}),
         ...(outFlag !== undefined ? { outDir: resolve(outFlag) } : {}),

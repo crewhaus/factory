@@ -26,6 +26,7 @@
 import { type SpawnSyncOptions, spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { closeSync, openSync, readFileSync } from "node:fs";
+import { parseProcBtime, parseProcStartTime, parsePsLstart } from "@crewhaus/control-records";
 
 /** A handle on a spawned child. Deliberately narrower than Node's
  *  `ChildProcess`: the supervisor only ever needs these few things. */
@@ -155,49 +156,9 @@ export function argvFingerprint(cwd: string, argv: readonly string[]): string {
 // Start-time parsers (pure — unit-tested against captured output)
 // ---------------------------------------------------------------------------
 
-/** Parse `ps -p <pid> -o lstart=` output (e.g. `Mon Aug  4 00:22:11 2026`).
- *  Whole-second granularity, hence the tolerance on every comparison. */
-export function parsePsLstart(stdout: string): number | undefined {
-  const line = stdout.trim();
-  if (line === "") return undefined;
-  const ms = Date.parse(line);
-  return Number.isFinite(ms) ? ms : undefined;
-}
-
-/**
- * Derive a start time from Linux `/proc` inputs:
- *   - `statLine` — the contents of `/proc/<pid>/stat`; field 22 is the
- *     process start time in clock ticks since boot. The comm field (2) is
- *     parenthesised and may itself contain spaces and parentheses, so the
- *     split happens AFTER the last `)`.
- *   - `btimeSeconds` — `btime` from `/proc/stat`, the boot time in epoch
- *     seconds.
- *   - `clockTicksPerSecond` — `USER_HZ`, 100 on every mainstream build.
- */
-export function parseProcStartTime(
-  statLine: string,
-  btimeSeconds: number,
-  clockTicksPerSecond = 100,
-): number | undefined {
-  const close = statLine.lastIndexOf(")");
-  if (close === -1) return undefined;
-  const fields = statLine
-    .slice(close + 1)
-    .trim()
-    .split(/\s+/);
-  // After the comm field, field 3 (state) is index 0, so field 22 is index 19.
-  const ticks = Number(fields[19]);
-  if (!Number.isFinite(ticks) || !Number.isFinite(btimeSeconds)) return undefined;
-  return Math.round(btimeSeconds * 1000 + (ticks / clockTicksPerSecond) * 1000);
-}
-
-/** Parse `/proc/stat` for the `btime <seconds>` line. */
-export function parseProcBtime(procStat: string): number | undefined {
-  const m = /^btime\s+(\d+)$/m.exec(procStat);
-  if (m === null) return undefined;
-  const n = Number(m[1]);
-  return Number.isFinite(n) ? n : undefined;
-}
+// One copy of the POSIX parsers lives in control-records, which the budget
+// ledger's probe reads with; this module's public names are unchanged.
+export { parseProcBtime, parseProcStartTime, parsePsLstart };
 
 /** Parse the PowerShell start-time probe's round-trip (`o`) timestamp. */
 export function parseWindowsStartTime(stdout: string): number | undefined {

@@ -4,15 +4,25 @@
  * (item-27 option mapping), and the scaffold verb.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { lower } from "@crewhaus/compiler";
 import { parseArgs } from "@crewhaus/infra-utils";
 import type { DreamRunReport } from "@crewhaus/memory-service";
+import { parseSpec } from "@crewhaus/spec";
 import {
   DREAM_CLI_SCHEMA,
   type DreamChatLoopOptions,
   buildDreamModelPhase,
+  dreamSpendOf,
   renderDreamRunReport,
   runDreamCommand,
 } from "./dream-cli";
@@ -166,6 +176,70 @@ describe("buildDreamModelPhase — item-27 budget threading", () => {
     expect(result.sessionId).toMatch(/^sess_[0-9a-f]{16}$/);
     expect(result.spentUsd).toBe(0); // no cost events flowed in the fake
     expect(result.summary).toBe("consolidated.");
+  });
+});
+
+describe("the dream session and the harness's budget period", () => {
+  const PERIOD_SPEC = [
+    "name: support-bot",
+    "target: cli",
+    "agent:",
+    "  model: claude-haiku-4-5",
+    "  instructions: hi",
+    "memory:",
+    "  dream:",
+    "    every: 1d",
+    "    mode: full",
+    "    budget_usd: 0.5",
+    "budget:",
+    "  usd: 5",
+    "  period: {every: month, usd: 100}",
+    "",
+  ].join("\n");
+
+  const capture = async (spend: ReturnType<typeof dreamSpendOf>) => {
+    const captured: DreamChatLoopOptions[] = [];
+    const phase = buildDreamModelPhase({
+      model: "claude-haiku-4-5",
+      specName: "support-bot",
+      fragment: { specName: "support-bot", memory: {} },
+      cwd: tmp,
+      chatLoop: async (opts) => {
+        captured.push(opts);
+        return "consolidated.";
+      },
+      ...spend,
+    });
+    await phase.run({ playbook: "p", prompt: "f", budgetUsd: 0.5, maxToolIterations: 3 });
+    return captured[0];
+  };
+
+  test("a declared period reaches the session's budget, with the spec's directory as the ledger root", async () => {
+    const specPath = join(tmp, "agent.yaml");
+    writeFileSync(specPath, PERIOD_SPEC);
+    const ir = lower(parseSpec(PERIOD_SPEC)) as unknown as Parameters<typeof dreamSpendOf>[0];
+    const spend = dreamSpendOf(ir, specPath);
+    expect(spend).toEqual({
+      period: { every: "month", usdMicros: 100_000_000 },
+      spendLedgerRoot: realpathSync(tmp),
+    });
+    const opts = await capture(spend);
+    expect(opts?.budget).toEqual({
+      usdMicros: 500_000,
+      onExceed: { kind: "stop" },
+      period: { every: "month", usdMicros: 100_000_000 },
+    });
+    expect(opts?.spendLedgerRoot).toBe(realpathSync(tmp));
+  });
+
+  test("without a period the session's options are as they were: no period, no ledger root", async () => {
+    const plain = PERIOD_SPEC.replace("  period: {every: month, usd: 100}\n", "");
+    const ir = lower(parseSpec(plain)) as unknown as Parameters<typeof dreamSpendOf>[0];
+    const spend = dreamSpendOf(ir, join(tmp, "agent.yaml"));
+    expect(spend).toEqual({});
+    const opts = await capture(spend);
+    expect(opts?.budget).toEqual({ usdMicros: 500_000, onExceed: { kind: "stop" } });
+    expect(opts !== undefined && "spendLedgerRoot" in opts).toBe(false);
   });
 });
 

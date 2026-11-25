@@ -33,6 +33,7 @@
 import { randomBytes } from "node:crypto";
 import type { ProviderAdapter, ProviderId } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import type { SpendMeter } from "@crewhaus/cost-tracker/spend";
 import { judgePairwise, judgeSelect } from "@crewhaus/eval-judge";
 import type { IrModelPoolStrategy } from "@crewhaus/ir";
 import { type RunContext, createRunContext, lineageOf, mintRunId } from "@crewhaus/run-context";
@@ -184,6 +185,11 @@ export async function runNestedSingleTurn(
     ...(args.stage !== undefined ? { stage: args.stage } : {}),
   };
   const usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  // A budgeted parent's spend meter: the side call reserves its own worst case on it,
+  // naming the parent's call in progress (if any) so it never waits on it, and
+  // prices its cost with the run's table.
+  const spendMeter = spendMeterOf(parent);
+  const pricing = spendMeter?.pricing ?? DEFAULT_PRICING;
   // A child call's request and response share one span id on the child bus;
   // they share one on the parent bus too, so the pair still matches there.
   const parentSpans = new Map<string, string>();
@@ -200,7 +206,7 @@ export async function runNestedSingleTurn(
       usage.cacheCreate += r.usage.cacheCreate ?? 0;
       durationMs += r.durationMs;
       const row =
-        r.provider !== undefined ? resolvePricing(DEFAULT_PRICING, r.provider, r.model) : undefined;
+        r.provider !== undefined ? resolvePricing(pricing, r.provider, r.model) : undefined;
       if (row !== undefined) {
         costUsdMicros =
           (costUsdMicros ?? 0) +
@@ -227,8 +233,6 @@ export async function runNestedSingleTurn(
     }
   });
   const injected = deps._consultAdapters?.get(args.target.modelString);
-  // A budgeted parent's spend meter: the side call reserves its own worst case on it.
-  const spendMeter = spendMeterOf(parent);
   const t0 = performance.now();
   try {
     const text = await runChatLoop({
@@ -265,6 +269,12 @@ export async function runNestedSingleTurn(
   } finally {
     unsubscribe();
   }
+}
+
+/** The run's spend meter as a judge option: present only when the run is budgeted. */
+function spendOf(runContext: RunContext): { spend?: SpendMeter } {
+  const spend = spendMeterOf(runContext);
+  return spend !== undefined ? { spend } : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +467,8 @@ export function buildShadowSideCall(
         bus: ctx.bus,
         role: "judge",
         stage: "shadow",
+        // The judge reserves on the run's spend meter, as the shadow call did.
+        ...spendOf(ctx.runContext),
       });
       const verdict =
         comparison.verdict === "new" ? "shadow" : comparison.verdict === "prev" ? "primary" : "tie";
@@ -652,6 +664,7 @@ export function buildCommitteeSideCall(
           bus: ctx.bus,
           role: "judge",
           stage: "committee",
+          ...spendOf(ctx.runContext),
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);

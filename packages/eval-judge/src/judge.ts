@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   type ProviderAdapter,
   type ProviderId,
@@ -7,6 +8,7 @@ import {
   extractToolUse,
 } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import { type SpendMeter, estimateCallMicros } from "@crewhaus/cost-tracker/spend";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
@@ -163,6 +165,12 @@ export type JudgeBusOptions = {
   readonly role?: ModelRole;
   /** Hybrid-strategy stage the call belongs to (`"verify"`, `"member"`, …). */
   readonly stage?: string;
+  /**
+   * The spend meter the call reserves on (a run's, or an eval's period
+   * meter): its worst case is reserved before it is sent, and it settles on
+   * its usage. A refusal sends nothing and throws a {@link JudgeError}.
+   */
+  readonly spend?: SpendMeter;
 };
 
 /**
@@ -195,6 +203,11 @@ export type JudgeCallUsage = {
  * shape, because a judge that answered wrongly still burned the tokens.
  * Shared by the scalar, categorical and pairwise judges so every judge
  * call in the system meters identically.
+ *
+ * With `spend`, the call reserves its worst case before it is sent (waiting
+ * while only other calls' reservations stand in the way), settles on its
+ * usage, and, when it fails after it was sent, settles at the reserved worst
+ * case. A refusal sends nothing.
  */
 export async function meteredJudgeCall(
   adapter: ProviderAdapter,
@@ -207,6 +220,10 @@ export async function meteredJudgeCall(
   const specModelField: { readonly specModel?: string } =
     meta.specModel !== request.model ? { specModel: meta.specModel } : {};
   const startEnvelope = bus?.envelope();
+  const spend = meta.spend;
+  const spendId = `rsv_judge_${startEnvelope?.spanId ?? randomBytes(8).toString("hex")}`;
+  const spendMeta = { role, model: request.model };
+  if (spend !== undefined) await reserveJudgeCall(spend, spendId, adapter, request, spendMeta);
   if (bus !== undefined && startEnvelope !== undefined) {
     bus.publish({
       ...startEnvelope,
@@ -221,8 +238,29 @@ export async function meteredJudgeCall(
     });
   }
   const t0 = performance.now();
-  const final = await collectWithTemperatureRetry(adapter, request);
+  let final: ProviderMessage;
+  try {
+    final = await collectWithTemperatureRetry(adapter, request);
+  } catch (err) {
+    // Sent: it is counted, at its reserved worst case.
+    if (spend !== undefined) await spend.settleUnreported(spendId, spendMeta);
+    throw err;
+  }
   const durationMs = performance.now() - t0;
+  if (spend !== undefined) {
+    await spend.settle(
+      spendId,
+      {
+        provider: adapter.providerId,
+        modelId: request.model,
+        input: final.usage.input,
+        output: final.usage.output,
+        ...(final.usage.cacheRead !== undefined ? { cacheRead: final.usage.cacheRead } : {}),
+        ...(final.usage.cacheCreate !== undefined ? { cacheCreate: final.usage.cacheCreate } : {}),
+      },
+      spendMeta,
+    );
+  }
   if (bus !== undefined && startEnvelope !== undefined) {
     bus.publish({
       ...bus.envelope(),
@@ -263,6 +301,47 @@ export async function meteredJudgeCall(
   // in the wrong shape still burned the tokens it burned.
   meta.onUsage?.({ model: meta.specModel, input: final.usage.input, output: final.usage.output });
   return { final, usage };
+}
+
+/**
+ * Reserve a judge call's worst case on `spend`: its system, messages and
+ * tools at the input rate, `maxTokens` at the output rate. Waits while only
+ * other calls' reservations stand in the way; a refusal throws.
+ */
+async function reserveJudgeCall(
+  spend: SpendMeter,
+  id: string,
+  adapter: ProviderAdapter,
+  request: ProviderRequest,
+  meta: { readonly role: ModelRole; readonly model: string },
+): Promise<void> {
+  const chars = JSON.stringify({
+    system: request.system,
+    messages: request.messages,
+    tools: request.tools ?? [],
+  }).length;
+  const estimate = estimateCallMicros(
+    chars,
+    0,
+    request.maxTokens,
+    adapter.providerId,
+    request.model,
+    spend.pricing,
+  );
+  for (;;) {
+    const answer = await spend.reserve(id, estimate, meta);
+    if (answer.admit) return;
+    if (answer.on === "spent") {
+      throw new JudgeError(
+        answer.scope === "period"
+          ? "the harness's budget for this period is used up; the judge call was not sent"
+          : answer.scope === "share"
+            ? "this sub-agent's share of the budget is used up; the judge call was not sent"
+            : "the run's budget is used up; the judge call was not sent",
+      );
+    }
+    await answer.settled;
+  }
 }
 
 export type JudgeOptions = {
@@ -399,6 +478,7 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
     {
       specModel: model,
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -551,6 +631,7 @@ export async function judgeCategorical(
     {
       specModel: model,
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -677,6 +758,7 @@ export async function verifyDraft(opts: VerifyDraftOptions): Promise<VerifyDraft
       // The verifier is the cascade's judge: role "judge" unless overridden,
       // stage "verify" by default so the run's cost fold names the stage.
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+      ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       stage: opts.stage ?? "verify",
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -907,6 +989,8 @@ export function createJudgeGrader(
     bus?: TraceEventBus;
     role?: ModelRole;
     stage?: string;
+    /** The spend meter every judge call this grader makes reserves on before it is sent. */
+    spend?: SpendMeter;
     /**
      * 0.6.0 §4.2 — the judge profile's pinned request params, threaded into
      * EVERY call this grader makes (single verdicts, each repeat, each
@@ -929,6 +1013,7 @@ export function createJudgeGrader(
   // 0.6.0 — the bus/attribution fragment spread into every judge call.
   const busOpts: JudgeBusOptions = {
     ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+    ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
     ...(opts.role !== undefined ? { role: opts.role } : {}),
     ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
   };

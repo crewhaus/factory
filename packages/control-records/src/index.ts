@@ -142,6 +142,12 @@ export {
   defaultLeaseProbe,
   holderProvablyDead,
 } from "./lease";
+export {
+  parseProcBtime,
+  parseProcStartTime,
+  parsePsLstart,
+  systemLeaseProbe,
+} from "./process-start";
 export { type RunnableMode, type RunnableVerdict, assertRunnable } from "./runnable";
 export {
   type DeploymentsRead,

@@ -52,7 +52,7 @@ describe("what the sources import", () => {
   );
 
   test("the scan really reads the sources", () => {
-    expect(SOURCES.length).toBe(26);
+    expect(SOURCES.length).toBe(27);
     expect(imports.length).toBeGreaterThan(40);
     expect(imports.some((i) => i.path === "node:fs")).toBe(true);
     expect(imports.some((i) => i.path === "@crewhaus/tool-safety/fs")).toBe(true);
@@ -188,6 +188,10 @@ describe("what the package exports", () => {
         "foldStates",
         "harnessLedger",
         "holderProvablyDead",
+        "parseProcBtime",
+        "parseProcStartTime",
+        "parsePsLstart",
+        "systemLeaseProbe",
         "intakeRoot",
         "intakeVerdict",
         "listClaims",

@@ -225,3 +225,150 @@ describe("worst-case estimates", () => {
     expect(actualCallMicros({ input: 3, output: 4 }, "openai", "no-price", FLAT)).toBeUndefined();
   });
 });
+
+describe("a call made inside another call's tool", () => {
+  test("never waits on the enclosing call's reservation: the answer is final at the first ask", async () => {
+    const meter = createSpendMeter({ capMicros: 100, pricing: FLAT });
+    expect(await meter.reserve("P", 100)).toEqual({ admit: true });
+    // Without the view the same reserve waits on P, which settles only after the tool returns.
+    const plain = await meter.reserve("c0", 10);
+    expect(plain.admit === false && plain.on).toBe("others");
+    expect(await meter.within("P").reserve("c", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    expect(meter.snapshot().activeReservations).toBe(1);
+  });
+
+  test("a child of a view, and a view of a view, keep the ancestor; a view made before is fixed", async () => {
+    const meter = createSpendMeter({ capMicros: 100, pricing: FLAT });
+    // Made while no call is in progress: it names no ancestor, and never adopts a later one.
+    const early = meter.within(undefined);
+    await meter.reserve("P", 100);
+    const child = meter.within("P").child({ capMicros: 1_000 });
+    expect(await child.reserve("k", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    const nested = meter.within("P").within("Q");
+    expect(await nested.reserve("n", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    const late = await early.reserve("e", 10);
+    expect(late.admit === false && late.on).toBe("others");
+  });
+
+  test("a sibling still in progress is waited for, and the wait ends when the sibling settles", async () => {
+    const meter = createSpendMeter({ capMicros: 100, seedMicros: 10, pricing: FLAT });
+    await meter.reserve("P", 40);
+    await meter.reserve("S", 60);
+    const answer = await meter.within("P").reserve("c", 5);
+    if (answer.admit || answer.on !== "others") throw new Error("expected a wait on the sibling");
+    let ended = false;
+    void answer.settled.then(() => {
+      ended = true;
+    });
+    await Promise.resolve();
+    expect(ended).toBe(false);
+    await meter.settle("S", costing(1));
+    // P never settles: the wait ended on S alone.
+    await answer.settled;
+    expect(ended).toBe(true);
+    expect(await meter.within("P").reserve("c", 5)).toEqual({ admit: true });
+  });
+
+  test("the ancestor's id goes to the period ledger only when it was reserved there", async () => {
+    const seen: (readonly string[] | undefined)[] = [];
+    const ledger: SpendLedgerPort = {
+      reserve: async ({ ancestors }) => {
+        seen.push(ancestors);
+        return { admit: false, on: "spent", inFlight: true };
+      },
+      settle: async () => {},
+      release: async () => {},
+    };
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    // A period refusal that counts an ancestor is final too.
+    expect(await meter.within("never-reserved").reserve("c", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "period",
+      inFlight: true,
+    });
+    expect(seen).toEqual([undefined]);
+    const lines: string[] = [];
+    const recording: SpendLedgerPort = {
+      reserve: async ({ id, ancestors }) => {
+        lines.push(`reserve ${id} ${(ancestors ?? []).join(",")}`);
+        return { admit: true };
+      },
+      settle: async () => {},
+      release: async () => {},
+    };
+    const tree = createSpendMeter({ capMicros: 1_000, ledger: recording, pricing: FLAT });
+    await tree.reserve("P", 10);
+    await tree.within("P").child().reserve("k", 10);
+    expect(lines).toEqual(["reserve P ", "reserve k P"]);
+  });
+});
+
+describe("a call that was sent and reported no usage", () => {
+  function recordingLedger(): SpendLedgerPort & { lines: string[] } {
+    const lines: string[] = [];
+    return {
+      lines,
+      reserve: async ({ id, usdMicros }) => {
+        lines.push(`reserve ${id} ${usdMicros}`);
+        return { admit: true };
+      },
+      settle: async ({ id, usdMicros }) => {
+        lines.push(`settle ${id} ${usdMicros}`);
+      },
+      release: async (id) => {
+        lines.push(`release ${id}`);
+      },
+    };
+  }
+
+  test("counts its reserved worst case as spent, on the meter and the period", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("a", 70);
+    expect(await meter.settleUnreported("a")).toEqual({ usdMicros: 70 });
+    expect(meter.snapshot()).toMatchObject({ spentMicros: 70, activeReservations: 0 });
+    expect(ledger.lines).toEqual(["reserve a 70", "settle a 70"]);
+  });
+
+  test("an unpriced call counts one unknown call and settles the period with null", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("u", undefined);
+    expect(await meter.settleUnreported("u")).toEqual({ usdMicros: undefined });
+    expect(meter.snapshot()).toMatchObject({ spentMicros: 0, unknownCalls: 1 });
+    expect(ledger.lines).toEqual(["settle u null"]);
+  });
+
+  test("an id reserved through a view settles on the period through the base", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("P", 10);
+    await meter.within("P").reserve("v", 20);
+    await meter.release("v");
+    await meter.within("P").reserve("w", 30);
+    await meter.settle("w", costing(5));
+    expect(ledger.lines).toEqual([
+      "reserve P 10",
+      "reserve v 20",
+      "release v",
+      "reserve w 30",
+      "settle w 5",
+    ]);
+  });
+});

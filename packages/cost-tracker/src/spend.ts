@@ -3,14 +3,23 @@
  * calls that spend at the same time.
  *
  * Every model call in a budgeted run reserves its worst case before it is
- * dispatched, settles on its response and releases on failure. A call is
- * admitted while, in every scope it spends from (the run, each enclosing
- * sub-agent share, the harness's budget period), the spend so far plus the
- * OTHER active reservations stays under that scope's cap; equality refuses.
- * A call's own estimate is not added, so a run that makes one call at a time
- * decides exactly as a cap check on spend so far does. A sub-agent spends
- * from its parent's meter as it goes (`child()`), so its reservations count
- * against every ancestor's cap at once.
+ * dispatched and settles on its response. A call that was never sent spends
+ * nothing (`release`); a call that was sent and failed counts the usage it
+ * reported, or its reserved worst case when it reported none
+ * (`settleUnreported`). A call is admitted while, in every scope it spends
+ * from (the run, each enclosing sub-agent share, the harness's budget
+ * period), the spend so far plus the OTHER active reservations stays under
+ * that scope's cap; equality refuses. A call's own estimate is not added, so
+ * a run that makes one call at a time decides exactly as a cap check on spend
+ * so far does. A sub-agent spends from its parent's meter as it goes
+ * (`child()`), so its reservations count against every ancestor's cap at once.
+ *
+ * A call made inside a tool never waits on the call running that tool: that
+ * call settles only after the tool returns. A nested loop reserves through a
+ * view (`within(id)`) that names the enclosing call's reservation as an
+ * ancestor. An ancestor's reservation still counts against the cap, but it is
+ * never waited for: when spend so far plus the ancestors' reservations reach a
+ * cap, the answer is final (`on: "spent"`, `inFlight: true`).
  *
  * Unknown cost is never $0: an estimate of `undefined` (the model has no
  * price) reserves nothing and always admits, and a settle nothing can price
@@ -58,6 +67,12 @@ export type SpendAdmission =
       readonly on: "spent";
       readonly scope?: SpendScope;
       readonly held?: true;
+      /**
+       * The cap is reached only counting the reservation of a call still in
+       * progress that this call runs inside (an ancestor): it settles only
+       * after this call returns, so waiting could not end.
+       */
+      readonly inFlight?: true;
     }
   /**
    * Only other calls' reservations stand in the way: `settled` resolves when
@@ -79,11 +94,14 @@ export type SpendLedgerPort = {
   /**
    * Reserve `usdMicros` against the period under the same admission rule as
    * the meter's own scopes, with the period's cap plus its top-ups.
+   * `ancestors` names reservations of calls this one runs inside: they count,
+   * but are never waited for (the answer is `on: "spent"`, `inFlight: true`).
    */
   reserve(entry: {
     readonly id: string;
     readonly usdMicros: number;
     readonly meta?: SpendReserveMeta;
+    readonly ancestors?: readonly string[];
   }): Promise<SpendAdmission>;
   /** The call's real cost; `null` when nothing could price it. */
   settle(entry: {
@@ -120,10 +138,26 @@ export type SpendMeter = {
   ): Promise<SpendAdmission>;
   /** The call answered: price `usage` with the meter's table and record the spend. */
   settle(id: string, usage: SpendUsage, meta?: SpendReserveMeta): Promise<SpendSettled>;
-  /** The call failed: drop its reservation, spending nothing. */
+  /** The call was never sent: drop its reservation, spending nothing. */
   release(id: string): Promise<void>;
+  /**
+   * The call was sent and reported no usage: count what it reserved as spent
+   * in every scope and on the period. A call that reserved nothing (an
+   * unpriced model) counts one unknown call and settles the period with
+   * `null`.
+   */
+  settleUnreported(id: string, meta?: SpendReserveMeta): Promise<SpendSettled>;
   /** A meter for a sub-agent, spending from this one live, with its own share cap. */
   child(opts?: { readonly capMicros?: number }): SpendMeter;
+  /**
+   * A view on the same scopes, ledger and pricing whose reservations treat
+   * `ancestor` (the reservation of the call a nested loop runs inside) as an
+   * ancestor: it counts against the caps but is never waited for. The id is
+   * fixed when the view is made. Views chain: a view's `within()` adds to the
+   * ancestors it has, and its `child()` keeps them. An id reserved through a
+   * view settles or releases through the view or its base alike.
+   */
+  within(ancestor: string | undefined): SpendMeter;
   snapshot(): SpendSnapshot;
   /** The table this meter prices with. */
   readonly pricing: PricingTable;
@@ -160,11 +194,28 @@ function scopeChain(scope: Scope): Scope[] {
   return chain;
 }
 
-function othersIn(scope: Scope, id: string): number {
-  let sum = 0;
-  for (const [rid, r] of scope.active) if (rid !== id) sum += r.micros;
-  return sum;
+/** The scope's active reservations other than `id`, split into ancestors and the rest. */
+function standingIn(
+  scope: Scope,
+  id: string,
+  ancestors: ReadonlySet<string>,
+): { anc: number; others: number; waitOn: Promise<void>[] } {
+  let anc = 0;
+  let others = 0;
+  const waitOn: Promise<void>[] = [];
+  for (const [rid, r] of scope.active) {
+    if (rid === id) continue;
+    if (ancestors.has(rid)) {
+      anc += r.micros;
+    } else {
+      others += r.micros;
+      waitOn.push(r.done);
+    }
+  }
+  return { anc, others, waitOn };
 }
+
+const NO_ANCESTORS: ReadonlySet<string> = new Set();
 
 /** Create the meter for one run tree. */
 export function createSpendMeter(opts: CreateSpendMeterOptions): SpendMeter {
@@ -175,17 +226,18 @@ export function createSpendMeter(opts: CreateSpendMeterOptions): SpendMeter {
     unknownCalls: 0,
     active: new Map(),
   };
-  return meterFor(root, opts.ledger, opts.pricing);
+  return meterFor(root, opts.ledger, opts.pricing, NO_ANCESTORS, new Set());
 }
 
 function meterFor(
   scope: Scope,
   ledger: SpendLedgerPort | undefined,
   pricing: PricingTable,
+  ancestors: ReadonlySet<string>,
+  /** Ids the run tree reserved on the ledger, so settle and release know to write. */
+  onLedger: Set<string>,
 ): SpendMeter {
   const chain = scopeChain(scope);
-  /** Ids this meter reserved on the ledger, so settle and release know to write. */
-  const onLedger = new Set<string>();
 
   const drop = (id: string): void => {
     const held = scope.active.get(id);
@@ -198,11 +250,17 @@ function meterFor(
     let others: Promise<void>[] | undefined;
     for (const s of chain) {
       if (s.capMicros === undefined) continue;
+      const scopeName: SpendScope = s.parent === undefined ? "run" : "share";
       if (s.spent >= s.capMicros) {
-        return { admit: false, on: "spent", scope: s.parent === undefined ? "run" : "share" };
+        return { admit: false, on: "spent", scope: scopeName };
       }
-      if (s.spent + othersIn(s, id) >= s.capMicros) {
-        others = [...(others ?? []), ...[...s.active.values()].map((r) => r.done)];
+      const standing = standingIn(s, id, ancestors);
+      // An ancestor settles only after this call returns: never wait on it.
+      if (s.spent + standing.anc >= s.capMicros) {
+        return { admit: false, on: "spent", scope: scopeName, inFlight: true };
+      }
+      if (s.spent + standing.anc + standing.others >= s.capMicros) {
+        others = [...(others ?? []), ...standing.waitOn];
       }
     }
     if (others !== undefined) {
@@ -228,10 +286,12 @@ function meterFor(
       if (ledger === undefined) return { admit: true };
       let answer: SpendAdmission;
       try {
+        const onPeriod = [...ancestors].filter((a) => a !== id && onLedger.has(a));
         answer = await ledger.reserve({
           id,
           usdMicros: held.micros,
           ...(meta !== undefined ? { meta } : {}),
+          ...(onPeriod.length > 0 ? { ancestors: onPeriod } : {}),
         });
       } catch (err) {
         drop(id);
@@ -245,6 +305,7 @@ function meterFor(
           on: "spent",
           scope: "period",
           ...(answer.held === true ? { held: true as const } : {}),
+          ...(answer.inFlight === true ? { inFlight: true as const } : {}),
         };
       }
       onLedger.add(id);
@@ -281,6 +342,24 @@ function meterFor(
       drop(id);
       if (ledger !== undefined && onLedger.delete(id)) await ledger.release(id);
     },
+    async settleUnreported(id, meta) {
+      const held = scope.active.get(id);
+      drop(id);
+      const micros = held?.micros;
+      for (const s of chain) {
+        if (micros === undefined) s.unknownCalls += 1;
+        else s.spent += micros;
+      }
+      if (ledger !== undefined) {
+        onLedger.delete(id);
+        await ledger.settle({
+          id,
+          usdMicros: micros ?? null,
+          ...(meta !== undefined ? { meta } : {}),
+        });
+      }
+      return { usdMicros: micros };
+    },
     child(childOpts = {}) {
       return meterFor(
         {
@@ -292,7 +371,15 @@ function meterFor(
         },
         ledger,
         pricing,
+        ancestors,
+        onLedger,
       );
+    },
+    within(ancestor) {
+      if (ancestor === undefined || ancestors.has(ancestor)) {
+        return meterFor(scope, ledger, pricing, ancestors, onLedger);
+      }
+      return meterFor(scope, ledger, pricing, new Set([...ancestors, ancestor]), onLedger);
     },
     snapshot() {
       let reserved = 0;
