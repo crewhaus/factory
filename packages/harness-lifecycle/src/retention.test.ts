@@ -95,7 +95,13 @@ describe("parseRetentionDate", () => {
 describe("loadRetentionConfig", () => {
   test("missing file → session-store's 30-day TTL, no pins, no windows", async () => {
     const cfg = await loadRetentionConfig(root);
-    expect(cfg).toEqual({ sessionMaxAgeDays: 30, pins: [], auditWindows: [], fromFile: false });
+    expect(cfg).toEqual({
+      sessionMaxAgeDays: 30,
+      knowledgeUsageMaxAgeDays: 396,
+      pins: [],
+      auditWindows: [],
+      fromFile: false,
+    });
   });
 
   test("the engine's default TTL cannot drift from session-store's DEFAULT_TTL_DAYS", () => {

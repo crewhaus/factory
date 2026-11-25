@@ -699,6 +699,16 @@ export const KNOWLEDGE_SCHEMA: ParseArgsSchema = {
     { name: "dry-run", takesValue: false },
     { name: "no-redact", takesValue: false },
     { name: "help", short: "h" },
+    // `knowledge status|list|show|why|usage|search|reindex|erase`: what one harness knows.
+    { name: "type", takesValue: true },
+    { name: "status", takesValue: true },
+    { name: "scope", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "history", takesValue: false },
+    { name: "harness", takesValue: true },
+    { name: "include-sources", takesValue: false },
+    { name: "yes", takesValue: false },
+    { name: "confirm", takesValue: true },
   ],
 };
 

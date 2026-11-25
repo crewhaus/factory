@@ -8,7 +8,9 @@ stops.
 | `retire` | the ordered, evidenced decommission of a harness |
 | `run-tokens` | which files are a daemon's run bearer secrets, and their removal from an archived state directory |
 | `retention` | which sessions and audit records are past their TTL |
+| `knowledge-retention` | which usage segments and fallback markers are past their window |
 | `knowledge-sync` | what a harness and the fleet's shared store owe each other |
+| `erasure` | which lines of the shared store are a person's, and how their pulled copies are withdrawn |
 
 ## Retirement refuses before it deletes
 
@@ -35,6 +37,11 @@ by the same code in `@crewhaus/data-retention-engine`. A CLI sweep and an
 unattended sweep that disagreed about a TTL would be worse than either alone.
 A dry run is the identical computation with the deletion left off, so the plan
 you review is the plan that runs.
+
+The sweep also ages out the records that say which knowledge a run used: usage segments and backend
+fallback markers are kept for `knowledge.usageMaxAgeDays` of `.crewhaus/retention.json` (13 months by
+default). A segment goes whole, oldest first, and the newest is always kept, so a reader knows what was
+evicted instead of meeting half a segment.
 
 ## A fragment is named after its own body
 

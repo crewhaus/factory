@@ -85,7 +85,7 @@
  * (continuity/wiki take the `tenant` option; the fact store — which has no
  * fence of its own — is constructed inside the tenant root).
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
@@ -606,6 +606,12 @@ export type RecalledRef = {
   readonly version?: number | string;
 };
 
+/**
+ * One item the `<current_plan>` tail rendered: its ref, and the 0-based lines
+ * of the tail it takes, as `[from, to)`.
+ */
+export type TailRef = RecalledRef & { readonly lines?: readonly [number, number] };
+
 /** One recalled item: the line `recall` returns, and the entry it came from when known. */
 export type RecalledItem = {
   readonly text: string;
@@ -684,11 +690,12 @@ export type ContinuitySeam = {
   readonly storeFiles?: readonly string[];
   /**
    * What the `<current_plan>` tail renders, by reference: the focus, the
-   * active plan and each open goal, read from the same store state
-   * `loadPlan` renders from. The runtime reads them after each plan load and
-   * records them by id. Ids only, never text.
+   * active plan and each open goal, each with the lines of the tail it takes,
+   * read from the same store state `loadPlan` renders from. The runtime reads
+   * them after each plan load and records them by id, each at what became of
+   * its own lines. Ids and line numbers only, never text.
    */
-  readonly tailRefs?: () => Promise<RecalledRef[]>;
+  readonly tailRefs?: () => Promise<TailRef[]>;
 };
 
 /**
@@ -828,14 +835,36 @@ export function thredzTiers(fragment: MemoryWiringFragment): ThredzTier[] {
   return tiers;
 }
 
+/** The `(working directory, spec, tier)` fallbacks this process has recorded. */
+const recordedFallbacks = new Set<string>();
+
+/** Test seam: forget which fallbacks this process has recorded. */
+export function _resetRecordedFallbacksForTest(): void {
+  recordedFallbacks.clear();
+}
+
+/** A working directory by its real path, so one harness under two names is one entry. */
+function realCwd(cwd: string): string {
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
+}
+
 /**
  * Record that a declared Thredz backend fell back to the local stores: one
  * line per tier in `<cwd>/.crewhaus/run/knowledge/backends.jsonl` (0600),
- * appended without following a link out of the working directory. Ids and
- * closed codes only. Best effort: a failed append is logged and boot goes on.
+ * appended without following a link out of the working directory. Each tier is
+ * written once per process, however often the process wires memory for the
+ * spec (a channel bot does per conversation), and a tier whose append failed
+ * is tried again. Ids and closed codes only. Best effort: a failed append is
+ * logged and boot goes on.
  */
 function recordThredzFallback(fragment: MemoryWiringFragment, deps: WireMemoryDeps): void {
-  const tiers = thredzTiers(fragment);
+  const where = realCwd(deps.cwd);
+  const entryOf = (tier: ThredzTier): string => `${where}\0${fragment.specName}\0${tier}`;
+  const tiers = thredzTiers(fragment).filter((tier) => !recordedFallbacks.has(entryOf(tier)));
   if (tiers.length === 0) return;
   const at = (deps.now?.() ?? new Date()).toISOString();
   const lines = tiers
@@ -857,7 +886,11 @@ function recordThredzFallback(fragment: MemoryWiringFragment, deps: WireMemoryDe
       createParents: true,
       mode: 0o600,
     });
-    if (!result.ok) deps.log?.(`[memory] backend fallback not recorded (${result.code})\n`);
+    if (!result.ok) {
+      deps.log?.(`[memory] backend fallback not recorded (${result.code})\n`);
+      return;
+    }
+    for (const tier of tiers) recordedFallbacks.add(entryOf(tier));
   } catch (err) {
     deps.log?.(`[memory] backend fallback not recorded (${(err as Error).name})\n`);
   }
@@ -1016,7 +1049,7 @@ async function renderPlanTail(
   store: ContinuityStore,
   includePlans: boolean,
   proofMode: ContinuityProofMode | undefined,
-  rendered?: (refs: RecalledRef[]) => void,
+  rendered?: (refs: TailRef[]) => void,
   where: { readonly spec?: string; readonly partition?: string } = {},
 ): Promise<string | null> {
   const focus = await store.readFocus();
@@ -1024,42 +1057,50 @@ async function renderPlanTail(
   const goals = includePlans ? await store.listGoals() : [];
   const openGoals = goals.filter((g) => !countsAsProven(g, proofMode));
 
-  // What this render shows, by reference, for the runtime's usage records.
-  const ref = (kind: "plan" | "goal" | "focus", localId: string): RecalledRef => ({
-    store: kind,
-    backend: "local",
-    ...where,
-    localId,
-  });
-  rendered?.([
-    ...(focus !== null && focus.body !== "" ? [ref("focus", "focus")] : []),
-    ...(activePlan !== null ? [ref("plan", activePlan.id)] : []),
-    ...openGoals.map((g) => ref("goal", g.id)),
-  ]);
-
+  // What this render shows, by reference and by the lines that show it, for
+  // the runtime's usage records.
+  const refs: TailRef[] = [];
   const lines: string[] = [];
+  let rows = 0;
+  /** Add one entry and say which of the text's lines it takes. */
+  const push = (text: string): readonly [number, number] => {
+    const from = rows;
+    lines.push(text);
+    rows += text.split("\n").length;
+    return [from, rows];
+  };
+  const shown = (
+    kind: "plan" | "goal" | "focus",
+    localId: string,
+    span: readonly [number, number],
+  ): void => {
+    refs.push({ store: kind, backend: "local", ...where, localId, lines: span });
+  };
   if (focus !== null && focus.body !== "") {
-    lines.push(`focus: ${focus.body}`);
+    shown("focus", "focus", push(`focus: ${focus.body}`));
   }
   if (activePlan !== null) {
-    if (lines.length > 0) lines.push("");
-    lines.push(`${activePlan.id} — ${activePlan.title}`);
+    if (lines.length > 0) push("");
+    const [from] = push(`${activePlan.id} — ${activePlan.title}`);
     for (const step of activePlan.steps) {
       // Proven-by-assertion (`proof: off`) renders apart from a verified ✓.
-      lines.push(`${step.index}. ${renderLadderStatus(step)} ${step.text}`);
+      push(`${step.index}. ${renderLadderStatus(step)} ${step.text}`);
     }
+    shown("plan", activePlan.id, [from, rows]);
   }
   if (openGoals.length > 0) {
-    if (lines.length > 0) lines.push("");
-    lines.push("goals:");
+    if (lines.length > 0) push("");
+    push("goals:");
     for (const goal of openGoals) {
       const progress =
         goal.target !== undefined
           ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
           : "";
-      lines.push(`- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progress}`);
+      const span = push(`- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progress}`);
+      shown("goal", goal.id, span);
     }
   }
+  rendered?.(refs);
   return lines.length > 0 ? lines.join("\n") : null;
 }
 
@@ -1147,8 +1188,8 @@ export function wireContinuity(
 
   // The refs of the last tail rendered, so `tailRefs` names exactly what the
   // runtime was handed.
-  let lastTailRefs: RecalledRef[] = [];
-  const noteTail = (refs: RecalledRef[]): void => {
+  let lastTailRefs: TailRef[] = [];
+  const noteTail = (refs: TailRef[]): void => {
     lastTailRefs = refs;
   };
   const where = {

@@ -43,7 +43,12 @@ export {
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export { type IoTap, _setIoTapForTest } from "./io";
 export { openRecordFd, readAt, readRecordFile } from "./io";
-export { _setRollBytesForTest } from "./segments";
+export {
+  type RetainedSegments,
+  _setRollBytesForTest,
+  retainedSegments,
+  segmentRel,
+} from "./segments";
 export {
   CACHE_INDEX_DIR,
   type FleetAppend,

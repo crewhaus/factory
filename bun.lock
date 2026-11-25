@@ -77,6 +77,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/ir-passes": "workspace:*",
         "@crewhaus/justification-judge-claude": "workspace:*",
+        "@crewhaus/knowledge-index": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/mcp-server": "workspace:*",
@@ -668,6 +669,7 @@
       "name": "@crewhaus/continuity-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -1408,9 +1410,12 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/harness-registry": {
@@ -1488,6 +1493,29 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/knowledge-index": {
+      "name": "@crewhaus/knowledge-index",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/harness-lifecycle": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+        "@crewhaus/tool-state": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+      },
+    },
     "packages/logging": {
       "name": "@crewhaus/logging",
       "version": "0.8.3",
@@ -1546,6 +1574,7 @@
       "name": "@crewhaus/memory-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
@@ -4085,6 +4114,7 @@
       "name": "@crewhaus/wiki-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -4395,6 +4425,8 @@
     "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
 
     "@crewhaus/justification-judge-claude": ["@crewhaus/justification-judge-claude@workspace:packages/justification-judge-claude"],
+
+    "@crewhaus/knowledge-index": ["@crewhaus/knowledge-index@workspace:packages/knowledge-index"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 

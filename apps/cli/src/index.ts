@@ -24679,8 +24679,31 @@ switch (subcommand) {
   case "knowledge": {
     // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
     const action = rest[0] ?? "";
+    // What one harness knows: the reads, `reindex` and `erase` (knowledge-cmd.ts).
+    if (
+      action === "status" ||
+      action === "list" ||
+      action === "show" ||
+      action === "why" ||
+      action === "usage" ||
+      action === "search" ||
+      action === "reindex" ||
+      action === "erase"
+    ) {
+      const { KnowledgeCmdError, runKnowledgeCmd } = await import("./knowledge-cmd");
+      try {
+        const code = await runKnowledgeCmd(action, parseFor(rest.slice(1), KNOWLEDGE_SCHEMA));
+        if (code !== 0) process.exitCode = code;
+      } catch (err) {
+        if (err instanceof KnowledgeCmdError || err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "" && action !== "sync") {
-      die(`knowledge action must be "sync" (got "${action}")`);
+      die(
+        `knowledge action must be one of: sync, status, list, show, why, usage, search, reindex, erase (got "${action}")`,
+      );
     }
     await runKnowledge(parseFor(rest.slice(1), KNOWLEDGE_SCHEMA), action || "sync");
     break;

@@ -31,7 +31,7 @@
  * marker-carrying `LESSONS.md` (`MARKER_GATED_FILES`) and the per-user
  * preference files (`extraFiles`) — are mined from ratings, feedback and
  * session logs, so they are screened as remembered memory instead: each line,
- * each two adjacent lines and the file as a whole are classified at
+ * each two adjacent items and the file as a whole are classified at
  * TrustOrigin `"memory"`, and what the classifier redacts is replaced by its
  * notice ({@link screenRememberedLines}).
  *
@@ -43,6 +43,10 @@ import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { classifyBoundary } from "@crewhaus/boundary-classifier";
+import type { RecalledItemStatus } from "@crewhaus/event-log";
+
+/** What became of one line of screened text; a `blank` line is never classified. */
+export type RememberedLineOutcome = "blank" | RecalledItemStatus;
 
 /** Text screened as remembered memory, line by line and as a whole. */
 export type ScreenedLines = {
@@ -57,17 +61,65 @@ export type ScreenedLines = {
   readonly warned: number;
   /** The detector rules behind the replaced and flagged lines, first seen first. */
   readonly rules: readonly string[];
+  /**
+   * What became of each input line, in order: `redacted` by its own verdict,
+   * `split-redacted` when a pair or the whole text redacted.
+   */
+  readonly outcomes: readonly RememberedLineOutcome[];
 };
+
+/** The markers a line's content is written behind, as often as they repeat. */
+const LINE_MARKERS_RE =
+  /^(?:- goal-\d+ \[[^\]]*\] |\s*\d+\. \[[^\]]*\] |\s*[-*] |focus: |plan-\d+ — )+/;
+/** A goal line as the plan tail renders it. */
+const GOAL_LINE_RE = /^- goal-\d+ \[[^\]]*\] /;
+/** A goal's trailing progress: ` (current/target unit)`. */
+const GOAL_PROGRESS_RE = /\s\(-?[\d.]+\/-?[\d.]+(?: ([^)]*))?\)$/;
+const HEADING_RE = /^#{1,6} /;
+
+/** A line as content: the unit of content it holds, and every word on it with the markup off. */
+type LineContent = {
+  /** The line's content, or `""` for a line that only separates content (a heading, a comment). */
+  readonly unit: string;
+  /** The line's content and every other word on it: a heading's text, a goal's unit. */
+  readonly words: string;
+};
+
+function lineContent(line: string): LineContent {
+  const trimmed = line.trim();
+  if (trimmed === "goals:") return { unit: "", words: "" };
+  if (HEADING_RE.test(line)) return { unit: "", words: line.replace(/^#+ /, "").trim() };
+  if (trimmed.startsWith("<!--") && trimmed.endsWith("-->")) {
+    return { unit: "", words: trimmed.slice(4, -3).trim() };
+  }
+  const content = line.replace(LINE_MARKERS_RE, "");
+  if (!GOAL_LINE_RE.test(line) || !content.endsWith(")")) return { unit: content, words: content };
+  // The progress is the text's last parenthesis, so nothing before the one
+  // that closes before it is looked at.
+  const from = content.lastIndexOf(")", content.length - 2) + 1;
+  const progress = GOAL_PROGRESS_RE.exec(content.slice(from));
+  if (progress === null) return { unit: content, words: content };
+  const title = content.slice(0, from + progress.index);
+  return { unit: title, words: progress[1] !== undefined ? `${title} ${progress[1]}` : title };
+}
 
 /**
  * Screen text the runtime re-reads from earlier work as remembered memory,
  * at TrustOrigin `"memory"`, in three passes:
  *
- * 1. Each line: a line the classifier redacts becomes its redaction notice.
- * 2. Each two adjacent non-blank lines still kept, read together: when the
- *    pair redacts, both lines become the pair's notice.
+ * 1. Each line, as rendered: a line the classifier redacts becomes its
+ *    redaction notice.
+ * 2. Each two adjacent lines still kept, read together: when the pair
+ *    redacts, both lines become the pair's notice.
  * 3. The kept lines as a whole: when they still redact, the whole text is
  *    withheld and becomes that notice, every non-blank line counted.
+ *
+ * The pair and whole passes read the lines three ways: as rendered; as their
+ * content, with the markers it is rendered behind off (a plan step's number
+ * and status, a goal's id, status and progress, a list bullet, the focus and
+ * plan-title labels) and the lines that only separate content left out (the
+ * `goals:` header, a heading, a comment), so two plan steps, two goals or two
+ * list items are adjacent; and as every word on them with the markers off.
  *
  * Every other line is kept as it is, with its line break. A classifier
  * rejection rejects.
@@ -75,59 +127,80 @@ export type ScreenedLines = {
 export async function screenRememberedLines(text: string): Promise<ScreenedLines> {
   const classify = (t: string) => classifyBoundary(t, { origin: "memory" });
   const lines = text.split("\n");
-  const withheld = lines.map(() => false);
+  const outcomes: RememberedLineOutcome[] = lines.map((line) =>
+    line.trim() === "" ? "blank" : "included",
+  );
   const rules = new Set<string>();
   const note = (hits: ReadonlyArray<{ readonly rule: string }>): void => {
     for (const hit of hits) rules.add(hit.rule);
   };
-  let redacted = 0;
-  let warned = 0;
-  const withhold = (i: number, notice: string): void => {
+  const isKept = (i: number): boolean => outcomes[i] === "included" || outcomes[i] === "warned";
+  const isWithheld = (i: number): boolean =>
+    outcomes[i] === "redacted" || outcomes[i] === "split-redacted";
+  const withhold = (i: number, notice: string, as: "redacted" | "split-redacted"): void => {
     lines[i] = notice;
-    withheld[i] = true;
-    redacted += 1;
+    outcomes[i] = as;
   };
+  const result = (withheldWhole?: string): ScreenedLines => ({
+    text: withheldWhole ?? lines.join("\n"),
+    redacted: outcomes.filter((o) => o === "redacted" || o === "split-redacted").length,
+    warned: outcomes.filter((o) => o === "warned").length,
+    rules: [...rules],
+    outcomes,
+  });
   for (const [i, line] of lines.entries()) {
-    if (line.trim() === "") continue;
+    if (outcomes[i] === "blank") continue;
     const boundary = await classify(line);
     if (boundary.action === "pass") continue;
     note(boundary.verdict.hits);
-    if (boundary.action === "redact") withhold(i, boundary.redacted ?? "");
-    else warned += 1;
+    if (boundary.action === "redact") withhold(i, boundary.redacted ?? "", "redacted");
+    else outcomes[i] = "warned";
   }
-  /** The kept non-blank lines, in order, and their text joined as one. */
-  const kept = (): { readonly at: number[]; readonly text: string } => {
-    const at = lines.flatMap((line, i) => (!withheld[i] && line.trim() !== "" ? [i] : []));
-    return { at, text: at.map((i) => lines[i]).join("\n") };
-  };
-  const before = kept();
-  if (before.at.length < 2) return { text: lines.join("\n"), redacted, warned, rules: [...rules] };
-  // Each two adjacent kept lines, read from the text as it stood after the
-  // line pass, so a pair is judged by its own two lines.
-  const original = before.at.map((i) => lines[i] ?? "");
-  for (let k = 0; k + 1 < before.at.length; k += 1) {
-    const boundary = await classify(`${original[k]}\n${original[k + 1]}`);
-    if (boundary.action !== "redact") continue;
-    note(boundary.verdict.hits);
-    for (const i of [before.at[k], before.at[k + 1]] as number[]) {
-      if (!withheld[i]) withhold(i, boundary.redacted ?? "");
+  if (lines.filter((_, i) => isKept(i)).length < 2) return result();
+  // Each reading holds the kept lines' text as it stood after the line pass,
+  // so a pair is judged by its own two lines.
+  type Part = { readonly at: number; readonly text: string };
+  const readings: Part[][] = [[], [], []];
+  for (const [i, line] of lines.entries()) {
+    if (!isKept(i)) continue;
+    const { unit, words } = lineContent(line);
+    for (const [r, part] of [line, unit, words].entries()) {
+      if (part.trim() !== "") readings[r]?.push({ at: i, text: part });
     }
   }
-  const after = kept();
-  if (after.at.length > 0) {
-    const whole = await classify(after.text);
-    if (whole.action === "redact") {
-      note(whole.verdict.hits);
-      const nonBlank = lines.filter((line) => line.trim() !== "").length;
-      return {
-        text: whole.redacted ?? "",
-        redacted: nonBlank,
-        warned,
-        rules: [...rules],
-      };
+  // Read once per two lines and text, so a reading that says nothing new asks nothing.
+  const read = new Set<string>();
+  for (const reading of readings) {
+    for (const [k, first] of reading.entries()) {
+      const second = reading[k + 1];
+      if (second === undefined) break;
+      const pair = `${first.text}\n${second.text}`;
+      const seen = `${first.at}:${second.at}:${pair}`;
+      if (read.has(seen)) continue;
+      read.add(seen);
+      const boundary = await classify(pair);
+      if (boundary.action !== "redact") continue;
+      note(boundary.verdict.hits);
+      for (const i of [first.at, second.at]) {
+        if (!isWithheld(i)) withhold(i, boundary.redacted ?? "", "split-redacted");
+      }
     }
   }
-  return { text: lines.join("\n"), redacted, warned, rules: [...rules] };
+  const wholes = new Set<string>();
+  for (const reading of readings) {
+    const kept = reading.filter((part) => isKept(part.at)).map((part) => part.text);
+    const joined = kept.join("\n");
+    if (kept.length === 0 || wholes.has(joined)) continue;
+    wholes.add(joined);
+    const whole = await classify(joined);
+    if (whole.action !== "redact") continue;
+    note(whole.verdict.hits);
+    for (const i of lines.keys()) {
+      if (isKept(i)) outcomes[i] = "split-redacted";
+    }
+    return result(whole.redacted ?? "");
+  }
+  return result();
 }
 
 export const CANONICAL_MEMORY_FILES = [

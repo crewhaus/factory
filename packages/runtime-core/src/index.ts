@@ -197,6 +197,7 @@ import {
   hasModelChosenDestination,
   hasSelfCheckedOpening,
   legacyMcpToolName,
+  reportsKnowledge,
   stripJustificationField,
   withJustificationField,
   withoutSelfCheckedOpenings,
@@ -247,6 +248,7 @@ import { attachIncidentCollector } from "./incident-collector";
 import { contextForSeed, refuseBlockedSeed, seedVerdict } from "./input-origin";
 import {
   type ContinuityTailRead,
+  type ContinuityTailRef,
   createKnowledgeUsage,
   readContinuityTail,
   tailRegions,
@@ -2473,11 +2475,12 @@ export type RunChatLoopOptions = {
     readonly storeFiles?: readonly string[];
     /**
      * What the last `loadPlan` / `onPlanDirty` render showed, by reference:
-     * the focus, the active plan and each open goal. Read after each plan
+     * the focus, the active plan and each open goal, each with the lines of
+     * the text it rendered when the store says which. Read after each plan
      * load; the run records them as knowledge usage (`via: "tail"`) and on
      * the plan block of each context manifest. Ids only, never text.
      */
-    readonly tailRefs?: () => Promise<readonly RecalledRef[]>;
+    readonly tailRefs?: () => Promise<readonly ContinuityTailRef[]>;
   };
   /**
    * Item #56 — absolute paths to per-user preference files injected at run
@@ -8315,8 +8318,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
         }
       : undefined;
     // The knowledge items this call returns, as the tool reports them
-    // (`./knowledge-usage`); only when the loop records.
-    const reads = knowledgeUsage.collector();
+    // (`./knowledge-usage`); only from the built-in knowledge tools, and only
+    // when the loop records.
+    const reads = reportsKnowledge(tool) ? knowledgeUsage.collector() : undefined;
     const raw = await executeTool(tool, operativeInput, {
       toolUseId: tu.id,
       signal: toolAbort.signal,

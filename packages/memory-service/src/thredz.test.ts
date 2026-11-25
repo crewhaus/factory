@@ -10,7 +10,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { McpHost } from "@crewhaus/mcp-host";
 import { ToolCatalog } from "@crewhaus/tool-catalog";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -22,6 +22,7 @@ import {
   type ThredzCallResult,
   type ThredzClient,
   type WireMemoryDeps,
+  _resetRecordedFallbacksForTest,
   classifyThredzFailure,
   connectThredz,
   extractThredzGoalId,
@@ -898,6 +899,8 @@ describe("goal mirror × require rechecks frozen proofs", () => {
 });
 
 describe("a declared Thredz backend that falls back is recorded", () => {
+  beforeEach(() => _resetRecordedFallbacksForTest());
+
   const markersOf = (): Array<Record<string, unknown>> => {
     const file = join(tmp, BACKEND_MARKERS_FILE);
     if (!existsSync(file)) return [];
@@ -954,6 +957,54 @@ describe("a declared Thredz backend that falls back is recorded", () => {
     ]);
   });
 
+  test("two wireMemory calls in one process write one line per tier; another spec, or another directory, its own", async () => {
+    const fragment = {
+      specName: "fallback-spec",
+      memory: { backend: "thredz" as const, wiki: {} },
+      continuity: {},
+      thredz: { goals: true },
+    };
+    for (let i = 0; i < 3; i += 1) await wireMemory(fragment, deps().deps);
+    expect(markersOf().map((m) => m["tier"])).toEqual(["wiki", "goals"]);
+    await wireMemory({ ...fragment, specName: "other-spec" }, deps().deps);
+    expect(markersOf().map((m) => `${m["spec"]}/${m["tier"]}`)).toEqual([
+      "fallback-spec/wiki",
+      "fallback-spec/goals",
+      "other-spec/wiki",
+      "other-spec/goals",
+    ]);
+    // A tier that joins later is written then, and only it.
+    await wireMemory({ ...fragment, learning: {} }, deps().deps);
+    expect(
+      markersOf()
+        .slice(4)
+        .map((m) => m["tier"]),
+    ).toEqual(["gaps"]);
+    // The same directory under another name is the same harness.
+    const alias = join(dirname(tmp), `${basename(tmp)}-alias`);
+    symlinkSync(tmp, alias);
+    try {
+      await wireMemory(fragment, { ...deps().deps, cwd: alias });
+      expect(markersOf()).toHaveLength(5);
+    } finally {
+      rmSync(alias);
+    }
+  });
+
+  test("a marker that could not be written is tried again", async () => {
+    const fragment = {
+      specName: "fallback-spec",
+      memory: { backend: "thredz" as const, wiki: {} },
+    };
+    mkdirSync(join(tmp, BACKEND_MARKERS_FILE), { recursive: true });
+    const { deps: d, logs } = deps();
+    await wireMemory(fragment, d);
+    expect(logs.join("")).toContain("backend fallback not recorded");
+    rmSync(join(tmp, BACKEND_MARKERS_FILE), { recursive: true });
+    await wireMemory(fragment, deps().deps);
+    expect(markersOf().map((m) => m["tier"])).toEqual(["wiki"]);
+  });
+
   test("a live connection writes none", async () => {
     const { client } = fakeClient();
     const { deps: d } = deps({ thredz: { client } });
@@ -985,11 +1036,31 @@ describe("the continuity seam names what its tail rendered", () => {
     expect(text).toContain("ship the report");
     const where = { backend: "local", spec: "tail-spec", partition: "-" };
     expect(await seam.tailRefs?.()).toEqual([
-      { store: "focus", ...where, localId: "focus" },
-      { store: "plan", ...where, localId: plan.id },
-      { store: "goal", ...where, localId: goal.id },
+      { store: "focus", ...where, localId: "focus", lines: [0, 1] },
+      { store: "plan", ...where, localId: plan.id, lines: [2, 5] },
+      { store: "goal", ...where, localId: goal.id, lines: [7, 8] },
     ]);
     expect(plan.id).toMatch(/^plan-\d{4}$/);
     expect(goal.id).toMatch(/^goal-\d{4}$/);
+  });
+
+  test("each ref's lines are the ones that render it, a focus over several lines included", async () => {
+    const { deps: d } = deps();
+    const wired = wireContinuity({ specName: "span-spec", continuity: {} }, d);
+    if (wired === null) throw new Error("continuity was not wired");
+    const plan = await wired.store.createPlan({ title: "Ship", steps: ["draft", "send"] });
+    await wired.store.setActivePlan(plan.id);
+    await wired.store.writeFocus("first line\n\nthird line");
+    for (const title of ["Report sent", "Summary sent"]) await wired.store.writeGoal({ title });
+    const lines = ((await wired.continuity.loadPlan()) ?? "").split("\n");
+    const spans = (await wired.continuity.tailRefs?.()) ?? [];
+    const textOf = (span: readonly [number, number] | undefined): string =>
+      span === undefined ? "" : lines.slice(span[0], span[1]).join("\n");
+    expect(spans.map((ref) => textOf(ref.lines))).toEqual([
+      "focus: first line\n\nthird line",
+      `${plan.id} — Ship\n1. [open] draft\n2. [open] send`,
+      "- goal-0001 [open] Report sent",
+      "- goal-0002 [open] Summary sent",
+    ]);
   });
 });

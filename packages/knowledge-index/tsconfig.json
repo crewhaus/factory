@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../continuity-store" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
+    { "path": "../dataset-registry" },
+    { "path": "../eval-grader" },
+    { "path": "../harness-lifecycle" },
+    { "path": "../memory-store" },
+    { "path": "../session-store" },
+    { "path": "../spec-patch" },
+    { "path": "../tool-safety" },
+    { "path": "../tool-state" },
+    { "path": "../tool-work" },
+    { "path": "../wiki-store" }
+  ],
+  "include": ["src/**/*"]
+}

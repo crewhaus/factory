@@ -3,9 +3,10 @@
  *
  * Three records, all ids and never text:
  *
- * - **`knowledge_read`** (the session log): one line per tool call that
- *   reported the knowledge items it returned (`ToolExecuteContext.recordReads`:
- *   Recall's facts, the wiki read tools' articles, Retrieve's documents), on
+ * - **`knowledge_read`** (the session log): one line per call of a built-in
+ *   knowledge tool that reported the items it returned
+ *   (`ToolExecuteContext.recordReads`, handed to those tools alone: Recall's
+ *   facts, the wiki read tools' articles, Retrieve's documents), on
  *   the call's span, after its post-tool check. At most
  *   {@link KNOWLEDGE_READ_CAP} refs; `more` counts the rest.
  * - **the usage log** (`.crewhaus/run/knowledge/usage/NNNNNN.jsonl`, under the
@@ -25,10 +26,10 @@
  *
  * Text the runtime re-reads from earlier work is screened here too: the plan
  * tail is classified by line, by adjacent pair and as a whole at TrustOrigin
- * `"memory"` before the model reads it again ({@link readContinuityTail}).
+ * `"memory"` before the model reads it again ({@link readContinuityTail}), and
+ * each item it rendered is recorded at what became of its own lines.
  */
-import { join } from "node:path";
-import { append, harnessLedger, keyedDigest } from "@crewhaus/control-records";
+import { append, controlPaths, harnessLedger, keyedDigest } from "@crewhaus/control-records";
 import type {
   KnowledgeReadPayload,
   KnowledgeReadRef,
@@ -37,7 +38,7 @@ import type {
 } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
 import type { ToolReadRef } from "@crewhaus/tool-catalog";
-import { screenRememberedLines } from "./project-memory";
+import { type RememberedLineOutcome, screenRememberedLines } from "./project-memory";
 import {
   type RecallNote,
   type RecalledRef,
@@ -52,7 +53,7 @@ type Logger = RunContext["logger"];
 export const KNOWLEDGE_ITEM_LABEL = "knowledge-item";
 
 /** Where the usage log's segments live, relative to the loop's control-records root. */
-export const KNOWLEDGE_USAGE_DIR = join(".crewhaus", "run", "knowledge", "usage");
+export const KNOWLEDGE_USAGE_DIR = controlPaths("").knowledgeUsageDir;
 
 /** The most refs one `knowledge_read` line lists; `more` counts the rest. */
 export const KNOWLEDGE_READ_CAP = 64;
@@ -145,19 +146,57 @@ export function createReadCollector(): ReadCollector {
 // The continuity tail, screened and by reference
 // ---------------------------------------------------------------------------
 
+/**
+ * One item the continuity tail rendered: its ref, and the 0-based lines of the
+ * tail it rendered as `[from, to)` when the store says which.
+ */
+export type ContinuityTailRef = RecalledRef & { readonly lines?: readonly [number, number] };
+
 /** One read of the continuity tail: its screened text, what it rendered, and the screen's outcome. */
 export type ContinuityTailRead = {
   readonly text: string | null;
   readonly refs: readonly RecalledRef[];
+  /**
+   * What became of each ref, by position: the worst outcome of the lines it
+   * rendered, or `status` for a ref that does not say which lines they are.
+   */
+  readonly statuses: readonly RecalledItemStatus[];
   /** `redacted` when the screen withheld a line, `warned` when it flagged one, else `included`. */
   readonly status: KnowledgeReadStatus;
 };
+
+/** Worst first: what a run records of an item several lines rendered. */
+const WORST_FIRST: readonly RecalledItemStatus[] = [
+  "redacted",
+  "split-redacted",
+  "warned",
+  "included",
+];
+
+/** The worst outcome of the lines a ref rendered, or `undefined` when it does not name them. */
+function spanStatus(
+  ref: ContinuityTailRef,
+  outcomes: readonly RememberedLineOutcome[],
+): RecalledItemStatus | undefined {
+  if (!Array.isArray(ref.lines)) return undefined;
+  const [from, to] = ref.lines as readonly [number, number];
+  const fits =
+    Number.isInteger(from) &&
+    Number.isInteger(to) &&
+    from >= 0 &&
+    from < to &&
+    to <= outcomes.length;
+  if (!fits) return undefined;
+  const span = outcomes.slice(from, to);
+  return WORST_FIRST.find((status) => span.includes(status)) ?? "included";
+}
 
 /**
  * Load the `<current_plan>` text, screen it at TrustOrigin `"memory"` by line,
  * by adjacent pair and as a whole ({@link screenRememberedLines}: what the
  * classifier redacts becomes its notice, every other line is unchanged), and
- * read the refs of what it rendered. The text is
+ * read the refs of what it rendered, each with what became of its own lines.
+ * The text is
  * model-authored working state from earlier turns and sessions, so it is
  * screened as remembered memory before the model reads it again. It is not
  * tagged into the run's lineage. A load or a classifier failure rejects, so
@@ -165,11 +204,11 @@ export type ContinuityTailRead = {
  */
 export async function readContinuityTail(
   load: () => Promise<string | null>,
-  tailRefs: (() => Promise<readonly RecalledRef[]>) | undefined,
+  tailRefs: (() => Promise<readonly ContinuityTailRef[]>) | undefined,
   logger: Logger,
 ): Promise<ContinuityTailRead> {
   const loaded = await load();
-  if (loaded === null) return { text: null, refs: [], status: "included" };
+  if (loaded === null) return { text: null, refs: [], statuses: [], status: "included" };
   const screened = await screenRememberedLines(loaded);
   if (screened.redacted > 0) {
     logger.warn("plan tail line withheld (prompt injection detected)", {
@@ -177,7 +216,7 @@ export async function readContinuityTail(
       rules: screened.rules,
     });
   }
-  let refs: readonly RecalledRef[] = [];
+  let refs: readonly ContinuityTailRef[] = [];
   if (tailRefs !== undefined) {
     try {
       refs = await tailRefs();
@@ -185,10 +224,12 @@ export async function readContinuityTail(
       logger.warn("continuity tail refs could not be read", { error: (err as Error).name });
     }
   }
+  const status = screened.redacted > 0 ? "redacted" : screened.warned > 0 ? "warned" : "included";
   return {
     text: screened.text,
-    refs,
-    status: screened.redacted > 0 ? "redacted" : screened.warned > 0 ? "warned" : "included",
+    refs: refs.map(({ lines: _lines, ...ref }) => ref),
+    statuses: refs.map((ref) => spanStatus(ref, screened.outcomes) ?? status),
+    status,
   };
 }
 
@@ -225,7 +266,7 @@ export type KnowledgeUsage = {
   collector(): ReadCollector | undefined;
   /** An auto-recall ran: one usage line per item with a ref, at its own status. */
   noteRecall(note: RecallNote): Promise<void>;
-  /** The continuity tail was (re)loaded: one usage line per item it rendered. */
+  /** The continuity tail was (re)loaded: one usage line per item it rendered, at its own status. */
   noteTail(read: ContinuityTailRead): Promise<void>;
   /**
    * A tool call returned, its output past the post-tool check: the
@@ -347,9 +388,9 @@ export function createKnowledgeUsage(args: {
     },
     async noteTail(read) {
       const uses: KnowledgeUse[] = [];
-      for (const raw of read.refs) {
+      for (const [i, raw] of read.refs.entries()) {
         const ref = recordableRef(raw);
-        if (ref !== null) uses.push({ ref, via: "tail", status: read.status });
+        if (ref !== null) uses.push({ ref, via: "tail", status: read.statuses[i] ?? read.status });
       }
       await writeUsage(uses);
     },

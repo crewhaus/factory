@@ -78,8 +78,8 @@
  * pure-text claims of equal textual relevance.
  */
 import { closeSync, existsSync, mkdirSync, readSync, readdirSync } from "node:fs";
-import { join, resolve } from "node:path";
-import { type Ledger, type LockedAppend, withLedgerLock } from "@crewhaus/control-records";
+import { join } from "node:path";
+import { type LockedAppend, withLedgerLock } from "@crewhaus/control-records";
 import { CrewhausError } from "@crewhaus/errors";
 import {
   appendContained,
@@ -87,6 +87,7 @@ import {
   openForReadFd,
   writeFileSafe,
 } from "@crewhaus/tool-safety/fs";
+import { ARCHIVE_SEGMENT_RE, isArchivedLine, memoryLayout } from "./layout";
 
 export const DEFAULT_ROOT_DIR = ".crewhaus/memories";
 
@@ -392,8 +393,8 @@ export function _setCompactSeamsForTest(next: CompactSeams | undefined): void {
   compactSeams = next ?? {};
 }
 
-/** The archive's segment names: six digits and `.jsonl`. */
-const ARCHIVE_SEGMENT_RE = /^\d{6}\.jsonl$/;
+/** How often a compaction reads a file again that was replaced under it. */
+const COMPACT_ATTEMPTS = 5;
 
 const DEFAULT_K = 5;
 const ID_PREFIX = "mem_";
@@ -490,29 +491,11 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
     if (!appended.ok) throw refused("append to", appended.reason);
   }
 
-  const lockName = `.${opts.specName}.lock`;
-  const archiveDir = join("archive", opts.specName);
-  /** The fact lock and the archive, on control-records' one lock policy. */
-  const ledger: Ledger = {
-    root: resolve(rootDir),
-    lock: lockName,
-    records: { dir: archiveDir },
-    // Never written: the archive takes no claims.
-    claims: join(archiveDir, ".claims"),
-  };
-
-  /**
-   * The archive's own lock, `archive/<spec>/.lock`: a compaction appends the
-   * lines it drops under it, never under the fact lock, so a fact write
-   * never waits on the archive. Two compactions' appends still never
-   * interleave, and the locked append seals a torn final line.
-   */
-  const archiveLedger: Ledger = {
-    root: resolve(rootDir),
-    lock: join(archiveDir, ".lock"),
-    records: { dir: archiveDir },
-    claims: join(archiveDir, ".claims"),
-  };
+  // The fact lock, and the archive's own (a compaction appends the lines it
+  // drops under it, never under the fact lock, so a fact write never waits on
+  // the archive; two compactions' appends still never interleave, and the
+  // locked append seals a torn final line).
+  const { lockName, archiveDir, ledger, archiveLedger } = memoryLayout(rootDir, opts.specName);
 
   /** Lines archived between yields to the event loop, so a long archive does not stall it. */
   const ARCHIVE_YIELD_EVERY = 256;
@@ -520,12 +503,23 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
   /**
    * Append `lines` to the archive under the archive lock (see
    * {@link archiveLedger}). A refusal throws, and the caller then leaves the
-   * live file as it was.
+   * live file as it was. `false`, with nothing appended, when another file has
+   * replaced the one `snap` was read from.
    */
-  async function archiveLines(lines: ReadonlyArray<string>, archivedAt: string): Promise<void> {
-    let answer: { readonly done: true } | { readonly ok: false; readonly reason: string };
+  async function archiveLines(
+    lines: ReadonlyArray<string>,
+    archivedAt: string,
+    snap: Pick<Snapshot, "dev" | "ino">,
+  ): Promise<boolean> {
+    let answer: { readonly done: boolean } | { readonly ok: false; readonly reason: string };
     try {
       answer = await withLedgerLock(archiveLedger, async (lockedAppend) => {
+        // An erasure rewrites the live file and the archive under this lock.
+        // Lines read before it may be lines it removed, so they are read again.
+        const live = readFrom(Number.MAX_SAFE_INTEGER);
+        if (live === undefined || live.dev !== snap.dev || live.ino !== snap.ino) {
+          return { done: false };
+        }
         for (let i = 0; i < lines.length; i++) {
           if (i > 0 && i % ARCHIVE_YIELD_EVERY === 0) {
             await new Promise<void>((done) => setImmediate(done));
@@ -538,7 +532,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
           }
           await compactSeams.afterArchiveLine?.();
         }
-        return { done: true as const };
+        return { done: true };
       });
     } catch (err) {
       if (err instanceof MemoryStoreError) throw err;
@@ -552,6 +546,7 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
         `could not lock the archive of ${fileName} in ${rootDir} (${archiveLedger.lock}): ${answer.reason}; the live file was not changed`,
       );
     }
+    return answer.done;
   }
 
   /**
@@ -1049,20 +1044,35 @@ export function createMemoryStore(opts: MemoryStoreOptions): MemoryStore {
       // 1. Outside the lock: the snapshot, up to its last whole line, split
       //    into what stays and what goes. A fragment past it is re-read under
       //    the lock with the rest of the tail.
-      const snap = readFrom(0);
-      if (snap === undefined || snap.size === 0) return { kept: 0, dropped: 0, archived: 0 };
+      const plan = () => {
+        const snap = readFrom(0);
+        if (snap === undefined || snap.size === 0) return undefined;
+        const snapEnd = snap.bytes.lastIndexOf(0x0a) + 1;
+        const lines = splitLines(snap.bytes.subarray(0, snapEnd));
+        return { snap, snapEnd, planned: { lines, ...splitKeptDropped(lines, now().getTime()) } };
+      };
+      let planning = plan();
+      if (planning === undefined) return { kept: 0, dropped: 0, archived: 0 };
       await compactSeams.afterSnapshot?.();
-      const snapEnd = snap.bytes.lastIndexOf(0x0a) + 1;
-      const snapLines = splitLines(snap.bytes.subarray(0, snapEnd));
-      const planned = { lines: snapLines, ...splitKeptDropped(snapLines, now().getTime()) };
       // 2. Still outside the fact lock: every line about to be dropped goes to
       //    the archive first. Those lines are dead and stay dead (a tombstone
       //    is final), so nothing a writer appends meanwhile can revive one; a
       //    crash before the rename archives a line twice, and `history()`
       //    reads it once.
-      if (planned.dropped.length > 0) {
-        await archiveLines(planned.dropped, now().toISOString());
+      for (let attempt = 1; planning.planned.dropped.length > 0; attempt++) {
+        const { snap: from, planned: plannedNow } = planning;
+        if (await archiveLines(plannedNow.dropped, now().toISOString(), from)) break;
+        // The file was replaced since the snapshot, by an erasure or another
+        // compaction: what it holds now is read again.
+        if (attempt >= COMPACT_ATTEMPTS) {
+          throw new MemoryStoreError(
+            `${fileName} in ${rootDir} kept being rewritten while it was compacted; run the compaction again`,
+          );
+        }
+        planning = plan();
+        if (planning === undefined) return { kept: 0, dropped: 0, archived: 0 };
       }
+      const { snap, snapEnd, planned } = planning;
       const archived = new Set(planned.dropped);
       // 3. Under the lock, only the re-read, the tail copy and the rename.
       return withStoreLock(async () => {
@@ -1725,17 +1735,6 @@ export function isMemoryAnnotation(value: unknown): value is MemoryAnnotation {
     typeof v["target"] === "string" &&
     (v["value"] === "person" || v["value"] === null) &&
     typeof v["at"] === "string"
-  );
-}
-
-function isArchivedLine(value: unknown): value is MemoryArchivedLine {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
-  const v = value as Record<string, unknown>;
-  return (
-    v["v"] === 1 &&
-    typeof v["archivedAt"] === "string" &&
-    v["cause"] === "compaction" &&
-    (v["line"] !== undefined || typeof v["raw"] === "string")
   );
 }
 
