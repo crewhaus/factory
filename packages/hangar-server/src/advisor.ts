@@ -55,7 +55,7 @@ import {
   assembleFeed,
   deriveAdvisorItems as deriveWith,
 } from "@crewhaus/harness-advice/advisor";
-import { runPreflight } from "@crewhaus/preflight";
+import { PORTS_NOT_CHECKED, runPreflight } from "@crewhaus/preflight";
 import { foldApprovals, statusOf } from "./approvals";
 import { foldHarnessCosts } from "./costs";
 import { mergedSpawnEnv } from "./env-file";
@@ -275,7 +275,11 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
   let preflight: { items: readonly HealthPreflightItem[] } | null = null;
   try {
     const merged = mergedSpawnEnv(ctx.env, dir);
-    const report = await runPreflight({ harnessDir: dir, env: merged.env });
+    const report = await runPreflight({
+      harnessDir: dir,
+      env: merged.env,
+      ...(ctx.checkPort !== undefined ? { checkPort: ctx.checkPort } : {}),
+    });
     preflight = { items: report.items };
   } catch (err) {
     ctx.warn(
@@ -1125,7 +1129,9 @@ export type AdvisorSweepHome = Pick<
  * One harness's open Advisor findings off the request path, for Home's attention sweep:
  * gathered in a context built as the fleet board builds one per harness (every read
  * contained in that harness, no process handle), with no caller, every permission
- * refused and every job refused. It runs a preflight, so only the sweep calls it.
+ * refused and every job refused. It runs a preflight, so only the sweep calls it. The
+ * preflight binds no port here: no one is waiting for the answer, and a daemon may be
+ * about to bind the same one. A check a person opens looks at the ports.
  */
 export async function advisorSweepItems(
   home: AdvisorSweepHome,
@@ -1155,6 +1161,7 @@ export async function advisorSweepItems(
     submitJob: refuse,
     checkJob: refuse,
     warn: home.warn,
+    checkPort: PORTS_NOT_CHECKED,
     ...(home.hangarRoot !== undefined ? { hangarRoot: home.hangarRoot } : {}),
   };
   return advisorOpenItems(ctx, harness.dir);

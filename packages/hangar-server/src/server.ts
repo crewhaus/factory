@@ -121,7 +121,7 @@ import {
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { EXPORT_JOB_KIND } from "@crewhaus/harness-supervisor/job-kinds";
-import { runPreflight } from "@crewhaus/preflight";
+import { type PortChecker, runPreflight } from "@crewhaus/preflight";
 import {
   type AccessView,
   type Caller,
@@ -438,6 +438,8 @@ export type HangarServerOptions = {
   readonly schedulerTimers?: SchedulerTimers;
   /** Gathers one harness's Advisor findings for the attention sweep; injected in tests. */
   readonly advisorItems?: HomePorts["advisorItems"];
+  /** How an Advisor read a person opened looks at a port; injected in tests. */
+  readonly checkPort?: PortChecker;
   /** When the machine last booted, epoch ms; injected in tests. */
   readonly hostBootedAt?: () => number;
 };
@@ -2028,6 +2030,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       now,
       operator,
       principal: requestCaller().principal,
+      ...(opts.checkPort !== undefined ? { checkPort: opts.checkPort } : {}),
       authorize: (permission, target) => {
         const access = currentRequestAccess();
         const at = target ?? (entry !== null ? { harness: entry.id } : undefined);
