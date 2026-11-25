@@ -4,6 +4,22 @@ The compiler's typed intermediate representation: one variant per harness shape
 (`IrNode`), the loop projection (`projectLoop`) and the bundle README renderer.
 Emitters consume the IR, never the raw spec.
 
+## `@crewhaus/ir/slots`
+
+`enumerateModelSlots(ir)` lists every model a lowered harness can call, one row
+per slot: the primary model of each agent, step, node or role, its pool
+candidates (the shadow arm included), tiers and fallback chains, the profiles a
+sub-agent's Task call may pick, every judge (a judge the consumer defaults, such
+as the justification judge's, with the model it runs), compaction, the degrade
+target and the grounding model. Each row carries a label, the model string, its
+kind, its `models:` profile and whether a downshift may swap it. A sub-agent
+whose turns go to a remote peer is listed as kind `federation`, with the peer's
+URL in place of a model: a reader that prices or resolves models skips it.
+
+`auxModelsFor` and `primarySlot` are the views `doctor --models` and
+`model right-size` read. The module is pure: no `node:` import, no file, no
+pricing table, no clock.
+
 ## `@crewhaus/ir/support`
 
 What each shape does with each setting a spec can declare, generated from the

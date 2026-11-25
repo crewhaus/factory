@@ -7,9 +7,14 @@
  */
 import { describe, expect, test } from "bun:test";
 import { lower } from "@crewhaus/compiler";
+import {
+  JUSTIFICATION_JUDGE_DEFAULT_MODEL,
+  auxModelsFor,
+  enumerateModelSlots,
+  primarySlot,
+} from "@crewhaus/ir/slots";
 import { parseSpec } from "@crewhaus/spec";
 import { humanOwnedReason } from "@crewhaus/spec-patch";
-import { auxModelsFor, enumerateModelSlots, primarySlot } from "./model-slots";
 
 function walk(yaml: string) {
   return enumerateModelSlots(lower(parseSpec(yaml)));
@@ -228,5 +233,200 @@ routing: { kind: llm, model: claude-opus-5 }
         expect(humanOwnedReason(s.path)).not.toBe("judge identity");
       }
     }
+  });
+});
+
+/**
+ * The slots a harness calls that are not written as a slot of their own: the
+ * shadow arm, the profiles a sub-agent's Task call may pick, a remote peer,
+ * and the model a judge runs on when the spec names none.
+ */
+describe("the walk lists every model the harness calls", () => {
+  test("the shadow arm of a pool is a candidate slot, with its profile", () => {
+    const slots = walk(`
+name: shadowed
+target: cli
+models:
+  strong:
+    model: claude-opus-4-8
+agent:
+  model: claude-haiku-4-5
+  instructions: hi
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-sonnet-4-6, tags: [strong] }
+    strategy:
+      shadow: { candidate: $strong, sample_rate: 0.2 }
+`);
+    const shadow = slots.find((s) => s.label === "agent.model_pool.strategy.shadow.candidate");
+    expect(shadow).toMatchObject({
+      model: "claude-opus-4-8",
+      kind: "candidate",
+      profile: "strong",
+      swappable: false,
+    });
+    expect(shadow?.path).toBeUndefined();
+  });
+
+  test("each profile a sub-agent's Task call may pick is a candidate slot, with its fallbacks", () => {
+    const slots = walk(`
+name: options
+target: cli
+models:
+  fast:
+    model: claude-haiku-4-5
+    fallbacks: [claude-sonnet-4-6]
+  strong:
+    model: claude-opus-4-8
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+  sub_agents:
+    helper:
+      description: helps
+      instructions: help
+      allowed_profiles: [$fast, $strong]
+`);
+    const options = slots.filter((s) => s.label.startsWith("sub_agents.helper.allowed_profiles"));
+    expect(options.map((s) => [s.label, s.model, s.kind, s.profile ?? null])).toEqual([
+      ["sub_agents.helper.allowed_profiles[0]", "claude-haiku-4-5", "candidate", "fast"],
+      [
+        "sub_agents.helper.allowed_profiles[0].model_fallbacks[0]",
+        "claude-sonnet-4-6",
+        "fallback",
+        null,
+      ],
+      ["sub_agents.helper.allowed_profiles[1]", "claude-opus-4-8", "candidate", "strong"],
+    ]);
+    for (const s of options) expect(s.swappable).toBe(false);
+  });
+
+  test("a federated sub-agent is a federation slot naming its peer; a model it declares keeps its own row", () => {
+    const slots = walk(`
+name: federated
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+  sub_agents:
+    peer:
+      description: a remote peer
+      instructions: delegate
+      federation:
+        url: https://peer.example.com
+    both:
+      description: remote, with a model
+      instructions: delegate
+      model: claude-haiku-4-5
+      federation:
+        url: https://other.example.com
+`);
+    // Sub-agents lower in name order.
+    expect(slots.filter((s) => s.kind === "federation")).toEqual([
+      {
+        label: "sub_agents.both.federation.url",
+        model: "https://other.example.com",
+        kind: "federation",
+        swappable: false,
+      },
+      {
+        label: "sub_agents.peer.federation.url",
+        model: "https://peer.example.com",
+        kind: "federation",
+        swappable: false,
+      },
+    ]);
+    expect(slots.find((s) => s.label === "sub_agents.both.model")).toMatchObject({
+      model: "claude-haiku-4-5",
+      kind: "sub-agent",
+    });
+    // A peer's URL is not a model: `doctor --models` never checks it.
+    expect(auxModelsFor(slots).some((a) => a.model.startsWith("https://"))).toBe(false);
+    expect(auxModelsFor(slots).map((a) => a.slot)).toContain("sub_agents.both.model");
+  });
+
+  test("a crew role's sub-agents are walked the same way, under the role's label", () => {
+    const slots = walk(`
+name: crewed
+target: crew
+model: claude-opus-5
+entry: writer
+models:
+  fast:
+    model: claude-haiku-4-5
+roles:
+  writer:
+    instructions: write
+    sub_agents:
+      peer:
+        description: a remote peer
+        instructions: delegate
+        federation:
+          url: https://peer.example.com
+      helper:
+        description: helps
+        instructions: help
+        allowed_profiles: [$fast]
+`);
+    expect(slots.find((s) => s.kind === "federation")?.label).toBe(
+      "roles[0].sub_agents.peer.federation.url",
+    );
+    expect(
+      slots.find((s) => s.label === "roles[0].sub_agents.helper.allowed_profiles[0]"),
+    ).toMatchObject({ model: "claude-haiku-4-5", kind: "candidate", profile: "fast" });
+  });
+
+  test("a sub-agent with no model of its own still lists the pool it routes over", () => {
+    const slots = walk(`
+name: pooled-helper
+target: cli
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+  sub_agents:
+    helper:
+      description: helps
+      instructions: help
+      model_pool:
+        candidates:
+          - { model: claude-haiku-4-5, tags: [cheap] }
+          - { model: claude-opus-4-8, tags: [strong] }
+`);
+    const helper = slots.filter((s) => s.label.startsWith("sub_agents.helper"));
+    expect(helper.map((s) => [s.label, s.model, s.kind])).toEqual([
+      ["sub_agents.helper.model_pool.candidates[0]", "claude-haiku-4-5", "candidate"],
+      ["sub_agents.helper.model_pool.candidates[1]", "claude-opus-4-8", "candidate"],
+    ]);
+  });
+
+  test("a model-backed justification judge with no model lists the model it runs on", () => {
+    const judged = walk(`
+name: gated
+target: cli
+agent:
+  model: claude-opus-5
+  instructions: hi
+security:
+  justification: { judge: claude }
+`);
+    expect(judged.find((s) => s.label === "security.justification.model")).toEqual({
+      label: "security.justification.model",
+      model: JUSTIFICATION_JUDGE_DEFAULT_MODEL,
+      kind: "judge",
+      path: ["security", "justification", "model"],
+      swappable: false,
+    });
+    // The rule-based judge calls no model, so it adds no slot.
+    const ruled = walk(`
+name: gated
+target: cli
+agent:
+  model: claude-opus-5
+  instructions: hi
+security:
+  justification: { judge: rule-based }
+`);
+    expect(ruled.some((s) => s.label === "security.justification.model")).toBe(false);
   });
 });

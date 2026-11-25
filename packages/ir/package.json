@@ -8,6 +8,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./policy": "./src/policy.ts",
+    "./slots": "./src/slots.ts",
     "./support": "./src/support.ts",
     "./support-manifest.json": "./support-manifest.json"
   },

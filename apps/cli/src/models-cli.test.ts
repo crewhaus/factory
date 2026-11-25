@@ -317,6 +317,89 @@ agent:
   });
 });
 
+/** A spec that declares each slot the walk lists without a slot of its own. */
+const NEW_SLOTS = `
+name: new-slots
+target: cli
+models:
+  fast:
+    model: claude-haiku-4-5
+  strong:
+    model: claude-opus-4-8
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-sonnet-4-6, tags: [strong] }
+    strategy:
+      shadow: { candidate: $strong, sample_rate: 0.2 }
+  sub_agents:
+    peer:
+      description: a remote peer
+      instructions: delegate
+      federation:
+        url: https://peer.example.com
+    helper:
+      description: helps
+      instructions: help
+      allowed_profiles: [$fast]
+security:
+  justification: { judge: claude }
+`;
+
+describe("models audit and explain over the slots the walk adds", () => {
+  test("a fixture without them reads as before; with them, their rows are the only change", () => {
+    // HYBRID declares none of the four: its explain lists the slots it always did.
+    const hybrid = formatModelsExplain(ir(HYBRID), slotsOf(HYBRID));
+    expect(hybrid).not.toContain("shadow.candidate");
+    expect(hybrid).not.toContain("allowed_profiles");
+    expect(hybrid).not.toContain("federation");
+    expect(hybrid).not.toContain("security.justification.model");
+    // With them, each adds its one row and changes no other line (the label
+    // column widens, so lines are compared with their spacing folded).
+    const added = [
+      "agent.model_pool.strategy.shadow.candidate",
+      "sub_agents.helper.allowed_profiles[0]",
+      "sub_agents.peer.federation.url",
+      "security.justification.model",
+    ];
+    const fold = (text: string) => text.split("\n").map((l) => l.trim().replace(/\s+/g, " "));
+    const all = slotsOf(NEW_SLOTS);
+    const full = fold(formatModelsExplain(ir(NEW_SLOTS), all));
+    const without = fold(
+      formatModelsExplain(
+        ir(NEW_SLOTS),
+        all.filter((s) => !added.includes(s.label)),
+      ),
+    );
+    for (const label of added) {
+      expect(full.filter((l) => l.startsWith(`${label} `)).length, label).toBe(1);
+    }
+    expect(full.filter((l) => !added.some((label) => l.startsWith(`${label} `)))).toEqual(without);
+  });
+
+  test("a federated sub-agent's peer URL gets no pricing, capability, params or sunset finding", () => {
+    const emptyPricing = { ...DEFAULT_PRICING, providers: {} } as unknown as PricingTable;
+    const findings = auditModelSlots(slotsOf(NEW_SLOTS), { pricing: emptyPricing, sunsets: {} });
+    expect(findings.length).toBeGreaterThan(0);
+    expect(findings.filter((f) => f.model.includes("peer.example.com"))).toEqual([]);
+    expect(findings.filter((f) => f.slot.endsWith("federation.url"))).toEqual([]);
+    // The other new slots are audited like any model slot.
+    for (const slot of [
+      "agent.model_pool.strategy.shadow.candidate",
+      "sub_agents.helper.allowed_profiles[0]",
+      "security.justification.model",
+    ]) {
+      expect(
+        findings.some((f) => f.slot === slot && f.kind === "pricing"),
+        slot,
+      ).toBe(true);
+    }
+  });
+});
+
 describe("models audit --propose (the sunset loop)", () => {
   test("emits the replacement patch for a retired, spec-addressable slot", () => {
     const findings = auditModelSlots(slotsOf(RETIRED), {
