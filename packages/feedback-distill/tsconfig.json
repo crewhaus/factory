@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-records" },
     { "path": "../dataset-registry" },
     { "path": "../eval-dataset" },
     { "path": "../pii-redactor" }

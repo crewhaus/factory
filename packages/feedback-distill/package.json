@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/dataset-registry": "workspace:*",
     "@crewhaus/eval-dataset": "workspace:*",
     "@crewhaus/pii-redactor": "workspace:*"

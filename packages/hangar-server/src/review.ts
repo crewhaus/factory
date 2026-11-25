@@ -16,14 +16,20 @@
  * event on the session's own log, and only then the queue entry resolved.
  * Items with no session turn (eval abstentions, quarantine pointers) record
  * the human's pass/fail on the item itself, exactly as the CLI's `next` does.
+ *
+ * Whoever resolves an item takes its claim first, before a rating or a line is
+ * written: of two verdicts on one item one is recorded, whichever surface each
+ * came from, and it says who and where.
  */
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { openEventLog } from "@crewhaus/event-log";
 import {
   FEEDBACK_EVENT_KIND,
+  type ReviewActor,
   type ReviewQueueEntry,
   buildFeedbackRecord,
+  claimReviewEntry,
   readReviewQueue,
   resolveReviewEntry,
 } from "@crewhaus/feedback-distill";
@@ -138,6 +144,10 @@ export async function adjudicateReview(args: {
   readonly verdict: ReviewVerdict;
   readonly note?: string;
   readonly by: string;
+  /** Who resolves it as the resolved line records it: a stored actor and a door. */
+  readonly actor?: ReviewActor;
+  /** Where the rating was captured: Home's own screen, or the command line. */
+  readonly source?: "ui" | "cli";
   readonly nowIso: string;
 }): Promise<AdjudicateResult> {
   const entry = readReviewQueue(args.harnessDir).find((e) => e.id === args.itemId);
@@ -153,7 +163,7 @@ export async function adjudicateReview(args: {
     };
   }
 
-  let adjudicated = false;
+  let rating: { record: ReturnType<typeof buildFeedbackRecord>; root: string } | undefined;
   if (isThumbs) {
     const sessionId = entry.sourceRef.sessionId as string;
     const turnNumber = entry.sourceRef.turn as number;
@@ -170,8 +180,7 @@ export async function adjudicateReview(args: {
         sessionId,
         turnNumber,
         ts: args.nowIso,
-        // The manager console is a `ui` capture surface, not the CLI.
-        source: "ui",
+        source: args.source ?? "ui",
         thumbs: args.verdict,
         rater: args.by,
         adjudicate: true,
@@ -179,13 +188,24 @@ export async function adjudicateReview(args: {
     } catch (err) {
       return { outcome: "rejected", reason: err instanceof Error ? err.message : String(err) };
     }
-    const log = await openEventLog(sessionId, { rootDir: root });
+    rating = { record, root };
+  }
+
+  // Claimed before anything is written: a loser appends no rating and no line.
+  const claim = claimReviewEntry(args.harnessDir, args.itemId, {
+    at: args.nowIso,
+    ...(args.actor !== undefined ? { actor: args.actor } : {}),
+  });
+  if (claim.outcome === "unavailable") return { outcome: "rejected", reason: claim.reason };
+  if (claim.outcome === "taken") return { outcome: "already-resolved", entry };
+  const adjudicated = rating !== undefined;
+  if (rating !== undefined) {
+    const log = await openEventLog(rating.record.sessionId, { rootDir: rating.root });
     try {
-      await log.append({ kind: FEEDBACK_EVENT_KIND, payload: record });
+      await log.append({ kind: FEEDBACK_EVENT_KIND, payload: rating.record });
     } finally {
       await log.close();
     }
-    adjudicated = true;
   }
 
   const resolution =
@@ -194,8 +214,16 @@ export async function adjudicateReview(args: {
       : adjudicated
         ? `adjudicated: thumbs ${args.verdict}`
         : args.verdict;
-  const result = resolveReviewEntry(args.harnessDir, args.itemId, resolution, args.nowIso);
+  const result = resolveReviewEntry(
+    args.harnessDir,
+    args.itemId,
+    resolution,
+    args.nowIso,
+    args.actor,
+    { claimed: true },
+  );
   if (result.outcome === "not-found") return { outcome: "not-found" };
+  if (result.outcome === "unavailable") return { outcome: "rejected", reason: result.reason };
   if (result.outcome === "already-resolved") {
     return { outcome: "already-resolved", entry: result.entry };
   }
