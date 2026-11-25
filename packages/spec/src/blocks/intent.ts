@@ -3,9 +3,12 @@ import type { Spec } from "../index";
 import type { SpecAddIssue } from "./delta-090";
 
 /**
- * `intent:` — what this harness is for, in its owner's words (#514). Authoring
- * only: no IR field, no lowering and no reader, so a bundle is the same bytes
- * with or without it. Only its owner changes it: the optimizer refuses it on
+ * `intent:` — what this harness is for, in its owner's words (#514). It has one reader: on
+ * the shapes where `repositories:` takes effect, and only when the spec declares that too, it
+ * lowers into the bundle as the acceptance check's judge input (`@crewhaus/tool-work`), and
+ * nothing else reads it: no system prompt, no tool description or result, no README, and no
+ * file a harness writes. Without `repositories:`, and on every other shape, a bundle is the
+ * same bytes with or without it. Only its owner changes it: the optimizer refuses it on
  * every shape and the spec editor asks for the typed confirmation
  * (`packages/spec-patch/src/owner-keys.ts`).
  */

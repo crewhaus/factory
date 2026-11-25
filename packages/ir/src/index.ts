@@ -7,6 +7,7 @@ import type { IrBudgetPeriod } from "./budget-period";
 import type { IrDelegationCeiling } from "./delegation";
 import type { IrDeclaredPricing, IrModelPrice } from "./model-price";
 import type { IrPluginEntry } from "./plugins";
+import type { IrIntent, IrRepository } from "./repositories";
 import type { IrScheduleLane } from "./schedule-lanes";
 
 export type IrPermissionRule = {
@@ -1445,6 +1446,10 @@ export type IrV0 = {
   /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
    *  declares one; emitters never read it. */
   readonly models?: IrModelProfiles;
+  /** Where this harness may deliver work (#514). Present only when the spec declares it. */
+  readonly repositories?: readonly IrRepository[];
+  /** The acceptance judge's input (#514). Present only beside `repositories`. */
+  readonly intent?: IrIntent;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1609,6 +1614,10 @@ export type IrWorkflowV0 = {
   /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
    *  declares one; emitters never read it. */
   readonly models?: IrModelProfiles;
+  /** Where this harness may deliver work (#514). Present only when the spec declares it. */
+  readonly repositories?: readonly IrRepository[];
+  /** The acceptance judge's input (#514). Present only beside `repositories`. */
+  readonly intent?: IrIntent;
   readonly steps: readonly IrWorkflowStep[];
   readonly mcp_servers: IrMcpServers;
   readonly permissions: IrPermissions;
@@ -1871,6 +1880,10 @@ export type IrChannelV0 = {
   /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
    *  declares one; emitters never read it. */
   readonly models?: IrModelProfiles;
+  /** Where this harness may deliver work (#514). Present only when the spec declares it. */
+  readonly repositories?: readonly IrRepository[];
+  /** The acceptance judge's input (#514). Present only beside `repositories`. */
+  readonly intent?: IrIntent;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -1990,6 +2003,10 @@ export type IrManagedV0 = {
   /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
    *  declares one; emitters never read it. */
   readonly models?: IrModelProfiles;
+  /** Where this harness may deliver work (#514). Present only when the spec declares it. */
+  readonly repositories?: readonly IrRepository[];
+  /** The acceptance judge's input (#514). Present only beside `repositories`. */
+  readonly intent?: IrIntent;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -2511,6 +2528,10 @@ export type IrBatchV0 = {
   /** 0.6.0 §4.2 — the lowered `models:` registry. Present only when the spec
    *  declares one; emitters never read it. */
   readonly models?: IrModelProfiles;
+  /** Where this harness may deliver work (#514). Present only when the spec declares it. */
+  readonly repositories?: readonly IrRepository[];
+  /** The acceptance judge's input (#514). Present only beside `repositories`. */
+  readonly intent?: IrIntent;
   readonly agent: {
     readonly model: string;
     readonly instructions: string;
@@ -2906,6 +2927,7 @@ export type { IrDelegationCeiling } from "./delegation";
 
 // `plugins:` entries (#522). See ./plugins.ts.
 export type { IrPluginEntry, IrPluginGrant } from "./plugins";
+export type { IrIntent, IrRepository } from "./repositories";
 
 // Generated-bundle README renderer (item 42) — pure functions over the IR,
 // shared by every target emitter. See ./readme.ts for the module docs.

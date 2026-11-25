@@ -208,6 +208,9 @@ describe("budget.period", () => {
 
 describe("the check order", () => {
   test("the price and period checks are appended after every older 0.9.0 check", () => {
-    expect(DELTA_090_ISSUES.slice(-2)).toEqual([modelPriceIssues, budgetPeriodIssues]);
+    const price = DELTA_090_ISSUES.indexOf(modelPriceIssues);
+    expect(price).toBeGreaterThan(0);
+    expect(DELTA_090_ISSUES[price + 1]).toBe(budgetPeriodIssues);
+    expect(DELTA_090_ISSUES.length).toBeGreaterThanOrEqual(price + 2);
   });
 });

@@ -22,6 +22,7 @@ import {
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   type ToolSite,
   readmeToolFacts,
   resolveBuiltinTools,
@@ -133,7 +134,7 @@ function stepSites(steps: readonly IrWorkflowStep[]): ReadonlyArray<ToolSite> {
  */
 function resolveStepTools(
   steps: readonly IrWorkflowStep[],
-  chains?: SpecChainBlocks,
+  blocks?: SpecChainBlocks & SpecRepositoryBlocks,
 ): {
   readonly imports: ReadonlyArray<string>;
   readonly inits: ReadonlyArray<string>;
@@ -143,7 +144,7 @@ function resolveStepTools(
 } {
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("workflow", stepSites(steps), chains);
+    resolved = resolveBuiltinTools("workflow", stepSites(steps), blocks);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;

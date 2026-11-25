@@ -512,6 +512,7 @@ import {
   CATEGORIES,
   LOOP_TOOL_NAMES,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   ToolCategoryError,
   type ToolShape,
   builtinToolsFor,
@@ -3914,7 +3915,8 @@ async function applyToolConfigs(
   ir: {
     readonly tools: readonly string[];
     readonly toolConfigs: Readonly<Record<string, unknown>>;
-  } & SpecChainBlocks,
+  } & SpecChainBlocks &
+    SpecRepositoryBlocks,
 ): Promise<void> {
   try {
     await registerToolConfigs(
@@ -3923,6 +3925,7 @@ async function applyToolConfigs(
       {
         env: process.env,
         chains: ir,
+        repositories: ir,
       },
     );
   } catch (err) {

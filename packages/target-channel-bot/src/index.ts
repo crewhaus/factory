@@ -43,6 +43,7 @@ import {
   SANDBOX_AVAILABLE_EXPR,
   SANDBOX_AVAILABLE_IMPORT,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
@@ -141,7 +142,7 @@ const AGENT_TOOL_CONFIG = "agent.tool_config";
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
-  chains?: SpecChainBlocks,
+  blocks?: SpecChainBlocks & SpecRepositoryBlocks,
 ): {
   imports: ReadonlyArray<string>;
   inits: ReadonlyArray<string>;
@@ -154,7 +155,7 @@ function resolveTools(
     resolved = resolveBuiltinTools(
       "channel",
       [{ tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG }],
-      chains,
+      blocks,
     );
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
