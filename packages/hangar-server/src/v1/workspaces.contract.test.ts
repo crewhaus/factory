@@ -211,6 +211,14 @@ describe("reading workspaces", () => {
       await engine.settle(wi, { actor: HARNESS });
       const got = await home.call("GET", `/api/v1/work/${h.id}/work/${wi}`);
       expect(got.body["item"]).toMatchObject({ status: "in-review", statusWord: "In review" });
+      const list = await home.call("GET", `/api/v1/harnesses/${h.id}/workspaces?limit=500`);
+      const row = (list.body["items"] as Array<Record<string, unknown>>).find(
+        (i) => i["work"] === wi,
+      );
+      expect(row?.["outcome"]).toMatchObject({
+        state: "open",
+        url: `${b.fake.url}/acme/app/pull/${row?.["pr"]}`,
+      });
       expect(got.body["content"]).toMatchObject({ delivered: [{ kind: "pr" }] });
     },
     SLOW,

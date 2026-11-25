@@ -438,6 +438,7 @@ describe("the module", () => {
     const declared = new Set(
       [
         readFileSync(join(CONTRACT, "areas", "runtime-work.ts"), "utf8"),
+        readFileSync(join(CONTRACT, "areas", "runtime-workspace.ts"), "utf8"),
         readFileSync(join(CONTRACT, "operations", "meta.ts"), "utf8"),
       ].flatMap((text) => [...text.matchAll(/id: "([a-z]+(?:\.[a-zA-Z]+)+)"/g)].map((m) => m[1])),
     );

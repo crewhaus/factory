@@ -18,7 +18,7 @@ import {
   readOutcomes,
   readWorkspaces,
 } from "../work-items/index";
-import type { BindingsFile } from "./bindings";
+import type { BindingsFile, RepositoryBinding } from "./bindings";
 import { checkName } from "./checks";
 import { readCheckFile } from "./records";
 
@@ -43,11 +43,20 @@ export function attemptView(a: FoldedAttempt): WorkPublishView {
   };
 }
 
-function outcomeView(o: OutcomeLine): WorkPrView {
+/** A pull request's page on its code host: the binding's git origin, the repository, its number. */
+function pullUrl(binding: RepositoryBinding | undefined, pr: number): string | undefined {
+  if (binding === undefined) return undefined;
+  const url = `${binding.server.git}/${binding.repo}/pull/${pr}`;
+  return /^https?:\/\/[^/\s]+\/[A-Za-z0-9._/-]+\/pull\/\d+$/.test(url) ? url : undefined;
+}
+
+function outcomeView(o: OutcomeLine, binding: RepositoryBinding | undefined): WorkPrView {
+  const url = pullUrl(binding, o.pr);
   return {
     pr: o.pr,
     state: o.state,
     at: o.at,
+    ...(url !== undefined ? { url } : {}),
     ...(o.review !== undefined ? { review: o.review } : {}),
     ...(o.changed === true ? { changed: true as const } : {}),
     ...(o.reverted === true ? { reverted: true as const } : {}),
@@ -58,21 +67,26 @@ function outcomeView(o: OutcomeLine): WorkPrView {
 function pullOf(
   attempts: readonly FoldedAttempt[],
   outcome: OutcomeLine | undefined,
+  binding: RepositoryBinding | undefined,
 ): WorkPrView | undefined {
   const opened = [...attempts].reverse().find((a) => a.state === "done" && a.pr !== undefined);
   if (outcome !== undefined && (opened === undefined || outcome.pr === opened.pr)) {
-    return outcomeView(outcome);
+    return outcomeView(outcome, binding);
   }
-  return opened?.pr === undefined ? undefined : { pr: opened.pr, state: "open", at: opened.at };
+  if (opened?.pr === undefined) return undefined;
+  const url = pullUrl(binding, opened.pr);
+  return { pr: opened.pr, state: "open", at: opened.at, ...(url !== undefined ? { url } : {}) };
 }
 
 function summaryOf(
   ws: FoldedWorkspace,
   attempts: readonly FoldedAttempt[],
   outcome: OutcomeLine | undefined,
+  bindings: BindingsFile | undefined,
 ): WorkspaceSummaryView {
   const newest = attempts.at(-1);
-  const pull = pullOf(attempts, outcome);
+  const binding = bindings?.repositories.find((r) => r.name === ws.binding);
+  const pull = pullOf(attempts, outcome, binding);
   return {
     work: ws.id,
     binding: ws.binding,
@@ -84,13 +98,19 @@ function summaryOf(
   };
 }
 
-/** Every workspace of a harness, newest first. */
-export function workspaceSummaries(harnessDir: string): readonly WorkspaceSummaryView[] {
+/**
+ * Every workspace of a harness, newest first. With the bindings the harness wrote, each pull
+ * request carries its page on the code host.
+ */
+export function workspaceSummaries(
+  harnessDir: string,
+  opts: { readonly bindings?: BindingsFile } = {},
+): readonly WorkspaceSummaryView[] {
   const attempts = readAttempts(harnessDir);
   const outcomes = readOutcomes(harnessDir);
   return [...readWorkspaces(harnessDir).values()]
     .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : a.id < b.id ? -1 : 1))
-    .map((ws) => summaryOf(ws, attempts.get(ws.id) ?? [], outcomes.get(ws.id)));
+    .map((ws) => summaryOf(ws, attempts.get(ws.id) ?? [], outcomes.get(ws.id), opts.bindings));
 }
 
 function tail(text: string): string {
@@ -135,7 +155,7 @@ export function workspaceView(
       ? readCheckFile(harnessDir, wi, newest.reasons)
       : undefined;
   return {
-    ...summaryOf(ws, attempts, outcome),
+    ...summaryOf(ws, attempts, outcome, opts.bindings),
     ...(headSha !== undefined ? { headSha } : {}),
     ...(ws.wip !== undefined ? { wip: ws.wip } : {}),
     ...(checks !== undefined ? { checks } : {}),

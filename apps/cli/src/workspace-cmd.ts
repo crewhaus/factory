@@ -177,7 +177,8 @@ export async function runWorkspaceCommand(
 }
 
 function runVerb(verb: Sub, rest: readonly string[], deps: WorkspaceCmdDeps): WorkspaceOutput {
-  const args = parseArgs(`workspace ${verb}`, rest, CLI_FAMILY.sub[verb].flags);
+  const label = `workspace ${verb}`;
+  const args = parseArgs(label, rest, CLI_FAMILY.sub[verb].flags);
   const json = args.booleans.has("json");
   const opts: DaemonCommandOptions = {
     ...(deps.env !== undefined ? { env: deps.env } : {}),
@@ -190,7 +191,7 @@ function runVerb(verb: Sub, rest: readonly string[], deps: WorkspaceCmdDeps): Wo
     if (args.positional.length > 0) {
       throw new Refused("workspace list: unexpected argument", "invalid");
     }
-    const items = workspaceSummaries(dir);
+    const items = workspaceSummaries(dir, bindings !== undefined ? { bindings } : {});
     if (json) return { lines: [JSON.stringify({ items }, null, 2)], exitCode: 0 };
     if (items.length === 0) {
       return {

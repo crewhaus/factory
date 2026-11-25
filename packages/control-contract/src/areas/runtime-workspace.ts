@@ -181,6 +181,8 @@ export type WorkPrView = {
   readonly state: WorkPrState;
   readonly at: string;
   readonly review?: WorkPrReview;
+  /** Its page on the code host, from the binding's git origin. */
+  readonly url?: string;
   /** Merged after a maintainer changed it. */
   readonly changed?: true;
   readonly reverted?: true;

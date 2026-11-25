@@ -57,6 +57,7 @@ export const workPrView = z
     state: oneOf(WORK_PR_STATES),
     at: timestamp,
     review: oneOf(WORK_PR_REVIEWS).optional(),
+    url: z.string().optional(),
     changed: z.literal(true).optional(),
     reverted: z.literal(true).optional(),
   })

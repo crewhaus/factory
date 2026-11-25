@@ -261,9 +261,12 @@ describe("every flag list answers --help", () => {
       }
     }
     // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect`
-    // (#518); `work` came with its eleven (#516); budget is show, history and extend.
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6 + 11 + 3));
-  }, 30_000); // sixteen modules' imports and two hundred and twelve calls; slow on a loaded runner
+    // (#518); `work` came with its eleven and then `publish` (#516); budget is show, history and
+    // extend; workspace is list and show.
+    expect(asked).toBe(
+      2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6 + 12 + 3 + 2),
+    );
+  }, 30_000); // seventeen modules' imports and two hundred and eighteen calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

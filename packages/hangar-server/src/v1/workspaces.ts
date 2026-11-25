@@ -61,9 +61,11 @@ const list: V1Handler = async (ctx) => {
   const paging = pagingOf(ctx.query, "workspaces");
   const snapshot =
     dir === undefined ? [] : readPage(workspacesLedger(dir), { limit: 1 }).snapshotAt;
-  const all = dir === undefined ? [] : workspaceSummaries(dir);
+  const bindings = dir === undefined ? undefined : bindingsOf(dir);
+  const all =
+    dir === undefined ? [] : workspaceSummaries(dir, bindings !== undefined ? { bindings } : {});
   const items = all.slice(0, paging.limit);
-  const declares = dir !== undefined && bindingsOf(dir) !== undefined;
+  const declares = bindings !== undefined;
   return {
     status: 200,
     body: {
