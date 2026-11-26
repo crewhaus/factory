@@ -843,7 +843,9 @@ these on: they reach every harness that uses what each one names.
   saved it.** Each Recall result reads `• (<id> · <score>) <text>`, so an
   answer can name the memory it used and `crewhaus memory show <id>` opens it.
   Remember stamps `provenance.sessionId` from the run that called it, never
-  from what the model passes. If an eval grades Recall's exact output,
+  from what the model passes, and marks the fact as written by the agent
+  (`provenance.author`), so a dream pass does not count it as a conversation
+  that corroborates another. If an eval grades Recall's exact output,
   rebaseline it.
 
 - **Runs record which knowledge they used.** A tool call that returns stored
@@ -853,7 +855,10 @@ these on: they reach every harness that uses what each one names.
   the plan tail and those calls also add lines to
   `.crewhaus/run/knowledge/usage/`, one per item the first time a run uses it
   each way: the item as a keyed digest under the harness's digest key, its
-  store, version and status, no text. `CREWHAUS_RUN_STAMPS=0` turns both off.
+  store, version and status, no text. Usage lines are kept 13 months:
+  `crewhaus retention sweep` removes older segments, and
+  `knowledge.usageMaxAgeDays` in `.crewhaus/retention.json` sets another
+  window. `CREWHAUS_RUN_STAMPS=0` turns both off.
 
 - **A harness with `knowledge:` writes `.crewhaus/run/knowledge/corpus.json`
   at boot.** It lists each declared source by its label, whether it was
@@ -864,15 +869,17 @@ these on: they reach every harness that uses what each one names.
 - **A declared Thredz backend that falls back is recorded.** When `thredz:` or
   `memory.backend: thredz` is declared and no connection comes up, boot adds
   one line per part Thredz would have served (the wiki, the goal mirror,
-  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, beside the
-  warning it prints.
+  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, once per
+  boot, beside the warning it prints. `crewhaus retention sweep` keeps 13
+  months of them.
 
 - **Text the runtime re-reads from earlier work is screened as remembered
   memory.** The plan, focus and goals in the `<current_plan>` block, a
   `LESSONS.md` that `crewhaus lessons update` wrote and the per-user
   preference files are checked with the screen recalled memories pass, line
-  by line, two adjacent lines at a time and as a whole. What it withholds
-  reaches the model as a notice. The findings
+  by line, two adjacent lines at a time and as a whole, and plan steps, goals
+  and list items are also read as their text, without the markers around it.
+  What it withholds reaches the model as a notice. The findings
   the dream pass starts from are checked the same way; a withheld one is left
   out and counted. `crewhaus optimize --few-shot` checks each example's input
   and output, leaves out one the screen withholds, prints the ids it injects,

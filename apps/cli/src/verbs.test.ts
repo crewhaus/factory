@@ -481,8 +481,8 @@ describe("legacy sub-verbs match the dispatch", () => {
     expect(wiki?.[1]?.split(", ")).toEqual(subKeys("wiki"));
     const state = INDEX.match(/state action must be one of ([a-z, ]+) \(got/);
     expect(state?.[1]?.split(", ")).toEqual(subKeys("state"));
-    expect(INDEX).toContain('knowledge action must be "sync"');
-    expect(subKeys("knowledge")).toEqual(["sync"]);
+    const knowledge = INDEX.match(/knowledge action must be one of: ([a-z, ]+) \(got/);
+    expect(knowledge?.[1]?.split(", ")).toEqual(subKeys("knowledge"));
     expect(INDEX).toContain(
       'dreamFirst === "run" || dreamFirst === "status" || dreamFirst === "init"',
     );

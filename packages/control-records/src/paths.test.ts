@@ -35,6 +35,9 @@ describe("the layout", () => {
       budgetDir: join(CONTROL, "budget"),
       budgetLockFile: join(CONTROL, "budget", "lock"),
       budgetStateFile: join(CONTROL, "budget-state.json"),
+      knowledgeUsageDir: join(".crewhaus", "run", "knowledge", "usage"),
+      knowledgeBackendsFile: join(".crewhaus", "run", "knowledge", "backends.jsonl"),
+      knowledgeErasuresDir: join(".crewhaus", "run", "knowledge", "erasures"),
       attentionDir: join(CONTROL, "attention"),
     });
     expect(readdirSync(root)).toEqual([]);

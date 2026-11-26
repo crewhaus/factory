@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEmbedder } from "@crewhaus/embedder";
 import { auditToolScopes } from "@crewhaus/tool-builder";
+import { reportsKnowledge } from "@crewhaus/tool-catalog";
 import { createVectorStore } from "@crewhaus/vector-store";
 import {
   CORPUS_MANIFEST_FILE,
@@ -609,6 +610,25 @@ describe("Retrieve reports the documents it returned", () => {
       });
     }
     expect(knowledgeSourceFingerprint("fox.md")).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  test("every Retrieve reports reads to the runtime: the pipeline's, before and after its config, and a knowledge tool", async () => {
+    expect(reportsKnowledge(retrieve)).toBe(true);
+    registerRetrieveConfig({
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+    });
+    expect(reportsKnowledge(retrieve)).toBe(true);
+    const dir = mkdtempSync(join(tmpdir(), "crewhaus-knowledge-"));
+    TEMP_DIRS.push(dir);
+    writeFileSync(join(dir, "a.md"), "a", "utf-8");
+    const tool = await knowledgeRetrieve({
+      sources: [{ kind: "glob", glob: "*.md" }],
+      embedder: createEmbedder({ model: "mock/det" }),
+      vectorStore: createVectorStore({ backend: "in-memory" }),
+      cwd: dir,
+    });
+    expect(reportsKnowledge(tool)).toBe(true);
   });
 
   test("a hit without a docId reports nothing", async () => {

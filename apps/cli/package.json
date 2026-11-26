@@ -38,6 +38,7 @@
     "@crewhaus/prompt-optimizer": "workspace:*",
     "@crewhaus/prompt-optimizer-claude": "workspace:*",
     "@crewhaus/justification-judge-claude": "workspace:*",
+    "@crewhaus/knowledge-index": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/canary-controller": "workspace:*",
     "@crewhaus/checkpoint-store": "workspace:*",

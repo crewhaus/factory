@@ -22,6 +22,7 @@ import { setDefaultBoundaryLlmClassifier } from "@crewhaus/boundary-classifier";
 import { createEmbedder } from "@crewhaus/embedder";
 import { openEventLog } from "@crewhaus/event-log";
 import { createRunContext } from "@crewhaus/run-context";
+import { type RegisteredTool, reportsKnowledge } from "@crewhaus/tool-catalog";
 import { WikiVersionConflictError, createWikiStore } from "@crewhaus/wiki-store";
 import {
   GAPS_TAG,
@@ -1203,6 +1204,19 @@ describe("read tools report the articles they returned", () => {
     const reported: unknown[] = [];
     return { reported, recordReads: (refs) => reported.push(...refs) };
   };
+
+  test("wiki_get and wiki_recall alone report reads to the runtime", () => {
+    const bundle = makeBundle();
+    const marked = Object.values(bundle)
+      .flatMap((value) => (Array.isArray(value) ? value : [value]))
+      .filter(
+        (value): value is RegisteredTool =>
+          typeof value === "object" && value !== null && "execute" in value,
+      )
+      .filter(reportsKnowledge)
+      .map((tool) => tool.name);
+    expect([...new Set(marked)].sort()).toEqual(["wiki_get", "wiki_recall"]);
+  });
 
   test("wiki_get reports the slug and the version it read", async () => {
     const bundle = makeBundle();

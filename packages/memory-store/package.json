@@ -6,12 +6,14 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./erasure": "./src/erasure.ts"
   },
   "scripts": {
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*"

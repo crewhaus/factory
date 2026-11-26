@@ -6583,6 +6583,146 @@
               "takesValue": false
             }
           ]
+        },
+        "status": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "list": {
+          "flags": [
+            {
+              "name": "type",
+              "takesValue": true
+            },
+            {
+              "name": "status",
+              "takesValue": true
+            },
+            {
+              "name": "scope",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "history",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "why": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "usage": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "search": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "reindex": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "erase": {
+          "flags": [
+            {
+              "name": "include-sources",
+              "takesValue": false
+            },
+            {
+              "name": "shared",
+              "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
+            },
+            {
+              "name": "confirm",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
         }
       },
       "flags": [

@@ -9,6 +9,12 @@
       "path": "../audit-log"
     },
     {
+      "path": "../control-contract"
+    },
+    {
+      "path": "../control-records"
+    },
+    {
       "path": "../data-retention-engine"
     },
     {
@@ -16,6 +22,9 @@
     },
     {
       "path": "../session-store"
+    },
+    {
+      "path": "../tool-safety"
     }
   ],
   "include": ["src/**/*"]

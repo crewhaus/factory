@@ -9,16 +9,20 @@
     ".": "./src/index.ts",
     "./retire": "./src/retire.ts",
     "./retention": "./src/retention.ts",
-    "./knowledge-sync": "./src/knowledge-sync.ts"
+    "./knowledge-sync": "./src/knowledge-sync.ts",
+    "./erasure": "./src/erasure.ts"
   },
   "scripts": {
     "test": "bun test src"
   },
   "dependencies": {
     "@crewhaus/audit-log": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
     "@crewhaus/data-retention-engine": "workspace:*",
     "@crewhaus/memory-store": "workspace:*",
-    "@crewhaus/session-store": "workspace:*"
+    "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {
