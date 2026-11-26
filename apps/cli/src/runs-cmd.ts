@@ -69,7 +69,8 @@ export const CLI_FAMILY = {
         user: "value",
         "no-mcp-quarantine": "boolean",
         "ignore-pause": "boolean",
-        // A paused graph run's: the decision, and the harness it is in.
+        // A paused graph run's: the pause it settles, the decision, and the harness it is in.
+        checkpoint: "value",
         decision: "value",
         harness: "value",
         help: "boolean",
@@ -113,7 +114,7 @@ const USAGE = [
   "       crewhaus runs create <harness> --input-file <path> [--admission reject|queue] [--json]",
   "       crewhaus runs cancel <run> [--harness <h>] [--json]",
   "       crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--ignore-pause] …",
-  "       crewhaus runs resume <grun_…> --decision approve|reject|<words> [--harness <h>]",
+  "       crewhaus runs resume <grun_…> --decision approve|reject|<words> [--checkpoint <ckpt_…>] [--harness <h>]",
   "       crewhaus runs inspect <run|session> [--run <run>] [--timeline key|full | --why <step> |",
   "                             --context <n>|all] [--limit n] [--before <entry>] [--harness <h>] [--json]",
   "  A harness's runs, newest first, and the run commands. <h> is a harness id or its",
@@ -290,7 +291,7 @@ function readCreateInput(path: string): string {
 }
 
 /** The flags `runs resume <grun_…>` takes; the rest are a session's. */
-const GRAPH_RESUME_FLAGS: ReadonlySet<string> = new Set(["decision", "harness"]);
+const GRAPH_RESUME_FLAGS: ReadonlySet<string> = new Set(["checkpoint", "decision", "harness"]);
 
 /** Whether `runs resume` names a graph run: the first word that is no flag, nor a flag's value. */
 function namesGraphRun(argv: readonly string[]): boolean {
@@ -313,7 +314,7 @@ function graphResumeCommand(argv: readonly string[], deps: RunsDeps): Promise<Ru
   );
   if (foreign !== undefined) {
     throw new Error(
-      `runs resume: a graph run takes --decision and --harness, not --${foreign}; its build sets the rest`,
+      `runs resume: a graph run takes --decision, --checkpoint and --harness, not --${foreign}; its build sets the rest`,
     );
   }
   const extra = args.positional[1];
@@ -323,6 +324,7 @@ function graphResumeCommand(argv: readonly string[], deps: RunsDeps): Promise<Ru
     {
       grun: args.positional[0] as string,
       decision: args.values.get("decision")?.[0],
+      checkpoint: args.values.get("checkpoint")?.[0],
       harness: args.values.get("harness")?.[0],
     },
     {

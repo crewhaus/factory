@@ -24,7 +24,9 @@
  * `_meta.json` (`pendingHitl`: the checkpoint, the node and the prompt its
  * spec gives), and a new checkpoint or a resume clears it. A pause is
  * resumed once: `claimResume` publishes `_resume-<checkpointId>.claim`
- * exclusively, so of two resumes one gets it.
+ * exclusively, so of two resumes one gets it. Once a run has recorded a
+ * pause (`recordsPauses`), it is resumed only at the pause it says it waits
+ * at; a resume can name that pause through {@link RESUME_CHECKPOINT_ENV}.
  *
  * Pluggable adapter: callers can substitute a different
  * `CheckpointStoreAdapter` (SQLite, Postgres, S3) and the
@@ -86,6 +88,12 @@ export type PendingHitl = {
 };
 
 /**
+ * The env that names the one pause a resume may settle. A build started to settle a pause
+ * the person saw carries it, and its engine refuses to resume the run anywhere else.
+ */
+export const RESUME_CHECKPOINT_ENV = "CREWHAUS_GRAPH_RESUME_CHECKPOINT";
+
+/**
  * The file that says a pause was resumed, in its run's folder. The file-backed adapter
  * creates it exclusively; a reader that only looks for it changes nothing.
  */
@@ -101,6 +109,11 @@ export type GraphRunMeta = {
   head?: CheckpointId;
   /** The run is waiting for a decision. A reader that does not know the key ignores it. */
   pendingHitl?: PendingHitl;
+  /**
+   * The run has recorded a pause: from then on it is resumed only at the pause it says it
+   * waits at. A run paused by an older release has none, and is resumed once at its head.
+   */
+  recordsPauses?: true;
   readonly createdAt: string;
   /** Set when this run was branched from a sibling. */
   readonly branchedFrom?: BranchInfo;
@@ -127,6 +140,8 @@ export interface CheckpointStoreAdapter {
    * say whether a pause was resumed, so nothing resumes on it.
    */
   claimResume?(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<"claimed" | "taken">;
+  /** Whether a pause's resume was taken. Reads only. */
+  resumeClaimed?(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<boolean>;
 }
 
 export interface CheckpointStore {
@@ -160,6 +175,11 @@ export interface CheckpointStore {
    * after (and on an adapter that cannot claim, so nothing resumes twice).
    */
   claimResume(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<"claimed" | "taken">;
+  /**
+   * Whether the pause at `checkpointId` was already resumed, or `undefined` when the store
+   * cannot say. Reads only.
+   */
+  resumeClaimed?(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<boolean | undefined>;
   /** Delete a graph run's directory tree. Idempotent. */
   drop(graphRunId: GraphRunId): Promise<void>;
 }
@@ -363,6 +383,10 @@ class FileSystemAdapter implements CheckpointStoreAdapter {
     return "claimed";
   }
 
+  async resumeClaimed(graphRunId: GraphRunId, checkpointId: CheckpointId): Promise<boolean> {
+    return existsSync(join(this.dir(graphRunId), resumeClaimName(checkpointId)));
+  }
+
   async drop(graphRunId: GraphRunId): Promise<void> {
     const dir = this.dir(graphRunId);
     if (!existsSync(dir)) return;
@@ -476,7 +500,9 @@ export function createCheckpointStore(opts: CreateCheckpointStoreOptions = {}): 
     async markWaiting(graphRunId, pending): Promise<void> {
       validateGraphRunId(graphRunId);
       if (pending !== undefined) validateCheckpointId(pending.checkpointId);
-      const { pendingHitl: _waited, ...rest } = await ensureMeta(graphRunId);
+      const { pendingHitl: _waited, ...was } = await ensureMeta(graphRunId);
+      // Once a pause is recorded (or resumed), the run is resumed only where it says it waits.
+      const rest: GraphRunMeta = { ...was, recordsPauses: true };
       await adapter.saveMeta(
         pending === undefined
           ? rest
@@ -497,6 +523,11 @@ export function createCheckpointStore(opts: CreateCheckpointStoreOptions = {}): 
       return adapter.claimResume === undefined
         ? "taken"
         : adapter.claimResume(graphRunId, checkpointId);
+    },
+    async resumeClaimed(graphRunId, checkpointId): Promise<boolean | undefined> {
+      validateGraphRunId(graphRunId);
+      validateCheckpointId(checkpointId);
+      return adapter.resumeClaimed?.(graphRunId, checkpointId);
     },
     async drop(graphRunId): Promise<void> {
       validateGraphRunId(graphRunId);

@@ -12,6 +12,8 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { screenHref } from "../assets/js/router.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import * as acts from "../assets/js/views/attention-acts.js";
 import {
   ATTENTION_TEXT,
@@ -19,6 +21,7 @@ import {
   KIND_WORDS,
   UNKNOWN_TEXT,
   bandsOf,
+  cardMemory,
   cardModel,
   causeLine,
   classWord,
@@ -32,6 +35,7 @@ import {
   newCount,
   nextIndex,
   placeOf,
+  restoreCards,
   settledLine,
   showTwin,
   sinceLine,
@@ -233,7 +237,22 @@ describe("a card", () => {
       standingLines(item(over), { nowMs: NOW, meId: "prn_me" });
     expect(lines({})).toEqual([]);
     expect(lines({ assignee: "prn_me" })).toEqual(["With you."]);
-    expect(lines({ assignee: "prn_x" })).toEqual(["With prn_x."]);
+    // Someone else is named as Home knows them, and never by their raw id.
+    expect(lines({ assignee: "prn_x" })).toEqual(["With Someone else."]);
+    expect(
+      standingLines(item({ assignee: "prn_x" }), {
+        nowMs: NOW,
+        meId: "prn_me",
+        people: [{ id: "prn_x", name: "Ana" }],
+      }),
+    ).toEqual(["With Ana."]);
+    expect(
+      cardModel(item({ assignee: "prn_x" }), {
+        nowMs: NOW,
+        people: [{ id: "prn_x", name: "Ana" }],
+      }).standing,
+    ).toEqual(["With Ana."]);
+    expect(SOURCE).toContain("people: list.people ?? []");
     expect(lines({ deferral: { until: ahead, deadlineMoved: true } })).toEqual([
       "Put off. It is due again in 2h.",
     ]);
@@ -303,6 +322,102 @@ describe("the choices", () => {
     expect(acts.choiceRow("permission", "explode")).toBeNull();
     // Never from what an item says: a choice no table knows is not offered.
     expect(models({ choices: [choice("explode")] })).toEqual([]);
+  });
+
+  /** A closed list the contract declares, read from its source. */
+  const contractList = (name: string): string[] => {
+    const body = new RegExp(`export const ${name} = deepFreeze\\(\\[([^\\]]*)\\]`).exec(
+      CONTRACT,
+    )?.[1];
+    return [...(body ?? "").matchAll(/"([a-z-]+)"/g)].map((m) => m[1] as string);
+  };
+
+  test("an Advisor finding opens the screen it names, with a button that says which", () => {
+    const advisor = (kind: string, place?: string) =>
+      models({
+        kind,
+        band: kind === "setup" ? "consider" : "fix",
+        source: { kind: "advisor", id: "x" },
+        choices: [choice("open", { cliTwin: null, ...(place !== undefined ? { place } : {}) })],
+      })[0];
+    const rows: Array<[string, string, string, string]> = [
+      ["security", "security", "Open the incident", "Opens the incident."],
+      ["spec", "spec", "Open the spec", "Opens the spec."],
+      ["quality-regression", "evals", "Open the results", "Opens the results."],
+      ["budget", "costs", "Open the budget", "Opens the budget."],
+      ["setup", "creds", "Open where it is fixed", "Opens the place that fixes it."],
+    ];
+    for (const [kind, place, label, effect] of rows) {
+      expect(advisor(kind, place)).toMatchObject({
+        label,
+        effect,
+        does: "open",
+        href: screenHref(A, place),
+      });
+    }
+    expect(advisor("security", "approvals")?.href).toBe(screenHref(A, "approvals"));
+    // A screen it does not name, or one no list holds, opens the suggestion in Advice, and says so.
+    for (const place of [undefined, "javascript:alert(1)", "nowhere"]) {
+      expect(advisor("security", place)).toMatchObject({
+        label: "Open in Advice",
+        effect: "Opens the suggestion in Advice.",
+        href: "#/home/needs-you?type=advice",
+      });
+    }
+    // One control goes to the place: the card adds no second link to Advice.
+    const finding = item({
+      kind: "security",
+      band: "fix",
+      source: { kind: "advisor", id: "incident-1" },
+      choices: [choice("open", { place: "security" })],
+    });
+    expect(placeOf(finding)).toBeNull();
+    expect(acts.PLACES).toEqual(contractList("ATTENTION_PLACES"));
+    expect(acts.PLACES).toHaveLength(15);
+  });
+
+  test("an Advisor finding's job says what it starts, and what it spends", () => {
+    const act = (job?: string) =>
+      models({
+        kind: "quality-regression",
+        band: "fix",
+        source: { kind: "advisor", id: "eval-below-baseline" },
+        choices: [choice("act", job !== undefined ? { job } : {})],
+      })[0];
+    expect(act("optimize")).toMatchObject({
+      label: "Queue an optimize run",
+      effect:
+        "Starts an optimize run. It uses model credits and proposes changes for you to review.",
+      does: "act",
+    });
+    expect(act("compile")).toMatchObject({
+      label: "Recompile",
+      effect: "Rebuilds the bundle from the spec.",
+    });
+    expect(act("dream-run")?.label).toBe("Run the memory review");
+    expect(act("eval")).toMatchObject({
+      label: "Run the evals",
+      effect: "Starts an eval run. It uses model credits.",
+    });
+    expect(act("doctor")?.effect).toBe(
+      "Checks the harness's setup and says what it finds. It changes nothing.",
+    );
+    for (const job of [undefined, "rm-rf", "toString"]) {
+      expect(act(job)).toMatchObject({
+        label: "Start the suggested job",
+        effect: "Starts the suggested job.",
+      });
+    }
+    // Every job has its words here and in the terminal, the same words.
+    const jobs = contractList("ATTENTION_JOBS");
+    expect(jobs.length).toBeGreaterThan(5);
+    expect(Object.keys(acts.JOB_CHOICES).sort()).toEqual([...jobs].sort());
+    for (const job of jobs) {
+      const key = job.includes("-") ? `"${job}"` : job;
+      const said = new RegExp(`\\n  ${key}:\\s*"((?:[^"\\\\]|\\\\.)*)"`).exec(SENTENCES)?.[1];
+      expect(`${job}: ${acts.JOB_CHOICES[job][1]}`).toBe(`${job}: ${said}`);
+    }
+    expect(acts.doneWords("act")).toBe("Queued.");
   });
 
   test("each is a button with what it does and its exact command, or why there is none", () => {
@@ -667,6 +782,15 @@ describe("the acts beside the choices", () => {
     expect(acts.messageHead({ by: `local:#${"a".repeat(64)}` }, { ago: "" })).toContain(
       "Someone at this computer",
     );
+    // Another member reads as their name, or as "Someone else": never as their id.
+    const people = [{ id: "prn_ana", name: "Ana" }];
+    expect(acts.messageHead({ by: "prn_ana" }, { meId: "prn_me", people, ago: "1m ago" })).toBe(
+      "Ana · 1m ago",
+    );
+    expect(acts.messageHead({ by: "prn_bo" }, { meId: "prn_me", people, ago: "1m ago" })).toBe(
+      "Someone else · 1m ago",
+    );
+    expect(ACTS).toContain('title: typeof message.by === "string" ? message.by : null');
   });
 });
 
@@ -742,8 +866,67 @@ describe("the list", () => {
     expect(firstNewIndex(["a", "b"], ["c", "a", "b"])).toBe(0);
     expect(firstNewIndex(["a", "b"], ["a", "d", "b"])).toBe(1);
     expect(firstNewIndex(["a", "b"], ["a", "b"])).toBe(-1);
-    expect(SOURCE).toContain("redraw({ restore: { shownRefs, openRefs: openBodyRefs(host) } })");
+    expect(SOURCE).toContain("redraw({ restore: { shownRefs } })");
     expect(SOURCE).toContain("announce(added > 0 ? `Showing ${added} new`");
+  });
+
+  /** A card as the list draws it, with just what a redraw keeps: its disclosures and draft. */
+  function fakeCard(ref: string, opts: { body?: boolean } = {}) {
+    const body = opts.body === true ? { open: false } : null;
+    const thread = { open: false };
+    const text = { value: "" };
+    const parts: Record<string, unknown> = {
+      "details.attention-body": body,
+      "details.attention-thread": thread,
+      ".attention-discuss textarea": text,
+    };
+    return {
+      body,
+      thread,
+      text,
+      getAttribute: (name: string) => (name === "data-ref" ? ref : null),
+      querySelector: (selector: string) => parts[selector] ?? null,
+    };
+  }
+  const listOf = (cards: unknown[]) => ({
+    querySelectorAll: (selector: string) => (selector === ".attention-card" ? cards : []),
+  });
+
+  test("deciding one card leaves another's open discussion open, with what was typed in it", () => {
+    const a = fakeCard("home/attention/a", { body: true });
+    const b = fakeCard("home/attention/b", { body: true });
+    b.thread.open = true;
+    b.text.value = "Let's wait for the release notes.";
+    const memory = cardMemory(listOf([a, b]));
+    // A is decided: the list is drawn again from fresh cards, and A is gone.
+    const fresh = fakeCard("home/attention/b", { body: true });
+    restoreCards([fresh], memory);
+    expect(fresh.thread.open).toBe(true);
+    // The card's first disclosure is what the harness sent: it stays as it was.
+    expect(fresh.body?.open).toBe(false);
+    expect(fresh.text.value).toBe("Let's wait for the release notes.");
+    // What was open on what the harness sent is kept the same way, on its own.
+    const shown = fakeCard("home/attention/c", { body: true });
+    if (shown.body !== null) shown.body.open = true;
+    const kept = cardMemory(listOf([shown]));
+    const again = fakeCard("home/attention/c", { body: true });
+    restoreCards([again], kept);
+    expect(again.body?.open).toBe(true);
+    expect(again.thread.open).toBe(false);
+    // A card nobody touched is remembered as nothing.
+    expect(cardMemory(listOf([fakeCard("home/attention/d")])).size).toBe(0);
+  });
+
+  test("every redraw keeps the cards' disclosures and drafts: after an act, Show settled and Show N new alike", () => {
+    const draw = SOURCE.slice(SOURCE.indexOf("async function drawInbox"));
+    const kept = draw.indexOf("const memory = cardMemory(frame.body);");
+    const cleared = draw.indexOf("clear(frame.body);");
+    const put = draw.indexOf("restoreCards(drawn.roving.rows(), memory);");
+    expect(kept).toBeGreaterThan(-1);
+    expect(cleared).toBeGreaterThan(-1);
+    expect(put).toBeGreaterThan(-1);
+    expect(kept).toBeLessThan(cleared);
+    expect(put).toBeGreaterThan(draw.indexOf("frame.body.appendChild(drawn.region);"));
   });
 
   test("what a harness sent wraps inside its card", () => {

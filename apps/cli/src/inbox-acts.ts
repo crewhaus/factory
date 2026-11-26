@@ -244,9 +244,9 @@ function depsOf(context: ActContext, harness: ActHarness): ActDeps {
         ? { outcome: "rejected", reason: answer.reason }
         : { outcome: answer.outcome };
     },
-    resumeGraph: async ({ dir, grun, decision }) => {
+    resumeGraph: async ({ dir, grun, ckpt, decision }) => {
       const answer = await startGraphResume(
-        { grun, decision, harness: dir },
+        { grun, checkpoint: ckpt, decision, harness: dir },
         { ...context.graph, control: () => context.control, now: context.now },
       );
       return answer.ok

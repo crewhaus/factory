@@ -81,16 +81,21 @@ function lineOf(record: Readonly<Record<string, unknown>>) {
   return { id, event, state, at, rev, via, how, until, deferReason, to, member };
 }
 
-/** The overlay with the fields a state change leaves behind dropped. */
+/**
+ * The overlay with the fields a state change leaves behind dropped. A line that settles the
+ * item ends its round: who had it and who hid it from themselves stay with that round, so a
+ * later ask that reuses the item's id starts with neither.
+ */
 function moved(
   before: ItemOverlay | undefined,
   next: { readonly state: AttentionState; readonly evidenceRev: string; readonly at: string },
   extra: Partial<ItemOverlay> = {},
 ): ItemOverlay {
+  const carried = next.state !== "resolved";
   return {
     ...next,
-    ...(before?.assignee !== undefined ? { assignee: before.assignee } : {}),
-    ...(before?.snoozes !== undefined ? { snoozes: before.snoozes } : {}),
+    ...(carried && before?.assignee !== undefined ? { assignee: before.assignee } : {}),
+    ...(carried && before?.snoozes !== undefined ? { snoozes: before.snoozes } : {}),
     ...(before?.anomalies !== undefined ? { anomalies: before.anomalies } : {}),
     ...extra,
   };
@@ -183,6 +188,23 @@ export function idOfItem(item: Pick<AttentionItem, "ref">): string {
   return item.ref.slice(item.ref.lastIndexOf("/") + 1);
 }
 
+/**
+ * Whether an overlay is about the item as it stands. An item that waits on a record of its
+ * own starts a new round with each ask that reuses its id: an overlay whose newest line is
+ * older than the item's oldest evidence was made on an earlier round, decided wherever it was
+ * decided, and says nothing about this one.
+ */
+export function currentFor(
+  item: Pick<AttentionItem, "band" | "since">,
+  overlay: ItemOverlay | undefined,
+): overlay is ItemOverlay {
+  if (overlay === undefined) return false;
+  if (!decidesItself(item)) return true;
+  const since = msOf(item.since);
+  const at = msOf(overlay.at);
+  return since === undefined || at === undefined || at >= since;
+}
+
 /** An item with what people did about it. Pure. */
 export function overlaid(
   drafted: Drafted,
@@ -190,8 +212,8 @@ export function overlaid(
   now: number,
   viewer: string | undefined,
 ): Drafted {
-  if (overlay === undefined) return drafted;
   const { item } = drafted;
+  if (!currentFor(item, overlay)) return drafted;
   const effective = effectiveAttentionState(
     {
       source: "item",
@@ -226,7 +248,7 @@ export function overlaidGroup(
   const reads = perHarness.filter((h) => members.has(h.harness));
   const overlays = reads.flatMap((h) => {
     const overlay = h.overlays[id];
-    return overlay === undefined ? [] : [overlay];
+    return currentFor(item, overlay) ? [overlay] : [];
   });
   if (overlays.length === 0) return drafted;
   const everywhere = overlays.length === reads.length;

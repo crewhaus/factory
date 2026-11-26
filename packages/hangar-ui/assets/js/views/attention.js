@@ -288,9 +288,22 @@ export function placeOf(item) {
       : { label: "See the run that asked", href: hrefInspect(`${harness}/run/${run}`) };
   }
   if (item?.source?.kind === "advisor") {
-    return { label: "Open in Advice", href: hrefFleet("home", "needs-you", { type: "advice" }) };
+    // A finding that opens a place says so on its own button: one control, one place.
+    const opens = Array.isArray(item?.choices) && item.choices.some((c) => c?.id === "open");
+    return opens
+      ? null
+      : { label: "Open in Advice", href: hrefFleet("home", "needs-you", { type: "advice" }) };
   }
   return fixOn(item);
+}
+
+/**
+ * A member's name, from an answer's `people`, else "Someone else": a raw id is technical
+ * detail, never what a person reads. Pure.
+ */
+export function personOf(people, id) {
+  const hit = Array.isArray(people) ? people.find((p) => p?.id === id) : undefined;
+  return typeof hit?.name === "string" && hit.name !== "" ? hit.name : "Someone else";
 }
 
 /** Who has an item and until when it is out of the way. Pure. */
@@ -302,7 +315,9 @@ export function standingLines(item, ctx = {}) {
   };
   const out = [];
   if (typeof item?.assignee === "string") {
-    out.push(item.assignee === ctx.meId ? "With you." : `With ${item.assignee}.`);
+    out.push(
+      item.assignee === ctx.meId ? "With you." : `With ${personOf(ctx.people, item.assignee)}.`,
+    );
   }
   if (item?.deferral) {
     out.push(
@@ -358,7 +373,7 @@ export function cardModel(item, ctx = {}) {
     harnesses: harnessIds.map((id) => nameOf(names, id)),
     since: sinceLine(item, nowMs),
     settled,
-    standing: standingLines(item, { nowMs, meId: ctx.me?.id }),
+    standing: standingLines(item, { nowMs, meId: ctx.me?.id, people: ctx.people }),
     deadline: decide && settled === null ? deadlineLine(item, nowMs) : null,
     ifUnanswered: item?.ifUnanswered ? textOf({ template: item.ifUnanswered.template }) : null,
     who: decide ? classWord(item?.requiredClass) : null,
@@ -701,11 +716,40 @@ function focusItem(drawn, itemId, status) {
   drawn.roving.focus(index);
 }
 
-/** The cards whose "What the harness sent" or discussion is open, by ref. */
-function openBodyRefs(host) {
-  return [...host.querySelectorAll(".attention-card details[open]")]
-    .map((details) => details.closest("[data-ref]")?.getAttribute("data-ref"))
-    .filter((ref) => typeof ref === "string");
+/** The disclosures a card keeps open across a redraw, each known by its own class. */
+const KEPT_DISCLOSURES = ["attention-body", "attention-thread"];
+
+/**
+ * What a reader left on each card, by ref: which of its disclosures are open, and what they
+ * typed in its discussion and have not sent. Read before a redraw replaces the cards.
+ */
+export function cardMemory(root) {
+  const memory = new Map();
+  for (const card of root?.querySelectorAll?.(".attention-card") ?? []) {
+    const ref = card.getAttribute("data-ref");
+    if (typeof ref !== "string") continue;
+    const open = KEPT_DISCLOSURES.filter(
+      (name) => card.querySelector(`details.${name}`)?.open === true,
+    );
+    const draft = card.querySelector(".attention-discuss textarea")?.value ?? "";
+    if (open.length > 0 || draft !== "") memory.set(ref, { open, draft });
+  }
+  return memory;
+}
+
+/** Put back what {@link cardMemory} kept, on the cards that are still there. */
+export function restoreCards(rows, memory) {
+  if (!(memory instanceof Map) || memory.size === 0) return;
+  for (const row of rows) {
+    const kept = memory.get(row.getAttribute("data-ref"));
+    if (kept === undefined) continue;
+    for (const name of kept.open) {
+      const details = row.querySelector(`details.${name}`);
+      if (details !== null && details !== undefined) details.open = true;
+    }
+    const text = row.querySelector(".attention-discuss textarea");
+    if (kept.draft !== "" && text !== null && text !== undefined) text.value = kept.draft;
+  }
 }
 
 /** Focus the list's own heading: where there is no card to go to. */
@@ -717,17 +761,11 @@ function focusHeading(host) {
 }
 
 /**
- * After "Show N new": what was open stays open, focus moves to the first new card (or
- * the list's heading when none is left), and the count is said.
+ * After "Show N new": focus moves to the first new card (or the list's heading when none
+ * is left), and the count is said. What was open and typed was put back by the redraw.
  */
 function restoreAfterNew(host, drawn, restore) {
   const rows = drawn.roving.rows();
-  const open = new Set(restore.openRefs ?? []);
-  for (const row of rows) {
-    if (!open.has(row.getAttribute("data-ref"))) continue;
-    const details = row.querySelector("details");
-    if (details !== null) details.open = true;
-  }
   const refs = rows.map((row) => row.getAttribute("data-ref"));
   const index = firstNewIndex(restore.shownRefs, refs);
   const added = refs.filter((ref) => !new Set(restore.shownRefs ?? []).has(ref)).length;
@@ -860,6 +898,8 @@ async function drawInbox(host, view, ctx, redraw, over) {
   drawKinds(frame.kinds, all, kind);
   status.textContent = "";
   frame.fresh.replaceChildren();
+  // Whatever redrew the list, an open discussion and its unsent words stay as they were.
+  const memory = cardMemory(frame.body);
   clear(frame.body);
   for (const note of listNotes(list)) {
     frame.body.appendChild(el("p", { class: "muted", text: note }));
@@ -930,6 +970,7 @@ async function drawInbox(host, view, ctx, redraw, over) {
   };
   const drawn = drawList(items, {
     names,
+    people: list.people ?? [],
     nowMs,
     you: list.you,
     me: me ?? undefined,
@@ -942,6 +983,7 @@ async function drawInbox(host, view, ctx, redraw, over) {
     side: (item, id, opener) => void runSideAct(id, item, actContext(item, opener)),
   });
   frame.body.appendChild(drawn.region);
+  restoreCards(drawn.roving.rows(), memory);
   const waiting = items.filter((item) => settledLine(item, nowMs) === null).length;
   focusItem(drawn, wanted, status);
   if (over.restore !== undefined) restoreAfterNew(host, drawn, over.restore);
@@ -963,7 +1005,7 @@ async function drawInbox(host, view, ctx, redraw, over) {
               class: "btn",
               type: "button",
               text: label,
-              onClick: () => redraw({ restore: { shownRefs, openRefs: openBodyRefs(host) } }),
+              onClick: () => redraw({ restore: { shownRefs } }),
             }),
           );
           announce(`${n} new item${s(n)} waiting. ${label} to see them.`);

@@ -13,7 +13,7 @@
  */
 
 import { el } from "../dom.js";
-import { hrefFleet, hrefHarness, hrefInspect } from "../router.js";
+import { hrefFleet, hrefHarness, hrefInspect, screenHref } from "../router.js";
 import { openDialog } from "../ui/dialog.js";
 import { announce } from "../ui/live.js";
 import { call, createAction } from "../v1.js";
@@ -81,21 +81,82 @@ export const CHOICES = Object.freeze({
   "budget.raise-period": ["open", "Opens this period's budget, to raise it once."],
   "budget.wait-for-renewal": ["act", "Puts it off until the budget renews."],
   "budget.acknowledge": ["act", "Sets it aside until it happens again."],
-  "budget.act": ["act", "Starts the suggested check."],
+  "budget.act": ["act", "Starts the suggested job."],
   "budget.open": ["open", "Opens the budget."],
   "spec.acknowledge": ["act", "Sets it aside until it fails again."],
   "spec.inspect": ["open", "Opens the runs it stopped."],
-  "spec.act": ["act", "Starts the suggested check."],
+  "spec.act": ["act", "Starts the suggested job."],
   "spec.open": ["open", "Opens the spec."],
   "run-failures.acknowledge": ["act", "Sets it aside until it fails again."],
   "run-failures.inspect": ["open", "Opens the runs that failed."],
-  "security.act": ["act", "Starts the suggested check."],
+  "security.act": ["act", "Starts the suggested job."],
   "security.open": ["open", "Opens the incident."],
-  "quality-regression.act": ["act", "Starts the suggested check."],
+  "quality-regression.act": ["act", "Starts the suggested job."],
   "quality-regression.open": ["open", "Opens the results."],
-  "setup.act": ["act", "Starts the suggested check."],
+  "setup.act": ["act", "Starts the suggested job."],
   "setup.open": ["open", "Opens the place that fixes it."],
 });
+
+/**
+ * An Advisor finding's `act` choice, by the job it starts: its button and what starting it
+ * does, the sentence a person confirms before a job that spends model credits or rebuilds
+ * the harness. The terminal's table says the same.
+ */
+export const JOB_CHOICES = Object.freeze({
+  doctor: [
+    "Run the checks",
+    "Checks the harness's setup and says what it finds. It changes nothing.",
+  ],
+  compile: ["Recompile", "Rebuilds the bundle from the spec."],
+  optimize: [
+    "Queue an optimize run",
+    "Starts an optimize run. It uses model credits and proposes changes for you to review.",
+  ],
+  "dream-run": ["Run the memory review", "Starts the memory review now. It uses model credits."],
+  eval: ["Run the evals", "Starts an eval run. It uses model credits."],
+  "route-propose": ["Propose the routing change", "Proposes the routing change for you to review."],
+  "route-status": ["Compare the models", "Shows how the models compare. It changes nothing."],
+  "models-explain": [
+    "Explain the routing",
+    "Explains which model each step uses. It changes nothing.",
+  ],
+  "models-audit": ["Audit the models", "Checks the models in use. It changes nothing."],
+});
+
+/** The screens an `open` choice may name: where the console keeps a finding's fix. */
+export const PLACES = Object.freeze([
+  "overview",
+  "approvals",
+  "spec",
+  "runs",
+  "schedulers",
+  "evals",
+  "memory",
+  "feedback",
+  "costs",
+  "models",
+  "creds",
+  "channels",
+  "security",
+  "deploy",
+  "dev",
+]);
+
+/** What an `open` choice that names no screen says, and where it goes instead. */
+const IN_ADVICE = Object.freeze(["Open in Advice", "Opens the suggestion in Advice."]);
+
+/** The screen an item's `open` choice names, or `null`. Pure. */
+function placeOfChoice(item) {
+  const list = Array.isArray(item?.choices) ? item.choices : [];
+  const place = list.find((c) => c?.id === "open")?.place;
+  return typeof place === "string" && PLACES.includes(place) ? place : null;
+}
+
+/** The job an `act` choice names, or `null`. Pure. */
+function jobOf(choice) {
+  const job = choice?.job;
+  return typeof job === "string" && Object.hasOwn(JOB_CHOICES, job) ? job : null;
+}
 
 /** A choice's button, by kind and choice, else by choice. */
 const CHOICE_LABELS = Object.freeze({
@@ -116,8 +177,13 @@ const CHOICE_LABELS = Object.freeze({
   "raise-spec": "Raise the limit in the spec",
   "raise-period": "Raise this period's limit",
   "wait-for-renewal": "Wait for renewal",
-  act: "Start the check",
-  open: "Open it",
+  act: "Start the suggested job",
+  "budget.open": "Open the budget",
+  "spec.open": "Open the spec",
+  "security.open": "Open the incident",
+  "quality-regression.open": "Open the results",
+  "setup.open": "Open where it is fixed",
+  open: "Open in Advice",
   adopt: "Review and adopt",
   review: "See what it would allow",
 });
@@ -135,7 +201,7 @@ const DONE_WORDS = Object.freeze({
   up: "Settled as a good answer.",
   down: "Settled as a bad answer.",
   promote: "Started.",
-  act: "Started.",
+  act: "Queued.",
   acknowledge: "Acknowledged.",
   "wait-for-renewal": "Put off until the budget renews.",
 });
@@ -221,8 +287,13 @@ export function openHref(item, id) {
         ? hrefHarness(harness, "setup", "delegations", "new", action, item?.source?.id)
         : hrefHarness(harness, "setup", "delegations");
     }
-    case "open":
-      return hrefFleet("home", "needs-you", { type: "advice" });
+    case "open": {
+      // The screen the finding names, on its harness; with none, the suggestion in Advice.
+      const place = placeOfChoice(item);
+      return place !== null && harness !== null
+        ? screenHref(harness, place)
+        : hrefFleet("home", "needs-you", { type: "advice" });
+    }
     default:
       return null;
   }
@@ -255,12 +326,21 @@ export function choiceModels(item, you) {
         : null;
     const why =
       row.does === "open" ? lacks : (classGap(reach, choice.needs ?? item?.requiredClass) ?? lacks);
+    // A job is worded by what it does; a screen that is not named opens Advice, and says so.
+    const job = id === "act" ? jobOf(choice) : null;
+    const advice = id === "open" && (placeOfChoice(item) === null || oneHarness(item) === null);
+    const [label, effect] =
+      job !== null
+        ? JOB_CHOICES[job]
+        : advice
+          ? IN_ADVICE
+          : [choiceLabel(item?.kind, id), row.effect];
     return [
       {
         id,
-        label: choiceLabel(item?.kind, id),
+        label,
         does: row.does,
-        effect: row.effect,
+        effect,
         href,
         why,
         twin,
@@ -773,14 +853,21 @@ export function messageProblem(text) {
     : null;
 }
 
-/** A message's line: who, from where and when. Pure. */
+/**
+ * A message's line: who and when. A member is shown by the name the answer gives them,
+ * else as "Someone else"; their id stays in the line's title. Pure.
+ */
 export function messageHead(message, ctx = {}) {
+  const by = message?.by;
+  const named = Array.isArray(ctx.people) ? ctx.people.find((p) => p?.id === by) : undefined;
   const who =
-    typeof ctx.meId === "string" && message?.by === ctx.meId
+    typeof ctx.meId === "string" && by === ctx.meId
       ? "You"
-      : typeof message?.by === "string" && message.by.startsWith("local:")
+      : typeof by === "string" && by.startsWith("local:")
         ? "Someone at this computer"
-        : String(message?.by ?? "");
+        : typeof named?.name === "string" && named.name !== ""
+          ? named.name
+          : "Someone else";
   return `${who} · ${ctx.ago ?? ""}`;
 }
 
@@ -814,13 +901,15 @@ export function discussion(item, ctx) {
       return;
     }
     const items = Array.isArray(answer.body?.items) ? answer.body.items : [];
+    const people = Array.isArray(answer.body?.people) ? answer.body.people : [];
     status.textContent = items.length === 0 ? "No one has said anything here yet." : "";
     list.replaceChildren(
       ...items.map((message) =>
         el("li", null, [
           el("div", {
             class: "muted",
-            text: messageHead(message, { meId: ctx.meId, ago: ctx.ago(message.at) }),
+            title: typeof message.by === "string" ? message.by : null,
+            text: messageHead(message, { meId: ctx.meId, people, ago: ctx.ago(message.at) }),
           }),
           el("p", { class: "attention-message", text: String(message.text ?? "") }),
         ]),

@@ -23,6 +23,7 @@ import {
   APPROVAL_ID_RE,
   CANONICAL_RUN_ID_RE,
   DEPLOYMENT_ID_RE,
+  GRAPH_CHECKPOINT_ID_RE,
   GRAPH_RUN_ID_RE,
   HARNESS_ID_RE,
 } from "./ids.js";
@@ -117,8 +118,8 @@ export const CLI_VERBS = deepFreeze({
  * `{att}` is an attention item's id, `att_` and 26 characters derived from what it is about.
  * `{attChoice}` is a choice the inbox carries out, `{prn}` a member's id and
  * `{dismissReason}` one of the reasons a person may set a problem aside for. `{grun}` is a
- * graph run's id and `{graphDecision}` one of the two words a command may settle its pause
- * with. `{specName}`, `{env}` and `{version}` are a registered spec, an environment and a
+ * graph run's id, `{ckpt}` the checkpoint its pause saved, and `{graphDecision}` one of the
+ * two words a command may settle that pause with. `{specName}`, `{env}` and `{version}` are a registered spec, an environment and a
  * version of it, each a name that can never read as a flag.
  * `{wi}` and `{belowWi}` are work items' ids. `{declineReason}` is one of the reasons a
  * person may give to decline a proposal, and `{correctionScope}` how far a ranking
@@ -160,6 +161,7 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{prn}": /^prn_[0-9a-hjkmnp-tv-z]{26}$/,
   "{dismissReason}": new RegExp(`^(?:${DISMISS_REASONS.join("|")})$`),
   "{grun}": GRAPH_RUN_ID_RE,
+  "{ckpt}": GRAPH_CHECKPOINT_ID_RE,
   "{graphDecision}": /^(?:approve|reject)$/,
   "{specName}": SPEC_NAME_RE,
   "{env}": ENVIRONMENT_NAME_RE,

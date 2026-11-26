@@ -10196,6 +10196,10 @@
               "takesValue": false
             },
             {
+              "name": "checkpoint",
+              "takesValue": true
+            },
+            {
               "name": "decision",
               "takesValue": true
             },

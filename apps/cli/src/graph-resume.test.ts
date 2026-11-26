@@ -17,10 +17,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createCheckpointStore } from "@crewhaus/checkpoint-store";
+import { RESUME_CHECKPOINT_ENV, createCheckpointStore } from "@crewhaus/checkpoint-store";
 import { EXIT_FOR_ERROR } from "@crewhaus/control-contract";
 import { readPage, runsLedger } from "@crewhaus/control-records";
-import type { ApiRunInput, StartResult } from "@crewhaus/harness-supervisor";
+import {
+  type ApiRunInput,
+  GRAPH_RESUME_CHECKPOINT_ENV,
+  type StartResult,
+} from "@crewhaus/harness-supervisor";
 import { AGENT_TOOL_ENV } from "./approvals-cmd";
 import { directControl } from "./daemon-cmd";
 import {
@@ -136,12 +140,16 @@ function receipts(): Array<Record<string, unknown>> {
 
 describe("crewhaus runs resume <grun_…>", () => {
   test("starts the build once with the decision, under a run and a receipt of its own", async () => {
-    await paused();
+    const ckpt = await paused();
     const out = await resume([GRUN, "--decision", "approve", "--harness", dir]);
     expect(out.exitCode).toBe(0);
     expect(starts).toHaveLength(1);
     const runId = starts[0]?.runId as string;
-    expect(starts[0]).toEqual({ runId, graphResume: { grun: GRUN, decision: "approve" } });
+    // Bound to the pause it read as waiting: the build resumes there, or nowhere.
+    expect(starts[0]).toEqual({
+      runId,
+      graphResume: { grun: GRUN, ckpt, decision: "approve" },
+    });
     expect(out.lines[0]).toBe(`${GRUN} resumes as run ${runId}`);
     const rows = runRows().filter((row) => row["id"] === runId);
     expect(rows.map((row) => row["state"])).toEqual(["queued"]);
@@ -154,12 +162,37 @@ describe("crewhaus runs resume <grun_…>", () => {
   });
 
   test("a person's own words are a decision on the command line", async () => {
-    await paused();
+    const ckpt = await paused();
     const out = await resume(["--decision", "approve, but shorter", GRUN]);
     expect(out.exitCode).toBe(0);
     expect(starts.map((s) => s.graphResume)).toEqual([
-      { grun: GRUN, decision: "approve, but shorter" },
+      { grun: GRUN, ckpt, decision: "approve, but shorter" },
     ]);
+  });
+
+  test("a verdict names the pause it was made on, and is carried out only there", async () => {
+    const ckpt = await paused();
+    const out = await resume([GRUN, "--checkpoint", ckpt, "--decision", "reject"]);
+    expect(out.exitCode).toBe(0);
+    expect(starts.map((s) => s.graphResume)).toEqual([{ grun: GRUN, ckpt, decision: "reject" }]);
+    // The CLI and the build's engine name the pause by one env.
+    expect(GRAPH_RESUME_CHECKPOINT_ENV).toBe(RESUME_CHECKPOINT_ENV);
+  });
+
+  test("a verdict queued for one pause, after another resume moved the run to the next, is refused with nothing claimed", async () => {
+    // Paused at A; someone else resumed A (a reject that loops), and the run waits at A'.
+    const a = await paused();
+    expect(await store().claimResume(GRUN, a)).toBe("claimed");
+    const next = await store().save({ graphRunId: GRUN, nodeName: "review", state: {} });
+    await store().markWaiting(GRUN, { checkpointId: next.id, nodeName: "review", prompt: "?" });
+    const before = treeOf(base);
+    // The job Home queued for A runs now.
+    const out = await resume([GRUN, "--checkpoint", a, "--decision", "approve"]);
+    expect(out.exitCode).toBe(EXIT_FOR_ERROR.already_decided);
+    expect(out.lines[0]).toBe(`runs resume: the pause at ${a} in ${GRUN} was already decided`);
+    expect(starts).toEqual([]);
+    expect(treeOf(base)).toEqual(before);
+    expect(await graphRunWaiting(dir, GRUN)).toEqual({ state: "waiting", ckpt: next.id });
   });
 
   test("a start that fails ends the run it queued, and says why", async () => {
@@ -207,6 +240,20 @@ describe("crewhaus runs resume <grun_…>", () => {
       },
       exit: EXIT_FOR_ERROR.already_decided,
       says: `runs resume: ${GRUN} was already decided; it is resumed once`,
+    },
+    {
+      name: "a pause the run does not wait at",
+      argv: [GRUN, "--checkpoint", "ckpt_0123456789abcdef", "--decision", "approve"],
+      setUp: paused,
+      exit: EXIT_FOR_ERROR.conflict,
+      says: `runs resume: ${GRUN} is not waiting at ckpt_0123456789abcdef`,
+    },
+    {
+      name: "a checkpoint that is not one",
+      argv: [GRUN, "--checkpoint", "ckpt_x;id", "--decision", "approve"],
+      setUp: paused,
+      exit: EXIT_FOR_ERROR.invalid,
+      says: "runs resume: --checkpoint names a pause: ckpt_ and 16 hex",
     },
     {
       name: "no decision",
@@ -285,7 +332,7 @@ describe("crewhaus runs resume <grun_…>", () => {
   test("a session's flags are not a graph run's", async () => {
     await paused();
     await expect(resume([GRUN, "--decision", "approve", "--model", "x"])).rejects.toThrow(
-      "a graph run takes --decision and --harness, not --model",
+      "a graph run takes --decision, --checkpoint and --harness, not --model",
     );
     expect(starts).toEqual([]);
   });

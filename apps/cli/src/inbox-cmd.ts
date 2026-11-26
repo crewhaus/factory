@@ -11,7 +11,11 @@
  * `crewhaus approvals` masks it.
  */
 import { existsSync } from "node:fs";
-import type { LocalIdentity } from "@crewhaus/access-control";
+import {
+  type AccessSnapshot,
+  type LocalIdentity,
+  loadAccessSnapshot,
+} from "@crewhaus/access-control";
 import {
   type HarnessAttention,
   type HarnessFacts,
@@ -35,6 +39,7 @@ import {
   EXIT_FOR_ERROR,
   attentionRef,
   encodeCursor,
+  isId,
   memberMayDecide,
   parseRef,
 } from "@crewhaus/control-contract";
@@ -258,10 +263,40 @@ function idOf(ref: string): string {
   return ref.slice(ref.lastIndexOf("/") + 1);
 }
 
+/** A person an item or a message names, in words: never the raw id. */
+type Who = (id: string) => string;
+
+/**
+ * "you" for the reader, a member's name as Home's records hold it, else "someone else"; the
+ * id is for `--json`. Home's records are read once, and only when a name is wanted.
+ */
+export function whoOf(hangarRoot: string, me: ReadonlySet<string>): Who {
+  let snapshot: AccessSnapshot | undefined | null = null;
+  return (id) => {
+    if (me.has(id)) return "you";
+    if (id.startsWith("local:")) return "someone at this computer";
+    if (snapshot === null) {
+      let read: ReturnType<typeof loadAccessSnapshot> | undefined;
+      try {
+        read = loadAccessSnapshot(hangarRoot);
+      } catch {
+        read = undefined;
+      }
+      snapshot = read?.state === "present" ? read.snapshot : undefined;
+    }
+    const principals = snapshot?.subjects.principals;
+    const name =
+      principals !== undefined && isId("prn", id) && Object.hasOwn(principals, id)
+        ? principals[id]?.displayName
+        : undefined;
+    return typeof name === "string" && name !== "" ? name : "someone else";
+  };
+}
+
 /** Who has an item and until when it is out of the way, as lines. */
-function standingLines(item: AttentionItem): string[] {
+function standingLines(item: AttentionItem, who: Who): string[] {
   const out: string[] = [];
-  if (item.assignee !== undefined) out.push(`    With ${item.assignee}`);
+  if (item.assignee !== undefined) out.push(`    With ${who(item.assignee)}`);
   if (item.deferral !== undefined) {
     out.push(
       `    Put off until ${item.deferral.until}${
@@ -314,6 +349,7 @@ function itemLines(
   names: ReadonlyMap<string, string>,
   now: number,
   owns: Owns,
+  who: Who,
 ): string[] {
   const where = (item.harnesses ?? (item.harness !== undefined ? [item.harness] : []))
     .map((id) => names.get(id) ?? id)
@@ -334,7 +370,7 @@ function itemLines(
   if (item.band === "decide" && item.deadline === undefined && item.choices.length > 0) {
     out.push("    No deadline. It waits until someone decides.");
   }
-  out.push(...standingLines(item));
+  out.push(...standingLines(item, who));
   if (item.recommendation !== undefined) {
     out.push(
       `    Suggested: ${item.recommendation.choiceId}. ${sentenceOf(item.recommendation.reason)}`,
@@ -346,7 +382,7 @@ function itemLines(
         ? `    ${choice.id}: ${choice.cliTwin}`
         : `    ${choice.id}: ${choice.nullReason ?? "no command"}`,
     );
-    const effect = choiceEffectOf(item.kind, choice.id);
+    const effect = choiceEffectOf(item.kind, choice.id, choice);
     if (effect !== "") out.push(`      ${effect}`);
   }
   return out;
@@ -386,7 +422,12 @@ const unknownItem = (label: string, id: string): Out =>
 /** Every item, open and settled, as this person sees them. */
 async function wholeInbox(reader: Reader, harnesses: readonly Harness[], now: number) {
   const reads = await Promise.all(harnesses.map((h) => readHarness(reader, h, now)));
-  return { ...assembleInbox(reads, now, { state: "all" }), owns: ownsOf(reads, harnesses, now) };
+  const me = new Set(reads.flatMap((h) => (h.viewer === undefined ? [] : [h.viewer])));
+  return {
+    ...assembleInbox(reads, now, { state: "all" }),
+    owns: ownsOf(reads, harnesses, now),
+    who: whoOf(reader.hangarRoot, me),
+  };
 }
 
 /** What was said about an item, oldest first, with where when it is about several. */
@@ -404,6 +445,7 @@ function showMessages(
   harnesses: readonly Harness[],
   now: number,
   json: boolean,
+  who: Who,
 ): Out {
   const { said, several, truncated } = messagesView(item, harnesses);
   const items = said.map(({ message }) => ({ ...message, text: String(masked(message.text)) }));
@@ -421,7 +463,7 @@ function showMessages(
   return {
     lines: [
       ...said.flatMap(({ harness, message }, i) => [
-        `  ${[ago(message.at, now), message.by, `via ${message.via}`, ...(several ? [harness.name] : [])].join(" · ")}`,
+        `  ${[ago(message.at, now), who(message.by), `via ${message.via}`, ...(several ? [harness.name] : [])].join(" · ")}`,
         ...(items[i]?.text ?? "").split("\n").map((line) => `    ${line}`),
       ]),
       ...(truncated ? ["(older messages are left out)"] : []),
@@ -591,13 +633,13 @@ async function inboxCommand(argv: readonly string[], deps: InboxDeps): Promise<O
     const inbox = await wholeInbox(readerOf(env, all, identity), all, now);
     const item = inbox.all.find((candidate) => candidate.ref === attentionRef(id));
     if (item === undefined) return unknownItem("inbox show", id);
-    if (args.booleans.has("messages")) return showMessages(item, all, now, json);
+    if (args.booleans.has("messages")) return showMessages(item, all, now, json, inbox.who);
     const view = shown(item);
     if (json) return { lines: [JSON.stringify(view, null, 2)], exitCode: 0 };
     return {
       lines: [
         `${BAND_LABEL[view.band] ?? view.band} · ${view.kind} · ${view.state}`,
-        ...itemLines(view, names, now, inbox.owns),
+        ...itemLines(view, names, now, inbox.owns, inbox.who),
         ...(view.body !== undefined
           ? [
               "  What the harness sent (masked):",
@@ -663,6 +705,7 @@ async function inboxCommand(argv: readonly string[], deps: InboxDeps): Promise<O
   }
   const mine = args.booleans.has("mine");
   const me = new Set(perHarness.map((h) => h.viewer).filter((v) => v !== undefined));
+  const who = whoOf(reader.hangarRoot, me);
   const inbox = assembleInbox(perHarness, now, {
     state: args.booleans.has("all") ? "all" : "open",
     ...(kind !== undefined ? { kind } : {}),
@@ -689,7 +732,7 @@ async function inboxCommand(argv: readonly string[], deps: InboxDeps): Promise<O
     const inBand = body.items.filter((item) => item.band === b);
     if (inBand.length === 0) continue;
     lines.push(BAND_LABEL[b] ?? b);
-    for (const item of inBand) lines.push(...itemLines(item, names, now, owns));
+    for (const item of inBand) lines.push(...itemLines(item, names, now, owns, who));
   }
   if (body.items.length === 0) {
     lines.push(

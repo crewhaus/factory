@@ -319,6 +319,42 @@ describe("decisions, review entries and Advisor findings", () => {
     expect(budget?.title.params).toEqual({ percent: 90, period: "total" });
   });
 
+  test("an Advisor finding's choice names its job or its screen, from closed lists only", () => {
+    const dir = harnessDir(root(), "advised-choices");
+    const base = {
+      severity: "warn" as const,
+      title: "t",
+      detail: "d",
+      explain: "e",
+      guidance: "g",
+      source: "s",
+      status: "open" as const,
+    };
+    const job = (jobKind: string) => ({ kind: "job", label: "x", cliTwin: null, jobKind });
+    const link = { kind: "link", label: "x", cliTwin: null, jobKind: null };
+    const snapshot = {
+      at: iso(NOW - MIN),
+      items: [
+        { ...base, id: "eval-below-baseline", screen: "evals", action: job("optimize") },
+        { ...base, id: "spec-issue-1", screen: "spec", action: job("rm -rf") },
+        { ...base, id: "incident-1", screen: "security", action: link },
+        { ...base, id: "budget-absent", screen: "nowhere", action: link },
+      ] as unknown as AdvisorItem[],
+    };
+    const facts = testFacts({}, new Map([[dir, snapshot]]));
+    const items = assembleInbox([foldHarness(dir, facts, NOW, { harness: HRN })], NOW).items;
+    const choiceOf = (kind: string) => items.find((i) => i.kind === kind)?.choices[0];
+    expect(choiceOf("quality-regression")).toMatchObject({ id: "act", job: "optimize" });
+    expect(choiceOf("quality-regression")?.place).toBeUndefined();
+    expect(choiceOf("spec")?.id).toBe("act");
+    expect(choiceOf("spec")?.job).toBeUndefined();
+    expect(choiceOf("security")).toMatchObject({ id: "open", place: "security" });
+    expect(choiceOf("budget")?.id).toBe("open");
+    expect(choiceOf("budget")?.place).toBeUndefined();
+    expect(JSON.stringify(items)).not.toContain("rm -rf");
+    expect(JSON.stringify(items.map((i) => i.choices))).not.toContain("nowhere");
+  });
+
   test("without a snapshot, the harness is named as not checked yet", () => {
     const dir = harnessDir(root(), "unchecked");
     expect(inboxOf(dir).advisorUnchecked).toEqual([HRN]);

@@ -32,7 +32,11 @@
  */
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
-import { CANONICAL_RUN_ID_RE, GRAPH_RUN_ID_RE } from "@crewhaus/control-contract";
+import {
+  CANONICAL_RUN_ID_RE,
+  GRAPH_CHECKPOINT_ID_RE,
+  GRAPH_RUN_ID_RE,
+} from "@crewhaus/control-contract";
 import { readDeployments } from "@crewhaus/control-records";
 import { readManagerSettings } from "./manager-settings";
 import type { EnvOverride, RunClass, RunKind } from "./types";
@@ -825,6 +829,13 @@ export type SpawnPlanInput = {
   readonly apiRun?: ApiRunInput;
 };
 
+/**
+ * The env a graph build's engine reads the pause it may resume from. The bundle resumes the
+ * run's newest checkpoint; with this set, its engine refuses unless that checkpoint is the
+ * one named, so a decision is never applied to a pause the person did not see.
+ */
+export const GRAPH_RESUME_CHECKPOINT_ENV = "CREWHAUS_GRAPH_RESUME_CHECKPOINT";
+
 /** A control-API run as a plan's input: its id, and the file its input is read from. */
 export type ApiRunInput = {
   readonly runId: string;
@@ -834,9 +845,15 @@ export type ApiRunInput = {
   readonly stdinFile?: string;
   /**
    * graph: the pause this run settles, in place of an input: the paused graph run and the
-   * decision its node reads, two arguments of the bundle's own `--resume`.
+   * decision its node reads, two arguments of the bundle's own `--resume`, and the
+   * checkpoint the person decided, which the build's engine is told in
+   * {@link GRAPH_RESUME_CHECKPOINT_ENV} and resumes at, or nowhere.
    */
-  readonly graphResume?: { readonly grun: string; readonly decision: string };
+  readonly graphResume?: {
+    readonly grun: string;
+    readonly ckpt: string;
+    readonly decision: string;
+  };
 };
 
 /** The shapes the control API starts a run of, and how each takes its input. */
@@ -955,6 +972,12 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
           "compile",
         );
       }
+      if (!GRAPH_CHECKPOINT_ID_RE.test(resume.ckpt)) {
+        throw new SpawnPlanError(
+          "a graph resume needs the pause it settles: ckpt_ and 16 hex",
+          "compile",
+        );
+      }
       // The bundle reads the decision by position: an empty one, or one that reads as a
       // flag, would not be the decision.
       if (resume.decision === "" || resume.decision.startsWith("-")) {
@@ -968,6 +991,8 @@ export function buildSpawnPlan(input: SpawnPlanInput): SpawnPlan {
     }
     // A resume brings no input of its own: graph-engine checks its decision at `api`.
     if (resume === undefined) extra["CREWHAUS_INPUT_ORIGIN"] = "api";
+    // The pause the person decided: the build's engine resumes there, or refuses.
+    else extra[GRAPH_RESUME_CHECKPOINT_ENV] = resume.ckpt;
     extra["CREWHAUS_RUN_ID"] = apiRun.runId;
   }
   const { env, envFiles, envFileRefs, overrides } = buildSpawnEnv({

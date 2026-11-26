@@ -30,7 +30,7 @@ import {
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
-import { SHOW_NEEDS_ONE, runInboxCommand } from "./inbox-cmd";
+import { SHOW_NEEDS_ONE, runInboxCommand, whoOf } from "./inbox-cmd";
 
 type Schema = { safeParse(value: unknown): { success: boolean; error?: unknown } };
 const schemaOf = (id: string) => (SCHEMAS as unknown as Readonly<Record<string, Schema>>)[id];
@@ -361,4 +361,20 @@ describe("crewhaus inbox", () => {
     expect(outputs).toEqual(["inbox --json: 0", "inbox stats: 0", "inbox show nope: 55"]);
     expect(records()).toEqual(before);
   }, 30_000); // three CLI processes, each loading the whole entry file; slow on a loaded runner
+});
+
+describe("who an item is with, in words", () => {
+  test("you, someone at this computer, or someone else: never a raw id", () => {
+    const root = mkdtempSync(join(tmpdir(), "crewhaus-inbox-who-"));
+    try {
+      const me = "prn_00000000000000000000000001";
+      const who = whoOf(join(root, "no-hangar"), new Set([me]));
+      expect(who(me)).toBe("you");
+      expect(who(`local:#${"a".repeat(64)}`)).toBe("someone at this computer");
+      expect(who("prn_00000000000000000000000002")).toBe("someone else");
+      expect(who("not a principal")).toBe("someone else");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

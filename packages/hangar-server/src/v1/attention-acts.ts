@@ -169,6 +169,26 @@ function queue(
   }
 }
 
+/**
+ * The names of the members an answer mentions by id, as Home's sign-in records hold them:
+ * only those the answer already names, and only members (a local actor has no name here).
+ */
+export function peopleOf(
+  ctx: V1Context,
+  ids: Iterable<string | undefined>,
+): Array<{ id: string; name: string }> {
+  const read = ctx.deps.home.signIn.snapshot();
+  if (read.state !== "present") return [];
+  const principals = read.snapshot.subjects.principals;
+  const wanted = [...new Set(ids)].filter(
+    (id): id is string => typeof id === "string" && isId("prn", id),
+  );
+  return wanted.sort().flatMap((id) => {
+    const name = Object.hasOwn(principals, id) ? principals[id]?.displayName : undefined;
+    return typeof name === "string" && name !== "" ? [{ id, name }] : [];
+  });
+}
+
 /** The name the approvals file shows for the caller: a member's own, else their id. */
 function displayOf(ctx: V1Context): string {
   const read = ctx.deps.home.signIn.snapshot();
@@ -215,7 +235,7 @@ function depsOf(ctx: V1Context, entry: HangarHarnessEntry): ActDeps {
       }
       return queue(ctx, entry, { kind: job.kind, argv: job.argv, needs: [job.permission] }, cmd);
     },
-    resumeGraph: async ({ dir, grun, decision, cmd }) => {
+    resumeGraph: async ({ dir, grun, ckpt, decision, cmd }) => {
       const refused = intakeRefusal(dir) ?? runBundleRefusal(dir, "graph");
       if (refused !== undefined) {
         return {
@@ -226,7 +246,7 @@ function depsOf(ctx: V1Context, entry: HangarHarnessEntry): ActDeps {
           ...(refused.verb !== undefined ? { verb: refused.verb } : {}),
         };
       }
-      const argv = runsResumeArgv(grun, decision);
+      const argv = runsResumeArgv(grun, ckpt, decision);
       return queue(ctx, entry, { kind: RUNS_RESUME_JOB_KIND, argv, needs: [] }, cmd);
     },
     promote: async ({ subject, cmd }) => {
@@ -384,11 +404,16 @@ export function attentionActHandlers(find: ItemFinder): Readonly<Record<string, 
       const { item } = await find(ctx, ctx.params["ref"] ?? "");
       if (item.harness !== entry.id && !(item.harnesses ?? []).includes(entry.id)) throw MISSING();
       const thread = listMessages(dir, idOfItem(item));
+      const people = peopleOf(
+        ctx,
+        thread.messages.map((m) => m.by),
+      );
       return {
         status: 200,
         body: {
           ref: item.ref,
           items: thread.messages,
+          ...(people.length > 0 ? { people } : {}),
           ...(thread.truncated
             ? {
                 truncated: {

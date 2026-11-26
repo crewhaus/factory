@@ -254,9 +254,9 @@ describe("crewhaus runs list, show and create", () => {
       },
     });
     expect(seen).toEqual([["sess_00000000000000aa", "--prompt", "go"]]);
-    // And the two a paused graph run takes, which a session's resume does not.
+    // And the three a paused graph run takes, which a session's resume does not.
     expect(Object.keys(CLI_FAMILY.sub.resume.flags).sort()).toEqual(
-      [...RUNS_SCHEMA.flags.map((f) => f.name), "decision", "harness"].sort(),
+      [...RUNS_SCHEMA.flags.map((f) => f.name), "checkpoint", "decision", "harness"].sort(),
     );
     for (const flag of RUNS_SCHEMA.flags) {
       const kind = (CLI_FAMILY.sub.resume.flags as Record<string, string>)[flag.name];

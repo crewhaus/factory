@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeError } from "@crewhaus/errors";
@@ -431,6 +431,37 @@ describe("a run waiting for a decision", () => {
     expect((await store.list(grun)).map((c) => c.id)).toEqual([cp.id]);
     const another = await store.save({ graphRunId: grun, nodeName: "next", state: 2 });
     expect(await store.claimResume(grun, another.id)).toBe("claimed");
+  });
+
+  test("once a pause is recorded the run says so for good, and whether a pause was resumed is read without a write", async () => {
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "ship", state: 1 });
+    expect((await store.meta(grun))?.recordsPauses).toBeUndefined();
+    await store.markWaiting(grun, { checkpointId: cp.id, nodeName: "ship", prompt: "ship it?" });
+    expect((await store.meta(grun))?.recordsPauses).toBe(true);
+    await store.markWaiting(grun, undefined);
+    await store.save({ graphRunId: grun, nodeName: "next", state: 2, parentCheckpointId: cp.id });
+    expect((await store.meta(grun))?.recordsPauses).toBe(true);
+    const before = readdirSync(join(tmp, grun)).sort();
+    expect(await store.resumeClaimed?.(grun, cp.id)).toBe(false);
+    expect(readdirSync(join(tmp, grun)).sort()).toEqual(before);
+    await store.claimResume(grun, cp.id);
+    expect(await store.resumeClaimed?.(grun, cp.id)).toBe(true);
+    // A branch is resumed at its head: it has recorded no pause of its own.
+    const { newGraphRunId: branched } = await store.branch(grun, cp.id);
+    expect((await store.meta(branched))?.recordsPauses).toBeUndefined();
+    // An adapter that cannot say answers nothing.
+    const custom = createCheckpointStore({
+      adapter: {
+        save: async () => undefined,
+        load: async () => undefined,
+        list: async () => [],
+        loadMeta: async () => undefined,
+        saveMeta: async () => undefined,
+        drop: async () => undefined,
+      },
+    });
+    expect(await custom.resumeClaimed?.(newGraphRunId(), newCheckpointId())).toBeUndefined();
   });
 
   test("ids outside their grammar are refused before anything is written", async () => {

@@ -50,6 +50,7 @@ const ACT = {
   prn: mintId("prn"),
   dismissReason: "known",
   grun: "grun_0123456789abcdef",
+  ckpt: "ckpt_0123456789abcdef",
   graphDecision: "approve",
   specName: "support-bot",
   env: "prod",
@@ -263,6 +264,7 @@ test("the placeholders, pinned, with empty flags", () => {
     "{prn}",
     "{dismissReason}",
     "{grun}",
+    "{ckpt}",
     "{graphDecision}",
     "{specName}",
     "{env}",
@@ -504,6 +506,9 @@ test("a choice, a decision and a name are their own grammar, never a flag", () =
   expect(fits("{graphDecision}", "ship it")).toBe(false);
   expect(fits("{grun}", "grun_0123456789abcdef")).toBe(true);
   expect(fits("{grun}", "run_0123456789abcdef")).toBe(false);
+  expect(fits("{ckpt}", "ckpt_0123456789abcdef")).toBe(true);
+  expect(fits("{ckpt}", "--checkpoint")).toBe(false);
+  expect(fits("{ckpt}", "ckpt_0123456789ABCDEF")).toBe(false);
   expect(fits("{prn}", mintId("prn"))).toBe(true);
   expect(fits("{prn}", "local:sam@laptop")).toBe(false);
   expect(fits("{dismissReason}", "not-a-problem")).toBe(true);

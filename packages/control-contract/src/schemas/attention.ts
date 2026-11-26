@@ -10,9 +10,11 @@ import {
   ATTENTION_ACTION_EVENTS,
   ATTENTION_ACT_CHOICES,
   ATTENTION_BANDS,
+  ATTENTION_JOBS,
   ATTENTION_KINDS,
   ATTENTION_MESSAGE_MAX_BYTES,
   ATTENTION_NOTE_MAX_BYTES,
+  ATTENTION_PLACES,
   ATTENTION_RESOLUTIONS,
   ATTENTION_SOURCE_KINDS,
   ATTENTION_STATES,
@@ -56,6 +58,8 @@ const choice = z
     cliTwin: z.string().nullable(),
     nullReason: z.string().optional(),
     permission: z.string().optional(),
+    job: oneOf(ATTENTION_JOBS).optional(),
+    place: oneOf(ATTENTION_PLACES).optional(),
   })
   .passthrough();
 
@@ -128,10 +132,14 @@ export const attentionItem = z
   })
   .passthrough();
 
+/** A person an answer names: the id it carries, and the name to show for it. */
+const person = z.object({ id: storedActor, name: z.string().min(1) }).passthrough();
+
 export const attentionList = listEnvelope.extend({
   items: z.array(attentionItem),
   advisorUnchecked: z.array(harnessId).optional(),
   names: z.array(z.object({ id: harnessId, name: z.string() }).passthrough()).optional(),
+  people: z.array(person).optional(),
   you: z
     .array(
       z
@@ -249,6 +257,7 @@ export const attentionMessages = z
     items: z.array(
       z.object({ at: timestamp, by: storedActor, via: z.string(), text: z.string() }).passthrough(),
     ),
+    people: z.array(person).optional(),
     truncated: z
       .object({ reason: z.string(), verb: z.string().optional() })
       .passthrough()

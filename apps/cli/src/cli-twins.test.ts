@@ -347,6 +347,7 @@ describe("the server's twins, by import", () => {
       att: attIdFromDigest(new Uint8Array(32).fill(7)),
       prn: mintId("prn"),
       grun: "grun_0123456789abcdef",
+      ckpt: "ckpt_0123456789abcdef",
       specName: "poly",
       env: "prod",
       version: "1.2.0",

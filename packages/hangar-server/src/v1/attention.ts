@@ -49,7 +49,7 @@ import { PEOPLE_SENSITIVITY } from "../access";
 import type { Sweep } from "../scheduler-host";
 import type { HomePorts } from "../sweeps";
 import type { HomeAreaRuntime } from "./areas";
-import { attentionActHandlers } from "./attention-acts";
+import { attentionActHandlers, peopleOf } from "./attention-acts";
 import type { RefResolver, V1Context, V1Handler } from "./context";
 import { actorOf } from "./decisions";
 import { V1Error } from "./errors";
@@ -223,7 +223,18 @@ const list: V1Handler = async (ctx) => {
     nameOf: (id) => names.get(id),
     snapshotAt: snapshotAtOf(ctx),
   });
-  return { status: 200, body: { ...body, you: youOf(ctx, scope, body.items) } };
+  const people = peopleOf(
+    ctx,
+    body.items.map((item) => item.assignee),
+  );
+  return {
+    status: 200,
+    body: {
+      ...body,
+      ...(people.length > 0 ? { people } : {}),
+      you: youOf(ctx, scope, body.items),
+    },
+  };
 };
 
 const MISSING = (): V1Error =>

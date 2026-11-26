@@ -190,6 +190,12 @@ describe("every write answers one receipt and the fields the view reads", () => 
     };
     expect((await acted("assign", { to: maintainer.principal }))["state"]).toBe("assigned");
     expect((await itemOf(h.id, "permission"))["assignee"]).toBe(maintainer.principal);
+    // The list names whom it is with, so no reader is shown a member's raw id.
+    const listed = await home.call("GET", `/api/v1/attention?harness=${h.id}`, {
+      secret: operator.secret,
+    });
+    expect(schemaOf("attentionList")?.safeParse(listed.body).success).toBe(true);
+    expect(listed.body["people"]).toEqual([{ id: maintainer.principal, name: "Mel" }]);
     expect((await acted("unassign", {}))["state"]).toBe("open");
     await acted("messages", { text: SAID });
     await acted(
@@ -219,6 +225,7 @@ describe("every write answers one receipt and the fields the view reads", () => 
     expect(said.status).toBe(200);
     expect(schemaOf("attentionMessages")?.safeParse(said.body).success).toBe(true);
     expect(said.body["items"]).toMatchObject([{ text: SAID, by: operator.principal, via: "sdk" }]);
+    expect(said.body["people"]).toEqual([{ id: operator.principal, name: "Olly" }]);
   });
 
   test("defer, undefer, dismiss, reopen and acknowledge a problem", async () => {
@@ -469,7 +476,16 @@ describe("what a choice starts", () => {
     const job = jobs.slice(before)[0];
     expect(jobs.length).toBe(before + 1);
     expect(job?.kind).toBe("runs-resume");
-    expect(job?.argv).toEqual(["runs", "resume", grun, "--decision", "approve"]);
+    // Bound to the pause the person saw: the CLI and the build resume it there, or nowhere.
+    expect(job?.argv).toEqual([
+      "runs",
+      "resume",
+      grun,
+      "--checkpoint",
+      ckpt,
+      "--decision",
+      "approve",
+    ]);
     expect(job?.commandId).toBe(receipt.id);
     expect(job?.harnessDir).toBe(h.dir);
     expect(res.body["job"]).toBe(job?.jobId as string);

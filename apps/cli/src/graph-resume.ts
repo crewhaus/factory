@@ -1,11 +1,13 @@
 /**
- * `crewhaus runs resume <grun_…> --decision <decision>`: settle a compiled graph run's
- * pause. The run says in its own record that it waits and where; its build is started
- * with the decision through the same supervisor `crewhaus runs create` uses, and the
- * build's own engine checks the decision before the paused node reads it, and takes the
- * one resume of that pause.
+ * `crewhaus runs resume <grun_…> --decision <decision> [--checkpoint <ckpt_…>]`: settle a
+ * compiled graph run's pause. The run says in its own record that it waits and where; its
+ * build is started with the decision through the same supervisor `crewhaus runs create`
+ * uses, bound to that pause: the build's own engine resumes the run only at the checkpoint
+ * this command saw waiting (or the one `--checkpoint` names), checks the decision before the
+ * paused node reads it, and takes the one resume of that pause.
  *
- * Refused before anything starts: a run that is not waiting, one that was already decided,
+ * Refused before anything starts: a run that is not waiting, or not at the pause named, one
+ * that was already decided,
  * a harness with no build or one too old, a harness that takes no new work, and a command
  * an agent's tool started. A refusal writes nothing.
  */
@@ -17,7 +19,12 @@ import {
   createCheckpointStore,
   resumeClaimName,
 } from "@crewhaus/checkpoint-store";
-import { EXIT_FOR_ERROR, type ErrorCode, mintRunId } from "@crewhaus/control-contract";
+import {
+  EXIT_FOR_ERROR,
+  type ErrorCode,
+  GRAPH_CHECKPOINT_ID_RE,
+  mintRunId,
+} from "@crewhaus/control-contract";
 import { append, runsLedger } from "@crewhaus/control-records";
 import {
   type ControlService,
@@ -76,8 +83,16 @@ type Waiting =
   | { readonly state: "waiting"; readonly ckpt: string }
   | { readonly state: "decided" | "not-waiting" | "unknown" | "unreadable" };
 
-/** Whether a graph run waits for a decision, from its own record. Creates nothing. */
-export async function graphRunWaiting(harnessDir: string, grun: string): Promise<Waiting> {
+/**
+ * Whether a graph run waits for a decision, from its own record. Creates nothing. With
+ * `at`, whether it waits at that pause: one already resumed is `decided`, and a run that
+ * waits somewhere else is `not-waiting` there.
+ */
+export async function graphRunWaiting(
+  harnessDir: string,
+  grun: string,
+  at?: string,
+): Promise<Waiting> {
   const rootDir = join(harnessDir, DEFAULT_ROOT_DIR);
   // The store makes its folder when it opens: one that is not there holds no run.
   if (!existsSync(join(rootDir, grun, "_meta.json"))) return { state: "unknown" };
@@ -96,6 +111,7 @@ export async function graphRunWaiting(harnessDir: string, grun: string): Promise
     }
   };
   const ckpt = meta?.pendingHitl?.checkpointId;
+  if (at !== undefined && at !== ckpt) return { state: taken(at) ? "decided" : "not-waiting" };
   if (ckpt === undefined) return { state: taken(meta?.head) ? "decided" : "not-waiting" };
   return taken(ckpt) ? { state: "decided" } : { state: "waiting", ckpt };
 }
@@ -103,6 +119,8 @@ export async function graphRunWaiting(harnessDir: string, grun: string): Promise
 export type GraphResumeRequest = {
   readonly grun: string;
   readonly decision: string | undefined;
+  /** The pause the person decided. Absent: the one the run waits at as this command reads it. */
+  readonly checkpoint?: string | undefined;
   readonly harness: string | undefined;
 };
 
@@ -133,20 +151,28 @@ export async function startGraphResume(
   if (decision === undefined || problem !== undefined) {
     return refuse("invalid", problem ?? "name the decision with --decision");
   }
+  const at = request.checkpoint;
+  if (at !== undefined && !GRAPH_CHECKPOINT_ID_RE.test(at)) {
+    return refuse("invalid", "--checkpoint names a pause: ckpt_ and 16 hex");
+  }
   const harness = deps.resolve(request.harness);
   if (harness.target !== "graph") {
     return refuse("unsupported", `${harness.dir} is a ${harness.target} harness, not a graph`);
   }
   const refused = intakeRefusal(harness.dir) ?? runBundleRefusal(harness.dir, "graph");
   if (refused !== undefined) return refuse(refused.code, refused.message, refused.verb);
-  const waiting = await graphRunWaiting(harness.dir, grun);
+  const waiting = await graphRunWaiting(harness.dir, grun, at);
   switch (waiting.state) {
     case "waiting":
       break;
     case "decided":
-      return refuse("already_decided", `${grun} was already decided; it is resumed once`);
+      return at !== undefined
+        ? refuse("already_decided", `the pause at ${at} in ${grun} was already decided`)
+        : refuse("already_decided", `${grun} was already decided; it is resumed once`);
     case "not-waiting":
-      return refuse("conflict", `${grun} is not waiting for a decision`);
+      return at !== undefined
+        ? refuse("conflict", `${grun} is not waiting at ${at}`)
+        : refuse("conflict", `${grun} is not waiting for a decision`);
     case "unreadable":
       return refuse("unavailable", `the record of ${grun} could not be read`);
     default:
@@ -162,7 +188,7 @@ export async function startGraphResume(
       target: `home/harness/${id}`,
       ledger: { harness: harness.dir },
       via: "cli",
-      body: { grun, decision },
+      body: { grun, ckpt: waiting.ckpt, decision },
     },
     async (receipt) => {
       const notStarted = (message: string, code: "unavailable" | "disabled" = "unavailable") => ({
@@ -180,7 +206,10 @@ export async function startGraphResume(
       if (!queued.ok) return notStarted(`its run could not be recorded (${queued.code})`);
       let started: StartResult;
       try {
-        started = await startRunJob(harness.dir, { runId, graphResume: { grun, decision } });
+        started = await startRunJob(harness.dir, {
+          runId,
+          graphResume: { grun, ckpt: waiting.ckpt, decision },
+        });
       } catch (err) {
         started = { ok: false, reason: "plan-failed", stage: "spawn", error: err as Error };
       }

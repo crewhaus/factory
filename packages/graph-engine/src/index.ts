@@ -42,6 +42,7 @@ import {
   type CheckpointId,
   type CheckpointStore,
   type GraphRunId,
+  RESUME_CHECKPOINT_ENV,
   newGraphRunId,
 } from "@crewhaus/checkpoint-store";
 import { CrewhausError, EXIT_CODES, type FailureReport, RunFailedError } from "@crewhaus/errors";
@@ -241,14 +242,31 @@ export interface RunnableGraph<Input, State> {
   /**
    * Resume a previously-paused run. Loads the checkpoint, threads the
    * decision through `NodeContext.approval`, and resumes execution from
-   * the node following the paused one.
+   * the node following the paused one. A run that recorded its pause is
+   * resumed only at the pause it waits at, and only at `opts.pause` (or the
+   * pause {@link RESUME_CHECKPOINT_ENV} names) when one is given.
    */
   resume(
     graphRunId: GraphRunId,
     checkpointId: CheckpointId,
     decision: string,
-    opts?: Omit<RunOptions, "resumeFrom">,
+    opts?: ResumeOptions,
   ): AsyncIterable<NodeEvent<State>>;
+}
+
+export type ResumeOptions = Omit<RunOptions, "resumeFrom"> & {
+  /**
+   * The pause the decision was made on. The resume is refused unless `checkpointId` is it.
+   * Absent: the pause {@link RESUME_CHECKPOINT_ENV} names, when the process has it.
+   */
+  readonly pause?: CheckpointId;
+};
+
+/** The pause a resume is bound to: the caller's, else the one its process was started for. */
+function boundPause(opts: ResumeOptions): string | undefined {
+  if (opts.pause !== undefined) return opts.pause;
+  const fromEnv = typeof process === "undefined" ? undefined : process.env[RESUME_CHECKPOINT_ENV];
+  return fromEnv === undefined || fromEnv === "" ? undefined : fromEnv;
 }
 
 export interface GraphBuilder<Input, State> {
@@ -429,7 +447,7 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
     graphRunId: GraphRunId,
     checkpointId: CheckpointId,
     decision: string,
-    opts: Omit<RunOptions, "resumeFrom"> = {},
+    opts: ResumeOptions = {},
   ): AsyncIterable<NodeEvent<State>> {
     const store = this.o.checkpointStore;
     if (store === undefined) {
@@ -437,17 +455,35 @@ class CompiledGraph<Input, State> implements RunnableGraph<Input, State> {
     }
     const self = this;
     return (async function* (): AsyncIterable<NodeEvent<State>> {
+      // Why a pause is not the one this resume may settle: it was decided, or it is not one.
+      const notHere = async (at: string): Promise<GraphRunError> => {
+        const decided = /^ckpt_[0-9a-f]{16}$/.test(at)
+          ? await store.resumeClaimed?.(graphRunId, at)
+          : undefined;
+        return new GraphRunError(
+          decided === true
+            ? `the pause at ${at} in run ${graphRunId} was already decided`
+            : `run ${graphRunId} is not waiting at ${at}`,
+        );
+      };
+      // A decision is made on one pause, and is never applied to another.
+      const pause = boundPause(opts);
+      if (pause !== undefined && pause !== checkpointId) throw await notHere(pause);
       const checkpoint = await store.load(graphRunId, checkpointId);
       if (checkpoint === undefined) {
         throw new GraphRunError(`checkpoint ${checkpointId} not found in run ${graphRunId}`);
       }
       // A run that says where it waits is resumed there and nowhere else.
-      const waiting = (await store.meta(graphRunId))?.pendingHitl;
+      const meta = await store.meta(graphRunId);
+      const waiting = meta?.pendingHitl;
       if (waiting !== undefined && waiting.checkpointId !== checkpointId) {
         throw new GraphRunError(
           `run ${graphRunId} is not waiting at ${checkpointId}; it waits at ${waiting.checkpointId}`,
         );
       }
+      // One that recorded a pause and waits nowhere now is moving, or done: a checkpoint it
+      // saved while running is no pause.
+      if (waiting === undefined && meta?.recordsPauses === true) throw await notHere(checkpointId);
       // Whoever decided, the decision is text the paused node reads: it is checked at `api`
       // first, and a refused one takes nothing, so the pause still waits.
       const runContext = opts.runContext ?? (await self.lazyRunContext());

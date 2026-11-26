@@ -27,6 +27,7 @@ import {
   MIN,
   type Members,
   NOW,
+  decide,
   harnessDir,
   iso,
   park,
@@ -604,6 +605,53 @@ describe("assignment grants nothing, and goes to someone who may decide", () => 
     expect(reasonOf(await unassignItem({ ...request, item: one(f.items()) }, f.deps))).toBe(
       "conflict/not_assigned",
     );
+  });
+
+  test("who had a request, and who hid it, end with its round: the next ask of the same call starts with neither", async () => {
+    for (const where of ["here", "elsewhere"] as const) {
+      const f = fixture(`round-${where}`);
+      const first = await park(f.dir, { askDigest: "d1" });
+      const m = await governed(f);
+      const item = one(f.items(), "permission");
+      const request = { dir: f.dir, item, actor: member(m.owner), via: "home" as const };
+      expect((await assignItem({ ...request, to: m.operator }, f.deps)).ok).toBe(true);
+      const snoozed = await snoozeItem(
+        {
+          dir: f.dir,
+          item: one(f.items(), "permission"),
+          actor: member(m.operator),
+          via: "home",
+          until: iso(NOW + 7 * DAY),
+        },
+        f.deps,
+      );
+      expect(snoozed.ok).toBe(true);
+      expect(f.items({ viewer: m.operator })).toEqual([]);
+      if (where === "here") {
+        const decided = await resolveItem(
+          { ...request, item: one(f.items(), "permission"), choice: "grant" },
+          f.deps,
+        );
+        expect(decided.ok).toBe(true);
+      } else {
+        // Decided on a surface that records nothing here.
+        await decide(f.dir, first, "grant", NOW);
+      }
+      expect(f.items()).toEqual([]);
+      f.clock.now = NOW + HOUR;
+      await park(f.dir, { askDigest: "d1", at: NOW + HOUR - MIN });
+      const next = one(f.items({ viewer: m.operator }), "permission");
+      expect(idOfItem(next)).toBe(idOfItem(item));
+      expect(next.state).toBe("open");
+      expect(next.assignee).toBeUndefined();
+      expect(next.snoozedUntil).toBeUndefined();
+      const mine = assembleInbox(
+        [foldHarness(f.dir, testFacts(), f.clock.now, { harness: HRN, viewer: m.operator })],
+        f.clock.now,
+        { assignee: m.operator },
+      );
+      expect(mine.items).toEqual([]);
+    }
   });
 
   test("a harness with no members has nobody to assign to", async () => {

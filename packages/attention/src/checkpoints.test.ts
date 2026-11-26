@@ -71,12 +71,12 @@ describe("a paused graph run", () => {
       {
         id: "approve",
         needs: "operator",
-        cliTwin: `crewhaus runs resume ${grun} --decision approve --harness ${HRN}`,
+        cliTwin: `crewhaus runs resume ${grun} --checkpoint ${ckpt} --decision approve --harness ${HRN}`,
       },
       {
         id: "reject",
         needs: "operator",
-        cliTwin: `crewhaus runs resume ${grun} --decision reject --harness ${HRN}`,
+        cliTwin: `crewhaus runs resume ${grun} --checkpoint ${ckpt} --decision reject --harness ${HRN}`,
       },
     ]);
     expect(pauseOf(item?.source.id ?? "")).toEqual({ grun, ckpt });

@@ -129,26 +129,57 @@ export const CHOICE_EFFECTS: Readonly<Record<string, string>> = {
   "budget.raise-period": "Opens this period's budget, to raise it once.",
   "budget.wait-for-renewal": "Puts it off until the budget renews.",
   "budget.acknowledge": "Sets it aside until it happens again.",
-  "budget.act": "Starts the suggested check.",
+  "budget.act": "Starts the suggested job.",
   "budget.open": "Opens the budget.",
   "spec.acknowledge": "Sets it aside until it fails again.",
   "spec.inspect": "Opens the runs it stopped.",
-  "spec.act": "Starts the suggested check.",
+  "spec.act": "Starts the suggested job.",
   "spec.open": "Opens the spec.",
   "run-failures.acknowledge": "Sets it aside until it fails again.",
   "run-failures.inspect": "Opens the runs that failed.",
-  "security.act": "Starts the suggested check.",
+  "security.act": "Starts the suggested job.",
   "security.open": "Opens the incident.",
-  "quality-regression.act": "Starts the suggested check.",
+  "quality-regression.act": "Starts the suggested job.",
   "quality-regression.open": "Opens the results.",
-  "setup.act": "Starts the suggested check.",
+  "setup.act": "Starts the suggested job.",
   "setup.open": "Opens the place that fixes it.",
 };
 
-/** What a choice does, or an empty string for one no table knows. Pure. */
-export function choiceEffectOf(kind: string, choice: string): string {
+/**
+ * What an Advisor finding's `act` choice does, by the job it starts: what a person confirms
+ * before a job that spends model credits or rebuilds the harness.
+ */
+export const JOB_EFFECTS: Readonly<Record<string, string>> = {
+  doctor: "Checks the harness's setup and says what it finds. It changes nothing.",
+  compile: "Rebuilds the bundle from the spec.",
+  optimize: "Starts an optimize run. It uses model credits and proposes changes for you to review.",
+  "dream-run": "Starts the memory review now. It uses model credits.",
+  eval: "Starts an eval run. It uses model credits.",
+  "route-propose": "Proposes the routing change for you to review.",
+  "route-status": "Shows how the models compare. It changes nothing.",
+  "models-explain": "Explains which model each step uses. It changes nothing.",
+  "models-audit": "Checks the models in use. It changes nothing.",
+};
+
+/** What an `open` choice that names no screen does. */
+export const OPEN_IN_ADVICE = "Opens the suggestion in Advice.";
+
+/**
+ * What a choice does, or an empty string for one no table knows. An Advisor finding's
+ * choice is worded by the job it starts or, with no screen named, as opening Advice. Pure.
+ */
+export function choiceEffectOf(
+  kind: string,
+  choice: string,
+  about: { readonly job?: string; readonly place?: string } = {},
+): string {
   const id = `${kind}.${choice}`;
-  return Object.hasOwn(CHOICE_EFFECTS, id) ? (CHOICE_EFFECTS[id] as string) : "";
+  if (!Object.hasOwn(CHOICE_EFFECTS, id)) return "";
+  if (choice === "act" && about.job !== undefined && Object.hasOwn(JOB_EFFECTS, about.job)) {
+    return JOB_EFFECTS[about.job] as string;
+  }
+  if (choice === "open" && about.place === undefined) return OPEN_IN_ADVICE;
+  return CHOICE_EFFECTS[id] as string;
 }
 
 /** What an id no table knows reads as. */

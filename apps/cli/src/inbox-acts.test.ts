@@ -378,7 +378,10 @@ describe("inbox decide", () => {
     const id = await one();
     const out = await run(["decide", id, "approve"]);
     expect(out.exitCode).toBe(0);
-    expect(starts.map((s) => s.graphResume)).toEqual([{ grun, decision: "approve" }]);
+    // Bound to the pause the item named.
+    expect(starts.map((s) => s.graphResume)).toEqual([
+      { grun, ckpt: saved.id, decision: "approve" },
+    ]);
     expect(out.lines[0]).toBe(
       `Recorded: approve on ${id}. It resumes as run ${String(starts[0]?.runId)}.`,
     );
@@ -454,7 +457,9 @@ describe("inbox assign, defer and snooze", () => {
     expect(given.lines[0]).toBe(`Gave ${id} to ${people.operator}.`);
     expect(await items(["--mine"])).toEqual([]);
     const shown = await run(["show", id]);
-    expect(shown.lines.join("\n")).toContain(`With ${people.operator}`);
+    // Named as Home knows them; never by the raw id.
+    expect(shown.lines.join("\n")).toContain("With Olly");
+    expect(shown.lines.join("\n")).not.toContain(people.operator);
 
     await run(["assign", id, "--to", people.owner]);
     expect((await items(["--mine"])).map(idOf)).toEqual([id]);

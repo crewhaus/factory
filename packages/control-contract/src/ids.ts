@@ -26,6 +26,8 @@ export const HARNESS_ID_RE = /^hrn_[0-9a-f]{16}$/;
  */
 export const EXECUTION_RUN_ID_RE = /^run_[0-9a-f]{16}$/;
 export const GRAPH_RUN_ID_RE = /^grun_[0-9a-f]{16}$/;
+/** A graph run's checkpoint: what a pause saved, and what a resume names. */
+export const GRAPH_CHECKPOINT_ID_RE = /^ckpt_[0-9a-f]{16}$/;
 /** A run id from `mintRunId()`. */
 export const CANONICAL_RUN_ID_RE = /^run_[0-9a-hjkmnp-tv-z]{26}$/;
 /** A deployment id, `dep_<ulid>`: the grammar `isId("dep", …)` accepts. */

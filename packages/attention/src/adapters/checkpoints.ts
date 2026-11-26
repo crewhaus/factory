@@ -130,6 +130,7 @@ function choicesOf(fact: CheckpointFact, harness: string): AttentionChoice[] {
   return (["approve", "reject"] as const).map((choice) => {
     const cliTwin = twinOf(ATTENTION_TWINS.graphResume, {
       grun: fact.grun,
+      ckpt: fact.ckpt,
       graphDecision: choice,
       hrn: harness,
     });

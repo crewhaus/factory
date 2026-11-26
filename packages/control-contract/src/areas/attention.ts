@@ -301,6 +301,45 @@ export const DISMISS_REASONS = deepFreeze([
 
 export type DismissReason = (typeof DISMISS_REASONS)[number];
 
+/**
+ * The jobs an Advisor finding's `act` choice may start: each is worded on its own, because
+ * what it does (and whether it spends model credits) is what a person confirms.
+ */
+export const ATTENTION_JOBS = deepFreeze([
+  "doctor",
+  "compile",
+  "optimize",
+  "dream-run",
+  "eval",
+  "route-propose",
+  "route-status",
+  "models-explain",
+  "models-audit",
+] as const);
+
+export type AttentionJob = (typeof ATTENTION_JOBS)[number];
+
+/** The console screens an Advisor finding's `open` choice may go to: where its fix lives. */
+export const ATTENTION_PLACES = deepFreeze([
+  "overview",
+  "approvals",
+  "spec",
+  "runs",
+  "schedulers",
+  "evals",
+  "memory",
+  "feedback",
+  "costs",
+  "models",
+  "creds",
+  "channels",
+  "security",
+  "deploy",
+  "dev",
+] as const);
+
+export type AttentionPlace = (typeof ATTENTION_PLACES)[number];
+
 /** What a person did about an item, as its actions line and its event name it. */
 export const ATTENTION_ACTION_EVENTS = deepFreeze([
   "resolved",
@@ -379,6 +418,10 @@ export type AttentionChoice = {
   readonly nullReason?: string;
   /** The permission this choice needs beyond the one to decide. */
   readonly permission?: string;
+  /** An `act` choice: the job it starts, one of {@link ATTENTION_JOBS}. */
+  readonly job?: AttentionJob;
+  /** An `open` choice: the screen it goes to, one of {@link ATTENTION_PLACES}. */
+  readonly place?: AttentionPlace;
 };
 
 export type AttentionCause = {
@@ -523,9 +566,14 @@ export type AttentionMessage = {
   readonly text: string;
 };
 
+/** A person an answer mentions by id (an assignee, a message's writer), with their name. */
+export type AttentionPerson = { readonly id: string; readonly name: string };
+
 export type AttentionMessages = {
   readonly ref: string;
   readonly items: readonly AttentionMessage[];
+  /** The name of each writer Home knows by name: the ids stay for technical details. */
+  readonly people?: readonly AttentionPerson[];
   readonly truncated?: { readonly reason: string; readonly verb?: string };
   readonly empty?: { readonly reason: EmptyReason; readonly remedy?: string };
 };
@@ -565,6 +613,8 @@ export type AttentionList = {
   readonly advisorUnchecked?: readonly string[];
   /** The name of every harness this answer mentions, for display. */
   readonly names?: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  /** The name of each member its items are assigned to, when Home knows it. */
+  readonly people?: readonly AttentionPerson[];
   /** What the reader may do in each harness this answer's items are about. Home's alone. */
   readonly you?: readonly AttentionYou[];
 };
@@ -670,7 +720,17 @@ const TWINS = {
   acknowledge: { argv: ["inbox", "acknowledge", "{att}"] },
   messages: { argv: ["inbox", "show", "{att}", "--messages"] },
   graphResume: {
-    argv: ["runs", "resume", "{grun}", "--decision", "{graphDecision}", "--harness", "{hrn}"],
+    argv: [
+      "runs",
+      "resume",
+      "{grun}",
+      "--checkpoint",
+      "{ckpt}",
+      "--decision",
+      "{graphDecision}",
+      "--harness",
+      "{hrn}",
+    ],
   },
   deployApprove: {
     argv: [
