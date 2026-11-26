@@ -13,7 +13,7 @@ import { createHash, randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { relative } from "node:path";
 import { loadAccessSnapshot } from "@crewhaus/access-control";
-import type { CommandReceipt } from "@crewhaus/control-contract";
+import type { CommandReceipt, DeployQuorumSubject } from "@crewhaus/control-contract";
 import { HARNESS_ID_RE, mintId, parseRef } from "@crewhaus/control-contract";
 import {
   type LedgerRecord,
@@ -27,6 +27,7 @@ import {
   writeHarnessIdentity,
 } from "@crewhaus/control-records";
 import { evaluateProtectedEnvGate } from "@crewhaus/deployment-controller/approval-gate";
+import { openQuorumDecision, settleQuorumDecision } from "@crewhaus/deployment-controller/quorum";
 import {
   type ActiveDeployment,
   type AdmitAnswer,
@@ -136,9 +137,30 @@ export const protectedEnvironmentGate: ActivationGate = {
       ok: false,
       reason: `"${environment}" is a protected environment: ${answer.decision.reason}`,
       verb: `crewhaus deploy activate ${String(deployment["id"])} --environment ${environment}`,
+      quorum: {
+        spec: specName,
+        environment,
+        version: String(deployment["id"]),
+        specHash,
+      },
     };
   },
 };
+
+/**
+ * Open the decision a protected environment's quorum answers, when an activation was
+ * refused for want of it. The check itself writes nothing: a read that only asks whether
+ * an activation would pass opens nothing. A decision that cannot be opened leaves the
+ * refusal as it is.
+ */
+async function askQuorum(
+  harnessDir: string,
+  quorum: DeployQuorumSubject | undefined,
+  now: number,
+): Promise<void> {
+  if (quorum === undefined) return;
+  await openQuorumDecision(harnessDir, quorum, { now }).catch(() => undefined);
+}
 
 /** The env chain as names and a keyed digest of their names and bytes: never a value. */
 async function envChainOf(
@@ -250,7 +272,10 @@ async function activationGateRefusal(
   gatesNotRun: boolean,
   actor: string,
   now: () => number,
-): Promise<{ readonly reason: string; readonly verb?: string } | undefined> {
+): Promise<
+  | { readonly reason: string; readonly verb?: string; readonly quorum?: DeployQuorumSubject }
+  | undefined
+> {
   for (const other of new Set(actives.map(environmentOf))) {
     if (other === undefined || other === environment) continue;
     const verdict = await protectedEnvironmentGate.check({
@@ -347,6 +372,7 @@ export async function activateDeployment(request: ActivationRequest): Promise<Ac
     now,
   );
   if (refused !== undefined) {
+    await askQuorum(request.harnessDir, refused.quorum, now());
     return {
       ok: false,
       code: "conflict",
@@ -365,6 +391,7 @@ export async function activateDeployment(request: ActivationRequest): Promise<Ac
         now: now(),
       });
       if (!verdict.ok) {
+        await askQuorum(request.harnessDir, verdict.quorum, now());
         return {
           ok: false,
           code: "conflict",
@@ -421,6 +448,20 @@ export async function activateDeployment(request: ActivationRequest): Promise<Ac
     request.dep,
     String(next["activatedAt"]),
   );
+  const activatedHash = (prepared["artifact"] as { specHash?: unknown } | undefined)?.specHash;
+  if (environment !== undefined && typeof activatedHash === "string") {
+    // The quorum's question is answered: it stops waiting. The activation stands either way.
+    await settleQuorumDecision(
+      request.harnessDir,
+      {
+        spec: specNameOf(request.harnessDir) ?? "",
+        environment,
+        version: request.dep,
+        specHash: activatedHash,
+      },
+      { now: now() },
+    ).catch(() => false);
+  }
   return { ok: true, record: moved.record, superseded };
 }
 

@@ -1,7 +1,9 @@
 /**
  * The spend meter as `runChatLoop` uses it (`@crewhaus/cost-tracker/spend`):
  * one meter per run tree, a reservation before each model call, a settle on
- * its response and a release when it fails.
+ * its response, a settle when it was sent and failed (at the usage its stream
+ * reported, else at its worst case), and a release only when it was never
+ * sent.
  *
  * - One meter per run tree. Loops that share a caller-owned `budgetMeter`
  *   (a workflow's steps) share one spend meter, keyed on that meter; a loop
@@ -10,14 +12,20 @@
  *   neither a meter nor a `budget` has none: nothing is reserved. Each loop's
  *   meter is also found from its `RunContext` ({@link spendMeterOf}), so a
  *   side call it makes spends from it.
+ * - A loop nested inside a call never waits on that call. Every handle a
+ *   nested loop gets (a side call's meter, a tool's `bridge.spend`) is a view
+ *   (`within`) naming the reservation of the loop's call in progress when the
+ *   handle was made; that call settles only after the nested loop returns, so
+ *   a cap it fills is a final refusal, never a wait.
  * - The run cap refuses a reservation under `on_exceed: stop` only. Under
  *   `degrade` the cap is the degrade ladder's (the per-call cap check moves
  *   the run to the cheaper model), so the meter holds the run's spend, and
  *   still refuses for a sub-agent's share and for the harness's period.
  * - A declared `budget.period` hands the meter a ledger port over the
  *   harness's period ledger (`@crewhaus/control-records/budget`), rooted where
- *   loop admission roots (the control plane's harness), else the working
- *   directory a harness runs from. No period, no ledger, no file.
+ *   loop admission roots (the control plane's harness), else the harness
+ *   directory the caller names (`crewhaus run`: the spec's directory), else
+ *   the working directory. No period, no ledger, no file.
  * - Unknown cost is never $0: a model with no price reserves nothing, its
  *   settle counts an unknown call, and a budgeted run publishes one
  *   `budget_unpriced` per wire model ({@link settleModelCall}, the one site).
@@ -38,11 +46,20 @@ import {
   createSpendMeter,
   estimateCallMicros,
 } from "@crewhaus/cost-tracker/spend";
+
+/** The stream reporter the loop wraps each call's stream in (`@crewhaus/cost-tracker/spend`). */
+export { type StreamReport, failedCallSpend, notingUsage } from "@crewhaus/cost-tracker/spend";
 import type { RunContext } from "@crewhaus/run-context";
 import type { ModelRole, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 
-/** The meter of the loop that last ran on each context, for its side calls. */
-const meters = new WeakMap<RunContext, SpendMeter>();
+/**
+ * The meter of the loop that last ran on each context, for its side calls,
+ * and that loop's call in progress (its reservation id), if any.
+ */
+const meters = new WeakMap<
+  RunContext,
+  { readonly meter: SpendMeter; readonly inFlight: () => string | undefined }
+>();
 /** One meter per caller-owned budget meter, so loops that share one share this too. */
 const shared = new WeakMap<object, SpendMeter>();
 /** Wire models a run already published `budget_unpriced` for. */
@@ -50,10 +67,13 @@ const unpricedSeen = new WeakMap<RunContext, Set<string>>();
 
 /**
  * The spend meter of the budgeted loop running on `runContext`, when it has
- * one. A side call's nested loop spends from it.
+ * one. A side call's nested loop spends from it. The answer is a view naming
+ * the loop's call in progress at this moment as an ancestor, so a side call
+ * made from inside that call's tools never waits on it; ask once per side call.
  */
 export function spendMeterOf(runContext: RunContext | undefined): SpendMeter | undefined {
-  return runContext === undefined ? undefined : meters.get(runContext);
+  const found = runContext === undefined ? undefined : meters.get(runContext);
+  return found === undefined ? undefined : found.meter.within(found.inFlight());
 }
 
 /** The loop's meter: the one it was given, the one its shared budget meter has, or a new one. */
@@ -74,15 +94,20 @@ export function attachSpendMeter(args: {
   readonly pricing: PricingTable;
   /** What started the run, recorded on the period ledger. */
   readonly trigger: string | undefined;
+  /** The loop's call in progress: its reservation id, while it is reserved. */
+  readonly inFlight?: () => string | undefined;
+  /** The harness directory a declared period's ledger lives in, when loop admission names none. */
+  readonly ledgerRoot?: string;
 }): SpendMeter | undefined {
+  const inFlight = args.inFlight ?? (() => undefined);
   if (args.given !== undefined) {
-    meters.set(args.runContext, args.given);
+    meters.set(args.runContext, { meter: args.given, inFlight });
     return args.given;
   }
   if (args.budget === undefined) return undefined;
   const existing = args.sharedWith !== undefined ? shared.get(args.sharedWith) : undefined;
   if (existing !== undefined) {
-    meters.set(args.runContext, existing);
+    meters.set(args.runContext, { meter: existing, inFlight });
     return existing;
   }
   const period = args.budget.period;
@@ -90,10 +115,12 @@ export function attachSpendMeter(args: {
     ...(args.budget.onExceed.kind === "stop" ? { capMicros: args.budget.usdMicros } : {}),
     seedMicros: args.seedMicros,
     pricing: args.pricing,
-    ...(period !== undefined ? { ledger: periodLedger(period, args.trigger) } : {}),
+    ...(period !== undefined
+      ? { ledger: periodLedger(period, args.trigger, args.ledgerRoot) }
+      : {}),
   });
   if (args.sharedWith !== undefined) shared.set(args.sharedWith, meter);
-  meters.set(args.runContext, meter);
+  meters.set(args.runContext, { meter, inFlight });
   return meter;
 }
 
@@ -184,7 +211,9 @@ function untilSettledOrAborted(settled: Promise<void>, signal: AbortSignal): Pro
 /**
  * Reserve call `id` before it is dispatched. Waits while only other calls'
  * reservations stand in the way and asks again; answers which cap refused
- * when spend so far reaches one. The wait ends when `signal` aborts (the
+ * when spend so far reaches one, and `inFlight` when it is reached counting a
+ * call this one runs inside (never a wait: that call settles only after this
+ * one returns). The wait ends when `signal` aborts (the
  * run's stop, its deadline, the turn's timeout), throwing an `AbortError`;
  * and the period ledger itself answers finally once only reservations past
  * their lease are left (`held`), so the wait is bounded by those leases.
@@ -197,7 +226,12 @@ export async function reserveModelCall(
   signal: AbortSignal,
 ): Promise<
   | { readonly admitted: true }
-  | { readonly admitted: false; readonly scope: SpendScope; readonly held?: true }
+  | {
+      readonly admitted: false;
+      readonly scope: SpendScope;
+      readonly held?: true;
+      readonly inFlight?: true;
+    }
 > {
   for (;;) {
     if (signal.aborted) throw abortError(signal);
@@ -212,6 +246,7 @@ export async function reserveModelCall(
         admitted: false,
         scope: answer.scope ?? "run",
         ...(answer.held === true ? { held: true as const } : {}),
+        ...(answer.inFlight === true ? { inFlight: true as const } : {}),
       };
     }
     await untilSettledOrAborted(answer.settled, signal);
@@ -219,7 +254,9 @@ export async function reserveModelCall(
 }
 
 /**
- * Settle call `id` with its response's usage. The first unpriced settle of a
+ * Settle call `id` with its response's usage, or, when `usage` is undefined
+ * (the call was sent and its stream never reported its final counts), at its
+ * reserved worst case (`settleUnreported`). The first unpriced settle of a
  * wire model in a budgeted run publishes `budget_unpriced` once: never a
  * stop, never a degrade.
  */
@@ -232,26 +269,32 @@ export async function settleModelCall(args: {
   readonly provider: ProviderId;
   readonly wireModelId: string;
   readonly role: ModelRole | undefined;
-  readonly usage: {
-    readonly input: number;
-    readonly output: number;
-    readonly cacheRead?: number;
-    readonly cacheCreate?: number;
-  };
+  readonly usage:
+    | {
+        readonly input: number;
+        readonly output: number;
+        readonly cacheRead?: number;
+        readonly cacheCreate?: number;
+      }
+    | undefined;
   readonly meta: SpendReserveMeta;
 }): Promise<void> {
-  const settled = await args.meter.settle(
-    args.id,
-    {
-      provider: args.provider,
-      modelId: args.wireModelId,
-      input: args.usage.input,
-      output: args.usage.output,
-      ...(args.usage.cacheRead !== undefined ? { cacheRead: args.usage.cacheRead } : {}),
-      ...(args.usage.cacheCreate !== undefined ? { cacheCreate: args.usage.cacheCreate } : {}),
-    },
-    args.meta,
-  );
+  const usage = args.usage;
+  const settled =
+    usage === undefined
+      ? await args.meter.settleUnreported(args.id, args.meta)
+      : await args.meter.settle(
+          args.id,
+          {
+            provider: args.provider,
+            modelId: args.wireModelId,
+            input: usage.input,
+            output: usage.output,
+            ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
+            ...(usage.cacheCreate !== undefined ? { cacheCreate: usage.cacheCreate } : {}),
+          },
+          args.meta,
+        );
   if (settled.usdMicros !== undefined || !args.budgeted) return;
   let seen = unpricedSeen.get(args.runContext);
   if (seen === undefined) {

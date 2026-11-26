@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { type Server, createServer } from "node:net";
-import { checkPortFree, portItems } from "./ports";
+import { PORTS_NOT_CHECKED, checkPortFree, portItems } from "./ports";
 
 function listenOnEphemeral(): Promise<{ server: Server; port: number }> {
   return new Promise((resolve, reject) => {
@@ -63,5 +63,19 @@ describe("portItems", () => {
       (port) => Promise.resolve({ port, free: port !== 8080 }),
     );
     expect(items.map((i) => i.level)).toEqual(["blocking", "info"]);
+  });
+
+  test("a port that was not checked is neither free nor taken: info, and it says so", async () => {
+    const { server, port } = await listenOnEphemeral();
+    try {
+      // The port is held: a probe would find it taken, and nothing is bound to learn that.
+      const items = await portItems([{ port, source: "spec gateway.port" }], PORTS_NOT_CHECKED);
+      expect(items.map((i) => i.level)).toEqual(["info"]);
+      expect(items[0]?.message).toBe(`port ${port} (spec gateway.port) was not checked`);
+      expect(items[0]?.message).not.toContain("is free");
+      expect(await PORTS_NOT_CHECKED(port)).toEqual({ port, free: undefined });
+    } finally {
+      await close(server);
+    }
   });
 });

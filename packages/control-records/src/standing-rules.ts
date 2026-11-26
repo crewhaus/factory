@@ -14,8 +14,9 @@
  * `decision` machine, in `.crewhaus/run/control/decisions/` (size segments). The first
  * decision on it wins through `casAppend(…, "pending", …)`: its generation claim decides.
  * The same ledger holds `change-adoption` decisions (a change record waiting to be
- * adopted) and the `merge` and `rollout` decisions a delegation rule may resolve; each
- * reader reads its own kind and passes over the other known kinds.
+ * adopted), the `merge` and `rollout` decisions a delegation rule may resolve, and the
+ * `deploy-quorum` decisions a protected environment's quorum answers; each reader reads
+ * its own kind and passes over the other known kinds.
  *
  * Both ledgers are `harnessLedger`s, so they share the harness's control lock and claims
  * directory: a writer that holds the lock for one may compare-and-set on both
@@ -26,9 +27,15 @@ import {
   DECISION_LOG_REASONS,
   DELEGABLE_DECISION_KINDS,
   DELEGATION_ACTIONS,
+  DEPLOY_QUORUM_KIND,
   type DecisionClass,
   type DelegableDecisionKind,
   type DelegationSubject,
+  type DeployQuorumSubject,
+  ENVIRONMENT_NAME_RE,
+  SPEC_NAME_RE,
+  SPEC_REVISION_RE,
+  SPEC_VERSION_RE,
   type StandingRuleTerms,
   isId,
   isRef,
@@ -150,11 +157,34 @@ export type ActionDecisionRow = {
   readonly supersededBy?: string;
 };
 
+/**
+ * A `dec_` decision that asks a protected environment's quorum whether one version of one
+ * spec may go there, on the `decision` machine. Who voted is in the votes' own claims and
+ * in the approvals file; the row holds what was asked and how it ended.
+ */
+export type DeployQuorumRow = {
+  readonly id: string;
+  readonly kind: typeof DEPLOY_QUORUM_KIND;
+  readonly createdAt: string;
+  /** When the decision stops waiting: it then reads `expired`. */
+  readonly expiresAt: string;
+  readonly requiredClass: "maintainer";
+  readonly subject: DeployQuorumSubject;
+  readonly state: "pending" | "granted" | "denied" | "consumed" | "superseded";
+  readonly decision?: "grant" | "deny";
+  readonly decidedAt?: string;
+  /** Whose vote ended it, as a stored actor. */
+  readonly decidedByPrincipal?: string;
+  readonly consumedAt?: string;
+  readonly supersededAt?: string;
+};
+
 /** The decision kinds the decisions ledger holds; a reader passes over the others. */
 const DECISION_ROW_KINDS: ReadonlySet<string> = new Set([
   "standing-rule-proposal",
   "change-adoption",
   ...DELEGABLE_DECISION_KINDS,
+  DEPLOY_QUORUM_KIND,
 ]);
 
 export type LedgerRead<T> =
@@ -541,6 +571,83 @@ export function actionDecisionState(
   row: ActionDecisionRow,
   nowMs: number,
 ): ActionDecisionRow["state"] | "expired" {
+  if (row.state !== "pending" && row.state !== "granted") return row.state;
+  const ends = Date.parse(row.expiresAt);
+  return Number.isFinite(ends) && Number.isFinite(nowMs) && nowMs < ends ? row.state : "expired";
+}
+
+/**
+ * How long a protected environment's quorum waits before the decision reads `expired`.
+ *
+ * First consumer: the writer that opens one when a promotion is blocked.
+ */
+export const DEPLOY_QUORUM_TTL_MS = 30 * 86_400_000;
+
+/**
+ * A row as a protected environment's quorum, or `undefined` when it is not one.
+ *
+ * First consumer: {@link readDeployQuorums}.
+ */
+export function deployQuorumOf(row: LedgerRecord): DeployQuorumRow | undefined {
+  const r = withoutBookkeeping(row);
+  const subject = r["subject"];
+  const s =
+    typeof subject === "object" && subject !== null && !Array.isArray(subject)
+      ? (subject as Record<string, unknown>)
+      : undefined;
+  const state = r["state"];
+  const named = (value: unknown, re: RegExp): boolean =>
+    typeof value === "string" && re.test(value);
+  const ok =
+    isId("dec", r["id"]) &&
+    r["kind"] === DEPLOY_QUORUM_KIND &&
+    isInstant(r["createdAt"]) &&
+    isInstant(r["expiresAt"]) &&
+    r["requiredClass"] === "maintainer" &&
+    s !== undefined &&
+    Object.keys(s).length === 4 &&
+    named(s["spec"], SPEC_NAME_RE) &&
+    named(s["environment"], ENVIRONMENT_NAME_RE) &&
+    named(s["version"], SPEC_VERSION_RE) &&
+    named(s["specHash"], SPEC_REVISION_RE) &&
+    (state === "pending" ||
+      state === "granted" ||
+      state === "denied" ||
+      state === "consumed" ||
+      state === "superseded") &&
+    optional(r["decision"], (v) => v === "grant" || v === "deny") &&
+    optional(r["decidedAt"], isInstant) &&
+    optional(r["decidedByPrincipal"], isStoredActor) &&
+    optional(r["consumedAt"], isInstant) &&
+    optional(r["supersededAt"], isInstant);
+  return ok ? (r as DeployQuorumRow) : undefined;
+}
+
+/**
+ * Every quorum decision in a harness, as its latest row says. A tolerant fold, like
+ * {@link readProposals}: the other known kinds are passed over.
+ *
+ * First consumers: the quorum's writer and the inbox.
+ */
+export function readDeployQuorums(harnessDir: string): LedgerRead<DeployQuorumRow> {
+  return readLedger(
+    foldStates(decisionsLedger(harnessDir)),
+    deployQuorumOf,
+    "protected-environment quorum",
+    otherDecisionKinds(DEPLOY_QUORUM_KIND),
+  );
+}
+
+/**
+ * A quorum's state as every reader shows it: a pending one, or an unconsumed grant, past
+ * its `expiresAt` reads `expired`. Computed, never written.
+ *
+ * First consumers: the quorum's writer and the inbox.
+ */
+export function deployQuorumState(
+  row: DeployQuorumRow,
+  nowMs: number,
+): DeployQuorumRow["state"] | "expired" {
   if (row.state !== "pending" && row.state !== "granted") return row.state;
   const ends = Date.parse(row.expiresAt);
   return Number.isFinite(ends) && Number.isFinite(nowMs) && nowMs < ends ? row.state : "expired";

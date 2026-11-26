@@ -736,6 +736,30 @@ describe("classifier — policy: classifier (§7.2.3)", () => {
     });
   });
 
+  test("the classifier of a budgeted run is handed the run's spend meter, and an unbudgeted one none", async () => {
+    const meters: (RunChatLoopOptions["spendMeter"] | "absent")[] = [];
+    const run = (extra: Partial<RunChatLoopOptions>) =>
+      singleTurn(
+        textAdapter("fast"),
+        textAdapter("strong"),
+        { policy: "classifier", classifier: CLASSIFIER },
+        [{ role: "user", content: "what time is it?" }],
+        {
+          routeClassifier: async (input) => {
+            meters.push("spend" in input ? input.spend : "absent");
+            return { label: "cheap", model: FAST, costUsdMicros: 7 };
+          },
+          ...extra,
+        },
+      );
+    await run({ budget: { usdMicros: 5_000_000, onExceed: { kind: "stop" } } });
+    await run({});
+    expect(meters).toHaveLength(2);
+    const [budgeted, plain] = meters;
+    expect(budgeted !== "absent" && budgeted?.snapshot().capMicros).toBe(5_000_000);
+    expect(plain).toBe("absent");
+  });
+
   test("the classifier runs ONCE per turn: a tool loop's inner model calls reuse the verdict, persisted on every route line", async () => {
     const fast = toolLoopAdapter(["tool", "text"], "fast");
     const strong = textAdapter("strong");

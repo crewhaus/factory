@@ -57,7 +57,7 @@ reflow rule, so the 320 px pass also measures every route and fails on one that 
 
 Three more journeys hold the screens beyond their first paint. `axe-states` sweeps their other
 states — every dialog, the command menu, the header's lists, a section's sub-view list, the tooltip,
-an armed inbox row, a filtered digest, every memory and Thredz panel, and each Readability choice —
+an inbox verdict to confirm, a filtered digest, every memory and Thredz panel, and each Readability choice —
 with the same verdict, into its own artifact (`axe-states-report.json`). `keyboard-tour` drives the
 toured screens (`TOURED_TEMPLATES`) and the shell by keyboard alone (including a badge update while
 a header list is open, and the buttons inside the lists), and `a11y-floor` checks reflow at

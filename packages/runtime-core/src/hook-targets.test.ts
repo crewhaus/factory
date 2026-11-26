@@ -318,14 +318,21 @@ describe("the manager-hook reading", () => {
   });
 });
 
-describe("the spec record of a spec kept elsewhere", () => {
-  const record = (dir: string) => join(dir, ".crewhaus", "run", "spec");
+describe("the run directory of a spec kept elsewhere", () => {
+  const record = (dir: string) => join(dir, ".crewhaus", "run");
 
   test("is a root when the spec's directory is not the working directory", () => {
     const cwd = tempDir();
     const specDir = tempDir("spec-dir-");
     const roots = runtimeStateRoots(undefined, undefined, cwd, {}, undefined, { specDir });
-    for (const name of ["surfaces.json", "commits.jsonl", join("drafts", "x"), "lock"]) {
+    for (const name of [
+      join("spec", "surfaces.json"),
+      join("spec", "commits.jsonl"),
+      join("spec", "drafts", "x"),
+      join("spec", "lock"),
+      join("control", "budget", "month-2026-11-01", "000001.jsonl"),
+      join("control", "budget-state.json"),
+    ]) {
       expect(protectedRootHolding(join(record(specDir), name), roots, cwd)).toBeDefined();
     }
     expect(roots).toContain(record(specDir));

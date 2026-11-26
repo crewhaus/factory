@@ -19,12 +19,8 @@ export const DESTINATIONS = Object.freeze([
   Object.freeze({ id: "connections", label: "Connections", path: "#/connections" }),
 ]);
 
-/** The Needs-you filters, as `?type=<id>`. */
-export const NEEDS_YOU_FILTERS = Object.freeze([
-  Object.freeze({ id: "approvals", label: "Approvals" }),
-  Object.freeze({ id: "review", label: "Review" }),
-  Object.freeze({ id: "advice", label: "Advice" }),
-]);
+/** The Needs-you filters, as `?type=<id>`: the inbox's own kinds are `?kind=<kind>`. */
+export const NEEDS_YOU_FILTERS = Object.freeze([Object.freeze({ id: "advice", label: "Advice" })]);
 
 /**
  * Home's panels. Each draws a short list on Home (`panel`) and owns the page

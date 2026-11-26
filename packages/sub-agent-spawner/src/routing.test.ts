@@ -82,7 +82,9 @@ type Step = { readonly tool: string; readonly input?: unknown } | { readonly tex
 /** Scripted adapter: plays one step per call, reports fixed usage, records every request. */
 function scripted(
   steps: ReadonlyArray<Step>,
-  usage: { input: number; output: number } = { input: 0, output: 0 },
+  // One token each way: a reply always reports its counts (a reply that reports
+  // none is counted at its worst case), and costs a few micros.
+  usage: { input: number; output: number } = { input: 1, output: 1 },
 ): ProviderAdapter & { requests: ProviderRequest[] } {
   const requests: ProviderRequest[] = [];
   let call = 0;
@@ -728,7 +730,7 @@ describe("end to end — Task profile, parent budget and budget_share (§7.7 / �
     const root = newTempRoot();
     try {
       // Cap: $0.001. The child bills 100k input tokens on haiku (~$0.10) and
-      // the parent's scripted adapter reports zero usage — so ONLY the
+      // the parent's scripted adapter reports a few micros — so ONLY the
       // re-published child roll-up can put the meter over the cap, and the
       // parent's second model call (after the Task result) is the one gated.
       const child = scripted([{ text: "child done" }], { input: 100_000, output: 1_000 });

@@ -706,6 +706,7 @@ describe("torn-line sealing", () => {
       truncated: false,
       gaps: [{ off: head.length, bytes: torn.length + 1, reason: "unreadable" }],
       torn: false,
+      bytesRead: statSync(segmentPath(ledger, 1)).size,
     });
   });
 

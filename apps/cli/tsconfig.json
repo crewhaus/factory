@@ -22,6 +22,7 @@
     { "path": "../../packages/audit-log" },
     { "path": "../../packages/boundary-classifier" },
     { "path": "../../packages/canary-controller" },
+    { "path": "../../packages/checkpoint-store" },
     { "path": "../../packages/compiler" },
     { "path": "../../packages/control-contract" },
     { "path": "../../packages/control-records" },

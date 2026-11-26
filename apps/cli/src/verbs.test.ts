@@ -259,10 +259,11 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect`
-    // (#518); `work` came with its eleven (#516); budget is show, history and extend.
-    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6 + 11 + 3));
-  }, 30_000); // sixteen modules' imports and two hundred and twelve calls; slow on a loaded runner
+    // harness gained `capabilities` (#514); inbox is list, show, stats and the ten that act;
+    // runs gained `inspect` (#518); `work` came with its eleven (#516); budget is show, history
+    // and extend.
+    expect(asked).toBe(2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 13 + 1 + 1 + 12 + 6 + 11 + 3));
+  }, 30_000); // sixteen modules' imports and 232 calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {

@@ -41,6 +41,7 @@
     "@crewhaus/knowledge-index": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/canary-controller": "workspace:*",
+    "@crewhaus/checkpoint-store": "workspace:*",
     "@crewhaus/chunker": "workspace:*",
     "@crewhaus/claim-ledger": "workspace:*",
     "@crewhaus/cloud-adapter-flyio": "workspace:*",

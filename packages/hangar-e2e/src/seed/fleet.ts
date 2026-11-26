@@ -43,7 +43,7 @@ export type SeedFleetOptions = {
   readonly envLines?: readonly string[];
   /**
    * Seed what the accessibility journeys need on screen: three pending
-   * approvals (a keyboard tour spends two grants and needs one left to hold
+   * approvals (a keyboard tour spends two verdicts and needs one left to hold
    * focus), an open review item, an eval history below its pinned baseline
    * (the charts, the trend, an Advisor item to explain), a spec registry
    * with one archived version (the version dialogs open from its row), a run

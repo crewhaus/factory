@@ -16,9 +16,13 @@ import {
   APPROVAL_ID_RE,
   type AttentionChoice,
   type AttentionKind,
+  CANONICAL_RUN_ID_RE,
   type DecisionClass,
   type DecisionRecordView,
+  EXECUTION_RUN_ID_RE,
+  GRAPH_RUN_ID_RE,
   IF_UNANSWERED,
+  SESSION_ID_RE,
 } from "@crewhaus/control-contract";
 import {
   DEFAULT_APPROVALS_FILENAME,
@@ -27,8 +31,17 @@ import {
   containedSessionRoot,
   foldWithClaims,
 } from "@crewhaus/session-store";
-import { attRefOf, digestPrefix } from "../ids";
-import { classOf, dirFits, draftItem, higherClass, isoOf, msOf, twinOf } from "../items";
+import { attIdOf, attRefOf, digestPrefix } from "../ids";
+import {
+  classOf,
+  decideChoice,
+  draftItem,
+  higherClass,
+  isoOf,
+  msOf,
+  timeOf,
+  viaOf,
+} from "../items";
 import { effectiveAttentionState } from "../lifecycle";
 import { type AttentionReader, READ_CAPS } from "../read";
 import type {
@@ -57,31 +70,47 @@ const str = (value: unknown): string | undefined =>
 /** What a digest a request carries may hold: the characters of an item key, nothing else. */
 const DIGEST_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 
-/** Whether a request's id is one the store mints: only those become items. */
-export function isApprovalRecord(record: Pick<PendingApproval, "id">): boolean {
-  return typeof record.id === "string" && APPROVAL_ID_RE.test(record.id);
+/** What a tool's name may be: no space, quote or control character. */
+const TOOL_NAME_RE = /^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,127}$/;
+
+/** The run ids a park carries: a ledger run, an execution, or a graph run. */
+const RUN_ID_RES = [CANONICAL_RUN_ID_RE, EXECUTION_RUN_ID_RE, GRAPH_RUN_ID_RE] as const;
+
+/** Whether a request's id is one the store mints, and its time one: only those become items. */
+export function isApprovalRecord(record: Pick<PendingApproval, "id" | "createdAt">): boolean {
+  return (
+    typeof record.id === "string" &&
+    APPROVAL_ID_RE.test(record.id) &&
+    timeOf(record.createdAt) !== undefined
+  );
 }
 
 /**
- * The parts of a request the inbox keeps: ids, names, classes and times. A digest outside
- * its grammar and a fallback outside its closed list are left out.
+ * The parts of a request the inbox keeps: ids, names, classes and times. A tool name, an
+ * id or a digest outside its grammar, a time that is not one, and a fallback, a door or a
+ * mark outside its closed list are left out (an unlisted door reads `unknown`).
  */
 export function approvalFactOf(record: PendingApproval): ApprovalFact {
   const r = record as unknown as Readonly<Record<string, unknown>>;
-  const pick = (name: string) => (str(r[name]) === undefined ? {} : { [name]: r[name] });
+  const time = (name: string) => (timeOf(r[name]) === undefined ? {} : { [name]: r[name] });
   const token = (name: string) =>
     typeof r[name] === "string" && DIGEST_RE.test(r[name] as string) ? { [name]: r[name] } : {};
+  const runId = str(r["runId"]);
+  const sessionId = str(r["sessionId"]);
+  const via = viaOf(r["decidedVia"]);
   return {
     id: record.id,
     kind: r["kind"] === "input" ? "input" : "tool",
-    toolName: record.toolName,
+    ...(typeof r["toolName"] === "string" && TOOL_NAME_RE.test(r["toolName"])
+      ? { toolName: r["toolName"] }
+      : {}),
     createdAt: record.createdAt,
-    runId: record.runId,
-    sessionId: record.sessionId,
+    ...(runId !== undefined && RUN_ID_RES.some((re) => re.test(runId)) ? { runId } : {}),
+    ...(sessionId !== undefined && SESSION_ID_RE.test(sessionId) ? { sessionId } : {}),
     ...token("askDigest"),
     ...(record.requiredClass !== undefined ? { requiredClass: classOf(record.requiredClass) } : {}),
-    ...pick("expiresAt"),
-    ...pick("deferredUntil"),
+    ...time("expiresAt"),
+    ...time("deferredUntil"),
     ...((IF_UNANSWERED as readonly unknown[]).includes(r["ifUnanswered"])
       ? { ifUnanswered: r["ifUnanswered"] }
       : {}),
@@ -89,14 +118,22 @@ export function approvalFactOf(record: PendingApproval): ApprovalFact {
     ...(record.decision === "grant" || record.decision === "deny"
       ? { decision: record.decision }
       : {}),
-    ...pick("decidedAt"),
-    ...pick("decidedVia"),
-    ...pick("resolvedBy"),
-    ...pick("consumedAt"),
-    ...pick("supersededBy"),
-    ...pick("expiredAt"),
-    ...pick("sensitivity"),
+    ...time("decidedAt"),
+    ...(via !== undefined ? { decidedVia: via } : {}),
+    ...(r["resolvedBy"] === "policy" || r["resolvedBy"] === "delegation"
+      ? { resolvedBy: r["resolvedBy"] }
+      : {}),
+    ...time("consumedAt"),
+    ...(str(r["supersededBy"]) !== undefined ? { supersededBy: "superseded" } : {}),
+    ...time("expiredAt"),
+    ...(r["sensitivity"] === "people" ? { sensitivity: "people" } : {}),
   } as ApprovalFact;
+}
+
+/** A kept fact held to the grammars a fresh read holds it to, or `undefined`. */
+export function closedApprovalFact(fact: ApprovalFact): ApprovalFact | undefined {
+  const record = fact as unknown as PendingApproval;
+  return isApprovalRecord(record) ? approvalFactOf(record) : undefined;
 }
 
 /**
@@ -182,41 +219,23 @@ function stateOf(fact: ApprovalFact, now: number) {
   );
 }
 
-/** The command that answers one request: the approvals area's own template. */
-const APPROVALS_CHOICE = { argv: ["approvals", "{choice}", "{appr}", "--dir", "{dir}"] } as const;
-
-/** Said where a request's id or folder fits no command. */
-const UNRECOGNISED = "This request's id or folder fits no command; decide it in Home.";
-
+/**
+ * What may be done about a request: allow or refuse it, and for one request alone, allow
+ * it from now on (an owner's narrow rule) or allow it once and ask the owner for that. A
+ * question is answered, never allowed or refused.
+ */
 function choicesOf(
-  records: readonly ApprovalFact[],
-  dir: string,
-  relocated: boolean,
+  kind: AttentionKind,
+  att: string,
+  count: number,
   needs: DecisionClass,
 ): AttentionChoice[] {
-  const one = records.length === 1 ? records[0] : undefined;
-  return (["grant", "deny"] as const).map((choice) => {
-    if (one === undefined) {
-      return {
-        id: choice,
-        needs,
-        cliTwin: null,
-        nullReason: "Decide each request: `crewhaus approvals list`.",
-      };
-    }
-    if (relocated) {
-      return {
-        id: choice,
-        needs,
-        cliTwin: null,
-        nullReason: "This harness keeps its sessions folder elsewhere; decide it in Home.",
-      };
-    }
-    const cliTwin = twinOf(APPROVALS_CHOICE, { choice, appr: one.id, dir });
-    return cliTwin !== undefined && dirFits(dir)
-      ? { id: choice, needs, cliTwin }
-      : { id: choice, needs, cliTwin: null, nullReason: UNRECOGNISED };
-  });
+  if (kind === "question") return [];
+  const ids =
+    count === 1
+      ? (["grant", "deny", "grant-always", "grant-propose"] as const)
+      : (["grant", "deny"] as const);
+  return ids.map((id) => decideChoice(att, id, id === "grant-always" ? "owner" : needs));
 }
 
 /**
@@ -274,7 +293,11 @@ export function approvalItems(
       (cls, fact) => higherClass(cls, classOf(fact.requiredClass)),
       "operator",
     );
-    const runs = [...new Set([...shown].reverse().map((fact) => fact.runId))];
+    const runs = [
+      ...new Set(
+        [...shown].reverse().flatMap((fact) => (fact.runId === undefined ? [] : [fact.runId])),
+      ),
+    ];
     const askDigest = first.askDigest;
     const refused = askDigest === undefined ? undefined : refusedAt.get(askDigest);
     const asked = askDigest === undefined ? 1 : sorted.length;
@@ -291,6 +314,12 @@ export function approvalItems(
         : ttl !== undefined && open
           ? { at: isoOf(ttl), source: "ttl" as const }
           : undefined;
+    const deferredUntil = open
+      ? shown
+          .map((fact) => fact.deferredUntil)
+          .filter((at): at is string => (msOf(at) ?? 0) > now)
+          .sort((a, b) => (msOf(a) ?? 0) - (msOf(b) ?? 0))[0]
+      : undefined;
     const fallback = shown.find((fact) => fact.ifUnanswered !== undefined)?.ifUnanswered;
     const binding = shown.length === 1 ? first.bindingDigest : undefined;
     // An ask about people carries the mark Home's exit withholds such items by.
@@ -311,7 +340,7 @@ export function approvalItems(
         source: { kind: "approval", id: shown.length === 1 ? first.id : (askDigest ?? first.id) },
         title: {
           template: kind === "question" ? "question.ask" : "permission.ask",
-          params: { tool: first.toolName },
+          params: first.toolName !== undefined ? { tool: first.toolName } : {},
         },
         whyNow:
           asked > 1 || refused !== undefined
@@ -322,14 +351,16 @@ export function approvalItems(
         evidence: shown.map((fact) => ({
           kind: "decision",
           ref: `${harness}/decision/${fact.id}`,
-          label: fact.toolName,
+          label: fact.toolName ?? "tool",
         })),
         revision: sorted.map((fact) => ({
           id: fact.id,
           state: stateOf(fact, now).state,
         })),
-        choices: open ? choicesOf(shown, ctx.dir, section.relocated === true, needs) : [],
-        ...(open && refused !== undefined && needs !== "owner"
+        choices: open
+          ? choicesOf(kind, attIdOf(harness, kind, approvalKeyOf(first)), shown.length, needs)
+          : [],
+        ...(open && kind === "permission" && refused !== undefined && needs !== "owner"
           ? {
               recommendation: {
                 choiceId: "deny",
@@ -342,7 +373,15 @@ export function approvalItems(
           ? { ifUnanswered: { template: `if-unanswered.${fallback}` } }
           : {}),
         requiredClass: needs,
-        state: open ? "open" : (settled?.state ?? "expired"),
+        // Put off: its own deadline moved with it, so it stays in the list.
+        ...(deferredUntil !== undefined
+          ? { deferral: { until: deferredUntil, deadlineMoved: true } }
+          : {}),
+        state: open
+          ? deferredUntil !== undefined
+            ? "deferred"
+            : "open"
+          : (settled?.state ?? "expired"),
         ...(settled?.resolution !== undefined ? { resolution: settled.resolution } : {}),
         ...(binding !== undefined ? { binding: { digestPrefix: binding.slice(0, 12) } } : {}),
         ...(people ? { sensitivity: "people" as const } : {}),

@@ -76,6 +76,8 @@ export type ControlPaths = {
   readonly knowledgeBackendsFile: string;
   /** What was erased from the knowledge stores, in size segments: counts, never content. */
   readonly knowledgeErasuresDir: string;
+  /** What people did about inbox items, in size segments: content-free. */
+  readonly attentionDir: string;
 };
 
 /**
@@ -113,6 +115,7 @@ export function controlPaths(harnessDir: string): ControlPaths {
     knowledgeUsageDir: join(knowledgeDir, "usage"),
     knowledgeBackendsFile: join(knowledgeDir, "backends.jsonl"),
     knowledgeErasuresDir: join(knowledgeDir, "erasures"),
+    attentionDir: join(controlDir, "attention"),
   };
 }
 
@@ -135,6 +138,17 @@ export function harnessLedger(
     claims: paths.claimsDir,
     ...(options.machine !== undefined ? { machine: options.machine } : {}),
   };
+}
+
+/**
+ * What people did about a harness's inbox items (assigned, put off, set aside, decided),
+ * one line each: ids, closed codes and times. It is on no machine: a line its item's
+ * lifecycle does not allow stays, is counted and is never applied.
+ *
+ * First consumers: the inbox's fold, its writers and the harness's event stream.
+ */
+export function attentionActionsLedger(harnessDir: string): Ledger {
+  return harnessLedger(harnessDir, { dir: controlPaths(harnessDir).attentionDir });
 }
 
 /**

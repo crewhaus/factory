@@ -51,7 +51,7 @@ describe("routeFor", () => {
     expect(routeFor("#/h/:id/knowledge/wiki/:slug", H)).toBe(
       `#/h/${H.id}/knowledge/wiki/getting-started`,
     );
-    expect(routeFor("#/home/needs-you?type=review")).toBe("#/home/needs-you?type=review");
+    expect(routeFor("#/home/needs-you?type=advice")).toBe("#/home/needs-you?type=advice");
   });
 
   test("refuses a template the console does not serve, and a token it cannot fill", () => {
@@ -86,8 +86,8 @@ describe("the routes", () => {
   });
 
   test("an old address is known for one, and lands where the router says", () => {
-    expect(redirectFor("#/approvals")).toBe("#/home/needs-you?type=approvals");
-    expect(templateOf("#/approvals")).toBe("#/home/needs-you?type=approvals");
+    expect(redirectFor("#/approvals")).toBe("#/home/needs-you?kind=permission");
+    expect(templateOf("#/approvals")).toBe("#/home/needs-you");
     expect(templateOf(`#/h/${H.id}/memory/wiki/x`)).toBe("#/h/:id/knowledge/wiki/:slug");
     expect(templateOf("#/nope")).toBeNull();
   });

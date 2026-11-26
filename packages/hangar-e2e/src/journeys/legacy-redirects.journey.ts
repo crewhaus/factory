@@ -16,8 +16,8 @@ type Case = { readonly from: string; readonly to: string; readonly page: string 
 /** The fleet screens: the old address, where it lands, and the page's name. */
 const FLEET: readonly Case[] = [
   { from: "#/runs", to: "#/home/working", page: "Working now" },
-  { from: "#/approvals", to: "#/home/needs-you?type=approvals", page: "Needs you" },
-  { from: "#/review", to: "#/home/needs-you?type=review", page: "Needs you" },
+  { from: "#/approvals", to: "#/home/needs-you?kind=permission", page: "Needs you" },
+  { from: "#/review", to: "#/home/needs-you?kind=review", page: "Needs you" },
   { from: "#/advisor", to: "#/home/needs-you?type=advice", page: "Needs you" },
   { from: "#/activity", to: "#/home/changes", page: "What changed" },
   { from: "#/health", to: "#/harnesses/health", page: "Health" },
@@ -124,9 +124,9 @@ export const legacyRedirects: Journey = {
       sessionStorage.setItem("hangar.return", "#/approvals");
     });
     await session.page.goto(`${home.url}${await signInPath(home)}`);
-    await settle(session.page, "#/home/needs-you?type=approvals");
+    await settle(session.page, "#/home/needs-you?kind=permission");
     const landed = await shown(session.page);
-    if (landed.hash !== "#/home/needs-you?type=approvals") {
+    if (landed.hash !== "#/home/needs-you?kind=permission") {
       out.push(`a remembered #/approvals landed on ${landed.hash} after signing in`);
     }
     if (landed.headings[0] !== "Needs you") {
