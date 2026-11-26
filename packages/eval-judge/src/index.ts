@@ -90,7 +90,7 @@ export {
   type Rubric,
   type RubricCriterion,
 } from "./rubric";
-export { JudgeError } from "./errors";
+export { JudgeBudgetError, type JudgeBudgetRefusal, JudgeError } from "./errors";
 export {
   buildCategoricalJudgePrompt,
   buildJudgePrompt,

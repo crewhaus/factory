@@ -703,6 +703,9 @@ function wrapWithBudgetGate(
       // The harness's budget period, when one is declared: the call reserves
       // its worst case there first, exactly as a run's model calls do.
       const reservation = `rsv_${runId}_${state.iteration}`;
+      const spendMeta = { run: runId, model: modelInfo.modelId };
+      // What the period holds for this call, once admitted (an unpriced call holds nothing).
+      let reservedMicros: number | undefined;
       if (ledger !== undefined) {
         const estimate = meter.estimate(inputChars);
         if (estimate !== undefined) {
@@ -710,9 +713,12 @@ function wrapWithBudgetGate(
             const answer = await ledger.reserve({
               id: reservation,
               usdMicros: estimate,
-              meta: { run: runId, model: modelInfo.modelId },
+              meta: spendMeta,
             });
-            if (answer.admit) break;
+            if (answer.admit) {
+              reservedMicros = estimate;
+              break;
+            }
             if (answer.on === "others") {
               await answer.settled;
               continue;
@@ -727,18 +733,25 @@ function wrapWithBudgetGate(
       try {
         mutation = await base.next(state);
       } catch (err) {
-        await ledger?.release(reservation);
+        // A call that failed is counted at its reserved worst case; one that
+        // reserved nothing (unpriced) is an unknown call.
+        await ledger?.settle({
+          id: reservation,
+          usdMicros: reservedMicros ?? null,
+          meta: spendMeta,
+        });
         throw err;
       }
       if (mutation.usage === undefined) {
-        await ledger?.release(reservation);
+        // It answered without usage: its cost is unknown, never $0.
+        await ledger?.settle({ id: reservation, usdMicros: null, meta: spendMeta });
         return mutation;
       }
       const micros = meter.record(state.iteration, mutation.usage);
       await ledger?.settle({
         id: reservation,
         usdMicros: micros ?? null,
-        meta: { run: runId, model: modelInfo.modelId },
+        meta: spendMeta,
       });
       if (traceBus !== undefined) {
         const accrual: CostAccrualEvent = {

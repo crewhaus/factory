@@ -213,7 +213,9 @@ describe("attention.list", () => {
         cliTwin: string | null;
       }[]
     )[0];
-    expect(choice?.cliTwin).toContain(`crewhaus approvals ${choice?.id} appr_00000000000000a1`);
+    const item = items.find((i) => i.kind === "permission" && i.harness === a.id) as Item;
+    const att = item.ref.slice(item.ref.lastIndexOf("/") + 1);
+    expect(choice?.cliTwin).toBe(`crewhaus inbox decide ${att} ${choice?.id}`);
   });
 
   test("after Home's projector runs, the same items come from the projection", async () => {

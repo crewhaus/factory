@@ -373,3 +373,13 @@ describe("the test-case confirmation", () => {
     expect(rule(".gated[hidden]")).toContain("display: none");
   });
 });
+
+describe("a work item's folded check log", () => {
+  test("wraps at any width and scrolls in its own box, so a long line never widens the page", () => {
+    const log = rule(".work-fold pre");
+    expect(log).toContain("white-space: pre-wrap");
+    expect(log).toContain("overflow-wrap: anywhere");
+    expect(log).toContain("overflow: auto");
+    expect(log).toContain("max-height: 16rem");
+  });
+});

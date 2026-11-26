@@ -28,7 +28,7 @@ import { readFileSync } from "node:fs";
 import { realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { lower } from "@crewhaus/compiler";
-import { createCostTracker } from "@crewhaus/cost-tracker";
+import { type DeclaredPricing, createCostTracker } from "@crewhaus/cost-tracker";
 import { CrewhausError } from "@crewhaus/errors";
 import { openEventLog } from "@crewhaus/event-log";
 import type { ParseArgsSchema, ParsedArgs } from "@crewhaus/infra-utils";
@@ -47,6 +47,7 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { DREAM_WORKFLOW_RELPATH, buildDreamWorkflowYaml } from "./ci-scaffold";
 import { scaffoldWorkflowFile } from "./flywheel";
 import { holdCliMutatingLease } from "./mutating-lease";
+import { runSpecDirOf } from "./surface-disclosure";
 
 export class DreamCliError extends CrewhausError {
   override readonly name = "DreamCliError";
@@ -83,7 +84,9 @@ const DREAM_USAGE =
  *  compiler tests use). */
 type FabricIr = {
   readonly name: string;
-  readonly agent?: { readonly model: string };
+  readonly agent?: { readonly model: string; readonly declaredPricing?: DeclaredPricing };
+  /** The harness's spending period, when the spec declares one. */
+  readonly budget?: { readonly period?: DreamBudgetPeriod };
   readonly memory?: {
     readonly enabled?: boolean;
     readonly dream?: {
@@ -134,6 +137,11 @@ function loadDreamSpec(specPath: string | undefined): {
 // the model phase (the DreamModelPhase reference implementation)
 // ---------------------------------------------------------------------------
 
+/** A declared `budget.period`, as the IR carries it. */
+type DreamBudgetPeriod = NonNullable<
+  NonNullable<Parameters<typeof runChatLoop>[0]["budget"]>["period"]
+>;
+
 /** The exact runChatLoop option subset the dream session uses — a dedicated
  *  type so tests can inject a capturing `chatLoop` and pin every field. */
 export type DreamChatLoopOptions = {
@@ -150,7 +158,13 @@ export type DreamChatLoopOptions = {
   readonly budget: {
     readonly usdMicros: number;
     readonly onExceed: { readonly kind: "stop" };
+    /** The harness's period: the session's calls reserve on its ledger. */
+    readonly period?: DreamBudgetPeriod;
   };
+  /** The spec's directory, where the period's ledger lives (only with a period). */
+  readonly spendLedgerRoot?: string;
+  /** The spec's declared prices (only with a period), so a model priced there reserves. */
+  readonly declaredPricing?: DeclaredPricing;
   readonly spinner: false;
 };
 
@@ -169,6 +183,10 @@ export function buildDreamModelPhase(opts: {
   readonly fragment: MemoryWiringFragment;
   readonly cwd: string;
   readonly chatLoop?: DreamChatLoopFn;
+  /** The harness's spending period, the spec's directory its ledger lives in, and its declared prices. */
+  readonly period?: DreamBudgetPeriod;
+  readonly spendLedgerRoot?: string;
+  readonly declaredPricing?: DeclaredPricing;
 }): DreamModelPhase {
   const chatLoop: DreamChatLoopFn = opts.chatLoop ?? runChatLoop;
   return {
@@ -200,7 +218,14 @@ export function buildDreamModelPhase(opts: {
           budget: {
             usdMicros: Math.round(input.budgetUsd * 1_000_000),
             onExceed: { kind: "stop" },
+            ...(opts.period !== undefined ? { period: opts.period } : {}),
           },
+          ...(opts.period !== undefined && opts.spendLedgerRoot !== undefined
+            ? { spendLedgerRoot: opts.spendLedgerRoot }
+            : {}),
+          ...(opts.period !== undefined && opts.declaredPricing !== undefined
+            ? { declaredPricing: opts.declaredPricing }
+            : {}),
           spinner: false,
         });
         return {
@@ -212,6 +237,33 @@ export function buildDreamModelPhase(opts: {
         tracker.unsubscribe();
       }
     },
+  };
+}
+
+/**
+ * The harness's period for the dream session: the period the lowered spec
+ * declares, the spec's real directory its ledger lives in, and the spec's
+ * declared prices (so a model priced only there reserves on the period too);
+ * `{}` when the spec declares no period, so the session's options carry none.
+ */
+export function dreamSpendOf(
+  ir: {
+    readonly agent?: { readonly declaredPricing?: DeclaredPricing };
+    readonly budget?: { readonly period?: DreamBudgetPeriod };
+  },
+  absSpec: string,
+): {
+  readonly period?: DreamBudgetPeriod;
+  readonly spendLedgerRoot?: string;
+  readonly declaredPricing?: DeclaredPricing;
+} {
+  const period = ir.budget?.period;
+  if (period === undefined) return {};
+  const declared = ir.agent?.declaredPricing;
+  return {
+    period,
+    spendLedgerRoot: runSpecDirOf(absSpec),
+    ...(declared !== undefined ? { declaredPricing: declared } : {}),
   };
 }
 
@@ -323,7 +375,13 @@ async function runVerb(args: ParsedArgs): Promise<void> {
   const model = ir.agent?.model;
   const modelPhase =
     model !== undefined
-      ? buildDreamModelPhase({ model, specName: ir.name, fragment, cwd })
+      ? buildDreamModelPhase({
+          model,
+          specName: ir.name,
+          fragment,
+          cwd,
+          ...dreamSpendOf(ir, absSpec),
+        })
       : undefined;
 
   const sessionRootDir = join(cwd, ".crewhaus", "sessions");

@@ -110,8 +110,8 @@ export const LEGACY_GLOBAL_VIEWS = Object.freeze([
 export const LEGACY_ROUTES = Object.freeze(
   [
     ["#/runs", "#/home/working"],
-    ["#/approvals", "#/home/needs-you?type=approvals"],
-    ["#/review", "#/home/needs-you?type=review"],
+    ["#/approvals", "#/home/needs-you?kind=permission"],
+    ["#/review", "#/home/needs-you?kind=review"],
     ["#/advisor", "#/home/needs-you?type=advice"],
     ["#/activity", "#/home/changes"],
     ["#/health", "#/harnesses/health"],

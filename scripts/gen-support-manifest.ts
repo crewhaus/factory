@@ -17,7 +17,8 @@
  *      safety setting the edge allow-list (`CF_WORKER_ENFORCED_KEYS`) says the
  *      worker meets by how it runs (one tool call at a time, every ask
  *      refused), so its build is the same with or without it;
- *   5. otherwise `authoring` for an authoring probe, `wired` via `toolchain`
+ *   5. otherwise `authoring` for an authoring probe (one that names this variant in its
+ *      `effectiveOn` is judged as a runtime setting instead), `wired` via `toolchain`
  *      for a toolchain probe, and for any other probe the generator FAILS: the
  *      setting changes nothing and says nothing.
  * An authoring probe that changes a byte or warns fails too. The cli, workflow
@@ -413,7 +414,7 @@ export function deriveCell(
   );
   const interpreter =
     baseline.interpreter !== undefined && baseline.interpreter !== probed.interpreter;
-  if (probe.kind === "authoring") {
+  if (probe.kind === "authoring" && probe.effectiveOn?.includes(variant) !== true) {
     if (changed || interpreter || added.length > 0) {
       throw new Error(
         `${probe.feature} on ${variant} is an authoring probe but changes the build${
@@ -553,7 +554,7 @@ export function placementFor(
   shape: string,
   variant: string = shape,
 ): ProbePlacement {
-  const placed = probe.place?.(shape);
+  const placed = probe.place?.(shape, variant);
   if (placed !== undefined) return placed;
   const edge = variant.endsWith("@cf-worker") ? probe.edge : undefined;
   const snippet = edge?.snippet ?? probe.snippet;

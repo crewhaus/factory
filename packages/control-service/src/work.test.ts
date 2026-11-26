@@ -21,7 +21,7 @@ import { openWorkStore, workLedger } from "@crewhaus/tool-work/work-items";
 // runtime-core's package entry exports no test seam; this is the module the loop loads.
 import { _resetRunLedgerForTest } from "../../runtime-core/src/run-ledger";
 import { AREA_RUNTIMES, compositionProblems } from "./areas";
-import { RUNTIME_RUNTIME, WORK_RECONCILERS } from "./areas/runtime";
+import { RUNTIME_RUNTIME, WORK_RECONCILERS, WORK_UNSUPERVISED } from "./areas/runtime";
 import { type RunHome, runAdapterFor } from "./runs";
 import { NOW, type Rig, removeTempDirs, rig, rowsOf } from "./test-helpers";
 import { type WorkCaller, type WorkHead, type WorkPlan, workCommands, workRefOf } from "./work";
@@ -245,6 +245,9 @@ describe("each work command writes one receipt and one line naming it", () => {
     expect(compositionProblems(AREA_RUNTIMES)).toEqual([]);
     expect(AREA_RUNTIMES).toContain(RUNTIME_RUNTIME);
     expect(RUNTIME_RUNTIME.unsupervised).not.toContain("work.start");
+    // The records-only kinds, and work.publish, which acts on the code host from Home's own
+    // process: no daemon takes part in any of them.
+    expect(WORK_UNSUPERVISED).not.toContain("work.publish");
     expect(
       [...(RUNTIME_RUNTIME.unsupervised ?? [])].filter((kind) => kind.startsWith("work.")).sort(),
     ).toEqual(
@@ -254,6 +257,7 @@ describe("each work command writes one receipt and one line naming it", () => {
         "work.cancel",
         "work.create",
         "work.decline",
+        "work.publish",
         "work.rank",
         "work.reopen",
         "work.update",

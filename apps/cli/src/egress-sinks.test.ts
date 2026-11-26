@@ -211,6 +211,12 @@ describe("which builtins are dynamic sinks", () => {
     WorkflowRunLogs: CODE_HOST,
     WorkflowRunRerun: CODE_HOST,
     WorkflowRuns: CODE_HOST,
+    // The repository, its base and the branch come from the spec's `repositories:` block and
+    // the item; the model names only the work item. What a publish sends is checked against
+    // the run's lineage inside the tool, as a commit and a pull request's text.
+    WorkspaceOpen: "the code host and repository the spec's repositories block declares",
+    WorkspacePublish:
+      "the code host and repository the spec's repositories block declares; the change and the pull request's text are screened against the run's data lineage before they leave",
   };
 
   test("a network tool is a dynamic sink, or says where its destination comes from", () => {

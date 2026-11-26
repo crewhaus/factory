@@ -75,6 +75,7 @@ import {
   readActionDecisions,
   readApproverProjection,
   readChangeAdoptions,
+  readDigestKey,
   readProposals,
   storedLocalActor,
 } from "@crewhaus/control-records";
@@ -464,6 +465,14 @@ export type Decisions = {
   principalOf(actor: DecisionActor, harnessDir?: string): ApprovalPrincipal;
   /** The stored actor a record in the harness names for this actor. */
   storedActorOf(harnessDir: string, actor: DecisionActor): Promise<string>;
+  /**
+   * The stored actor {@link storedActorOf} answers, as a reader finds it: under the key the
+   * harness already has, and none made. `undefined` where that key is not there, so no
+   * record in the harness names this actor yet, or cannot be read.
+   *
+   * First consumer: Home's inbox, which hides from a reader what they hid from themselves.
+   */
+  readActorOf(harnessDir: string, actor: DecisionActor): Promise<string | undefined>;
 };
 
 export function createDecisions(deps: DecisionsDeps): Decisions {
@@ -521,6 +530,10 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     return accessRoot === root ? { who } : { who: {} };
   };
 
+  /** The local user who stands in for an actor no principal names. */
+  const localOf = (actor: DecisionActor): string =>
+    localActorOf(actor.kind === "local" ? actor.identity : deps.identity);
+
   /** The stored actor a rule or a request names: the principal, else a keyed digest. */
   const storedActor = async (
     harnessDir: string,
@@ -532,10 +545,7 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     if (key.state !== "present") {
       throw new Error(`control-service: the harness's digest key cannot be read: ${key.reason}`);
     }
-    return storedLocalActor(
-      key.hmac,
-      localActorOf(actor.kind === "local" ? actor.identity : deps.identity),
-    );
+    return storedLocalActor(key.hmac, localOf(actor));
   };
 
   const runRule = (
@@ -1003,6 +1013,12 @@ export function createDecisions(deps: DecisionsDeps): Decisions {
     storedActorOf: (harnessDir, actor) => {
       const on = whoOn(actor, harnessDir);
       return storedActor(harnessDir, actor, "who" in on ? on.who : {});
+    },
+    readActorOf: async (harnessDir, actor) => {
+      const on = whoOn(actor, harnessDir);
+      if ("who" in on && on.who.principal !== undefined) return on.who.principal;
+      const key = await readDigestKey(harnessDir);
+      return key.state === "present" ? storedLocalActor(key.hmac, localOf(actor)) : undefined;
     },
   };
 }

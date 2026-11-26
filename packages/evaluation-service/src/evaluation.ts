@@ -127,7 +127,7 @@ export function buildRunEvaluation(
       ...escalate,
       evaluate: reportUnmeasured(
         { graderType: "llm_judge", maxRetries: ev.maxRetries, judgeModel },
-        async ({ finalText, messages, isSynthetic, bus }) => {
+        async ({ finalText, messages, isSynthetic, bus, spend, signal }) => {
           const verdict = await gradeWithJudgePanel({
             rubric,
             sample: { id: "in-loop-evaluation", input: "" },
@@ -142,6 +142,11 @@ export function buildRunEvaluation(
             // Judge spend rides the run bus (role "judge") — every panelist and
             // every repeat publishes its own model_request / model_response.
             bus,
+            // And reserves on the run's spend meter before each call is sent; a wait
+            // for room ends on the turn's stop. A refusal throws a typed
+            // `JudgeBudgetError`, which the run treats as a refused call, not an outage.
+            ...(spend !== undefined ? { spend } : {}),
+            ...(signal !== undefined ? { signal } : {}),
           });
           return {
             score: verdict.score,

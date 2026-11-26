@@ -66,9 +66,13 @@ export function nextCursor(source: CursorSource, position: CursorPosition): stri
   });
 }
 
-/** The position a ledger list was computed at. */
+/** Where every ledger starts: the position of a list that could read none of it. */
+const LEDGER_START: CursorPosition = { seg: 0, off: 0, tail: "" };
+
+/** The position a ledger list was computed at. A list that read nothing is at the start. */
 export function snapshotCursor(source: CursorSource, positions: readonly CursorPosition[]): string {
-  return encodeCursor({ v: 1, kind: "vector", sources: { [source]: positions } });
+  const at = positions.length > 0 ? positions : [LEDGER_START];
+  return encodeCursor({ v: 1, kind: "vector", sources: { [source]: at } });
 }
 
 /** A fleet list is computed from records, not a stream: its position is the access epoch. */

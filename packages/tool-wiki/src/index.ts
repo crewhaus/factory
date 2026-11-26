@@ -103,7 +103,12 @@ import { buildRedactionNotice, classifyBoundary } from "@crewhaus/boundary-class
 import type { WikiWriteEventPayload } from "@crewhaus/event-log";
 import { type RunContext, formatAgentIdentity, tagContent } from "@crewhaus/run-context";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolExecuteContext, ToolReadRef } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolExecuteContext,
+  type ToolReadRef,
+  markReportsKnowledge,
+} from "@crewhaus/tool-catalog";
 import {
   type WikiCreatedBy,
   type WikiEmbedder,
@@ -752,6 +757,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       return lines.join("\n");
     },
   });
+  markReportsKnowledge(recall);
 
   const semanticSearch: RegisteredTool = buildTool({
     name: "wiki_semantic_search",
@@ -844,6 +850,7 @@ export function createWikiTools(opts: CreateWikiToolsOptions): WikiToolBundle {
       return `${header.join("\n")}\n\n${body}`;
     },
   });
+  markReportsKnowledge(get);
 
   const write: RegisteredTool = buildTool({
     name: "wiki_write",

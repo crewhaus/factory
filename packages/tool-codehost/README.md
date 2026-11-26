@@ -180,6 +180,21 @@ A tool that overstates its coverage is worse than one that is narrow and says so
   step list at all.
 - **No merging, no deleting, no asset uploads, no line-level review comments, no GraphQL.**
 
+## Subpaths for callers outside the tools
+
+- **`@crewhaus/tool-codehost/pulls`** — a GitHub repository's pull requests: `findPullByHead`,
+  `createPull` (a second one for the same head answers `{exists: true}`), `updatePull`, `getPull`
+  (with an `If-None-Match` validator; a 304 answers `notModified`, a rate limit `rateLimited`),
+  `pullReview` and `listBaseCommits`, each over the same request path as the tools, inside
+  `withPullsCall`, whose allow-list is one API origin. `PrCreate`, `PrUpdate` and `PrGet` send
+  their GitHub requests through it.
+- **`@crewhaus/tool-codehost/credentials`** — `CredentialProvider` and its default,
+  `tokenEnvProvider` (the variable `tool_config.codehost.token_env` names; a missing one answers
+  `credential_unavailable` naming that key, never a value), and `assertCodehostOrigin`, the SSRF
+  check for a code host origin. A loopback host, `http:` included, is admitted only when the
+  caller passes `allowLoopback` because a spec declared that host private; RFC1918, link-local and
+  CGNAT addresses are refused whatever it says. No tool sets it, and no environment variable can.
+
 ## Layout
 
 ```
@@ -189,6 +204,8 @@ src/lib/shape.ts   one record shape per concept, from two hosts' payloads
 src/lib/logs.ts    the actionable excerpt of a CI log
 src/net.ts         allow-list, SSRF gate, deadlines, capped reads, redaction
 src/api.ts         one request, one paginated listing, the base-URL rule
+src/pulls.ts       pull requests for a caller outside the tools (`./pulls`)
+src/credentials.ts the token provider and the origin check (`./credentials`)
 src/index.ts       the tools
 ```
 

@@ -34,7 +34,9 @@
  * configured embedder, never one the model picks. `Remember` and
  * `MemoryForget` never call the embedder.
  *
- * Provenance is never taken from the model. `Remember` stamps
+ * Provenance is never taken from the model. `Remember` marks each fact as
+ * the agent's (`provenance.author` `{kind: "agent", via: "remember"}`), apart
+ * from a fact auto-capture read out of a session, and stamps
  * `provenance.sessionId` from the run itself (the run context the runtime
  * hands every call), and only a well-formed `sess_<16 hex>` id. Evidence
  * toolUseIds come only from the auto-capture path (`captureFacts`), which
@@ -48,7 +50,11 @@
 import { SESSION_ID_RE } from "@crewhaus/control-contract";
 import { type MemoryStore, createMemoryStore } from "@crewhaus/memory-store";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolExecuteContext,
+  markReportsKnowledge,
+} from "@crewhaus/tool-catalog";
 import { z } from "zod";
 
 export type CreateMemoryToolsOptions = {
@@ -152,7 +158,12 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
       const sessionId = runSessionId(ctx);
       const entry = await store.remember(input.text, input.tags ?? [], {
         ...(input.ttlDays !== undefined ? { ttlMs: input.ttlDays * MS_PER_DAY } : {}),
-        ...(sessionId !== undefined ? { provenance: { sessionId } } : {}),
+        // Marked as the agent's own, apart from what auto-capture reads out
+        // of a session, beside the session it ran in when there is one.
+        provenance: {
+          ...(sessionId !== undefined ? { sessionId } : {}),
+          author: { kind: "agent", via: "remember" },
+        },
       });
       const tagSuffix = entry.tags.length > 0 ? ` [${entry.tags.join(", ")}]` : "";
       const ttlSuffix =
@@ -197,6 +208,7 @@ export function createMemoryTools(opts: CreateMemoryToolsOptions): MemoryToolBun
       return lines.join("\n");
     },
   });
+  markReportsKnowledge(recall);
 
   const forget: RegisteredTool = buildTool({
     name: "MemoryForget",

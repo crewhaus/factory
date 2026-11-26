@@ -69,7 +69,7 @@ describe("itemActionModel", () => {
       { screen: "approvals", action: { kind: "link", label: "Open approvals", cliTwin: null } },
       ID,
     );
-    expect(model.href).toBe("#/home/needs-you?type=approvals");
+    expect(model.href).toBe("#/home/needs-you?kind=permission");
   });
 
   test("no action still says so instead of rendering nothing", () => {

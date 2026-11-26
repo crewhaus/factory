@@ -102,10 +102,12 @@ server's static-asset option; a server route for `path` responds with
   cadence + its source, last outcome, and next due — or an honest "cadence
   only" naming why the phase is unknown. Wake respects `pokeable`; a
   `tick_in_flight` refusal retries, a `draining` one does not.
-- **Approvals** (`#/home/needs-you?type=approvals`) and **Review** (`?type=review`) — cross-harness
-  triage with the verbatim (masked) tool input, keyboard-first (j/k to
-  move, one key per verdict, `.` row menu, `?` bindings). Review offers
-  thumbs only where they can land on a session turn.
+- **Needs you** (`#/home/needs-you`, one kind with `?kind=<kind>`) — everything waiting on a
+  person across harnesses, with the verbatim (masked) tool input. Each choice says what it
+  does and its command; a verdict opens one confirm step (Enter confirms, Escape cancels) and
+  focus goes on to the next card. j/k move and a letter opens a verdict, inside the list and
+  with "Single-key shortcuts" on. Items are given to someone, put off, hidden, set aside and
+  discussed here; a review offers thumbs only where they can land on a session turn.
 - **What changed** (`#/home/changes`) — what changed since yesterday, grouped by
   kind with per-group filters, every row deep-linking into the screen that
   owns it.
@@ -312,7 +314,7 @@ document title names the page (`<page> — Hangar`, or `<sub-view> — <harness>
 | Address | Screen |
 |---|---|
 | `#/` | Home: what needs you, what is working now, what changed (onboarding on a first visit) |
-| `#/home/needs-you[?type=approvals\|review\|advice]` | the approvals inbox, the review queue and the fleet advice, stacked or one at a time |
+| `#/home/needs-you[?kind=<kind>]`, `#/home/needs-you?type=advice` | Home's inbox, all of it or one kind of item; the fleet advice |
 | `#/home/working`, `#/home/changes` | the supervision board; the activity digest |
 | `#/harnesses[/health\|/feedback]` | the harness list; the fleet health board; the feedback rollup |
 | `#/people` | People (not in Home yet: says so, and names `crewhaus people list`) |
@@ -354,7 +356,7 @@ meant to.
 | Old | New |
 |---|---|
 | `#/runs` | `#/home/working` |
-| `#/approvals`, `#/review`, `#/advisor` | `#/home/needs-you?type=approvals`, `…?type=review`, `…?type=advice` |
+| `#/approvals`, `#/review`, `#/advisor` | `#/home/needs-you?kind=permission`, `…?kind=review`, `…?type=advice` |
 | `#/activity` | `#/home/changes` |
 | `#/health`, `#/feedback` | `#/harnesses/health`, `#/harnesses/feedback` |
 | `#/credentials`, `#/thredz` | `#/connections/credentials`, `#/connections/thredz` |
@@ -422,15 +424,13 @@ and on a module nothing reaches.
 | `assets/js/views/settings.js` | notification rules, read-only mode, the plugin inventory |
 | `assets/js/views/panes.js` | sandboxed plugin panes |
 
-**Keyboard ownership is a reducer, not a race.** M2 shipped the inbox half of
-HM-190 (`triageKey` in `supervision.js`: j/k, one-key verdicts, `.`, `?`).
-`keys.js` adds the layer above it and decides between them: a field owns its
+**Keyboard ownership is a reducer, not a race.** The inbox's own keys (j/k, the
+verdict letters) live on its list, in `views/attention.js`. `keys.js` is the
+layer above it and decides between them: a field owns its
 keys (including ⌘K), the open omnibox lets no other shortcut fire and leaves
 Tab, Enter and Space to its own controls (so an armed action's "Run it" is
-reachable by keyboard), and `?` goes to the app sheet unless focus is inside
-an inbox list — two sheets opening on one keypress is the bug that rule
-exists to prevent. The reducer claims nothing else, so the inbox keeps
-receiving j/k/g/d untouched.
+reachable by keyboard), and `?` opens the app sheet. The reducer claims nothing
+else, so the inbox keeps receiving its own letters untouched.
 
 The field rule has exactly one exception, and the omnibox is it: the overlay
 focuses its own input, so from the moment it opens every key arrives from a

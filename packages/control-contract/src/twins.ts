@@ -1,10 +1,17 @@
 /**
  * CLI twins: the exact command that does what an operation does, from a closed
  * vocabulary, never manufactured. A template's `argv` starts at the noun; a flag
- * is a `--flag {param}` pair. `renderTwin` fills a template in and `parseTwin` maps
+ * is a `--flag {param}` pair, or a flag on its own. `renderTwin` fills a template in and `parseTwin` maps
  * a command line back to its params, so one type serves both directions.
  */
-import { ATTENTION_ID_RE } from "./areas/attention.js";
+import {
+  ATTENTION_ACT_CHOICES,
+  ATTENTION_ID_RE,
+  DISMISS_REASONS,
+  ENVIRONMENT_NAME_RE,
+  SPEC_NAME_RE,
+  SPEC_VERSION_RE,
+} from "./areas/attention.js";
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { DELEGATION_ACTIONS } from "./areas/delegation.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
@@ -12,7 +19,14 @@ import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import { BUDGET_EXTEND_REASONS } from "./areas/runtime-budget.js";
 import { CORRECTION_SCOPES, DECLINE_REASONS } from "./areas/runtime-work.js";
 import type { CliTwin } from "./areas/types.js";
-import { APPROVAL_ID_RE, CANONICAL_RUN_ID_RE, DEPLOYMENT_ID_RE, HARNESS_ID_RE } from "./ids.js";
+import {
+  APPROVAL_ID_RE,
+  CANONICAL_RUN_ID_RE,
+  DEPLOYMENT_ID_RE,
+  GRAPH_CHECKPOINT_ID_RE,
+  GRAPH_RUN_ID_RE,
+  HARNESS_ID_RE,
+} from "./ids.js";
 import { deepFreeze } from "./util.js";
 
 export type { CliTwin } from "./areas/types.js";
@@ -22,10 +36,10 @@ export const CLI_VERBS = deepFreeze({
   harness: ["list", "show"],
   daemon: ["start", "stop", "restart", "drain", "pause", "resume", "disable", "enable"],
   approvals: ["show", "grant", "deny", "supersede", "defer", "rules", "revoke"],
-  deploy: ["activate", "list"],
+  deploy: ["activate", "list", "approve"],
   access: ["members", "tokens", "revoke", "unlink"],
   commands: ["list", "show"],
-  runs: ["list", "show", "cancel"],
+  runs: ["list", "show", "cancel", "resume"],
   people: [
     "init",
     "keys",
@@ -44,7 +58,20 @@ export const CLI_VERBS = deepFreeze({
   "eval-report": ["baseline"],
   plugins: ["grants", "revoke"],
   delegations: ["list", "show", "preview", "propose", "pause", "revoke", "apply"],
-  inbox: ["list", "show", "stats"],
+  inbox: [
+    "list",
+    "show",
+    "stats",
+    "decide",
+    "assign",
+    "unassign",
+    "defer",
+    "undefer",
+    "snooze",
+    "dismiss",
+    "reopen",
+    "acknowledge",
+  ],
   work: [
     "list",
     "show",
@@ -57,7 +84,9 @@ export const CLI_VERBS = deepFreeze({
     "start",
     "adopt",
     "rank",
+    "publish",
   ],
+  workspace: ["list", "show"],
   budget: ["show", "history", "extend"],
 } as const);
 
@@ -89,6 +118,11 @@ export const CLI_VERBS = deepFreeze({
  * keys a run by; an execution's `run_<16 hex>` never fits it.
  *
  * `{att}` is an attention item's id, `att_` and 26 characters derived from what it is about.
+ * `{attChoice}` is a choice the inbox carries out, `{prn}` a member's id and
+ * `{dismissReason}` one of the reasons a person may set a problem aside for. `{grun}` is a
+ * graph run's id, `{ckpt}` the checkpoint its pause saved, and `{graphDecision}` one of the
+ * two words a command may settle that pause with. `{specName}`, `{env}` and `{version}` are a registered spec, an environment and a
+ * version of it, each a name that can never read as a flag.
  * `{wi}` and `{belowWi}` are work items' ids. `{declineReason}` is one of the reasons a
  * person may give to decline a proposal, and `{correctionScope}` how far a ranking
  * correction reaches. `{workSource}` is a source the CLI can adopt, a continuity goal
@@ -125,6 +159,15 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   "{delegationAction}": new RegExp(`^(?:${DELEGATION_ACTIONS.join("|")})$`),
   "{run}": CANONICAL_RUN_ID_RE,
   "{att}": ATTENTION_ID_RE,
+  "{attChoice}": new RegExp(`^(?:${ATTENTION_ACT_CHOICES.join("|")})$`),
+  "{prn}": /^prn_[0-9a-hjkmnp-tv-z]{26}$/,
+  "{dismissReason}": new RegExp(`^(?:${DISMISS_REASONS.join("|")})$`),
+  "{grun}": GRAPH_RUN_ID_RE,
+  "{ckpt}": GRAPH_CHECKPOINT_ID_RE,
+  "{graphDecision}": /^(?:approve|reject)$/,
+  "{specName}": SPEC_NAME_RE,
+  "{env}": ENVIRONMENT_NAME_RE,
+  "{version}": SPEC_VERSION_RE,
   "{wi}": /^wi_[0-9a-hjkmnp-tv-z]{26}$/,
   "{belowWi}": /^wi_[0-9a-hjkmnp-tv-z]{26}$/,
   "{declineReason}": new RegExp(`^(?:${DECLINE_REASONS.join("|")})$`),
@@ -183,12 +226,16 @@ export function renderTwin(twin: CliTwin, params: TwinParams): RenderedTwin {
 export function parseTwin(twin: CliTwin, argv: readonly string[]): { params: TwinParams } | null {
   const positionals: string[] = [];
   const flags = new Map<string, string>();
+  const alone = new Set<string>();
   if (!Array.isArray(twin?.argv)) return null;
   const template: readonly string[] = twin.argv;
   for (let i = 0; i < template.length; i++) {
     const token = template[i] as string;
-    if (token.startsWith("--")) {
-      flags.set(token, template[i + 1] as string);
+    const next = template[i + 1];
+    if (token.startsWith("--") && (next === undefined || next.startsWith("--"))) {
+      alone.add(token);
+    } else if (token.startsWith("--")) {
+      flags.set(token, next as string);
       i++;
     } else {
       positionals.push(token);
@@ -209,9 +256,11 @@ export function parseTwin(twin: CliTwin, argv: readonly string[]): { params: Twi
     const value = argv[i];
     if (typeof value !== "string") return null;
     if (value.startsWith("--")) {
-      const token = flags.get(value);
-      if (token === undefined || seen.has(value)) return null;
+      if (seen.has(value)) return null;
       seen.add(value);
+      if (alone.has(value)) continue;
+      const token = flags.get(value);
+      if (token === undefined) return null;
       i++;
       const flagValue = argv[i];
       if (typeof flagValue !== "string" || !take(token, flagValue)) return null;
@@ -220,6 +269,6 @@ export function parseTwin(twin: CliTwin, argv: readonly string[]): { params: Twi
       if (token === undefined || !take(token, value)) return null;
     }
   }
-  if (position !== positionals.length || seen.size !== flags.size) return null;
+  if (position !== positionals.length || seen.size !== flags.size + alone.size) return null;
   return { params };
 }

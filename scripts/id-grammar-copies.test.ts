@@ -25,7 +25,7 @@ const KNOWN_COPIES: Readonly<Record<string, number>> = {
   "apps/cli/src/sessions-tail.ts": 1,
   "apps/cli/src/watchme-report.ts": 1,
   "packages/continuity-store/src/evidence.ts": 1,
-  "packages/continuity-store/src/index.ts": 2,
+  "packages/continuity-store/src/index.ts": 1,
   "packages/data-retention-engine/src/retention-config.ts": 1,
   "packages/dream-engine/src/phase1.ts": 1,
   "packages/evaluation-service/src/wire.ts": 1,

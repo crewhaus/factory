@@ -64,7 +64,6 @@ const EXACT: Readonly<Record<string, Readonly<Record<string, RegExp>>>> = {
     "views/jobs.js": /actionTwin\("job"/,
     "views/proc.js": /actionTwin\("job"/,
   },
-  adjudicateReview: { "views/review.js": /actionTwin\(\s*"adjudicate"/ },
   pinBaseline: { "views/evals.js": /actionTwin\("baseline"/ },
   controlWake: { "views/schedulers.js": /\{ action: "wake"/ },
   pinSession: { "views/sessions.js": /NO_TWIN_NOTES\["pin-session"\]/ },
@@ -79,6 +78,7 @@ const EXACT: Readonly<Record<string, Readonly<Record<string, RegExp>>>> = {
 
 /** Noted writes no console control sends, each with why. */
 const UNSENT: Readonly<Record<string, string>> = {
+  adjudicateReview: "Needs you settles a review through the versioned API",
   setGroupsAll: "an off-map route: the console's map does not name it",
   removeGroup: "an off-map route: the console's map does not name it",
   removeScanRoot: "an off-map route: the console's map does not name it",
@@ -169,7 +169,7 @@ describe("every console write shows its equivalent", () => {
     expect(missing).toEqual([]);
     expect(unsent.sort()).toEqual(Object.keys(UNSENT).sort());
     expect(shown.filter((f) => f.shows === "note")).toHaveLength(90);
-    expect(shown.filter((f) => f.shows === "exact")).toHaveLength(13);
+    expect(shown.filter((f) => f.shows === "exact")).toHaveLength(12);
     // Every exception names a module that sends the write.
     for (const [key, byModule] of Object.entries(EXACT)) {
       for (const rel of Object.keys(byModule)) {

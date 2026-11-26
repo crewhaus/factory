@@ -7,12 +7,13 @@
  * Bad input never throws. It answers the safe way: a time that cannot be read
  * counts as passed, and a check that cannot be made refuses.
  */
+import type { DeployQuorumSubject } from "./areas/attention.js";
 import { OPERATOR_SUPERSEDE_REASONS, VERIFY_REASONS } from "./areas/core.js";
 import type { DelegableDecisionKind, DelegationSubject } from "./areas/delegation.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
 import type { Role } from "./areas/types.js";
 import type { DecisionState } from "./machines.js";
-import { parseActor, parseResumeScope } from "./refs.js";
+import { RECEIPT_VIA, parseActor, parseResumeScope } from "./refs.js";
 import { deepFreeze } from "./util.js";
 
 // ---------------------------------------------------------------------------
@@ -144,11 +145,28 @@ export type DecisionSupersedes = {
 };
 
 /** What a grant is good for: the action's places, a scope and the revisions. */
+/**
+ * Who started a run, from the door its trigger came through (`Trigger.via`): a person
+ * (Home, the CLI, Slack), a service (an SDK caller) or the system (a receiver, a
+ * resident, the runtime). A run whose trigger names no door has no starter.
+ */
+export type RunStarter = "person" | "service" | "system";
+
+/** The starter a door means; `undefined` for a trigger that names none. */
+export function starterOf(via: unknown): RunStarter | undefined {
+  if (via === "home" || via === "cli" || via === "slack") return "person";
+  if (via === "sdk") return "service";
+  if (typeof via === "string" && (RECEIPT_VIA as readonly string[]).includes(via)) return "system";
+  return undefined;
+}
+
 export type DecisionBinding = {
   readonly runId: string;
   readonly resumeScope: string;
   readonly sessionId: string;
   readonly workItem?: string;
+  /** Who started the run that parked: what a work-scoped grant is read against. */
+  readonly starter?: RunStarter;
   readonly deploymentId?: string;
   readonly specHash?: string;
   readonly placesDigest: string;
@@ -220,6 +238,7 @@ export type DecisionRecordView = {
     | "input"
     | "standing-rule-proposal"
     | "change-adoption"
+    | "deploy-quorum"
     | DelegableDecisionKind;
   /** The decider as a stored actor: `prn_`, `local:#<digest>` or `sys:`. */
   readonly decidedByPrincipal?: string;
@@ -254,10 +273,11 @@ export type DecisionRecordView = {
   /** The tool approval a proposal was made from. */
   readonly derivedFrom?: string;
   /**
-   * What the decision is bound to: a change and the digests its check saw, or (a merge
-   * or a rollout) the subject's ref and revision.
+   * What the decision is bound to: a change and the digests its check saw, (a merge or a
+   * rollout) the subject's ref and revision, or (a protected environment's quorum) one
+   * version of one spec for that environment.
    */
-  readonly subject?: ChangeAdoptionSubject | DelegationSubject;
+  readonly subject?: ChangeAdoptionSubject | DelegationSubject | DeployQuorumSubject;
 };
 
 /** A change-adoption decision's subject: content-free ids, keyed digests and a revision. */
@@ -398,6 +418,8 @@ export type VerifyConsumer = {
   readonly resumeScope: string;
   /** The parking run this one continues, when it is a continuation. */
   readonly continues?: string;
+  /** Who started this run; absent when its trigger names no door, which is not a person. */
+  readonly starter?: RunStarter;
   readonly deploymentId?: string;
   readonly specHash?: string;
   readonly resourceRevision?: string;
@@ -623,7 +645,10 @@ function verifyDelegated(
  * conversation's next message re-enters is the binding on its own: each of those
  * is a new run, and the grant was given for the work, not for one run of it. A
  * supervised job's root scope (`run:<root>`) also needs the parking run or the
- * run that continues it, so only a resume of that job spends its grant.
+ * run that continues it, so only a resume of that job spends its grant. A work
+ * item's scope (`work:<wi>`) is spent by the run that asked, the run that continues
+ * it, or a new run a person started for the item: a run a service queued, the system
+ * started, or whose trigger names no door is refused `run-mismatch`.
  */
 export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
   const { decision: record, overlays, consumer, approvers, now } = input;
@@ -660,6 +685,13 @@ export function verifyDecision(input: VerifyDecisionInput): VerifyVerdict {
       if (consumer.runId !== binding.runId && consumer.continues !== binding.runId) {
         return refuse(record, "run-mismatch");
       }
+    }
+    if (parseResumeScope(binding.resumeScope)?.kind === "work") {
+      const same =
+        isText(binding.runId) &&
+        isText(consumer.runId) &&
+        (consumer.runId === binding.runId || consumer.continues === binding.runId);
+      if (!same && consumer.starter !== "person") return refuse(record, "run-mismatch");
     }
     if (
       differs(binding.deploymentId, consumer.deploymentId) ||

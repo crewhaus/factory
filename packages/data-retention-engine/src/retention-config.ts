@@ -19,6 +19,7 @@ import { join } from "node:path";
  *   {
  *     "version": 1,
  *     "sessions": { "maxAgeDays": 30 },   // default: DEFAULT_SESSION_MAX_AGE_DAYS
+ *     "knowledge": { "usageMaxAgeDays": 396 }, // default: DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS
  *     "pins": ["sess_0123456789abcdef"],  // session ids never deleted
  *     "auditWindows": [                   // active windows defer ALL deletion
  *       {                                 // (compliance-controls evidence
@@ -45,6 +46,14 @@ export const RETENTION_CONFIG_RELPATH = ".crewhaus/retention.json";
  */
 export const DEFAULT_SESSION_MAX_AGE_DAYS = 30;
 
+/**
+ * Default `knowledge.usageMaxAgeDays`: how long the content-free usage lines
+ * (`.crewhaus/run/knowledge/usage/`) and the backend fallback markers
+ * (`.crewhaus/run/knowledge/backends.jsonl`) are kept. 13 months, so a year of
+ * use can be compared with the year before.
+ */
+export const DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS = 396;
+
 /** The `sess_<16 hex>` session-id shape shared with `@crewhaus/session-store`. */
 export const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 
@@ -66,6 +75,8 @@ export type RetentionAuditWindowConfig = {
 export type RetentionConfig = {
   /** Max session age in days before enforcement deletes it (mtime-keyed). */
   readonly sessionMaxAgeDays: number;
+  /** Max age in days of a knowledge usage line and a backend fallback marker. */
+  readonly knowledgeUsageMaxAgeDays: number;
   /** Session ids (`sess_<16 hex>`) enforcement refuses to delete. */
   readonly pins: ReadonlyArray<string>;
   /** Declared audit windows; expired entries are dropped at load. */
@@ -78,9 +89,31 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+/** `<section>.<field>`, a finite number of days above 0, or `fallback` when it is not set. */
+function maxAgeOf(
+  parsed: Record<string, unknown>,
+  path: string,
+  section: string,
+  field: string,
+  fallback: number,
+): number {
+  const value = parsed[section];
+  if (value === undefined) return fallback;
+  if (!isRecord(value)) throw new RetentionConfigError(`${path}: "${section}" must be an object`);
+  const days = value[field];
+  if (days === undefined) return fallback;
+  if (typeof days !== "number" || !Number.isFinite(days) || days <= 0) {
+    throw new RetentionConfigError(
+      `${path}: "${section}.${field}" must be a finite number > 0 (got ${JSON.stringify(days)})`,
+    );
+  }
+  return days;
+}
+
 /**
  * Load `.crewhaus/retention.json` from `rootDir`, falling back to defaults
- * (sessions at {@link DEFAULT_SESSION_MAX_AGE_DAYS}, no pins, no windows)
+ * (sessions at {@link DEFAULT_SESSION_MAX_AGE_DAYS}, knowledge usage at
+ * {@link DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS}, no pins, no windows)
  * when the file is absent. A malformed file throws `RetentionConfigError` —
  * an enforcer that half-understands its policy must not guess.
  */
@@ -96,6 +129,7 @@ export async function loadRetentionConfig(
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return {
         sessionMaxAgeDays: DEFAULT_SESSION_MAX_AGE_DAYS,
+        knowledgeUsageMaxAgeDays: DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS,
         pins: [],
         auditWindows: [],
         fromFile: false,
@@ -113,21 +147,20 @@ export async function loadRetentionConfig(
     throw new RetentionConfigError(`${path}: expected a JSON object at the root`);
   }
 
-  let sessionMaxAgeDays = DEFAULT_SESSION_MAX_AGE_DAYS;
-  if (parsed["sessions"] !== undefined) {
-    if (!isRecord(parsed["sessions"])) {
-      throw new RetentionConfigError(`${path}: "sessions" must be an object`);
-    }
-    const maxAge = parsed["sessions"]["maxAgeDays"];
-    if (maxAge !== undefined) {
-      if (typeof maxAge !== "number" || !Number.isFinite(maxAge) || maxAge <= 0) {
-        throw new RetentionConfigError(
-          `${path}: "sessions.maxAgeDays" must be a finite number > 0 (got ${JSON.stringify(maxAge)})`,
-        );
-      }
-      sessionMaxAgeDays = maxAge;
-    }
-  }
+  const sessionMaxAgeDays = maxAgeOf(
+    parsed,
+    path,
+    "sessions",
+    "maxAgeDays",
+    DEFAULT_SESSION_MAX_AGE_DAYS,
+  );
+  const knowledgeUsageMaxAgeDays = maxAgeOf(
+    parsed,
+    path,
+    "knowledge",
+    "usageMaxAgeDays",
+    DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS,
+  );
 
   const pins: string[] = [];
   if (parsed["pins"] !== undefined) {
@@ -180,5 +213,5 @@ export async function loadRetentionConfig(
     }
   }
 
-  return { sessionMaxAgeDays, pins, auditWindows, fromFile: true };
+  return { sessionMaxAgeDays, knowledgeUsageMaxAgeDays, pins, auditWindows, fromFile: true };
 }

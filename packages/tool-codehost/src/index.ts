@@ -111,6 +111,7 @@ import {
   resolveCodehostConfig,
   startDeadline,
 } from "./net";
+import { fetchPull, patchPull, postPull } from "./pulls";
 
 export {
   CodehostPermissionError,
@@ -565,11 +566,13 @@ export const prGet: RegisteredTool = readTool({
       const idRefusal = checkId("number", input.number);
       if (idRefusal !== null) return idRefusal;
 
-      const path =
+      const res =
         c.host === "github"
-          ? `${target.path}/pulls/${input.number}`
-          : `${target.path}/merge_requests/${input.number}`;
-      const res = await apiRequest(c, { method: "GET", path });
+          ? await fetchPull(c, target.path, input.number)
+          : await apiRequest(c, {
+              method: "GET",
+              path: `${target.path}/merge_requests/${input.number}`,
+            });
       const problem = bodyProblem(res, c.maxBytes);
       if (problem !== null) return problem;
       const raw = asRec(res.json);
@@ -1764,17 +1767,17 @@ export const prCreate: RegisteredTool = writeTool({
       }
       const res =
         c.host === "github"
-          ? await apiRequest(c, {
-              method: "POST",
-              path: `${target.path}/pulls`,
-              body: compact({
+          ? await postPull(
+              c,
+              target.path,
+              compact({
                 title: input.title,
                 head: input.sourceBranch,
                 base: input.targetBranch,
                 body: input.body,
                 draft: input.draft ?? false,
               }),
-            })
+            )
           : await apiRequest(c, {
               method: "POST",
               path: `${target.path}/merge_requests`,
@@ -1867,11 +1870,7 @@ export const prUpdate: RegisteredTool = writeTool({
       });
       let pr: Rec | undefined;
       if (Object.keys(core).length > 0) {
-        const res = await apiRequest(c, {
-          method: "PATCH",
-          path: `${target.path}/pulls/${input.number}`,
-          body: core,
-        });
+        const res = await patchPull(c, target.path, input.number, core);
         const problem = bodyProblem(res, c.maxBytes);
         if (problem !== null) return problem;
         pr = normalizePr(c.host, res.json);

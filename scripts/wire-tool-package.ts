@@ -26,6 +26,11 @@
  *     "tools": [ { "key": "jsonQuery", "keywords": ["query json", "jsonpath"] }, ... ]
  *   }
  *
+ * A tool only some shapes carry names them (`"shapes": ["cli", "managed"]`): its row goes in
+ * the table's shape-specific section and in no category. `"actionClass"` says which kind of
+ * action it is, and `"repositorySymbol"` names the registrar that binds it from the spec's
+ * `repositories` block.
+ *
  * `--check` reports what is missing without writing, which is what CI wants.
  *
  * Idempotent: running it twice makes no second set of edits.
@@ -44,10 +49,23 @@ type ToolEntry = {
    */
   readonly export?: string;
   readonly keywords: ReadonlyArray<string>;
+  /**
+   * Only these shapes carry the tool. Such a row goes in the table's shape-specific
+   * section and in no category, so `all-<category>` never grants it.
+   */
+  readonly shapes?: ReadonlyArray<string>;
+  /** The kind of action the tool is, where its flags would answer wrongly. */
+  readonly actionClass?: string;
+  /**
+   * The registrar that binds it from the spec's `repositories` block. Such a tool takes
+   * none of its package's `tool_config` registrar.
+   */
+  readonly repositorySymbol?: string;
 };
 type Manifest = {
   readonly package: string;
-  readonly category: { readonly name: string; readonly title: string; readonly rollUp?: string };
+  /** Required unless every tool names the shapes that carry it. */
+  readonly category?: { readonly name: string; readonly title: string; readonly rollUp?: string };
   readonly tools: ReadonlyArray<ToolEntry>;
 };
 
@@ -65,6 +83,12 @@ const manifest = JSON.parse(readFileSync(manifestPath, "utf-8")) as Manifest;
 const pkgDir = manifest.package.startsWith("tool-") ? manifest.package : `tool-${manifest.package}`;
 const scope = `@crewhaus/${pkgDir}`;
 const keys = manifest.tools.map((t) => t.key);
+/** The keys a category owns: every tool but a shape-specific one. */
+const categorized = manifest.tools.filter((t) => t.shapes === undefined).map((t) => t.key);
+const category = manifest.category;
+if (category === undefined && categorized.length > 0) {
+  throw new Error(`the manifest names no category for ${categorized.join(", ")}`);
+}
 
 /**
  * A tool key must be unique across the whole monorepo.
@@ -133,66 +157,68 @@ function edit(rel: string, transform: (s: string) => string | undefined, why: st
 }
 
 // 1 — the category registry ---------------------------------------------------
-edit(
-  "packages/tool-categories/src/registry.ts",
-  (s) => {
-    // Per-KEY, like the other guards: when the category already exists, the
-    // new tools still have to be added to it. Keying on the category name
-    // alone silently dropped every tool added to an existing category.
-    const existing = new RegExp(`  ${manifest.category.name}: \\{[\\s\\S]*?\\n  \\},`).exec(s);
-    if (existing?.[0].includes("includes:")) {
-      // A category is a leaf OR a roll-up, never both. Silently doing nothing
-      // here is how tool-code's twenty tools ended up registered nowhere.
-      throw new Error(
-        `category "${manifest.category.name}" already exists as a roll-up, which cannot own tools — pick a different leaf name`,
-      );
-    }
-    if (existing !== null) {
-      const missingHere = keys.filter((k) => !existing[0].includes(`"${k}"`));
-      if (missingHere.length === 0) return undefined;
-      const insert = missingHere.map((k) => `      ${JSON.stringify(k)},`).join("\n");
-      // The tools array may be written on one line or across several; handle
-      // both rather than silently matching neither.
-      const multiline = /\n {4}\],/.test(existing[0]);
-      const grown = multiline
-        ? existing[0].replace(/(\n {4}\],)/, `\n${insert}$1`)
-        : existing[0].replace(
-            /tools: \[([^\]]*)\],/,
-            (_m, body: string) =>
-              `tools: [\n${body
-                .split(",")
-                .map((t) => t.trim())
-                .filter((t) => t.length > 0)
-                .map((t) => `      ${t},`)
-                .join("\n")}\n${insert}\n    ],`,
-          );
-      return s.replace(existing[0], grown);
-    }
-    const toolLines = keys.map((k) => `      ${JSON.stringify(k)},`).join("\n");
-    const block = [
-      `  ${manifest.category.name}: {`,
-      `    title: ${JSON.stringify(manifest.category.title)},`,
-      "    tools: [",
-      toolLines,
-      "    ],",
-      "  },",
-      "",
-    ].join("\n");
-    let out = s.replace("  // ---- roll-ups ----", `${block}\n  // ---- roll-ups ----`);
-    const rollUp = manifest.category.rollUp;
-    if (rollUp !== undefined) {
-      // Add this category to an existing roll-up's includes list.
-      const re = new RegExp(`(  ${rollUp}: \\{[\\s\\S]*?includes: \\[)([^\\]]*)(\\])`);
-      out = out.replace(re, (_m, head: string, body: string, tail: string) =>
-        body.includes(`"${manifest.category.name}"`)
-          ? `${head}${body}${tail}`
-          : `${head}${body.trimEnd().replace(/,$/, "")}, "${manifest.category.name}"${tail}`,
-      );
-    }
-    return out;
-  },
-  `category "${manifest.category.name}" with ${keys.length} tools`,
-);
+if (category !== undefined && categorized.length > 0) {
+  edit(
+    "packages/tool-categories/src/registry.ts",
+    (s) => {
+      // Per-KEY, like the other guards: when the category already exists, the
+      // new tools still have to be added to it. Keying on the category name
+      // alone silently dropped every tool added to an existing category.
+      const existing = new RegExp(`  ${category.name}: \\{[\\s\\S]*?\\n  \\},`).exec(s);
+      if (existing?.[0].includes("includes:")) {
+        // A category is a leaf OR a roll-up, never both. Silently doing nothing
+        // here is how tool-code's twenty tools ended up registered nowhere.
+        throw new Error(
+          `category "${category.name}" already exists as a roll-up, which cannot own tools — pick a different leaf name`,
+        );
+      }
+      if (existing !== null) {
+        const missingHere = categorized.filter((k) => !existing[0].includes(`"${k}"`));
+        if (missingHere.length === 0) return undefined;
+        const insert = missingHere.map((k) => `      ${JSON.stringify(k)},`).join("\n");
+        // The tools array may be written on one line or across several; handle
+        // both rather than silently matching neither.
+        const multiline = /\n {4}\],/.test(existing[0]);
+        const grown = multiline
+          ? existing[0].replace(/(\n {4}\],)/, `\n${insert}$1`)
+          : existing[0].replace(
+              /tools: \[([^\]]*)\],/,
+              (_m, body: string) =>
+                `tools: [\n${body
+                  .split(",")
+                  .map((t) => t.trim())
+                  .filter((t) => t.length > 0)
+                  .map((t) => `      ${t},`)
+                  .join("\n")}\n${insert}\n    ],`,
+            );
+        return s.replace(existing[0], grown);
+      }
+      const toolLines = categorized.map((k) => `      ${JSON.stringify(k)},`).join("\n");
+      const block = [
+        `  ${category.name}: {`,
+        `    title: ${JSON.stringify(category.title)},`,
+        "    tools: [",
+        toolLines,
+        "    ],",
+        "  },",
+        "",
+      ].join("\n");
+      let out = s.replace("  // ---- roll-ups ----", `${block}\n  // ---- roll-ups ----`);
+      const rollUp = category.rollUp;
+      if (rollUp !== undefined) {
+        // Add this category to an existing roll-up's includes list.
+        const re = new RegExp(`(  ${rollUp}: \\{[\\s\\S]*?includes: \\[)([^\\]]*)(\\])`);
+        out = out.replace(re, (_m, head: string, body: string, tail: string) =>
+          body.includes(`"${category.name}"`)
+            ? `${head}${body}${tail}`
+            : `${head}${body.trimEnd().replace(/,$/, "")}, "${category.name}"${tail}`,
+        );
+      }
+      return out;
+    },
+    `category "${category.name}" with ${categorized.length} tools`,
+  );
+}
 
 // 2 — the builtin table -----------------------------------------------------
 {
@@ -238,17 +264,26 @@ edit(
         `${scope} does not export a RegisteredTool named "${exp}" (for key "${key}")`,
       );
     }
+    const declared = manifest.tools.find((t) => t.key === key);
+    const bound = declared?.repositorySymbol;
     const parts = [
       `package: "${scope}"`,
       `export: "${exp}"`,
       `name: ${JSON.stringify(tool.name)}`,
-      ...(initSymbol !== undefined ? [`initSymbol: "${initSymbol}"`] : []),
-      ...(chainSymbol !== undefined ? [`chainSymbol: "${chainSymbol}"`] : []),
+      ...(initSymbol !== undefined && bound === undefined ? [`initSymbol: "${initSymbol}"`] : []),
+      ...(chainSymbol !== undefined && bound === undefined
+        ? [`chainSymbol: "${chainSymbol}"`]
+        : []),
+      ...(bound !== undefined ? [`repositorySymbol: "${bound}"`] : []),
+      ...(declared?.actionClass !== undefined ? [`actionClass: "${declared.actionClass}"`] : []),
       ...(tool.ioCapability === "process" || tool.ioCapability === "network"
         ? [`io: "${tool.ioCapability}"`]
         : []),
       ...(tool.requiresSandbox === true ? ["sandbox: true"] : []),
       ...(tool.requireJustification === true ? ["justify: true"] : []),
+      ...(declared?.shapes !== undefined
+        ? [`shapes: [${declared.shapes.map((shape) => `"${shape}"`).join(", ")}]`]
+        : []),
     ];
     return `  ${key}: { ${parts.join(", ")} },`;
   };
@@ -259,8 +294,18 @@ edit(
       if (absent.length === 0) return undefined;
       const anchor =
         "  // ---- scripts/wire-tool-package.ts inserts new builtins above this line ----";
-      if (!s.includes(anchor)) throw new Error("builtins.ts insertion anchor moved");
-      return s.replace(anchor, `${absent.map(rowFor).join("\n")}\n${anchor}`);
+      const shapedAnchor =
+        "  // ---- scripts/wire-tool-package.ts inserts new shape-specific builtins above this line ----";
+      let out = s;
+      for (const [at, wanted] of [
+        [anchor, absent.filter((k) => categorized.includes(k))],
+        [shapedAnchor, absent.filter((k) => !categorized.includes(k))],
+      ] as const) {
+        if (wanted.length === 0) continue;
+        if (!out.includes(at)) throw new Error("builtins.ts insertion anchor moved");
+        out = out.replace(at, `${wanted.map(rowFor).join("\n")}\n${at}`);
+      }
+      return out;
     },
     "builtin table rows",
   );

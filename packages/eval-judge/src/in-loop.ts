@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
+import type { SpendMeter } from "@crewhaus/cost-tracker/spend";
 /**
  * 0.6.0 §6.2 — the IN-LOOP judge seam: one call shape shared by every judge
  * site that is not the eval runner.
@@ -98,6 +99,10 @@ export async function gradeWithJudgePanel(
     readonly bus?: TraceEventBus;
     readonly role?: ModelRole;
     readonly stage?: string;
+    /** The run's spend meter: every judge call reserves on it before it is sent. */
+    readonly spend?: SpendMeter;
+    /** Ends a judge call's wait for room on `spend` (the turn's stop). */
+    readonly signal?: AbortSignal;
   },
 ): Promise<InLoopJudgeVerdict> {
   const calls: JudgeCallUsage[] = [];
@@ -110,6 +115,8 @@ export async function gradeWithJudgePanel(
     ...(opts.target !== undefined ? { target: opts.target } : {}),
     ...(opts.params !== undefined ? { params: opts.params } : {}),
     ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
+    ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     ...(opts.role !== undefined ? { role: opts.role } : {}),
     ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
     onCall: (usage) => {

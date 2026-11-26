@@ -160,6 +160,8 @@ const REFUSED =
 const DEFAULT_HOME = join(homedir(), ".crewhaus", "hangar");
 const DEFAULT_REGISTRY = join(homedir(), ".crewhaus", "harnesses.json");
 
+/** A steward workspace's git directory, under a binding named `app`. */
+const WORKSPACE_REPO = ".crewhaus/workspaces/app/repo";
 /** The directories and exact files a harness's gates and janitors read. */
 const GATE_DIRS = [
   ".crewhaus/approvals",
@@ -175,8 +177,10 @@ const GATE_DIRS = [
   ".crewhaus/idempotency",
   // The proposals staged for a person to adopt.
   ".crewhaus/proposals",
-  // The specs `crewhaus watchme synthesize` writes for a person to adopt.
-  ".crewhaus/watchme/synthesized",
+  // watchme's records: its judgments and the specs it synthesizes for a person to adopt.
+  ".crewhaus/watchme",
+  // A steward workspace's git directory: a root once its binding directory exists.
+  WORKSPACE_REPO,
   // The recorded ratings and the few-shot pools.
   ".crewhaus/feedback",
   ".crewhaus/fewshot",
@@ -239,6 +243,9 @@ const NEIGHBOURS = [
   ".crewhaus/proposals.md",
   ".crewhaus/slo/intake.json.bak",
   ".crewhaus/slo/other.json",
+  ".crewhaus/watchme-notes.md",
+  // A steward workspace's worktree is where the agent works.
+  ".crewhaus/workspaces/app/wt/01jabcdefg/src/a.ts",
 ];
 /** Each writer whose field keeps its store in a gate record, and that record. */
 const OWN_STORES: Readonly<Record<string, readonly string[]>> = {
@@ -911,7 +918,10 @@ describe("the tools that check their own writes refuse these roots in every mode
       [
         join(".crewhaus", "run"),
         join(".crewhaus", "settings.json"),
-        ...[...GATE_DIRS, ...GATE_FILES].map((rel) => rel.split("/").join(sep)),
+        // No binding directory here, so no workspace's git directory.
+        ...[...GATE_DIRS.filter((rel) => rel !== WORKSPACE_REPO), ...GATE_FILES].map((rel) =>
+          rel.split("/").join(sep),
+        ),
         ...ENV_FILES,
         ...START_CONFIG,
         "home",

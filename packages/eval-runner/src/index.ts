@@ -151,6 +151,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader, PerModelJudgeOverride } from "@crewhaus/eval-grader";
 import { perModelArmKey, perModelOverrideFor } from "@crewhaus/eval-grader";
 import {
+  JudgeBudgetError,
   type JudgeUsageSink,
   createJudgeGrader,
   loadCategoricalRubric,
@@ -767,6 +768,24 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
   // role the flag gives it, so a spec-declared gate graded by hand is gated
   // the same way (see registryProvabilityRoles).
   const registryRoles = await registryProvabilityRoles(compiledGraders);
+  // The harness's budget period (#516): one meter over its ledger for the whole eval,
+  // handed to every sample's loop and every judge call, so each model call the eval
+  // makes reserves and settles on the period as a run's calls do. A used-up period
+  // stops a sample's next call with the classified `crewhaus_budget` report, and a
+  // judge's call with a judge error. No period, no meter.
+  const period = ir.budget?.period;
+  const periodMeter =
+    period !== undefined
+      ? openPeriodSpendMeter({
+          period,
+          trigger: "eval",
+          ...(ir.agent.declaredPricing !== undefined
+            ? { declaredPricing: ir.agent.declaredPricing }
+            : {}),
+          ...(opts.specDir !== undefined ? { root: opts.specDir } : {}),
+        })
+      : undefined;
+  const judgeSpend = periodMeter !== undefined ? { spend: periodMeter } : {};
   const resolveEntry = (g: CompiledGrader, arm: string | undefined): GraderEntry => {
     if (g.judgeSpec) {
       // 0.6.0 §6.2 — this arm's override, already merged (file-level under
@@ -793,6 +812,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           ...(opts.judgeAdapter !== undefined ? { adapter: opts.judgeAdapter } : {}),
           // C35 — meter this grader's judge calls.
           onUsage: meterJudgeUsageFor(arm),
+          ...judgeSpend,
         });
         return { name: g.name, grader, weight };
       }
@@ -867,6 +887,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
         // report their own call, with their own model string), attributed to
         // the arm this set grades.
         onUsage: meterJudgeUsageFor(arm),
+        ...judgeSpend,
       });
       return { name: g.name, grader, weight };
     }
@@ -1138,6 +1159,7 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
       routed !== undefined && frozenScoreboard !== undefined
         ? { routed, scoreboard: frozenScoreboard, specName: ir.name }
         : undefined,
+      periodMeter,
     ));
   const invoker =
     sampleTimeoutMs !== undefined ? withSampleTimeout(baseInvoker, sampleTimeoutMs) : baseInvoker;
@@ -1434,6 +1456,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
                 gateHalted = isRunFailedError(err) && err.report.class === "provability";
                 budgetStopped = isRunFailedError(err) && err.report.class === "crewhaus_budget";
               },
+              // A judge call the budget refused: the answer stands, ungraded by that judge.
+              onGraderError: (err) => {
+                if (err instanceof JudgeBudgetError) budgetStopped = true;
+              },
             });
             // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
             // the budget cap (noise-retry attempts included — those tokens
@@ -1465,8 +1491,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           // the verdict for whatever a re-roll produces (an answer with no
           // claims passes vacuously), erasing the halt.
           if (gateHalted) return classifyFailure(first);
-          // Nor is a budget stop: the period is used up, and another attempt would
-          // only be refused again.
+          // Nor is a budget stop, the sample's or a judge's: the budget is used up,
+          // another attempt would only be refused again, and the sample's output
+          // and its other grades stand.
           if (budgetStopped) return classifyFailure(first);
           if (first.error !== undefined && taxonomy.length > 0) {
             const named = matchNamedFailure({ message: first.error }, taxonomy);
@@ -1990,6 +2017,8 @@ async function defaultInvoker(
   opts: RunEvalOptions,
   cassette: ToolCassette = { missPolicy: "error" },
   routing?: EvalRoutingWiring,
+  /** The harness's period meter (opened once per eval), handed to every sample's loop. */
+  periodMeter?: ReturnType<typeof openPeriodSpendMeter>,
 ): Promise<AgentInvoker> {
   const wired: SharedAgentDeps = await wireRunOnce(ir, {
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
@@ -2056,22 +2085,6 @@ async function defaultInvoker(
   // A pinned candidate is measured on ITS model and ITS `instructions`
   // overlay — the same expansion a `model: $<profile>` slot gets at lower
   // time, applied here because the eval pins the slot after lowering.
-  // The harness's budget period (#516): one meter over its ledger for the whole eval,
-  // handed to every sample's loop, so each model call a sample makes reserves and
-  // settles on the period as a run's calls do. A used-up period stops the sample's
-  // next call with the classified `crewhaus_budget` report. No period, no meter.
-  const period = ir.budget?.period;
-  const periodMeter =
-    period !== undefined
-      ? openPeriodSpendMeter({
-          period,
-          trigger: "eval",
-          ...(ir.agent.declaredPricing !== undefined
-            ? { declaredPricing: ir.agent.declaredPricing }
-            : {}),
-          ...(opts.specDir !== undefined ? { root: opts.specDir } : {}),
-        })
-      : undefined;
   const routedModel = routing?.routed.model ?? wired.model;
   const routedInstructions =
     routing?.routed.overlay !== undefined

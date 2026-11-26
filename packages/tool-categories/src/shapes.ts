@@ -14,11 +14,13 @@
 import { BUILTIN_TOOLS, type BuiltinToolEntry } from "./builtins";
 import {
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   type ToolConfigEnv,
   type ToolConfigInit,
   type ToolSite,
   applyToolConfig,
   planChainInits,
+  planRepositoryInits,
   planToolConfigInits,
   renderToolConfigEnvGate,
   renderToolConfigInit,
@@ -261,7 +263,8 @@ export type ToolPackageImporter = (pkg: string) => Promise<Readonly<Record<strin
  * The runtime half of the boot rule: call each registrar with its block —
  * `$VAR` references read from `env` — importing its package through
  * `importPackage`, then each chain registrar the tools need with the spec's
- * chain blocks. `crewhaus run` and `crewhaus eval` call this before wiring
+ * chain blocks, then the workspace tools' registrar with its `repositories`
+ * block, taken literally. `crewhaus run` and `crewhaus eval` call this before wiring
  * tools, so both apply exactly the registrations a compiled bundle makes.
  * Throws when two blocks for one registrar differ, when a referenced variable
  * is unset, or when a package does not export the registrar the table names.
@@ -269,7 +272,11 @@ export type ToolPackageImporter = (pkg: string) => Promise<Readonly<Record<strin
 export async function registerToolConfigs(
   sites: ReadonlyArray<ToolSite>,
   importPackage: ToolPackageImporter,
-  opts: { readonly env?: ToolConfigEnv; readonly chains?: SpecChainBlocks } = {},
+  opts: {
+    readonly env?: ToolConfigEnv;
+    readonly chains?: SpecChainBlocks;
+    readonly repositories?: SpecRepositoryBlocks;
+  } = {},
 ): Promise<ReadonlyArray<ToolConfigInit>> {
   const plan = [
     ...planToolConfigInits(sites),
@@ -277,13 +284,18 @@ export async function registerToolConfigs(
       sites.flatMap((s) => s.tools),
       opts.chains,
     ),
+    ...planRepositoryInits(sites, opts.repositories),
   ];
   for (const init of plan) {
     const registrar = (await importPackage(init.package))[init.initSymbol];
     if (typeof registrar !== "function") {
       throw new BuiltinToolError(
-        `${init.package} does not export ${init.initSymbol}, the registrar the builtin table names for ${init.where === "" ? "chains" : init.where}`,
+        `${init.package} does not export ${init.initSymbol}, the registrar the builtin table names for ${init.where === "" ? init.key : init.where}`,
       );
+    }
+    if (init.literal === true) {
+      (registrar as (config: unknown) => void)(init.config);
+      continue;
     }
     applyToolConfig(registrar as (config: never) => void, init.config, init.where, opts.env ?? {});
   }
@@ -327,15 +339,16 @@ export type ResolvedTools = {
  * resolves each role on its own, so each role checks its variables before its
  * own registrations.
  *
- * `chains` is the spec's chain blocks; a tool that reads a chain gets its
- * registrar called with them, and without them it refuses every call.
+ * `blocks` is the spec's chain blocks and its `repositories` block; a tool that reads
+ * a chain, or a workspace tool, gets its registrar called with them, and without them it
+ * refuses every call.
  * `layout.edgeImportsInSpecOrder` keeps the edge's tool imports in the order
  * the spec lists them, the layout the cf-worker cli bundle has always had.
  */
 export function resolveBuiltinTools(
   shape: ToolShape,
   sites: ReadonlyArray<ToolSite>,
-  chains?: SpecChainBlocks,
+  blocks?: SpecChainBlocks & SpecRepositoryBlocks,
   layout: { readonly edgeImportsInSpecOrder?: boolean } = {},
 ): ResolvedTools {
   const edge = SHAPE_TOOL_PROFILES[shape].runtime === "edge";
@@ -400,15 +413,17 @@ export function resolveBuiltinTools(
     ...planToolConfigInits(wiredForInit),
     ...planChainInits(
       wiredForInit.flatMap((s) => s.tools),
-      chains,
+      blocks,
     ),
+    ...planRepositoryInits(wiredForInit, blocks),
   ];
   // A daemon shape checks each variable just before the first registration
   // that reads it, so the registrations ahead of it run as they always have.
   const checks =
     SHAPE_TOOL_PROFILES[shape].daemonEntry === true ? renderToolConfigEnvGate(plan) : [];
   for (const [i, init] of plan.entries()) {
-    const ref = edge ? toolConfigEnvRefs(init.config, init.where)[0] : undefined;
+    const ref =
+      edge && init.literal !== true ? toolConfigEnvRefs(init.config, init.where)[0] : undefined;
     if (ref !== undefined) {
       throw new BuiltinToolError(
         `${ref.path} reads $${ref.name} from the environment, but a Cloudflare Worker has no environment at boot. Write the value itself, or compile without --emit-as cf-worker.`,

@@ -358,6 +358,13 @@ export const BOUNDARY_SITES: ReadonlyArray<BoundarySite> = [
     path: "packages/runtime-core/src/input-origin.ts",
     requireTag: true,
   },
+  // A graph pause's decision, classified at "api" before the paused node reads
+  // it and tagged into the run; a refused one fails the resume.
+  {
+    name: "graph-engine-resume-decision",
+    path: "packages/graph-engine/src/index.ts",
+    requireTag: true,
+  },
   // A batch job's payload, classified at "api" before the job's handler and
   // tagged into its run the same way.
   { name: "queue-consumer", path: "packages/queue-consumer/src/index.ts", requireTag: true },

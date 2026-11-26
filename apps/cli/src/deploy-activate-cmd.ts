@@ -83,7 +83,7 @@ function parse(argv: readonly string[]): Flags {
 }
 
 /** The harness a verb acts on: `--harness` (an `hrn_` id or a directory), else the cwd. */
-function resolveHarnessDir(
+export function resolveHarnessDir(
   flag: string | true | undefined,
   options: DeployActivateOptions,
 ): { readonly dir: string; readonly registryId?: string } {

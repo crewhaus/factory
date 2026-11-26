@@ -816,6 +816,30 @@ describe.if(hasPerl)("docker backend (fake CLI — no daemon)", () => {
     expect(cliCalls()[0]?.argv).not.toContain("--network=none");
   }, 20_000);
 
+  test("a working directory and a user reach docker before the image, and bad ones are refused", async () => {
+    const sandbox = createSandbox({ backend: "docker" });
+    await runExec(sandbox, {
+      image: "alpine:3.19",
+      argv: ["true"],
+      workdir: "/workspace",
+      user: "501:20",
+    });
+    const argv = [...(cliCalls()[0]?.argv ?? [])];
+    const image = argv.indexOf("alpine:3.19");
+    expect(image).toBeGreaterThan(-1);
+    expect(argv.slice(0, image).join(" ")).toContain("--workdir /workspace --user 501:20");
+    for (const bad of [
+      { workdir: "workspace" },
+      { workdir: "/a/../b" },
+      { user: "root" },
+      { user: "0" },
+    ]) {
+      await expect(
+        sandbox.exec({ image: "alpine:3.19", argv: ["true"], ...bad }),
+      ).rejects.toBeInstanceOf(SandboxError);
+    }
+  }, 20_000);
+
   test("forwards env vars and mounts (with :ro) to docker", async () => {
     const sandbox = createSandbox({ backend: "docker", mountWhitelist: ["/srv/agent"] });
     await runExec(sandbox, {

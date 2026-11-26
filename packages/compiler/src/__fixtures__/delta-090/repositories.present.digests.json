@@ -1,0 +1,26 @@
+{
+  "batch-repositories": {
+    "agent.ts": "e00b2194f9bc32cb05f4ba906009bf884ccb0e17db6fc8f1a269e59235f59fa8",
+    "README.md": "9ce5a6a6c5a93b378ff7b70514e79db9a8897878b546b1028af0564f3dd7de71"
+  },
+  "channel-repositories": {
+    "agent.ts": "bfebf6a53ea9b773c109471a198d912a498cd28950498343649a7b45eb23d603",
+    "session-router.ts": "d712670e1b9f733c5194a0bde65d6f5ca1d97e9779949a9221dd957a39a793d9",
+    "gateway.ts": "9c1ddd78ed9d5538bab1a64430931da42138c2b2bbcd07d54b7e15f3bb89e379",
+    "daemon.ts": "1b012f977f9e5f0a11dac2e97b636fc8d346c1b63848158f2073d552df20a618",
+    "README.md": "edd71ade2327596f1f8d275c0780755917d226d0ad6f91eb4333bede4b065cdc"
+  },
+  "cli-repositories": {
+    "agent.ts": "eb15ece7aa2a90adc5376aa1094bfa884d6552fa088bdc4c350ff48115686aff",
+    "README.md": "e6c14a0b3ea54df79619b5404f4c90d6d11d41c96e01a657e22417f19d223f97"
+  },
+  "managed-repositories": {
+    "agent.ts": "7a9bc2f632cbb3707153bf94be5256f002bf6a32c79ae9b82660d2e6a4fd2cc4",
+    "daemon.ts": "ee4bcbf513025fd7e0b7a4007e002f26a4906d18629c6fad19adc1c3b444cb8e",
+    "README.md": "9eb27d9be0bae230a231058dfedc558780cc24d5ca55c196cf3688f1045ac0ef"
+  },
+  "workflow-repositories": {
+    "agent.ts": "8f53570939f61741af0b7b3e3592d78ace8f1800e6a6507bc86a08c08ad554d5",
+    "README.md": "78cc38c179f4343a961b9d2f8369e8f52839e8956554968cf4b506f06135c067"
+  }
+}

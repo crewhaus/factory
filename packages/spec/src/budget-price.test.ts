@@ -362,8 +362,10 @@ describe("budget.period", () => {
 });
 
 describe("the check order", () => {
-  test("the price and period checks are appended after every older 0.9.0 check, the price-key check last", () => {
-    expect(DELTA_090_ISSUES.slice(-3)).toEqual([
+  test("the price and period checks are appended after every older 0.9.0 check, the price-key check right after them", () => {
+    const price = DELTA_090_ISSUES.indexOf(modelPriceIssues);
+    expect(price).toBeGreaterThan(0);
+    expect(DELTA_090_ISSUES.slice(price, price + 3)).toEqual([
       modelPriceIssues,
       budgetPeriodIssues,
       modelPriceKeyIssues,

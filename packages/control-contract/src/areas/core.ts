@@ -3,6 +3,7 @@
  * core declares lives here or in `../operations/`; every exported vocabulary is
  * composed from the modules, so the core and an area add entries the same way.
  */
+import { KNOWLEDGE_ID_PATTERN } from "../knowledge.js";
 import { ACCESS_OPERATIONS } from "../operations/access.js";
 import { AUTH_OPERATIONS } from "../operations/auth.js";
 import { COMMAND_OPERATIONS } from "../operations/commands.js";
@@ -126,9 +127,8 @@ export const CORE_MODULE = {
     { kind: "cmd", scope: "either", ids: [{ prefix: "cmd", grammar: ULID }] },
     { kind: "work", scope: "either", ids: [{ prefix: "wi", grammar: ULID }] },
     { kind: "connection", scope: "either", ids: [{ prefix: "con", grammar: ULID }] },
-    // The shape hangar-server accepts for one path segment, until the knowledge
-    // area registers an opaque grammar.
-    { kind: "knowledge", scope: "either", ids: [{ pattern: "[A-Za-z0-9_][A-Za-z0-9._-]{0,127}" }] },
+    // An item's id, in the codec's own grammar.
+    { kind: "knowledge", scope: "either", ids: [{ pattern: KNOWLEDGE_ID_PATTERN }] },
   ],
   eventFamilies: [
     {

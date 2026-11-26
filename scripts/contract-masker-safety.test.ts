@@ -139,7 +139,8 @@ describe("the masker is awake, and the caveat is real", () => {
   });
 
   test("a knowledge ref can spell one, which is why its ids are opaque once registered", () => {
-    const ref = `home/knowledge/${"api-keys-"}${"a".repeat(40)}`;
+    // An article named so: its slug is the store's own word, whatever it spells.
+    const ref = `home/knowledge/wiki~bot~-~${"api-keys-"}${"a".repeat(40)}`;
     expect(isRef(ref)).toBe(true);
     expect(maskDeep(ref)).not.toBe(ref);
   });

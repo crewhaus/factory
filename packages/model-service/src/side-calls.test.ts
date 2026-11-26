@@ -13,8 +13,11 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { DEFAULT_PRICING, mergeDeclaredPricing } from "@crewhaus/cost-tracker";
+import { type SpendMeter, createSpendMeter } from "@crewhaus/cost-tracker/spend";
 import type { IrModelPool } from "@crewhaus/ir";
-import { createRunContext } from "@crewhaus/run-context";
+import { type RunContext, createRunContext } from "@crewhaus/run-context";
+import { runChatLoop } from "@crewhaus/runtime-core";
 import type { ModelResponseEvent, ModelStageEvent, TraceEvent } from "@crewhaus/trace-event-bus";
 import {
   DEFAULT_SHADOW_SAMPLE_RATE,
@@ -32,6 +35,7 @@ import {
   wireModels,
   wireSideCalls,
 } from "./index";
+import { runNestedSingleTurn } from "./side-calls";
 
 const SESSION_ROOT = mkdtempSync(join(tmpdir(), "crewhaus-model-service-side-calls-"));
 beforeAll(() => {
@@ -684,5 +688,115 @@ describe("committee budget gate (§7.12)", () => {
     expect(cheap.requests).toHaveLength(1);
     expect(strong.requests).toHaveLength(1);
     expect(v?.members.map((m) => m.outcome)).toEqual(["done", "done"]);
+  });
+});
+
+/** Give `parent` a budgeted loop's spend meter, as a run that ran on it would. */
+async function meterOn(parent: RunContext, meter: SpendMeter): Promise<void> {
+  await runChatLoop({
+    model: MID,
+    instructions: "parent",
+    _adapter: textAdapter("ok"),
+    tools: [],
+    singleTurn: true,
+    seedMessages: [{ role: "user", content: "go" }],
+    installSigintHandler: false,
+    spinner: false,
+    stdout: () => {},
+    persistSession: false,
+    runContext: parent,
+    spendMeter: meter,
+  });
+}
+
+/** A meter whose views record each reserve as `<role> judge` or `<role> call`. */
+function countingReserves(meter: SpendMeter, reserves: string[]): SpendMeter {
+  return {
+    ...meter,
+    within: (ancestor) => {
+      const view = meter.within(ancestor);
+      return {
+        ...view,
+        reserve: async (id, estimate, meta) => {
+          reserves.push(`${meta?.role ?? "-"} ${id.startsWith("rsv_judge_") ? "judge" : "call"}`);
+          return view.reserve(id, estimate, meta);
+        },
+      };
+    },
+  };
+}
+
+describe("side calls on a budgeted run's spend meter", () => {
+  test("a side call's cost is priced with the run's own table, declared prices included", async () => {
+    const pricing = mergeDeclaredPricing(DEFAULT_PRICING, {
+      [MID]: { inputPer1M: 1_000, outputPer1M: 1_000 },
+    });
+    const { parent } = watch();
+    await meterOn(parent, createSpendMeter({ capMicros: 10_000_000, pricing }));
+    const result = await runNestedSingleTurn({
+      target: { modelString: MID },
+      instructions: "consult",
+      seedMessages: [{ role: "user", content: "a question" }],
+      role: "consult",
+      parent,
+      sessionTarget: "consult",
+      deps: { _consultAdapters: new Map([[MID, textAdapter("an answer")]]) },
+    });
+    // 10 in + 5 out at the declared $1000/M: 15 000 micros, not the installed table's 105.
+    expect(result.costUsd).toBe(0.015);
+  });
+
+  test("the shadow's call and its judge calls reserve on the view it was scheduled with", async () => {
+    const meter = createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING });
+    const reserves: string[] = [];
+    const counting = countingReserves(meter, reserves);
+    const { parent } = watch();
+    // The parent's loop holds a different meter: only the context's view is read.
+    await meterOn(parent, createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING }));
+    const shadow = buildShadowSideCall(
+      { ...POOL, strategy: { shadow: { candidate: MID, sampleRate: 1, gradeWith: STRONG } } },
+      {
+        _consultAdapters: new Map([[MID, textAdapter("the shadow says: queue")]]),
+        _judgeAdapter: judgeStub(selectContaining("shadow says")),
+      },
+    );
+    await shadow?.run({
+      ...ctxOf(parent),
+      spend: counting.within(undefined),
+      primaryText: "poll",
+      primaryModel: CHEAP,
+    });
+    // The shadow's own call, then both orders of the pairwise judge.
+    expect(reserves.filter((r) => r.endsWith(" call"))).toHaveLength(1);
+    expect(reserves.filter((r) => r === "judge judge")).toHaveLength(2);
+    expect(meter.snapshot()).toMatchObject({ activeReservations: 0 });
+    expect(meter.snapshot().spentMicros).toBeGreaterThan(0);
+  });
+
+  test("the committee's members and its judge reserve on the view it was started with", async () => {
+    const meter = createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING });
+    const reserves: string[] = [];
+    const { parent } = watch();
+    await meterOn(parent, createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING }));
+    const committee = buildCommitteeSideCall(
+      { ...POOL, strategy: { committee: { members: ["cheap", "strong"], judge: STRONG } } },
+      {
+        _consultAdapters: new Map([
+          [CHEAP, textAdapter("cheap answer")],
+          [STRONG, textAdapter("strong answer with because")],
+        ]),
+        _judgeAdapter: judgeStub(selectContaining("because")),
+      },
+    );
+    const before = meter.snapshot().spentMicros;
+    await committee?.run({
+      ...ctxOf(parent),
+      spend: countingReserves(meter, reserves).within(undefined),
+    });
+    // One call per member, then both orders of the judge's selection.
+    expect(reserves.filter((r) => r.endsWith(" call"))).toHaveLength(2);
+    expect(reserves.filter((r) => r === "judge judge")).toHaveLength(2);
+    expect(meter.snapshot().activeReservations).toBe(0);
+    expect(meter.snapshot().spentMicros).toBeGreaterThan(before);
   });
 });

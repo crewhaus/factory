@@ -14,10 +14,12 @@ import { DELTA_090_ISSUES, type SpecAddIssue } from "./blocks/delta-090";
 import { intentBlock } from "./blocks/intent";
 import { modelPriceBlock } from "./blocks/model-price";
 import { pluginsBlock } from "./blocks/plugins";
+import { repositoriesBlock } from "./blocks/repositories";
 import { scheduleBlockFrom } from "./blocks/schedule";
 
 export { DELTA_090_ISSUES, type SpecAddIssue };
 export { PLUGIN_ENTRY_TOOL_NAME_PATTERN } from "./blocks/plugins";
+export { REPOSITORY_DEFAULTS } from "./blocks/repositories";
 
 // SECURITY (codegen-injection backstop, #147/#148): spec/role/node/step names
 // flow verbatim into generated source across ~14 emitters — `//` and `/* */`
@@ -2960,6 +2962,7 @@ const cliSchema = z
     name: safeName,
     version: versionField,
     intent: intentBlock,
+    repositories: repositoriesBlock,
     target: z.literal("cli"),
     // 0.6.0 §4.1 — the model-profile registry (all 14 shapes).
     models: modelsBlock,
@@ -3080,6 +3083,7 @@ const workflowSchema = z
     name: safeName,
     version: versionField,
     intent: intentBlock,
+    repositories: repositoriesBlock,
     target: z.literal("workflow"),
     models: modelsBlock,
     model: z.string().min(1),
@@ -3224,6 +3228,7 @@ const channelSchema = z
     name: safeName,
     version: versionField,
     intent: intentBlock,
+    repositories: repositoriesBlock,
     target: z.literal("channel"),
     models: modelsBlock,
     agent: channelAgentSchema,
@@ -3479,6 +3484,7 @@ const managedSchema = z
     name: safeName,
     version: versionField,
     intent: intentBlock,
+    repositories: repositoriesBlock,
     target: z.literal("managed"),
     models: modelsBlock,
     agent: managedAgentSchema,
@@ -3791,6 +3797,7 @@ const batchSchema = z
     name: safeName,
     version: versionField,
     intent: intentBlock,
+    repositories: repositoriesBlock,
     target: z.literal("batch"),
     models: modelsBlock,
     agent: pooledSingleAgentWithMaxTokensSchema,
@@ -4199,6 +4206,8 @@ export type SpecWatchmeBlock = z.infer<typeof watchmeBlock>;
  *  or the strict object form, carried on cli/channel/managed/research/crew. */
 /** `intent:` — what this harness is for, in its owner's words, on every shape (#514). */
 export type SpecIntentBlock = z.infer<typeof intentBlock>;
+/** `repositories:` — where a harness may deliver work, and what a change must pass (#514). */
+export type SpecRepositoriesBlock = z.infer<typeof repositoriesBlock>;
 export type SpecProvabilityBlock = z.infer<typeof provabilityBlock>;
 /** 0.8.0 — the `provability:` object form. */
 export type SpecProvabilityObject = z.infer<typeof provabilityObject>;

@@ -1,0 +1,56 @@
+{
+  "name": "@crewhaus/knowledge-index",
+  "version": "0.8.3",
+  "type": "module",
+  "description": "One item model over everything a harness knows, a rebuildable search index, the usage fold, and the one erasure door. For Home and the CLI; never in a compiled harness.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./erasure": "./src/erasure.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/continuity-store": "workspace:*",
+    "@crewhaus/control-contract": "workspace:*",
+    "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/dataset-registry": "workspace:*",
+    "@crewhaus/eval-grader": "workspace:*",
+    "@crewhaus/harness-lifecycle": "workspace:*",
+    "@crewhaus/memory-store": "workspace:*",
+    "@crewhaus/session-store": "workspace:*",
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*",
+    "@crewhaus/tool-state": "workspace:*",
+    "@crewhaus/tool-work": "workspace:*",
+    "@crewhaus/wiki-store": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/memory-service": "workspace:*",
+    "@crewhaus/runtime-core": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/knowledge-index"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/knowledge-index#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

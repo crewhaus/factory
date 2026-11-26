@@ -105,4 +105,16 @@ export const DELTA_090_KEYS: ReadonlyArray<OwnerKey> = Object.freeze([
     reason: "a spending period is a person's decision",
     since: "0.9.0",
   } as const),
+  // Where a harness may deliver work and the bar a change must pass (#514): `checks` and
+  // `pull_requests.require` sit inside it, and an optimizer that could drop a failing check
+  // would blind its own critic.
+  Object.freeze({
+    pattern: Object.freeze(["repositories"]),
+    root: true,
+    refused: true,
+    security: true,
+    reason:
+      "which repository a harness changes and how its changes are checked is the owner's decision",
+    since: "0.9.0",
+  } as const),
 ]);
