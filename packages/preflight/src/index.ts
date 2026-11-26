@@ -101,7 +101,7 @@ export type { McpServersSpec } from "./mcp";
 export { mcpDryRunItems } from "./mcp";
 
 export type { PortChecker, PortRequest, PortStatus } from "./ports";
-export { checkPortFree, portItems } from "./ports";
+export { PORTS_NOT_CHECKED, checkPortFree, portItems } from "./ports";
 
 export type { BundleFreshness, FreshnessComparator } from "./bundle";
 export { bundleFreshnessItem, compareBundleFreshnessByMtime } from "./bundle";

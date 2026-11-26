@@ -11,16 +11,20 @@
  * Failure messages are read from the contained session root, the newest part of the logs
  * of the sessions whose runs failed with no structured cause: the sessions of the newest
  * such runs only, at most {@link FAILURE_SESSIONS_MAX} of them and
- * {@link FAILURE_READ_BYTES} in all, each file once however many names reach it, and at
- * most 200 failures clustered. Past a cap the section says `truncated`. When they cannot
+ * {@link FAILURE_READ_BYTES} read in all, each file once however many names reach it, and
+ * at most 200 failures clustered. Past a cap the section says `truncated`. When they cannot
  * be read the runs group by class alone, and the item says so.
+ *
+ * A row is a run only when its id is one the ledger's writers mint and its time is one;
+ * a failure class or a spec hash outside its grammar is left out.
  */
-import { SESSION_ID_RE, isId } from "@crewhaus/control-contract";
+import { CANONICAL_RUN_ID_RE, SESSION_ID_RE, isId } from "@crewhaus/control-contract";
+import { CHUNK_BYTES } from "@crewhaus/control-records";
 import { NON_FAILURE_CLASSES, clusterFailures } from "@crewhaus/harness-advice/failure-clusters";
 import { containedSessionRoot } from "@crewhaus/session-store";
 import { type CauseFacts, causeOf } from "../causes";
 import { digestPrefix } from "../ids";
-import { msOf } from "../items";
+import { msOf, timeOf } from "../items";
 import { type AttentionReader, READ_CAPS, SESSION_CAPS } from "../read";
 import {
   type AttentionModel,
@@ -50,26 +54,34 @@ const STRUCTURED = new Set(["auth", "billing", "rate_limit", "crewhaus_budget", 
 const str = (value: unknown): string | undefined =>
   typeof value === "string" && value !== "" ? value : undefined;
 
+/** A failure class is a lowercase word. */
+const FAILURE_CLASS_RE = /^[a-z][a-z0-9_]{0,47}$/;
+
+/** A spec's revision: `sha256:` and 64 hex, or a hex digest on its own. */
+const SPEC_HASH_RE = /^(?:sha256:)?[0-9a-f]{8,64}$/;
+
+const matching = (value: unknown, re: RegExp): string | undefined =>
+  typeof value === "string" && re.test(value) ? value : undefined;
+
 /** Fold one run-ledger line: the newest row wins, and the first session named is kept. */
 export function foldRunLine(
   state: AttentionModel,
   record: Readonly<Record<string, unknown>>,
 ): AttentionModel {
-  const id = str(record["id"]);
+  const id = matching(record["id"], CANONICAL_RUN_ID_RE);
   const runState = str(record["state"]);
-  const at = str(record["at"]);
+  const at = timeOf(record["at"]);
   if (id === undefined || runState === undefined || at === undefined) return state;
   const before = state.runs[id];
   const session = str(record["session"]) ?? before?.session;
   const deployment = str(record["deployment"]) ?? str(record["deploymentId"]) ?? before?.deployment;
-  const specHash = str(record["specHash"]) ?? before?.specHash;
+  const specHash = matching(record["specHash"], SPEC_HASH_RE) ?? before?.specHash;
+  const failureClass = matching(record["failureClass"], FAILURE_CLASS_RE);
   const next: RunFact = {
     id,
     state: runState,
     at,
-    ...(str(record["failureClass"]) !== undefined
-      ? { failureClass: record["failureClass"] as string }
-      : {}),
+    ...(failureClass !== undefined ? { failureClass } : {}),
     ...(session !== undefined && SESSION_ID_RE.test(session) ? { session } : {}),
     ...(deployment !== undefined && isId("dep", deployment) ? { deployment } : {}),
     ...(specHash !== undefined ? { specHash } : {}),
@@ -83,6 +95,19 @@ export function foldRunLine(
   }
   state.runs[id] = next;
   return state;
+}
+
+/** A kept fact held to the grammars a fresh read holds it to, or `undefined`. */
+export function closedRunFact(fact: RunFact): RunFact | undefined {
+  const { failureClass: cls, specHash: hash, ...rest } = fact;
+  if (!CANONICAL_RUN_ID_RE.test(fact.id) || timeOf(fact.at) === undefined) return undefined;
+  const failureClass = matching(cls, FAILURE_CLASS_RE);
+  const specHash = matching(hash, SPEC_HASH_RE);
+  return {
+    ...rest,
+    ...(failureClass !== undefined ? { failureClass } : {}),
+    ...(specHash !== undefined ? { specHash } : {}),
+  };
 }
 
 /**
@@ -110,12 +135,6 @@ function messageSessions(model: AttentionModel): { sessions: string[]; capped: b
     out.add(row.session as string);
   }
   return { sessions: [...out], capped };
-}
-
-/** The size a stamp records, or 0 when it records none. */
-function sizeOf(stamp: string): number {
-  const size = Number(stamp.split(":")[0]);
-  return Number.isFinite(size) && size > 0 ? size : 0;
 }
 
 /**
@@ -153,7 +172,7 @@ export function readFailuresSection(
   let truncated = capped;
   let budget = FAILURE_READ_BYTES;
   const seen = new Set<string>();
-  for (const [i, session] of sessions.entries()) {
+  for (const session of sessions) {
     const rel = `${session}.jsonl`;
     // A file reached by more than one name is read once.
     const identity = reader.identity?.(root, rel);
@@ -161,22 +180,29 @@ export function readFailuresSection(
       if (seen.has(identity)) continue;
       seen.add(identity);
     }
-    if (budget <= 0) {
+    // A backward read may take one chunk and a byte past the bytes it was given: what is
+    // handed out leaves room for that, so the reads together stay inside the budget.
+    const maxBytes = Math.min(SESSION_CAPS.maxBytes, budget - CHUNK_BYTES - 1);
+    if (maxBytes <= 0) {
       truncated = true;
       break;
     }
-    const maxBytes = Math.min(SESSION_CAPS.maxBytes, budget);
-    budget -= Math.min(sizeOf(stamps[i] ?? ""), maxBytes);
     const read = reader.tail(root, rel, { ...SESSION_CAPS, maxBytes });
-    if (read.state === "refused") unreadable = true;
+    if (read.state === "refused") {
+      unreadable = true;
+      // A read that failed part way may have taken all of it.
+      if (read.code === "io-error") budget -= maxBytes;
+    }
     if (read.state !== "read") continue;
+    // What the read took, however large the file had grown by then.
+    budget -= read.bytesRead ?? maxBytes;
     if (read.truncated && maxBytes < SESSION_CAPS.maxBytes) truncated = true;
     for (const event of read.records) {
       if (event["kind"] !== "run_failed") continue;
       const payload = (
         typeof event["payload"] === "object" && event["payload"] !== null ? event["payload"] : {}
       ) as Record<string, unknown>;
-      const cls = str(payload["class"]) ?? "unknown";
+      const cls = matching(payload["class"], FAILURE_CLASS_RE) ?? "unknown";
       if (NON_FAILURE_CLASSES.has(cls)) continue;
       records.push({
         source: "run_failed",

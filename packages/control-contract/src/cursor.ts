@@ -25,6 +25,7 @@ export const CURSOR_SOURCES = deepFreeze([
   "decisions",
   "approvals",
   "work",
+  "attention",
 ] as const);
 
 export type CursorSource = (typeof CURSOR_SOURCES)[number];

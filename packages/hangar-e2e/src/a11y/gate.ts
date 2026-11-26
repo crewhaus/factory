@@ -29,8 +29,6 @@ export async function gatedTemplates(): Promise<readonly string[]> {
 export const TOURED_TEMPLATES: readonly string[] = [
   "#/harnesses",
   "#/home/needs-you",
-  "#/home/needs-you?type=approvals",
-  "#/home/needs-you?type=review",
   "#/home/changes",
   "#/home/needs-you?type=advice",
   "#/h/:id/overview/needs-you",
@@ -51,9 +49,7 @@ export const TOURED_TEMPLATES: readonly string[] = [
  */
 export const GATE_EXPECTS: Readonly<Record<string, string>> = {
   "#/": ".home-panel .home-item a",
-  "#/home/needs-you": ".needs-you-section .inbox-card",
-  "#/home/needs-you?type=approvals": ".inbox-card",
-  "#/home/needs-you?type=review": ".inbox-card",
+  "#/home/needs-you": ".needs-you-section .inbox-card .attention-verdict",
   "#/home/needs-you?type=advice": ".adv-board-row",
   "#/home/working": "table.fleet tbody tr",
   "#/home/changes": ".activity-body .activity-row",

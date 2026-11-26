@@ -1,16 +1,15 @@
 /**
- * HM-190 — keyboard triage, at the APP level.
+ * HM-190 — the keyboard, at the APP level.
  *
- * The inbox half lives in `supervision.js` (`triageKey`: j/k movement, the
- * choose-then-Enter verdicts, the `.` row menu and the `?` inbox help) and is
- * mounted by `views/inbox.js` on the LIST, so its keys work only while the
- * list has focus (WCAG 2.1.4). This is the layer above that — ⌘K, `/`,
- * Escape, and a bindings sheet that works everywhere — and, more
- * importantly, it decides WHO owns a key when both layers want it.
+ * The inbox's own keys (j/k, the verdict letters) live in
+ * `views/attention.js`, on the LIST, so they work only while it has focus
+ * (WCAG 2.1.4). This is the layer above that — ⌘K, `/`, Escape, and a
+ * bindings sheet that works everywhere — and, more importantly, it decides
+ * WHO owns a key when both layers want it.
  *
  * The whole decision is one pure reducer, {@link globalKey}, so the answer
- * to "does `?` open the global sheet or the inbox's?" is a unit test rather
- * than an argument with a browser.
+ * to "who owns this key?" is a unit test rather than an argument with a
+ * browser.
  *
  * THE OWNERSHIP RULES, in the order they apply:
  *
@@ -40,9 +39,7 @@
  *      claimed — not here, and not in an inbox. Arrows, Enter, Escape and
  *      every button still work.
  *   6. `/` opens the command menu.
- *   7. `?` toggles the bindings sheet, except while focus is inside an inbox
- *      list, whose own help it opens instead; two sheets opening on one
- *      keypress is the bug this rule exists to prevent.
+ *   7. `?` toggles the bindings sheet.
  *
  * Nothing here touches `document`; the caller normalizes a KeyboardEvent
  * with {@link keyShape}, adds `dialogOpen`, and applies the returned effect.
@@ -56,37 +53,20 @@ export const GLOBAL_BINDINGS = [
   { keys: "Esc", does: "close the top overlay" },
 ];
 
-/** The inbox bindings, repeated in the global sheet so one overlay answers
- *  "what can I press here?" wherever it is opened. A letter only CHOOSES a
- *  verdict; Enter confirms it. */
-export const INBOX_BINDINGS = [
-  { keys: "j / ↓", does: "move down a row" },
-  { keys: "k / ↑", does: "move up a row" },
-  { keys: "g / d", does: "choose grant or deny, then Enter (approvals inbox)" },
-  { keys: "u / d / p / f", does: "choose up, down, pass or fail, then Enter (review queue)" },
-  { keys: "Enter", does: "confirm the choice, or open the row" },
-  { keys: "Esc", does: "cancel the choice" },
-  { keys: ".", does: "open the row menu" },
-  { keys: "?", does: "show the inbox's own keys" },
-];
-
-/** The Needs-you list (All): it moves between cards and nothing more. */
+/** The Needs-you list's keys, shown in the sheet. A letter opens a verdict's
+ *  confirm step; Enter there confirms it. */
 export const ATTENTION_BINDINGS = [
   { keys: "j / ↓", does: "move to the next card" },
   { keys: "k / ↑", does: "move to the previous card" },
   { keys: "Home / End", does: "move to the first or last card" },
+  { keys: "g / d", does: "choose allow or refuse, then Enter" },
+  { keys: "p / f / u", does: "choose pass, fail or good answer, then Enter (reviews)" },
+  { keys: "Esc", does: "cancel the choice" },
 ];
 
-/**
- * Which list a route puts on the page, for the sheet: `"triage"` (the
- * approvals or review inbox, whose own `?` help it opens), `"attention"`
- * (Needs you, All, which only moves between cards), or `false`. Pure.
- */
-export function inboxKindOf(route) {
-  if (route?.view !== "home" || route?.sub !== "needs-you") return false;
-  const type = route.query?.type;
-  if (type === undefined) return "attention";
-  return type === "approvals" || type === "review" ? "triage" : false;
+/** Whether a route puts the Needs-you list on the page. Pure. */
+export function inboxOn(route) {
+  return route?.view === "home" && route?.sub === "needs-you" && route.query?.type !== "advice";
 }
 
 /** Fields that own their keystrokes. */
@@ -106,9 +86,7 @@ export function isCharacterKey(key) {
 /**
  * Normalize a KeyboardEvent into the plain record the reducer takes. Pure
  * apart from reading the event; kept here so tests describe key presses as
- * data rather than constructing DOM events. `inboxFocused` is read off the
- * event, never kept in state: a re-render can remove the focused row with no
- * focusout, and only the event knows where focus is now.
+ * data rather than constructing DOM events.
  */
 export function keyShape(event) {
   const target = event?.target ?? null;
@@ -120,7 +98,6 @@ export function keyShape(event) {
     alt: event?.altKey === true,
     shift: event?.shiftKey === true,
     inField: FIELD_TAGS.has(tag) || target?.isContentEditable === true,
-    inboxFocused: typeof target?.closest === "function" && target.closest("[data-triage]") !== null,
   };
 }
 
@@ -148,7 +125,6 @@ export function globalKey(state, shape) {
     ctrl: false,
     alt: false,
     inField: false,
-    inboxFocused: false,
     dialogOpen: false,
     ...(shape ?? {}),
   };
@@ -203,9 +179,8 @@ export function globalKey(state, shape) {
     };
   }
 
-  // 7. `?` is the inbox's while focus is in an inbox list.
+  // 7. `?` toggles the bindings sheet.
   if (k.key === "?") {
-    if (k.inboxFocused) return keep;
     return { state: { ...s, sheetOpen: !s.sheetOpen }, effect: "toggle-sheet", claimed: true };
   }
 
@@ -214,20 +189,11 @@ export function globalKey(state, shape) {
 
 /**
  * Every binding the sheet shows, grouped. Pure — the overlay renders it.
- * `inboxMounted` is {@link inboxKindOf}'s answer (`true` reads as `"triage"`).
+ * `inboxMounted` is {@link inboxOn}'s answer.
  */
 export function bindingSheet(inboxMounted = false) {
-  if (inboxMounted === "attention") {
-    return [
-      { section: "Anywhere", bindings: GLOBAL_BINDINGS },
-      { section: "This list", bindings: ATTENTION_BINDINGS },
-    ];
-  }
   return [
     { section: "Anywhere", bindings: GLOBAL_BINDINGS },
-    {
-      section: inboxMounted ? "This inbox" : "Inboxes (approvals, review)",
-      bindings: INBOX_BINDINGS,
-    },
+    { section: inboxMounted ? "This list" : "Needs you", bindings: ATTENTION_BINDINGS },
   ];
 }

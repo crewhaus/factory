@@ -154,6 +154,7 @@ import {
   readHeldOutUses,
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
+import { openQuorumDecision, settleQuorumDecision } from "@crewhaus/deployment-controller/quorum";
 // Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
 // the fact-store embedder and hands it to wireMemory as `deps.embedder`,
 // which memory-service prefers over the fragment's `wiki.embedder` (the
@@ -584,6 +585,7 @@ import {
   DATASETS_SCHEMA,
   DATASET_SCHEMA,
   DEPLOY_ACTIVATE_SCHEMA,
+  DEPLOY_APPROVE_SCHEMA,
   DEPLOY_SCHEMA,
   DEV_SCHEMA,
   DISTILL_SCHEMA,
@@ -1423,6 +1425,7 @@ import {
 } from "./regression-pin";
 import { parseReplayToolsFlags } from "./replay-flags";
 import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
+import { alreadyTakenLine, localReviewActor } from "./review-actor";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -1432,6 +1435,7 @@ import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 import {
   REVIEW_KINDS,
   type ReviewKind,
+  claimReviewEntry,
   enqueueReviewEntries,
   entriesFromEvalRun,
   entriesFromQuarantine,
@@ -16266,15 +16270,24 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
     const id = args.positional[0];
     if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus review list`");
     const note = strFlag(args, "note");
-    const result = resolveReviewEntry(root, id, note ?? "resolved", new Date().toISOString());
+    const result = resolveReviewEntry(
+      root,
+      id,
+      note ?? "resolved",
+      new Date().toISOString(),
+      await localReviewActor(root),
+    );
     if (result.outcome === "not-found") {
       die(`no review item "${id}" — see \`crewhaus review list --all\``);
     }
+    if (result.outcome === "unavailable") die(`review item ${id}: ${result.reason}`);
     if (result.outcome === "already-resolved") {
       process.stdout.write(
-        `review item ${id} was already resolved${
-          result.entry.resolution !== undefined ? ` (${result.entry.resolution})` : ""
-        }\n`,
+        result.winner !== undefined
+          ? alreadyTakenLine(id, result.winner)
+          : `review item ${id} was already resolved${
+              result.entry.resolution !== undefined ? ` (${result.entry.resolution})` : ""
+            }\n`,
       );
       return;
     }
@@ -16325,6 +16338,18 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
       process.stdout.write("  → skipped (still open)\n");
       return;
     }
+    // Claimed first, so of two verdicts on one item only the first records a rating.
+    const actor = await localReviewActor(root);
+    const at = new Date().toISOString();
+    const claim = claimReviewEntry(root, item.id, {
+      at,
+      ...(actor !== undefined ? { actor } : {}),
+    });
+    if (claim.outcome === "unavailable") die(`review item ${item.id}: ${claim.reason}`);
+    if (claim.outcome === "taken") {
+      process.stdout.write(alreadyTakenLine(item.id, claim.winner));
+      return;
+    }
     // Route through the SAME capture machinery `crewhaus rate` uses, marked
     // as a B19 adjudication so the disagreement closes at the source too.
     await captureFeedback(
@@ -16335,7 +16360,9 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
       "cli",
       { thumbs: verdict as "up" | "down", adjudicate: true },
     );
-    resolveReviewEntry(root, item.id, `adjudicated: thumbs ${verdict}`, new Date().toISOString());
+    resolveReviewEntry(root, item.id, `adjudicated: thumbs ${verdict}`, at, actor, {
+      claimed: true,
+    });
     process.stdout.write(`  → resolved ${item.id} (adjudicated thumbs ${verdict})\n`);
     return;
   }
@@ -16350,7 +16377,18 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write("  → skipped (still open)\n");
     return;
   }
-  resolveReviewEntry(root, item.id, verdict, new Date().toISOString());
+  const result = resolveReviewEntry(
+    root,
+    item.id,
+    verdict,
+    new Date().toISOString(),
+    await localReviewActor(root),
+  );
+  if (result.outcome === "unavailable") die(`review item ${item.id}: ${result.reason}`);
+  if (result.outcome === "already-resolved") {
+    process.stdout.write(alreadyTakenLine(item.id, result.winner));
+    return;
+  }
   process.stdout.write(`  → resolved ${item.id} (${verdict})\n`);
 }
 
@@ -19675,6 +19713,8 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
+        "  crewhaus deploy approve <spec> --env <env> [--version <v>] [--deny]\n" +
+        "       [--harness <hrn|dir>] [--json]               answer a protected env's approval\n" +
         "  crewhaus deploy activate [<dep>] [--harness <hrn|dir>] [--environment <e>]\n" +
         "       [--no-autostart] [--json]                    make a prepared build the one this\n" +
         "                                                    harness runs (newest prepared by default)\n" +
@@ -20266,6 +20306,17 @@ async function enforceProtectedEnvGate(opts: {
   process.stdout.write(
     `[approval] ${opts.name} → ${opts.toEnv}@${opts.toVersion}: ${decision.reason}\n`,
   );
+  // The quorum is a decision in the inbox: opened when it is missing, closed when it is met.
+  const quorum = {
+    spec: opts.name,
+    environment: opts.toEnv,
+    version: opts.toVersion,
+    specHash: decisionInput.specHash,
+  };
+  const answered = decision.satisfied
+    ? settleQuorumDecision(opts.harnessRoot, quorum, { now: Date.now() })
+    : openQuorumDecision(opts.harnessRoot, quorum, { now: Date.now() });
+  await answered.catch(() => undefined);
   if (!decision.satisfied) {
     throw new ApprovalGateError(
       `${opts.verb} of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
@@ -25089,9 +25140,22 @@ switch (subcommand) {
       if (result.exitCode !== 0) process.exit(result.exitCode);
       break;
     }
+    if (action === "approve") {
+      const { deployApprove } = await import("./deploy-approve-cmd");
+      try {
+        const out = await deployApprove(parseFor(rest.slice(1), DEPLOY_APPROVE_SCHEMA));
+        const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+        for (const line of out.lines) sink.write(`${line}\n`);
+        if (out.exitCode !== 0) process.exit(out.exitCode);
+      } catch (err) {
+        if (err instanceof Error) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "promote" && action !== "rollback" && action !== "canary") {
       die(
-        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary, activate, list (got "${action}")`,
+        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary, approve, activate, list (got "${action}")`,
       );
     }
     try {

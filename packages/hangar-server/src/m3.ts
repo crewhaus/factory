@@ -102,6 +102,7 @@
  */
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import type { JobRecord } from "@crewhaus/harness-supervisor";
+import type { PortChecker } from "@crewhaus/preflight";
 import { type CallerVerdict, TAB_ONLY_MESSAGE, permissionMessage } from "./access";
 import { noteNeed } from "./command-context";
 import type { ControlClient } from "./control-client";
@@ -152,6 +153,13 @@ export type M3Context = {
    */
   readonly principal: string;
   /**
+   * This request's caller as the harness's own records store one: a member's id, or a keyed
+   * digest of the local user while no access records exist. `undefined` on a fleet-wide
+   * route, and where the harness's digest key cannot be read. Makes the key when there is
+   * none, so only a write asks.
+   */
+  readonly storedActor?: () => Promise<string | undefined>;
+  /**
    * Whether this request's caller holds `permission` on a harness (this route's when none
    * is named) or on the whole Home. The rule the choke point uses, bound to the request.
    */
@@ -190,6 +198,8 @@ export type M3Context = {
   readonly checkJob: () => void;
   /** Warning sink — an honest degradation, never a thrown 500. */
   readonly warn: (message: string) => void;
+  /** How a check a person opened looks at a port; a real bind when absent. */
+  readonly checkPort?: PortChecker;
   /** Home's own root, where its control records (plugin grants among them) live. */
   readonly hangarRoot?: string;
   /** Where installed plugins live. */

@@ -9,6 +9,12 @@
 import { createHash } from "node:crypto";
 import { decodeStrict, parseObject, readAt } from "./io";
 
+/**
+ * How much one read of a file takes: a backward read may take this much past its budget
+ * ({@link scanBack}).
+ *
+ * First consumer: the inbox's budget for reading failure logs.
+ */
 export const CHUNK_BYTES = 64 * 1024;
 /** How many bytes before an offset its `tail` covers. */
 export const TAIL_WINDOW_BYTES = 64;
@@ -177,7 +183,7 @@ export function scanBack(
   end: number,
   limits: { readonly maxRead: number; readonly maxLine: number },
   visit: (line: RawLine) => boolean,
-): { readonly outcome: BackOutcome; readonly torn: boolean } {
+): { readonly outcome: BackOutcome; readonly torn: boolean; readonly bytesRead: number } {
   const held = new LineParts(limits.maxLine);
   let pos = end;
   let bytesRead = 0;
@@ -186,12 +192,12 @@ export function scanBack(
   let foundEnd = false;
   let torn = false;
   while (pos > 0) {
-    if (bytesRead >= limits.maxRead) return { outcome: "budget", torn };
+    if (bytesRead >= limits.maxRead) return { outcome: "budget", torn, bytesRead };
     const want = Math.min(CHUNK_BYTES, pos);
     const chunk = Buffer.allocUnsafe(want);
     const got = readAt(fd, chunk, want, pos - want);
     bytesRead += got;
-    if (got < want) return { outcome: "short", torn };
+    if (got < want) return { outcome: "short", torn, bytesRead };
     pos -= want;
     let hi = want;
     if (!foundEnd) {
@@ -209,7 +215,7 @@ export function scanBack(
       held.prepend(chunk.subarray(nl + 1, hi));
       const off = pos + nl + 1;
       if (visit({ off, bytes: lineEnd - off, data: held.take() })) {
-        return { outcome: "stopped", torn };
+        return { outcome: "stopped", torn, bytesRead };
       }
       lineEnd = off;
       hi = nl;
@@ -217,7 +223,9 @@ export function scanBack(
     held.prepend(chunk.subarray(0, hi));
   }
   if (foundEnd && lineEnd > 0) {
-    if (visit({ off: 0, bytes: lineEnd, data: held.take() })) return { outcome: "stopped", torn };
+    if (visit({ off: 0, bytes: lineEnd, data: held.take() })) {
+      return { outcome: "stopped", torn, bytesRead };
+    }
   }
-  return { outcome: "start", torn };
+  return { outcome: "start", torn, bytesRead };
 }

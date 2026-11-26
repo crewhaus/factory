@@ -49,6 +49,8 @@ export type EventEnvelope = {
   readonly harness?: string;
   readonly run?: string;
   readonly work?: string;
+  /** An attention item's ref, `home/attention/att_…`. */
+  readonly attention?: string;
   readonly decision?: string;
   readonly command?: string;
   readonly deployment?: string;

@@ -255,7 +255,7 @@ const href = (id: string, section: string, sub: string, ...rest: string[]): stri
   );
 
 /** Where every pending approval is decided: Home's Needs-you page. */
-export const APPROVALS_HREF = "#/home/needs-you?type=approvals";
+export const APPROVALS_HREF = "#/home/needs-you?kind=permission";
 
 /** The env chain as the inbox fold asks of it: where the sessions folder is. */
 const OMNI_FACTS = harnessEnvFacts();
@@ -269,6 +269,9 @@ const ASK_STATE_WORDS: Readonly<Record<string, string>> = {
   expired: "expired",
   superseded: "replaced by a newer request",
 };
+/** The states in which a request still waits on a person. */
+const isWaiting = (state: string): boolean =>
+  state === "open" || state === "assigned" || state === "deferred";
 /** The harness list, where groups and tags are browsed. */
 export const HARNESSES_HREF = "#/harnesses";
 
@@ -488,7 +491,8 @@ export function buildHarnessEntries(
     if (item.sensitivity === "people") continue;
     const settled = item.resolution === undefined ? undefined : Date.parse(item.resolution.at);
     const recent = settled !== undefined && nowMs - settled <= APPROVAL_TTL_MS;
-    if (item.state !== "open" && !recent) continue;
+    // A request someone took, or put off, still waits: it is found until it is settled.
+    if (!isWaiting(item.state) && !recent) continue;
     const att = item.ref.slice(item.ref.lastIndexOf("/") + 1);
     const tool = item.title.params["tool"];
     push({

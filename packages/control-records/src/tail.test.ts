@@ -1,5 +1,5 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { _setIoTapForTest } from "./io";
 import { append } from "./ledger";
@@ -19,6 +19,9 @@ import {
 
 const CAPS = { maxLines: 100, maxBytes: 1024 * 1024 };
 
+/** A file read whole is charged its size. */
+const sizeOf = (root: string, name: string): number => statSync(join(root, name)).size;
+
 afterEach(() => {
   _setIoTapForTest(undefined);
   _setRollBytesForTest(undefined);
@@ -36,6 +39,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [],
       torn: true,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 
@@ -50,6 +54,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [{ off: first.length, bytes: "garbage\n".length, reason: "unreadable" }],
       torn: false,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 
@@ -98,6 +103,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [],
       torn: false,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 
@@ -134,7 +140,14 @@ describe("readTail", () => {
     const root = tempDir();
     plant(join(root, "log"), `${jsonLine({ n: 1 })}${jsonLine({ text: "x".repeat(100) })}`);
     const read = readTail(root, "log", { maxLines: 100, maxBytes: 20 });
-    expect(read).toEqual({ state: "read", records: [], truncated: true, gaps: [], torn: false });
+    expect(read).toEqual({
+      state: "read",
+      records: [],
+      truncated: true,
+      gaps: [],
+      torn: false,
+      bytesRead: sizeOf(root, "log"),
+    });
   });
 
   test("a read costs at most maxBytes plus one chunk, counted", () => {
@@ -154,6 +167,8 @@ describe("readTail", () => {
     expect(read.records.length).toBeGreaterThan(0);
     expect(bytes).toBeGreaterThan(0);
     expect(bytes).toBeLessThanOrEqual(maxBytes + CHUNK_BYTES);
+    // What the answer says was read is what was read.
+    expect(read.bytesRead).toBe(bytes);
   });
 
   test("a line that starts exactly at the byte window is inside it, even on a chunk boundary", () => {
@@ -214,6 +229,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [],
       torn: true,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 
@@ -226,6 +242,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [],
       torn: true,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 
@@ -238,6 +255,7 @@ describe("readTail", () => {
       truncated: true,
       gaps: [],
       torn: true,
+      bytesRead: CHUNK_BYTES,
     });
   });
 
@@ -250,6 +268,7 @@ describe("readTail", () => {
       truncated: false,
       gaps: [],
       torn: false,
+      bytesRead: sizeOf(root, "log"),
     });
   });
 

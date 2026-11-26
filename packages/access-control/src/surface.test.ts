@@ -151,6 +151,8 @@ describe("what the package exports", () => {
         "sealSecret",
         "shortCodeDigest",
         "unlinkOwn",
+        // Giving someone an inbox item: only one whose class reaches it.
+        "decideClassOf",
       ].sort(),
     );
   });

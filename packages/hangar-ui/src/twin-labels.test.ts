@@ -1,14 +1,11 @@
 /**
  * A row with several command-line equivalents names each one.
  *
- * A review row shows one equivalent per verdict, and an approval row one for
- * grant and one for deny. Each starts in the harness directory, so the words
- * that tell them apart sit late in a long line. The label beside each, and
- * the name of its copy button, say which action it mirrors.
+ * Each starts in the harness directory, so the words that tell them apart sit
+ * late in a long line. The label beside each, and the name of its copy
+ * button, say which action it mirrors.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 
 /** Just enough DOM for `el()`: nodes, attributes and text. */
 class FakeNode {
@@ -130,21 +127,6 @@ describe("a command-line equivalent's label", () => {
     expect(twin).toEqual({ label: "CLI twin", command: "crewhaus doctor", copyName: null });
     const none = control.cliTwin(null, "no verb yet", "pass");
     expect(read(none).label).toBe("pass");
-  });
-
-  test("the review and approval rows pass the verdict to every equivalent they show", () => {
-    const views = join(import.meta.dir, "..", "assets", "js", "views");
-    const review = readFileSync(join(views, "review.js"), "utf8");
-    const approvals = readFileSync(join(views, "approvals.js"), "utf8");
-    // Every actionTwin call in each row takes a third, label argument.
-    const calls = (source: string): string[] =>
-      [...source.matchAll(/actionTwin\(([\s\S]*?)\)(?=,?\s*\n)/g)].map((m) => m[1] as string);
-    expect(calls(review).length).toBe(2);
-    for (const call of calls(review)) expect(call.trimEnd()).toMatch(/verdict,?$/);
-    expect(calls(approvals)).toEqual([
-      '"grant", { id: row.id, dir: row.dir }, "Grant"',
-      '"deny", { id: row.id, dir: row.dir }, "Deny"',
-    ]);
   });
 });
 
