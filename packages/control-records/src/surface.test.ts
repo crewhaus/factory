@@ -155,6 +155,7 @@ describe("what the package exports", () => {
         "appendClaim",
         "appendDelegationLog",
         "appendPreparingRun",
+        "appendRecord",
         "claimedLog",
         "createDelegationReader",
         "delegationLogLedger",

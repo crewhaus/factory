@@ -22,10 +22,12 @@ import {
   type RunHome,
   type RunPlan,
   ensureHarnessIdentity,
+  rerunInputOf,
   runAdapterFor,
   runRefOf,
 } from "@crewhaus/control-service";
 import { createControlClient } from "@crewhaus/gateway-protocol/control-client";
+import { readHarnessEnvFiles } from "@crewhaus/harness-supervisor";
 import {
   type DaemonCommandOptions,
   controlTargetFor,
@@ -48,7 +50,9 @@ export const CLI_FAMILY = {
 
     show: { flags: { harness: "value", json: "boolean" } },
 
-    create: { flags: { "input-file": "value", admission: "value", json: "boolean" } },
+    create: {
+      flags: { "input-file": "value", from: "value", admission: "value", json: "boolean" },
+    },
 
     cancel: { flags: { harness: "value", json: "boolean" } },
 
@@ -111,7 +115,7 @@ export type RunsOutput = { readonly lines: readonly string[]; readonly exitCode:
 const USAGE = [
   "usage: crewhaus runs list [--harness <h>] [--limit n] [--json]",
   "       crewhaus runs show <run> [--harness <h>] [--json]",
-  "       crewhaus runs create <harness> --input-file <path> [--admission reject|queue] [--json]",
+  "       crewhaus runs create <harness> --input-file <path> | --from <run> [--admission reject|queue] [--json]",
   "       crewhaus runs cancel <run> [--harness <h>] [--json]",
   "       crewhaus runs resume <session|run> [--spec <path>] [--prompt <text>] [--ignore-pause] …",
   "       crewhaus runs resume <grun_…> --decision approve|reject|<words> [--checkpoint <ckpt_…>] [--harness <h>]",
@@ -119,7 +123,8 @@ const USAGE = [
   "                             --context <n>|all] [--limit n] [--before <entry>] [--harness <h>] [--json]",
   "  A harness's runs, newest first, and the run commands. <h> is a harness id or its",
   "  directory; without it, the current directory. `create` reads the input from a plain",
-  "  text file. `cancel` of a run parked on a decision withdraws what it waits on.",
+  "  text file, or with --from starts a run again with that run's recorded request.",
+  "  `cancel` of a run parked on a decision withdraws what it waits on.",
   "  `resume <grun_…>` settles a graph run paused for a decision: it runs on once.",
   "  `inspect` explains a run from its records and writes nothing.",
 ];
@@ -425,11 +430,25 @@ export async function runRunsCommand(
   }
 
   if (verb === "create") {
-    const harness = harnessOf(deps, args.positional[0]);
     const file = args.values["input-file"];
-    if (file === undefined) {
+    const from = args.values["from"];
+    if (file !== undefined && from !== undefined) {
       return {
-        lines: ["runs create: name the input with --input-file <path>"],
+        lines: ["runs create: pass --input-file or --from, not both"],
+        exitCode: EXIT_FOR_ERROR.invalid,
+      };
+    }
+    if (file === undefined && from === undefined) {
+      return {
+        lines: [
+          "runs create: name the input with --input-file <path>, or a run to start again with --from <run>",
+        ],
+        exitCode: EXIT_FOR_ERROR.invalid,
+      };
+    }
+    if (from !== undefined && !CANONICAL_RUN_ID_RE.test(from)) {
+      return {
+        lines: ["runs create: --from names a run, run_ and 26 characters"],
         exitCode: EXIT_FOR_ERROR.invalid,
       };
     }
@@ -440,9 +459,31 @@ export async function runRunsCommand(
         exitCode: EXIT_FOR_ERROR.invalid,
       };
     }
-    const input = readCreateInput(
-      isAbsolute(file) ? file : resolve(deps.cwd ?? process.cwd(), file),
-    );
+    const harness = harnessOf(deps, args.positional[0]);
+    let input: string;
+    if (from !== undefined) {
+      if (rowsOfRun(harness.dir, from).length === 0) {
+        return {
+          lines: [`runs create: no run ${from} in ${harness.dir}`],
+          exitCode: EXIT_FOR_ERROR.not_found,
+        };
+      }
+      // The recorded request, read whole: never a masked view.
+      const rerun = rerunInputOf(harness.dir, from, {
+        envVars: readHarnessEnvFiles(harness.dir).vars,
+        now: deps.now?.() ?? Date.now(),
+      });
+      if (!rerun.ok) {
+        return {
+          lines: [`runs create: ${rerun.refusal.message}`],
+          exitCode: refusalExit(rerun.refusal.code),
+        };
+      }
+      input = rerun.input;
+    } else {
+      const path = file as string;
+      input = readCreateInput(isAbsolute(path) ? path : resolve(deps.cwd ?? process.cwd(), path));
+    }
     const id = harnessIdOf(harness.dir, opts) ?? ensureIdentity(harness.dir);
     const runId = mintRunId();
     const plan = await runAdapterFor(harness.target).createRun({
@@ -452,12 +493,17 @@ export async function runRunsCommand(
       runId,
       input,
       admission,
+      ...(from !== undefined ? { attemptOf: from } : {}),
       home: home(harness.dir),
     });
-    const done = await carryOut(control(), "runs.create", harness.dir, runRefOf(id, runId), plan, {
-      input,
-      admission,
-    });
+    const done = await carryOut(
+      control(),
+      "runs.create",
+      harness.dir,
+      runRefOf(id, runId),
+      plan,
+      from !== undefined ? { from, admission } : { input, admission },
+    );
     if (!done.ok) {
       return {
         lines: [

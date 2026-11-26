@@ -5,10 +5,12 @@
  * or a clock.
  */
 import { extractFeedbackRecords } from "@crewhaus/feedback-distill";
+import { executionGaps } from "./exec";
 import type { SessionLine } from "./lines";
 import type { DecisionEntry, LoadedRun } from "./load";
 import {
   type ApprovalLater,
+  COST_NOT_RECORDED_WORDS,
   COST_NOT_TRACKED_WORDS,
   COST_UNKNOWN_WORDS,
   type CostView,
@@ -19,7 +21,9 @@ import {
   type TriggerView,
   WAKE_NOT_RECORDED,
   type WakeView,
+  flatText,
   notRecorded,
+  ownValue,
   reconstructed,
   recorded,
 } from "./model";
@@ -158,6 +162,8 @@ export type RunIndex = {
   /** `payload.kind` of each compaction line, by its span. */
   readonly compactionKind: ReadonlyMap<string, string>;
   readonly tools: readonly ToolCall[];
+  /** Each tool call by the `tool_use` line that opened it. */
+  readonly toolByUse: ReadonlyMap<SessionLine, ToolCall>;
   readonly verdicts: readonly VerdictInfo[];
   readonly manifests: readonly SessionLine[];
   /** The session turn of each line, when it can be told. */
@@ -180,7 +186,9 @@ function spanInfoOf(line: SessionLine): SpanInfo | undefined {
     ...(str(p["parent"]) !== undefined ? { parent: str(p["parent"]) as string } : {}),
     kind: code(p["kind"]),
     ...(str(p["status"]) !== undefined ? { status: code(p["status"]) } : {}),
-    ...(str(p["startedAt"]) !== undefined ? { startedAt: str(p["startedAt"]) as string } : {}),
+    ...(str(p["startedAt"]) !== undefined
+      ? { startedAt: flatText(str(p["startedAt"]) as string) }
+      : {}),
     ...(num(p["durationMs"]) !== undefined ? { durationMs: num(p["durationMs"]) as number } : {}),
     ...(str(p["toolUseId"]) !== undefined ? { toolUseId: str(p["toolUseId"]) as string } : {}),
     ...(num(p["call"]) !== undefined ? { call: num(p["call"]) as number } : {}),
@@ -212,6 +220,8 @@ export function runLinesOf(loaded: LoadedRun): SessionLine[] {
     }
     case "legacy":
       return [...loaded.lines];
+    case "unread":
+      return [];
   }
 }
 
@@ -312,7 +322,9 @@ export function indexRun(loaded: LoadedRun): RunIndex {
   const tools = toolCallsOf(lines, spans);
   const toolBySpan = new Map<string, ToolCall>();
   const toolByCall = new Map<number, ToolCall>();
+  const toolByUse = new Map<SessionLine, ToolCall>();
   for (const tool of tools) {
+    toolByUse.set(tool.use, tool);
     if (tool.span !== undefined) toolBySpan.set(tool.span, tool);
     if (tool.call !== undefined && !toolByCall.has(tool.call)) toolByCall.set(tool.call, tool);
   }
@@ -348,6 +360,7 @@ export function indexRun(loaded: LoadedRun): RunIndex {
     unfinished,
     compactionKind,
     tools,
+    toolByUse,
     verdicts,
     manifests,
     turnOf,
@@ -410,8 +423,8 @@ function usd(micros: number): string {
 
 /**
  * Sum cost lines. Any line marked unpriced makes the total unknown; so does a line that
- * reports tokens, costs nothing and does not say whether it was priced. Never $0 for
- * either.
+ * records no amount (or one that is not a number), and a line that reports tokens, costs
+ * nothing and does not say whether it was priced. Never $0 for any of them.
  */
 export function costFold(
   lines: readonly SessionLine[],
@@ -422,6 +435,7 @@ export function costFold(
   const refs = cost.map((line) => line.id);
   let total = 0;
   let zeroWithTokens = false;
+  let noAmount = false;
   for (const line of cost) {
     const p = payloadOf(line);
     if (p["unpriced"] === true) {
@@ -430,10 +444,27 @@ export function costFold(
         refs,
       );
     }
-    const micros = num(p["costUsdMicros"]) ?? 0;
+    const micros = num(p["costUsdMicros"]);
+    if (micros === undefined) {
+      noAmount = true;
+      continue;
+    }
     const tokens = (num(p["inputTokens"]) ?? 0) + (num(p["outputTokens"]) ?? 0);
-    if (micros === 0 && tokens > 0 && !("unpriced" in p)) zeroWithTokens = true;
+    if (micros === 0 && tokens > 0 && !Object.hasOwn(p, "unpriced")) zeroWithTokens = true;
     total += micros;
+  }
+  if (noAmount) {
+    return {
+      state: "not-recorded",
+      refs,
+      gap: { reason: "not-recorded" },
+      value: {
+        usdMicros: null,
+        lines: cost.length,
+        unknown: "not-recorded",
+        words: COST_NOT_RECORDED_WORDS,
+      },
+    };
   }
   if (zeroWithTokens) {
     return reconstructed(
@@ -490,6 +521,8 @@ function gapsOf(index: RunIndex): InspectGap[] {
   }
   if (executionOf(index) === undefined) {
     gaps.push({ reason: "not-supervised", remedy: "crewhaus daemon start" });
+  } else {
+    gaps.push(...executionGaps(loaded.executionEvents));
   }
   for (const [, from] of index.unfinished) gaps.push({ reason: "unfinished", from });
   return gaps;
@@ -538,7 +571,7 @@ export function triggerOf(index: RunIndex): Provenance<TriggerView> {
   const words =
     kind === "channel" && platform !== undefined
       ? `Started by a ${code(platform)} message`
-      : (TRIGGER_WORDS[kind] ?? `Started by ${kind}`);
+      : (ownValue(TRIGGER_WORDS, kind) ?? `Started by ${kind}`);
   const view: TriggerView = {
     kind,
     words,
@@ -554,37 +587,32 @@ export function triggerOf(index: RunIndex): Provenance<TriggerView> {
 }
 
 /**
- * An operator's wake: the reason and author the session log's marker records, never
- * the stamp. The marker is the last unscoped synthetic `user_message` of the stamp's
- * lane before the stamp, with no other `run_stamp` between them.
+ * An unscoped synthetic `user_message` an operator's wake wrote, on `lane`: exactly that
+ * lane when `exact`, else that lane when one is named and any lane when none is.
  */
-export function wakeOf(index: RunIndex): Provenance<WakeView> | undefined {
-  const stamp = index.stamp;
-  const trigger = rec(stamp?.payload["trigger"]);
-  if (stamp === undefined || trigger?.["synthetic"] !== true) return undefined;
-  const lane = trigger["lane"];
-  const stamps = index.loaded.lines
-    .filter((line) => line.kind === "run_stamp" && line.off < stamp.line.off)
-    .map((line) => line.off);
-  const candidates = [...index.loaded.markers, ...index.loaded.lines]
-    .filter((line) => line.off < stamp.line.off && line.kind === "user_message")
-    .filter((line) => line.run === undefined)
-    .filter((line) => {
-      const control = rec(payloadOf(line)["control"]);
-      return control?.["synthetic"] === true && control["lane"] === lane;
-    })
-    .filter((line) => !stamps.some((off) => off > line.off))
-    .sort((a, b) => a.off - b.off);
-  const marker = candidates.at(-1);
+function isMarkerOn(line: SessionLine, lane: unknown, exact: boolean): boolean {
+  if (line.kind !== "user_message" || line.run !== undefined) return false;
+  const control = rec(payloadOf(line)["control"]);
+  if (control?.["synthetic"] !== true) return false;
+  return exact || typeof lane === "string" ? control["lane"] === lane : true;
+}
+
+/** The wake a marker records, its free text flattened onto one line. */
+function wakeFromMarker(
+  marker: SessionLine | undefined,
+  refs: readonly string[],
+): Provenance<WakeView> {
   const control = marker !== undefined ? rec(payloadOf(marker)["control"]) : undefined;
-  const reason = str(control?.["reason"]);
+  const raw = str(control?.["reason"]);
+  const reason = raw !== undefined ? flatText(raw) : undefined;
   if (marker === undefined || reason === undefined) {
     return {
-      ...notRecorded<WakeView>({ reason: "not-recorded" }, [stamp.line.id]),
+      ...notRecorded<WakeView>({ reason: "not-recorded" }, refs),
       value: { reason: "", words: WAKE_NOT_RECORDED },
     };
   }
-  const by = str(control?.["by"]);
+  const rawBy = str(control?.["by"]);
+  const by = rawBy !== undefined ? flatText(rawBy) : undefined;
   return reconstructed(
     {
       reason,
@@ -592,8 +620,51 @@ export function wakeOf(index: RunIndex): Provenance<WakeView> | undefined {
       words: `operator wake: ${reason}${by !== undefined ? ` (by ${by})` : ""}`,
     },
     "synthetic-marker-by-position",
-    [marker.id, stamp.line.id],
+    [marker.id, ...refs],
   );
+}
+
+/**
+ * An operator's wake: the reason and author the session log's marker records, never
+ * the stamp, each flattened onto one line. For a stamped run, the marker is the last
+ * unscoped synthetic `user_message` of the stamp's lane before the stamp, with no other
+ * `run_stamp` between them. For a run recorded with run records off whose row says a
+ * wake started it, it is the last such marker below the run's `sessionAt` and above the
+ * session's previous run's (rule `synthetic-marker-by-position`).
+ */
+export function wakeOf(index: RunIndex): Provenance<WakeView> | undefined {
+  const { loaded } = index;
+  const stamp = index.stamp;
+  if (stamp === undefined) {
+    if (loaded.mode !== "records-off") return undefined;
+    const trigger = triggerOf(index).value;
+    if (trigger?.synthetic !== true) return undefined;
+    const { from, previous } = loaded.window;
+    const marker = [...loaded.markers, ...loaded.lines]
+      .filter((line) => line.off < from && (previous === undefined || line.off >= previous))
+      .filter((line) => isMarkerOn(line, trigger.lane, false))
+      .sort((a, b) => a.off - b.off)
+      .at(-1);
+    return wakeFromMarker(marker, []);
+  }
+  const trigger = rec(stamp.payload["trigger"]);
+  if (trigger?.["synthetic"] !== true) return undefined;
+  const lane = trigger["lane"];
+  const stamps = loaded.lines
+    .filter((line) => line.kind === "run_stamp" && line.off < stamp.line.off)
+    .map((line) => line.off);
+  const marker = [...loaded.markers, ...loaded.lines]
+    .filter((line) => line.off < stamp.line.off && isMarkerOn(line, lane, true))
+    .filter((line) => !stamps.some((off) => off > line.off))
+    .sort((a, b) => a.off - b.off)
+    .at(-1);
+  return wakeFromMarker(marker, [stamp.line.id]);
+}
+
+/** The id of the marker {@link wakeOf} chose for the run, when it chose one. */
+export function wakeMarkerId(index: RunIndex): string | undefined {
+  const wake = wakeOf(index);
+  return wake?.state === "reconstructed" ? wake.refs[0] : undefined;
 }
 
 /** What the run ran under, from its stamp. */
@@ -662,10 +733,11 @@ export function laterOutcomes(
   if (decided !== undefined && (choice === "grant" || choice === "deny")) {
     later.push(laterOf(decided, choice === "grant" ? "granted" : "denied"));
   }
-  const ended = lines.filter((entry) => LATER_EVENTS[entry.line.event] !== undefined).at(-1);
-  if (ended !== undefined) {
-    later.push(laterOf(ended, LATER_EVENTS[ended.line.event] as ApprovalLater["outcome"]));
-  }
+  const ended = lines
+    .filter((entry) => ownValue(LATER_EVENTS, entry.line.event) !== undefined)
+    .at(-1);
+  const endedAs = ended !== undefined ? ownValue(LATER_EVENTS, ended.line.event) : undefined;
+  if (ended !== undefined && endedAs !== undefined) later.push(laterOf(ended, endedAs));
   return later;
 }
 
@@ -674,7 +746,7 @@ function laterOf(entry: DecisionEntry, outcome: ApprovalLater["outcome"]): Appro
   return {
     id: entry.id,
     outcome,
-    at: line.at,
+    at: flatText(String(line.at)),
     ...(line.by !== undefined ? { by: code(line.by) } : {}),
     ...(typeof line.surface === "string" ? { surface: code(line.surface) } : {}),
     ...(line.reason !== undefined ? { reason: code(line.reason) } : {}),

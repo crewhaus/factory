@@ -34,6 +34,7 @@
     { "path": "../preflight" },
     { "path": "../runtime-core" },
     { "path": "../quality-service" },
+    { "path": "../run-inspect" },
     { "path": "../service-fakes" },
     { "path": "../spec" },
     { "path": "../spec-changelog" },

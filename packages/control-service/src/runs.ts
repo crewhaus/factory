@@ -213,6 +213,8 @@ export type CreateRunRequest = {
    * The run's rows name it, and the run resumes as `work:<wi>`.
    */
   readonly work?: string | WorkCreateSpec;
+  /** The run this one starts again (`runs.create` with `from`): on its `queued` row. */
+  readonly attemptOf?: string;
   readonly home: RunHome;
 };
 
@@ -632,6 +634,7 @@ const jobRunAdapter: RunAdapter = {
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
+          ...(req.attemptOf !== undefined ? { attemptOf: req.attemptOf } : {}),
         };
         const queued = append(runsLedger(req.harnessDir), row);
         if (!queued.ok) {
@@ -1181,6 +1184,7 @@ const managedRunAdapter: RunAdapter = {
           via: receipt.via,
           ...(req.subject !== undefined ? { subject: req.subject } : {}),
           ...(item.wi !== undefined ? { workItem: item.wi } : {}),
+          ...(req.attemptOf !== undefined ? { attemptOf: req.attemptOf } : {}),
           ...(req.home.now !== undefined ? { now: req.home.now } : {}),
         });
         if (!queued.ok) {

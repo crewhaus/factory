@@ -6,7 +6,15 @@
  * character; and it writes nothing.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import type { ProviderAdapter } from "@crewhaus/adapter-anthropic";
@@ -276,8 +284,9 @@ describe("crewhaus runs inspect", () => {
       expect(text).not.toContain("\u009b");
       expect(text).not.toContain("\u0007");
       if (argv.includes("--json")) {
-        expect(text).toContain("\\u009b");
-        expect(text).toContain("\\u001b");
+        // Taken out before masking, so not even escaped.
+        expect(text).not.toContain("\\u009b");
+        expect(text).not.toContain("\\u001b");
         expect(() => JSON.parse(text)).not.toThrow();
       }
     }
@@ -367,6 +376,107 @@ describe("crewhaus runs inspect", () => {
     expect(why.did.value.input.password).toBe(REDACTED_VALUE);
     expect(why.did.value.input.body).toBe(`${"b".repeat(SHOWN_MAX)}…`);
   }, 20_000); // a full run and seven inspections over real files
+
+  test("a credential split by a control character, and a short one inside a JSON tool result, never print whole", async () => {
+    const dir = harness();
+    const sessions = join(dir, ".crewhaus", "sessions");
+    const split = `${SECRET_VALUE.slice(0, 9)}\u0007${SECRET_VALUE.slice(9)}`;
+    const password = ["pw", "7q1"].join("-");
+    const apiKey = ["k", "ab9"].join("");
+    const body = JSON.stringify({ password, api_key: apiKey, note: "fine" });
+    const tool = buildTool({
+      name: "splitter",
+      description: "returns a split value and a JSON body",
+      inputSchema: z.object({ x: z.number() }).strict(),
+      readOnly: true,
+      destructive: false,
+      concurrencySafe: true,
+      execute: async () => `value=${split} body=${body}`,
+    });
+    const jsonTool = buildTool({
+      name: "jsonbody",
+      description: "returns a JSON body",
+      inputSchema: z.object({ x: z.number() }).strict(),
+      readOnly: true,
+      destructive: false,
+      concurrencySafe: true,
+      execute: async () => body,
+    });
+    for (const [one, name] of [
+      [tool, "splitter"],
+      [jsonTool, "jsonbody"],
+    ] as const) {
+      const context = createRunContext();
+      await runChatLoop({
+        ...LOOP,
+        runContext: context,
+        sessionRootDir: sessions,
+        runLedgerDir: dir,
+        permissionMode: "bypass",
+        tools: [one],
+        _adapter: scriptedAdapter(name),
+      });
+      for (const argv of [
+        ["inspect", context.runId, "--timeline", "full"],
+        ["inspect", context.runId, "--timeline", "full", "--json"],
+      ]) {
+        const out = await runRunsCommand(argv, { cwd: dir, env: env(dir) });
+        expect([argv.join(" "), out.exitCode]).toEqual([argv.join(" "), 0]);
+        const text = out.lines.join("\n");
+        expect(text).toContain(`Used ${name}`);
+        expect(text).not.toContain(SECRET_VALUE);
+        expect(text).not.toContain(SECRET_VALUE.slice(9));
+        if (name === "jsonbody") {
+          expect(text).not.toContain(password);
+          expect(text).not.toContain(apiKey);
+          expect(text).toContain("fine");
+        }
+      }
+    }
+  }, 20_000); // two full runs and four inspections over real files
+
+  test("an operator wake's reason holding a newline and a direction override prints on one line", async () => {
+    const dir = harness();
+    const sessions = join(dir, ".crewhaus", "sessions");
+    const session = "sess_00000000000000b7";
+    const run = mintRunId();
+    const at = Date.parse("2026-11-14T12:00:00.000Z");
+    const line = (kind: string, payload: unknown, extra: Record<string, unknown> = {}) =>
+      JSON.stringify({ ts: at, version: 1, kind, payload, ...extra });
+    const root = "0000000000000101";
+    const log = [
+      line("user_message", {
+        content: "wake",
+        synthetic: true,
+        control: {
+          lane: "heartbeat",
+          synthetic: true,
+          reason: "first\nsecond \u202Ethird",
+          by: "max",
+        },
+      }),
+      line(
+        "run_stamp",
+        { v: 1, run, trigger: { kind: "heartbeat", lane: "heartbeat", synthetic: true } },
+        { run, span: root },
+      ),
+      line("user_message", { content: "check the queue" }, { run, span: root }),
+    ];
+    mkdirSync(sessions, { recursive: true });
+    writeFileSync(join(sessions, `${session}.jsonl`), `${log.join("\n")}\n`);
+    for (const argv of [
+      ["inspect", session],
+      ["inspect", session, "--timeline", "full"],
+    ]) {
+      const out = await runRunsCommand(argv, { cwd: dir, env: env(dir) });
+      expect([argv.join(" "), out.exitCode]).toEqual([argv.join(" "), 0]);
+      const printed = out.lines.flatMap((l) => l.split("\n"));
+      const hits = printed.filter((l) => l.includes("third"));
+      expect(hits.length).toBeGreaterThan(0);
+      for (const hit of hits) expect(hit).toContain("first second third");
+      expect(out.lines.join("\n")).not.toContain("\u202E");
+    }
+  }, 20_000); // two inspections over real files
 });
 
 describe("maskedView", () => {

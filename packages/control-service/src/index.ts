@@ -291,6 +291,12 @@ export {
   withdrawQueued,
 } from "./runs";
 export {
+  RERUN_INPUT_MAX_BYTES,
+  type RerunInput,
+  type RerunOptions,
+  rerunInputOf,
+} from "./rerun";
+export {
   type ControlDeps,
   type ControlService,
   type WireOptions,

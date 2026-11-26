@@ -7,12 +7,16 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  truncateSync,
   writeFileSync,
 } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { _setIoTapForTest } from "@crewhaus/control-records";
+import { runsView } from "./run-detail";
 import {
   RUN_ID_RE,
+  RUN_LEDGER_READ_MAX_BYTES,
   START_LOCK_MAX_AGE_MS,
   _setPruneSeamsForTest,
   acquireStartLock,
@@ -27,9 +31,11 @@ import {
   readPrunedRuns,
   readRetentionPolicy,
   readRunLedger,
+  readRunLedgerView,
   readRunfile,
   readStartLock,
   recentRuns,
+  recentRunsView,
   releaseStartLock,
   runDir,
   runLogPath,
@@ -290,6 +296,7 @@ describe("retention", () => {
     });
     writeFileSync(runLogPath(dir, id), "x".repeat(bytes));
     writeFileSync(join(logsDir(dir), `${id}.events.jsonl`), "{}\n");
+    writeFileSync(join(logsDir(dir), `${id}.runs.jsonl`), "{}\n");
     writeFileSync(join(logsDir(dir), `${id}.cursor`), "{}\n");
   }
 
@@ -302,9 +309,11 @@ describe("retention", () => {
     for (const id of ids.slice(0, 3)) {
       expect(() => statSync(runLogPath(dir, id))).toThrow();
       expect(() => statSync(join(logsDir(dir), `${id}.events.jsonl`))).toThrow();
+      expect(() => statSync(join(logsDir(dir), `${id}.runs.jsonl`))).toThrow();
       expect(() => statSync(join(logsDir(dir), `${id}.cursor`))).toThrow();
     }
     expect(statSync(runLogPath(dir, ids[5] as string)).size).toBe(10);
+    expect(statSync(join(logsDir(dir), `${ids[5]}.runs.jsonl`)).isFile()).toBe(true);
   });
 
   test("the byte cap evicts further runs from the oldest end", () => {
@@ -382,15 +391,27 @@ describe("retention", () => {
     for (const id of ids) expect(statSync(runLogPath(dir, id)).size).toBe(10);
   });
 
-  test("a run's pump lease goes with it only when its holder is gone", () => {
+  test("a run's pump lease goes with it only when no live manager provably holds it", () => {
     const dir = tempHarness();
     const ids = Array.from({ length: 3 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
     for (const id of ids) makeRun(dir, id, 10);
     const lease = (pid: number) =>
-      JSON.stringify({ v: 1, pid, host: hostname(), at: "2020-01-01T00:00:00.000Z", pump: "p" });
+      JSON.stringify({
+        v: 1,
+        pid,
+        pidStartTimeMs: 5_000,
+        argv: ["crewhaus", "hangar"],
+        host: hostname(),
+        at: "2020-01-01T00:00:00.000Z",
+        pump: "p",
+      });
     writeFileSync(runPumpLockPath(dir, ids[0] as string), lease(100));
     writeFileSync(runPumpLockPath(dir, ids[1] as string), lease(200));
-    const probe = { isAlive: (pid: number) => pid === 200, startTimeMs: () => undefined };
+    const probe = {
+      isAlive: (pid: number) => pid === 200,
+      startTimeMs: (pid: number) => (pid === 200 ? 5_000 : undefined),
+      commandLine: (pid: number) => (pid === 200 ? "crewhaus hangar --lan" : undefined),
+    };
     pruneRuns(dir, { runs: 1, bytes: DEFAULT_RETENTION.bytes }, [], Date.now, probe);
     expect(() => statSync(runPumpLockPath(dir, ids[0] as string))).toThrow();
     expect(statSync(runPumpLockPath(dir, ids[1] as string)).isFile()).toBe(true);
@@ -585,4 +606,81 @@ describe("the run records are read only as regular files inside the harness", ()
     },
     20_000, // a child process, with a deadline that only a waiting call reaches
   );
+});
+
+describe("the run ledger is read within a byte budget", () => {
+  test("a 64 MiB ledger answers its newest rows, reads at most the budget, and says it stopped", () => {
+    const dir = tempHarness();
+    ensureRunDir(dir);
+    const ledger = join(runDir(dir), "runs.jsonl");
+    // Sparse: 64 MiB of nothing, then two real lines.
+    writeFileSync(ledger, "");
+    truncateSync(ledger, 64 * 1024 * 1024);
+    const row = (runId: string) =>
+      `${JSON.stringify({ runId, kind: "daemon", argv: ["bun"], startedAt: "t", logFile: "x" })}\n`;
+    appendFileSync(ledger, `\n${row("run_00000000000000b1")}${row("run_00000000000000b2")}`);
+    let read = 0;
+    _setIoTapForTest({
+      read: (_position, length) => {
+        read += length;
+      },
+    });
+    try {
+      const view = readRunLedgerView(dir);
+      expect(view.entries.map((e) => e.runId)).toEqual([
+        "run_00000000000000b1",
+        "run_00000000000000b2",
+      ]);
+      expect(view.truncated).toBe(true);
+      expect(read).toBeGreaterThan(0);
+      expect(read).toBeLessThanOrEqual(RUN_LEDGER_READ_MAX_BYTES);
+      expect(recentRunsView(dir, 1)).toMatchObject({ truncated: true });
+      expect(recentRunsView(dir, 1).entries.map((e) => e.runId)).toEqual(["run_00000000000000b2"]);
+      expect(runsView(dir)).toMatchObject({ truncated: true });
+      expect(runsView(dir).runs.map((r) => r.runId)).toEqual([
+        "run_00000000000000b2",
+        "run_00000000000000b1",
+      ]);
+    } finally {
+      _setIoTapForTest(undefined);
+    }
+  }, 20_000); // writes and reads tens of megabytes
+
+  test("a ledger within the budget is read whole and says so", () => {
+    const dir = tempHarness();
+    appendRunLedger(dir, {
+      runId: "run_00000000000000b3",
+      kind: "job",
+      argv: ["bun"],
+      startedAt: "t",
+      logFile: "x",
+    });
+    expect(readRunLedgerView(dir)).toMatchObject({ truncated: false });
+    expect(runsView(dir)).toMatchObject({ truncated: false });
+  });
+
+  test("a ledger read only in part is never rewritten from that part", () => {
+    const dir = tempHarness();
+    ensureRunDir(dir);
+    const ledger = join(runDir(dir), "runs.jsonl");
+    writeFileSync(ledger, "");
+    truncateSync(ledger, RUN_LEDGER_READ_MAX_BYTES + 1024);
+    appendFileSync(ledger, "\n");
+    const ids = Array.from({ length: 70 }, (_, i) => `run_${String(i).padStart(16, "0")}`);
+    for (const id of ids) {
+      appendRunLedger(dir, {
+        runId: id,
+        kind: "daemon",
+        argv: ["bun"],
+        startedAt: "t",
+        logFile: "x",
+      });
+      writeFileSync(runLogPath(dir, id), "x");
+    }
+    const size = statSync(ledger).size;
+    const done = pruneRuns(dir, { runs: 1, bytes: DEFAULT_RETENTION.bytes });
+    expect(done.removedRuns.length).toBe(69);
+    expect(done.compactedLedger).toBe(false);
+    expect(statSync(ledger).size).toBe(size);
+  }, 20_000); // writes a ledger past the read budget
 });

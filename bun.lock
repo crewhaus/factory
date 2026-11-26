@@ -752,6 +752,7 @@
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-inspect": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
@@ -1385,6 +1386,7 @@
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
+        "@crewhaus/run-inspect": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-changelog": "workspace:*",
@@ -2016,10 +2018,12 @@
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/runtime-core": {

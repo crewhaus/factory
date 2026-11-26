@@ -1,6 +1,14 @@
 /** What each `{param}` in an operation's path accepts. Closed. */
+import { CONTEXT_CALL_RE, WHY_ACTION_RE } from "../areas/inspection.js";
 import { PLUGIN_NAME_RE } from "../areas/integrations.js";
-import { CANONICAL_RUN_ID_RE, EXECUTION_RUN_ID_RE, HARNESS_ID_RE, isId, parseId } from "../ids.js";
+import {
+  CANONICAL_RUN_ID_RE,
+  EXECUTION_RUN_ID_RE,
+  HARNESS_ID_RE,
+  SESSION_ID_RE,
+  isId,
+  parseId,
+} from "../ids.js";
 import { isRef } from "../refs.js";
 import { deepFreeze } from "../util.js";
 
@@ -45,6 +53,14 @@ export const PATH_PARAMS = deepFreeze({
   pcl: prefixed("pcl"),
   plugin: (segments: readonly string[]): boolean =>
     segments.length === 1 && PLUGIN_NAME_RE.test(segments[0] ?? ""),
+  // A step to explain (`tool:` and its span id), a model call's number or `all`, and a
+  // session: what the inspector reads one of.
+  action: (segments: readonly string[]): boolean =>
+    segments.length === 1 && WHY_ACTION_RE.test(segments[0] ?? ""),
+  call: (segments: readonly string[]): boolean =>
+    segments.length === 1 && CONTEXT_CALL_RE.test(segments[0] ?? ""),
+  sess: (segments: readonly string[]): boolean =>
+    segments.length === 1 && SESSION_ID_RE.test(segments[0] ?? ""),
 });
 
 export type PathParam = keyof typeof PATH_PARAMS;

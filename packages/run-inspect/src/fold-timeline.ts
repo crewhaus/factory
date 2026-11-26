@@ -1,4 +1,3 @@
-import type { SessionLine } from "./lines";
 /**
  * The run's timeline: one entry per thing that happened, newest first, each under its
  * span, key events or everything recorded. A tool call and its result are one entry;
@@ -7,12 +6,17 @@ import type { SessionLine } from "./lines";
  * `detail`, and it is whole: a reader masks it first and only then cuts it short, so a
  * cut never leaves part of a secret the masker would have matched whole.
  */
+import { executionEntries } from "./exec";
+import type { SessionLine } from "./lines";
 import type { LoadedRun } from "./load";
 import {
+  type InspectGap,
   type InspectRefusal,
   STATUS_WORDS,
   type TimelineEntry,
   type TimelinePage,
+  flatText,
+  ownValue,
   refusal,
 } from "./model";
 import {
@@ -29,9 +33,10 @@ import {
   str,
   textOf,
   triggerOf,
+  wakeMarkerId,
   wakeOf,
 } from "./records";
-import { type EntryKind, LINE_KINDS, groupOf, importanceOf } from "./taxonomy";
+import { type EntryKind, groupOf, importanceOf, lineKindOf } from "./taxonomy";
 
 export const TIMELINE_DEFAULT_LIMIT = 50;
 export const TIMELINE_MAX_LIMIT = 500;
@@ -117,12 +122,12 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
     case "span_closed": {
       const info = index.spans.get(str(p["span"]) ?? line.span ?? "");
       if (info?.kind === "run") {
-        const state = info.status !== undefined ? SPAN_STATUS_STATE[info.status] : undefined;
+        const state = ownValue(SPAN_STATUS_STATE, info.status);
         return {
           ...base,
           entryKind: "run-end",
           kind: "run-end",
-          title: `Run ended: ${(state !== undefined ? STATUS_WORDS[state] : undefined) ?? "status unknown"}`,
+          title: `Run ended: ${ownValue(STATUS_WORDS, state) ?? "status unknown"}`,
           sensitivity: "internal",
         };
       }
@@ -149,8 +154,13 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
     case "user_message": {
       const control = rec(p["control"]);
       if (control?.["synthetic"] === true) {
-        const reason = str(control["reason"]);
-        const by = str(control["by"]);
+        // A wake marker is this run's only when it is the one its wake was read from; a
+        // session written before run records shows every marker it holds.
+        if (index.loaded.mode !== "legacy" && line.id !== wakeMarkerId(index)) return undefined;
+        const rawReason = str(control["reason"]);
+        const rawBy = str(control["by"]);
+        const reason = rawReason !== undefined ? flatText(rawReason) : undefined;
+        const by = rawBy !== undefined ? flatText(rawBy) : undefined;
         return {
           ...base,
           entryKind: "operator-wake",
@@ -198,7 +208,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
       };
     }
     case "tool_use": {
-      const tool = index.tools.find((t) => t.use === line);
+      const tool = index.toolByUse.get(line);
       if (tool === undefined) return undefined;
       const spanInfo = tool.span !== undefined ? index.spans.get(tool.span) : undefined;
       const result = tool.result !== undefined ? payloadOf(tool.result) : undefined;
@@ -229,7 +239,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "check",
         kind: "check",
         outcome,
-        title: `${GATE_WORDS[gate] ?? "Check"}: ${outcome}`,
+        title: `${ownValue(GATE_WORDS, gate) ?? "Check"}: ${outcome}`,
         ...(reason !== undefined ? { detail: reason } : {}),
         sensitivity: "internal",
       };
@@ -317,9 +327,9 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         sensitivity: "internal",
       };
     default: {
-      const kind = LINE_KINDS[line.kind];
-      if (kind === undefined) {
-        if (Object.hasOwn(LINE_KINDS, line.kind)) return undefined;
+      const kind = lineKindOf(line.kind);
+      if (kind === "merged") return undefined;
+      if (kind === "unknown") {
         return {
           ...base,
           entryKind: "other",
@@ -339,13 +349,67 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
   }
 }
 
+type Placed = TimelineEntry & { atMs: number };
+
+/**
+ * `inserts` placed into `list` in one pass: each goes before the first element whose key
+ * is greater than its own (after every element when none is, or when its key is not a
+ * number), inserts with equal keys in their given order. As inserting them one at a time
+ * would place them, in time linear in both lists plus one sort of the inserts.
+ */
+function placeAll<T>(
+  list: readonly T[],
+  inserts: readonly T[],
+  keyOf: (item: T) => number,
+  insertKeyOf: (item: T) => number = keyOf,
+): T[] {
+  if (inserts.length === 0) return [...list];
+  // The greatest key so far: the first element greater than k is the first place it passes k.
+  const upTo: number[] = [];
+  let most = Number.NEGATIVE_INFINITY;
+  for (const item of list) {
+    const key = keyOf(item);
+    if (key > most) most = key;
+    upTo.push(most);
+  }
+  const keyed = inserts.map((item, i) => ({ item, i, key: insertKeyOf(item) }));
+  const timed = keyed
+    .filter((k) => !Number.isNaN(k.key))
+    .sort((a, b) => a.key - b.key || a.i - b.i);
+  const out: T[] = [];
+  let at = 0;
+  for (const { item, key } of timed) {
+    while (at < list.length && !((upTo[at] as number) > key)) out.push(list[at++] as T);
+    out.push(item);
+  }
+  while (at < list.length) out.push(list[at++] as T);
+  for (const k of keyed) if (Number.isNaN(k.key)) out.push(k.item);
+  return out;
+}
+
+/** The session-log offset an entry stands for, or none. */
+function sessionOffsetOf(entry: Placed): number {
+  return entry.id.startsWith("s:") ? Number(entry.id.slice(2)) : Number.NEGATIVE_INFINITY;
+}
+
+/** The last line before byte `off`, in lines ordered by offset. */
+function lineBefore(lines: readonly SessionLine[], off: number): SessionLine | undefined {
+  let lo = 0;
+  let hi = lines.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if ((lines[mid] as SessionLine).off < off) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo > 0 ? lines[lo - 1] : undefined;
+}
+
 /** Every entry of the run, oldest first. */
 export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & { atMs: number }> {
-  const session: Array<TimelineEntry & { atMs: number }> = [];
+  let session: Placed[] = [];
   // An operator's wake: its marker is unscoped and precedes the run, and is the one
   // unscoped line attributed to it.
-  const wake = wakeOf(index);
-  const markerId = wake?.state === "reconstructed" ? wake.refs[0] : undefined;
+  const markerId = wakeMarkerId(index);
   const marker = [...index.loaded.markers, ...index.loaded.lines].find(
     (line) => line.id === markerId,
   );
@@ -357,10 +421,12 @@ export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & 
     const draft = draftOf(index, line);
     if (draft !== undefined) session.push(entryOf(draft));
   }
+  const gapEntries: Placed[] = [];
+  const gapOffsets = new Map<Placed, number>();
   for (const gap of index.loaded.gaps) {
     if (gap.from === undefined || !gap.from.startsWith("s:")) continue;
     const off = Number(gap.from.slice(2));
-    const before = [...index.loaded.lines].reverse().find((line) => line.off < off);
+    const before = lineBefore(index.loaded.lines, off);
     const atMs = before?.ts ?? Number.NaN;
     const draft: Draft = {
       id: `g:${gap.from}`,
@@ -374,12 +440,21 @@ export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & 
       sensitivity: "internal",
       ...(index.rootSpan !== undefined ? { parent: index.rootSpan } : {}),
     };
-    const at = session.findIndex(
-      (entry) => entry.id.startsWith("s:") && Number(entry.id.slice(2)) > off,
-    );
-    session.splice(at === -1 ? session.length : at, 0, entryOf(draft));
+    const entry = entryOf(draft);
+    gapEntries.push(entry);
+    gapOffsets.set(entry, off);
   }
+  session = placeAll(session, gapEntries, sessionOffsetOf, (entry) => gapOffsets.get(entry) ?? 0);
+  // The execution's events the session log has no line for, at their place in time.
+  const have = new Set(index.lines.map((line) => line.kind));
+  const atMsOf = (entry: Placed) => entry.atMs;
+  session = placeAll(
+    session,
+    executionEntries(index.loaded.executionEvents, have, index.rootSpan),
+    atMsOf,
+  );
   // An approval's later outcomes, at their place in time.
+  const outcomes: Placed[] = [];
   const seen = new Set<string>();
   for (const verdict of index.verdicts) {
     for (const later of laterOutcomes(index.loaded.decisions, index.loaded.session, verdict)) {
@@ -407,11 +482,10 @@ export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & 
         sensitivity: "internal",
         ...placeOf(index, verdict.line),
       };
-      const at = session.findIndex((entry) => entry.atMs > atMs);
-      session.splice(at === -1 ? session.length : at, 0, entryOf(draft));
+      outcomes.push(entryOf(draft));
     }
   }
-  return session;
+  return placeAll(session, outcomes, atMsOf);
 }
 
 export type TimelineOptions = {
@@ -419,6 +493,8 @@ export type TimelineOptions = {
   readonly limit?: number;
   /** An entry id: the page starts after it, older. */
   readonly before?: string;
+  /** An entry id: only the entries newer than it, newest first. Never with `before`. */
+  readonly after?: string;
 };
 
 /** A page of the run's timeline, newest first. */
@@ -431,20 +507,23 @@ export function timelineOf(
     TIMELINE_MAX_LIMIT,
     Math.max(1, Math.floor(options.limit ?? TIMELINE_DEFAULT_LIMIT)),
   );
+  if (options.before !== undefined && options.after !== undefined) {
+    return refusal("invalid", "page the timeline before an entry or after one, not both");
+  }
   const all = [...timelineEntries(index)].reverse();
-  let start = 0;
-  if (options.before !== undefined) {
-    const at = all.findIndex((entry) => entry.id === options.before);
+  const anchor = options.before ?? options.after;
+  let rest = all;
+  if (anchor !== undefined) {
+    const at = all.findIndex((entry) => entry.id === anchor);
     if (at === -1) {
       return refusal(
         "invalid",
-        `no entry ${options.before.slice(0, 40)} in this run's timeline`,
+        `no entry ${flatText(anchor).slice(0, 40)} in this run's timeline`,
         "crewhaus runs inspect <run> --timeline full",
       );
     }
-    start = at + 1;
+    rest = options.before !== undefined ? all.slice(at + 1) : all.slice(0, at);
   }
-  const rest = all.slice(start);
   const shown = view === "key" ? rest.filter((entry) => entry.importance === "key") : rest;
   const page = shown.slice(0, limit).map(({ atMs: _atMs, ...entry }) => entry);
   const last = page.at(-1);
@@ -465,4 +544,26 @@ export function foldTimeline(
   options: TimelineOptions = {},
 ): TimelinePage | InspectRefusal {
   return timelineOf(indexRun(loaded), options);
+}
+
+/**
+ * Every entry of a loaded run's timeline, newest first, built once: what an export holds.
+ * A reader that pages the whole timeline uses this instead of a fold per page.
+ */
+export function timelineAll(
+  loaded: LoadedRun,
+  view: "key" | "full" = "full",
+): {
+  readonly entries: readonly TimelineEntry[];
+  readonly gaps: readonly InspectGap[];
+  readonly truncated: boolean;
+} {
+  const index = indexRun(loaded);
+  const all = [...timelineEntries(index)].reverse();
+  const shown = view === "key" ? all.filter((entry) => entry.importance === "key") : all;
+  return {
+    entries: shown.map(({ atMs: _atMs, ...entry }) => entry),
+    gaps: index.gaps,
+    truncated: index.gaps.some((gap) => gap.reason === "truncated"),
+  };
 }

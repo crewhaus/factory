@@ -4,15 +4,9 @@
  * parse becomes a `torn` gap and reading goes on; a size limit becomes a `truncated`
  * gap. It takes no lock and creates nothing.
  */
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  openSync,
-  readSync,
-  realpathSync,
-} from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
+import { existsSync, readSync, realpathSync } from "node:fs";
+import { dirname, isAbsolute, join, relative } from "node:path";
+import { openRecordFd } from "@crewhaus/control-records";
 import type { InspectGap } from "./model";
 
 /** One parsed session-log line, and where it starts. */
@@ -31,8 +25,6 @@ export type SessionLine = {
 /** Called for every read the reader makes: where, and how many bytes. A test seam. */
 export type ReadObserver = (position: number, length: number) => void;
 
-const NOFOLLOW: number = fsConstants.O_NOFOLLOW ?? 0;
-
 /** How far the wake look-behind reads below the run's first byte, at most. */
 export const WAKE_LOOK_BEHIND_BYTES = 64 * 1024;
 const LOOK_BEHIND_CHUNK = 4096;
@@ -44,74 +36,71 @@ export function inside(parent: string, child: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * Where a checked session root sits inside its harness: the harness's real path, and the
+ * root's path in it. Reads named this way are proven inside the harness at the moment
+ * they open, so a folder swapped for a link out of the harness after the check is never
+ * read through. `undefined` when the root does not lie inside the harness.
+ */
+export type SessionsPlace = { readonly harness: string; readonly rel: string };
+
+export function sessionsPlace(harnessDir: string, root: string): SessionsPlace | undefined {
+  let harness: string;
+  try {
+    harness = realpathSync(harnessDir);
+  } catch {
+    return undefined;
+  }
+  // The root's real path; a part not made yet keeps its name.
+  let existing = root;
+  let rest = "";
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) return undefined;
+    rest = rest === "" ? relative(parent, existing) : join(relative(parent, existing), rest);
+    existing = parent;
+  }
+  let real: string;
+  try {
+    real = join(realpathSync(existing), rest);
+  } catch {
+    return undefined;
+  }
+  return inside(harness, real) ? { harness, rel: relative(harness, real) } : undefined;
+}
+
 export type OpenedLog =
   | { readonly ok: true; readonly fd: number; readonly size: number }
   | { readonly ok: false; readonly missing: boolean; readonly reason: string };
 
-function codeOf(err: unknown): string | undefined {
-  const code = (err as { code?: unknown } | null)?.code;
-  return typeof code === "string" ? code : undefined;
-}
+/** Why a session log is not read, by the contained open's refusal. */
+const REFUSED: Readonly<Record<string, string>> = Object.freeze({
+  "is-symlink": "the session log is a link, which is not read",
+  "escapes-root": "the session log leads out of the sessions folder",
+  changed: "the session log leads out of the sessions folder",
+  "not-regular-file": "the session log is not a file",
+});
 
 /**
- * Open `<root>/<name>` for reading: it must resolve inside the root once every link is
- * followed, must not itself be a link, and must be a regular file.
+ * Open the session log `name` of the sessions folder at `place` through the control
+ * records' contained open, rooted at the harness: the path must resolve inside the
+ * harness, the log must not itself be a link, and must be a regular file; and the
+ * descriptor it opened is checked to lie inside the harness, so a folder swapped for a
+ * link out of it at any time before the open is refused, never read.
  */
-export function openContained(root: string, name: string): OpenedLog {
-  let realRoot: string;
-  try {
-    realRoot = realpathSync(root);
-  } catch (err) {
-    return {
-      ok: false,
-      missing: codeOf(err) === "ENOENT",
-      reason: "the sessions folder can't be read",
-    };
+export function openContained(place: SessionsPlace, name: string): OpenedLog {
+  const opened = openRecordFd(place.harness, join(place.rel, name));
+  if (opened.ok) return { ok: true, fd: opened.fd, size: opened.stats.size };
+  if (opened.code === "not-found") {
+    return { ok: false, missing: true, reason: "the session log is not there" };
   }
-  const path = join(root, name);
-  let real: string;
-  try {
-    real = realpathSync(path);
-  } catch (err) {
-    const missing = codeOf(err) === "ENOENT";
-    return {
-      ok: false,
-      missing,
-      reason: missing ? "the session log is not there" : "the session log can't be resolved",
-    };
-  }
-  if (!inside(realRoot, real)) {
-    return {
-      ok: false,
-      missing: false,
-      reason: "the session log leads out of the sessions folder",
-    };
-  }
-  let fd: number;
-  try {
-    fd = openSync(path, fsConstants.O_RDONLY | NOFOLLOW);
-  } catch (err) {
-    const code = codeOf(err);
-    return {
-      ok: false,
-      missing: code === "ENOENT",
-      reason:
-        code === "ELOOP" || code === "EMLINK"
-          ? "the session log is a link, which is not read"
-          : `the session log can't be opened${code !== undefined ? ` (${code})` : ""}`,
-    };
-  }
-  try {
-    const stats = fstatSync(fd);
-    if (!stats.isFile()) {
-      closeSync(fd);
-      return { ok: false, missing: false, reason: "the session log is not a file" };
-    }
-    return { ok: true, fd, size: stats.size };
-  } catch (err) {
-    closeSync(fd);
-    return { ok: false, missing: false, reason: `the session log can't be read (${codeOf(err)})` };
-  }
+  return {
+    ok: false,
+    missing: false,
+    reason: Object.hasOwn(REFUSED, opened.code)
+      ? (REFUSED[opened.code] as string)
+      : "the session log can't be opened",
+  };
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {

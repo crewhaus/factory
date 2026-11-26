@@ -14,6 +14,7 @@ import {
 } from "./areas/attention.js";
 import { DEFER_REASONS, OPERATOR_SUPERSEDE_REASONS } from "./areas/core.js";
 import { DELEGATION_ACTIONS } from "./areas/delegation.js";
+import { CONTEXT_CALL_RE, WHY_ACTION_RE } from "./areas/inspection.js";
 import { PLUGIN_NAME_RE } from "./areas/integrations.js";
 import { PERSON_CHANGE_REASONS } from "./areas/quality.js";
 import { BUDGET_EXTEND_REASONS } from "./areas/runtime-budget.js";
@@ -26,6 +27,7 @@ import {
   GRAPH_CHECKPOINT_ID_RE,
   GRAPH_RUN_ID_RE,
   HARNESS_ID_RE,
+  SESSION_ID_RE,
 } from "./ids.js";
 import { deepFreeze } from "./util.js";
 
@@ -39,7 +41,7 @@ export const CLI_VERBS = deepFreeze({
   deploy: ["activate", "list", "approve"],
   access: ["members", "tokens", "revoke", "unlink"],
   commands: ["list", "show"],
-  runs: ["list", "show", "cancel", "resume"],
+  runs: ["list", "show", "cancel", "resume", "inspect"],
   people: [
     "init",
     "keys",
@@ -127,6 +129,9 @@ export const CLI_VERBS = deepFreeze({
  * person may give to decline a proposal, and `{correctionScope}` how far a ranking
  * correction reaches. `{workSource}` is a source the CLI can adopt, a continuity goal
  * (`continuity-goal:goal-NNNN`) only: a Thredz task or an issue is adopted from Home, so neither renders a twin.
+ *
+ * `{action}` is a step of a run to explain (`tool:`, `answer:`, `model:` or `turn:` and its
+ * 16-hex span id), `{call}` a model call's number or `all`, and `{sess}` a session's id.
  */
 export const TWIN_PLACEHOLDERS = deepFreeze({
   "{hrn}": HARNESS_ID_RE,
@@ -176,6 +181,9 @@ export const TWIN_PLACEHOLDERS = deepFreeze({
   // A raise in dollars: a positive amount with at most two decimals, never a flag.
   "{usd}": /^(?:0|[1-9][0-9]{0,6})(?:\.[0-9]{1,2})?$/,
   "{budgetReason}": new RegExp(`^(?:${BUDGET_EXTEND_REASONS.join("|")})$`),
+  "{action}": WHY_ACTION_RE,
+  "{call}": CONTEXT_CALL_RE,
+  "{sess}": SESSION_ID_RE,
 });
 
 export type TwinParams = Readonly<Record<string, string>>;

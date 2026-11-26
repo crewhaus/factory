@@ -43,7 +43,7 @@ export {
 } from "./ledger";
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export { type IoTap, _setIoTapForTest } from "./io";
-export { openRecordFd, readAt, readRecordFile } from "./io";
+export { appendRecord, openRecordFd, readAt, readRecordFile } from "./io";
 export { CHUNK_BYTES } from "./lines";
 export {
   type RetainedSegments,

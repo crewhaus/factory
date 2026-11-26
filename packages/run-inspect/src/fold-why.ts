@@ -1,4 +1,3 @@
-import type { SessionLine } from "./lines";
 /**
  * Why a step happened: for a tool call, an answer, a model call or a turn, what
  * started the run, what the model was given before it, the rules in force, what it did
@@ -7,6 +6,8 @@ import type { SessionLine } from "./lines";
  *
  * It shows the record, never the model's private reasoning: thinking is not read.
  */
+import { WHY_ACTION_RE } from "@crewhaus/control-contract";
+import type { SessionLine } from "./lines";
 import type { LoadedRun } from "./load";
 import {
   type CheckView,
@@ -39,8 +40,8 @@ import {
   wakeOf,
 } from "./records";
 
-/** `tool:<span>`, `answer:<span>`, `model:<span>` or `turn:<span>`. */
-export const WHY_ACTION_RE = /^(tool|answer|model|turn):([0-9a-f]{16})$/;
+/** `tool:<span>`, `answer:<span>`, `model:<span>` or `turn:<span>`: the control contract's grammar. */
+export { WHY_ACTION_RE };
 
 function checkOf(index: RunIndex, verdict: VerdictInfo): CheckView {
   const p = verdict.payload;
@@ -195,6 +196,13 @@ export function whyOf(index: RunIndex, action: string): WhyRecord | InspectRefus
   }
   const kind = parsed[1] as WhyAction;
   const span = parsed[2] as string;
+  if (index.loaded.mode === "unread") {
+    return refusal(
+      "not_found",
+      "none of this run's transcript was read: it was removed, or holds nothing from where the run starts",
+      `crewhaus runs show ${index.loaded.run ?? "<run>"}`,
+    );
+  }
   if (index.spans.size === 0 && index.unfinished.size === 0) {
     return refusal(
       "unsupported",

@@ -5,6 +5,7 @@
  * is missing.
  */
 import { effectiveRunState } from "@crewhaus/control-contract";
+import { traceOf } from "./exec";
 import { spanDuration } from "./fold-spans";
 import type { LoadedRun } from "./load";
 import {
@@ -15,6 +16,7 @@ import {
   type StatusView,
   UNKNOWN_STATUS_WORD,
   notRecorded,
+  ownValue,
   reconstructed,
   recorded,
   statusWord,
@@ -109,7 +111,7 @@ function statusOf(index: RunIndex): Provenance<StatusView> {
   const failureClass = failed !== undefined ? code(payloadOf(failed)["class"]) : root?.failureClass;
   const state =
     root?.status !== undefined
-      ? SPAN_STATUS_STATE[root.status]
+      ? ownValue(SPAN_STATUS_STATE, root.status)
       : failed !== undefined
         ? "failed"
         : undefined;
@@ -225,6 +227,7 @@ export function summaryOf(index: RunIndex): InspectSummary {
   const parent = str(stamp?.["parent"]) ?? str(loaded.rows[0]?.["parent"]);
   const continues = str(stamp?.["continues"]) ?? str(loaded.rows[0]?.["continues"]);
   const execution = executionOf(index);
+  const trace = execution !== undefined ? traceOf(loaded.executionEvents) : undefined;
   const gapCounts: Partial<Record<InspectGapReason, number>> = {};
   for (const gap of index.gaps)
     gapCounts[gap.reason] = (gapCounts[gap.reason] ?? 0) + (gap.count ?? 1);
@@ -274,6 +277,7 @@ export function summaryOf(index: RunIndex): InspectSummary {
       execution !== undefined
         ? recorded({ id: execution }, index.stamp !== undefined ? [index.stamp.line.id] : [])
         : notRecorded({ reason: "not-supervised", remedy: "crewhaus daemon start" }),
+    ...(trace !== undefined ? { trace } : {}),
     ...(loaded.sessionRuns.length > 0
       ? {
           runs: loaded.sessionRuns.map((run) => {

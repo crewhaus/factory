@@ -275,6 +275,9 @@ describe("GET routes change nothing", () => {
         rule: mintId("rule"),
         psn: mintId("psn"),
         plugin: "notes-pane",
+        action: "tool:0000000000000104",
+        call: "all",
+        sess: "sess_00000000000000a1",
       };
       const refFor: Readonly<Record<string, string>> = {
         "refs.resolve": `${live.id}/exec/${runId}`,
@@ -282,6 +285,7 @@ describe("GET routes change nothing", () => {
         "attention.get": `home/attention/att_${"0".repeat(26)}`,
         "attention.messages.list": `home/attention/att_${"0".repeat(26)}`,
         "work.get": `${live.id}/work/${mintId("wi")}`,
+        "inspect.work": `${live.id}/work/${mintId("wi")}`,
         "workspaces.get": `${live.id}/work/${mintId("wi")}`,
       };
       const v1Paths: Array<{ key: string; path: string }> = [];

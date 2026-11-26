@@ -85,6 +85,9 @@ const SAMPLES = [
     correctionScope: "item",
     usd: "50",
     budgetReason: "planned-work",
+    action: "tool:0000000000000104",
+    call: "2",
+    sess: "sess_00000000000000a1",
   },
   {
     hrn: HRN,
@@ -115,6 +118,9 @@ const SAMPLES = [
     correctionScope: "all",
     usd: "12.5",
     budgetReason: "other",
+    action: "answer:00000000000001ff",
+    call: "all",
+    sess: "sess_0123456789abcdef",
   },
 ];
 
@@ -276,6 +282,9 @@ test("the placeholders, pinned, with empty flags", () => {
     "{workSource}",
     "{usd}",
     "{budgetReason}",
+    "{action}",
+    "{call}",
+    "{sess}",
   ]);
   for (const grammar of Object.values(TWIN_PLACEHOLDERS)) expect(grammar.flags).toBe("");
 });

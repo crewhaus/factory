@@ -346,15 +346,29 @@ export const workCreateSpec = z
   })
   .strict();
 
+/**
+ * What starts a run: its input, or `from`, a run of this harness whose recorded request
+ * the new run starts with (exactly one of the two).
+ */
 export const runCreateRequest = z
   .object({
-    input: z.string().min(1),
+    input: z.string().min(1).optional(),
+    from: canonicalRunId.optional(),
     subject: z.string().min(1).optional(),
     admission: z.enum(["reject", "queue"]).default("reject"),
     // A work item of this harness (`<hrn>/work/<wi>` or a bare `wi_` id), or one to create.
     work: z.union([refString, workItemId, workCreateSpec]).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if ((value.input === undefined) === (value.from === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [value.input === undefined ? "input" : "from"],
+        message: "name the run's input or the run to start again (from), not both",
+      });
+    }
+  });
 
 export const runCreated = z.object({ run, receipt: commandReceipt }).passthrough();
 

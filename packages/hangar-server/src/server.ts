@@ -55,8 +55,8 @@
  * hand-branch, so it dispatches from ONE table (`m3-routes.ts`) through one
  * function (`runM3` below) that applies every guard above uniformly; the
  * per-area handler modules receive an already-validated `M3Context` and can
- * only be about their own subject. The handlers ship as 501 stubs whose
- * docblocks carry the write covenant each must honour.
+ * only be about their own subject. Each handler's docblock carries the write
+ * covenant it honours.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, hostname as osHostname, uptime, userInfo } from "node:os";
@@ -3358,7 +3358,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|PUT /api/notifications   POST /api/notifications/clear",
       "GET|PUT /api/read-only",
       "GET  /api/plugins     GET /api/plugins/:name/panes/:paneId   GET /api/h/:id/panes",
-      "--- M3 (handlers are stubs: every route below answers 501) ---",
+      "--- M3 ---",
       "PUT  /api/h/:id/spec  POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}",
       "GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}",
       "GET|POST /api/builders/…   GET|POST|DELETE /api/h/:id/builders/{graders,dataset,mcp}",
@@ -3372,6 +3372,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|PUT|POST|DELETE /api/h/:id/thredz/…   GET /api/thredz",
       "GET  /api/h/:id/inspect[/:store[/:name]]   PUT /api/h/:id/inspect/settings",
       "GET|POST /api/h/:id/{mcp-servers,dev}/…",
+      "--- crewhaus.hangar.v1: the run inspector ---",
+      "GET  /api/v1/runs/:run/{inspect,timeline,request,export,raw}",
+      "GET  /api/v1/runs/:run/why/:action   GET /api/v1/runs/:run/context/:call",
+      "GET  /api/v1/harnesses/:h/sessions/:sess/inspect   GET /api/v1/work/:ref/inspect",
     ];
     const items = routes.map((r) => `<li><code>${r}</code></li>`).join("\n");
     const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;session&gt;</code>.</p><ul>${items}</ul>`;

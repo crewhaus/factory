@@ -5,15 +5,19 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { createProcessOps } from "./process-ops";
+import { runEventsAt } from "./run-detail";
 import { START_LOCK_MAX_AGE_MS } from "./runfiles";
 import { createEnvScrubber } from "./scrub";
 import {
   LOG_TAIL_LINES,
   type LeaseProbe,
+  commandArgvOf,
   completeUtf8Length,
   createLogPump,
   drain,
@@ -386,11 +390,13 @@ describe("the pump lease", () => {
     startTimeMs: (pid) => alive[pid],
   });
   const LIVE = probeOf({ 100: 1_000, 200: 2_000 });
+  /** A compiled manager's command line, as a lease records it. */
+  const MANAGER = ["crewhaus", "hangar"] as const;
 
   test("two pumps over one log: every event lands once, and the second does not hold", () => {
     const files = pumpFiles();
-    const a = createLogPump({ ...files, pid: 100, probe: LIVE });
-    const b = createLogPump({ ...files, pid: 200, probe: LIVE });
+    const a = createLogPump({ ...files, pid: 100, probe: LIVE, argv: MANAGER });
+    const b = createLogPump({ ...files, pid: 200, probe: LIVE, argv: MANAGER });
     const lines: string[] = [];
     for (let turn = 1; turn <= 4; turn++) {
       appendFileSync(files.logFile, `${EVENT({ turn })}\n`);
@@ -406,37 +412,183 @@ describe("the pump lease", () => {
     expect(readPumpLease(`${files.dir}/logs/run.pump.lock`)?.pid).toBe(100);
   });
 
-  test("a lease whose holder is gone is broken; a live one is held however old it is", () => {
+  /** A lease file as another pump would have written it. */
+  const plant = (files: PumpFiles, lease: Record<string, unknown>): string => {
+    const lock = join(files.dir, "logs", "run.pump.lock");
+    writeFileSync(
+      lock,
+      JSON.stringify({ v: 1, at: new Date().toISOString(), pump: "x", ...lease }),
+    );
+    return lock;
+  };
+  /** A probe over fake processes: each pid with its start time and its command line. */
+  const fakeOps = (
+    procs: Readonly<Record<number, { start?: number; line?: string }>>,
+  ): LeaseProbe => ({
+    isAlive: (pid) => Object.hasOwn(procs, pid),
+    startTimeMs: (pid) => (Object.hasOwn(procs, pid) ? procs[pid]?.start : undefined),
+    commandLine: (pid) => (Object.hasOwn(procs, pid) ? procs[pid]?.line : undefined),
+  });
+
+  test("a planted lease naming pid 1 with no start time or command line does not stop the pump", () => {
     const files = pumpFiles();
     writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
-    const lock = join(files.dir, "logs", "run.pump.lock");
+    plant(files, { pid: 1, host: "here" });
+    // pid 1 is alive, started long ago, and runs something: still not a manager's lease.
+    const probe = fakeOps({ 1: { start: 1, line: "/sbin/launchd" }, 200: { start: 2_000 } });
+    const pump = createLogPump({ ...files, pid: 200, host: "here", probe });
+    const first = pump.pumpOnce();
+    expect(first.held).toBe(true);
+    expect(first.events.map((e) => e["turn"])).toEqual([1]);
+    appendFileSync(files.logFile, `${EVENT({ turn: 2 })}\n`);
+    expect(pump.flush().events.map((e) => e["turn"])).toEqual([2]);
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 2]);
+    expect(readPumpLease(join(files.dir, "logs", "run.pump.lock"))?.pid).toBe(200);
+  });
+
+  test.skipIf(process.platform === "win32")(
+    "the same planted lease, judged by the real probe on this machine",
+    () => {
+      const ops = createProcessOps();
+      for (const lease of [
+        { pid: 1, host: hostname() },
+        // pid 1's real start time, and one letter of its command line.
+        { pid: 1, host: hostname(), pidStartTimeMs: ops.startTimeMs(1), argv: ["d"] },
+      ]) {
+        const files = pumpFiles();
+        writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+        plant(files, lease);
+        const pump = createLogPump({ ...files, probe: ops });
+        expect(pump.pumpOnce()).toMatchObject({ held: true });
+        expect(pump.flush().held).toBe(true);
+        expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1]);
+      }
+    },
+  );
+
+  test("a holder whose probe cannot say its own start time keeps its lease", () => {
+    const files = pumpFiles();
+    // The platform answers who is alive, and no start time for anyone (a probe timeout).
+    const probe: LeaseProbe = {
+      isAlive: (pid) => pid === process.pid || pid === 200,
+      startTimeMs: () => undefined,
+    };
+    const a = createLogPump({ ...files, argv: MANAGER, probe });
+    const b = createLogPump({ ...files, pid: 200, argv: MANAGER, probe });
+    const held: boolean[] = [];
+    for (let turn = 1; turn <= 2; turn++) {
+      appendFileSync(files.logFile, `${EVENT({ turn })}\n`);
+      held.push(a.pumpOnce().held, b.pumpOnce().held);
+    }
+    expect(held).toEqual([true, false, true, false]);
+    expect(readPumpLease(join(files.dir, "logs", "run.pump.lock"))?.pid).toBe(process.pid);
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 2]);
+  });
+
+  test("a lease a live manager provably holds is kept, a compiled manager's included", () => {
+    const files = pumpFiles();
+    writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+    // A compiled crewhaus: `process.argv` reads bun and an embedded path, the OS shows
+    // the executable's own name and the arguments after the script.
+    const argv = commandArgvOf("/usr/local/bin/crewhaus", [
+      "bun",
+      "/$bunfs/root/crewhaus",
+      "hangar",
+    ]);
+    expect(argv).toEqual(["crewhaus", "hangar"]);
+    const holder = createLogPump({
+      ...files,
+      pid: 100,
+      host: "here",
+      argv,
+      probe: fakeOps({ 100: { start: 1_000, line: "crewhaus hangar --lan" } }),
+    });
+    expect(holder.pumpOnce().held).toBe(true);
+    const lease = readPumpLease(join(files.dir, "logs", "run.pump.lock"));
+    expect(lease).toMatchObject({ pid: 100, pidStartTimeMs: 1_000, argv: ["crewhaus", "hangar"] });
+    appendFileSync(files.logFile, `${EVENT({ turn: 2 })}\n`);
+    const probe = fakeOps({
+      100: { start: 1_000, line: "crewhaus hangar --lan" },
+      200: { start: 2_000, line: "bun /src/index.ts hangar" },
+    });
+    const other = createLogPump({ ...files, pid: 200, host: "here", probe });
+    expect(other.pumpOnce()).toMatchObject({ held: false, events: [] });
+    // When the platform will not say the command line, the lease is kept too.
+    const quiet = fakeOps({ 100: { start: 1_000 }, 200: { start: 2_000 } });
+    expect(createLogPump({ ...files, pid: 200, host: "here", probe: quiet }).pumpOnce().held).toBe(
+      false,
+    );
+    expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1]);
+    // A manager Bun runs from source: the script stands between the executable and the verb.
+    const bunArgv = commandArgvOf("/opt/bun/bin/bun", [
+      "bun",
+      "/src/apps/cli/src/index.ts",
+      "hangar",
+    ]);
+    expect(bunArgv).toEqual(["bun", "hangar"]);
+    const bunFiles = pumpFiles();
+    writeFileSync(bunFiles.logFile, `${EVENT({ turn: 1 })}\n`);
+    const bunLine = "/opt/bun/bin/bun /src/apps/cli/src/index.ts hangar";
+    const bunHolder = createLogPump({
+      ...bunFiles,
+      pid: 100,
+      host: "here",
+      argv: bunArgv,
+      probe: fakeOps({ 100: { start: 1_000, line: bunLine } }),
+    });
+    expect(bunHolder.pumpOnce().held).toBe(true);
+    const bunProbe = fakeOps({ 100: { start: 1_000, line: bunLine }, 200: { start: 2_000 } });
+    expect(
+      createLogPump({ ...bunFiles, pid: 200, host: "here", probe: bunProbe }).pumpOnce().held,
+    ).toBe(false);
+  });
+
+  test("a lease is broken for another program under its pid, a moved start time, another host or a gone holder", () => {
     const old = new Date(Date.now() - 10 * START_LOCK_MAX_AGE_MS).toISOString();
-    writeFileSync(
-      lock,
-      JSON.stringify({ v: 1, pid: 100, pidStartTimeMs: 1_000, host: "here", at: old, pump: "x" }),
-    );
-    const blocked = createLogPump({ ...files, pid: 200, host: "here", probe: LIVE });
-    expect(blocked.pumpOnce()).toMatchObject({ held: false, events: [] });
-    // Another host's lease is held whatever this host's probe says.
-    writeFileSync(lock, JSON.stringify({ v: 1, pid: 999, host: "there", at: old, pump: "x" }));
-    expect(blocked.pumpOnce().held).toBe(false);
-    // The pid is reused by another process: its start time moved.
-    writeFileSync(
-      lock,
-      JSON.stringify({ v: 1, pid: 100, pidStartTimeMs: 50_000, host: "here", at: old, pump: "x" }),
-    );
-    expect(blocked.pumpOnce()).toMatchObject({ held: true });
-    expect(replayRunEvents(files.eventsFile)).toHaveLength(1);
-    // A dead holder, plainly.
-    const next = pumpFiles();
-    writeFileSync(next.logFile, `${EVENT({ turn: 2 })}\n`);
-    writeFileSync(
-      join(next.dir, "logs", "run.pump.lock"),
-      JSON.stringify({ v: 1, pid: 300, host: "here", at: old, pump: "y" }),
-    );
-    expect(createLogPump({ ...next, pid: 200, host: "here", probe: LIVE }).pumpOnce().held).toBe(
-      true,
-    );
+    const held = { pid: 100, pidStartTimeMs: 1_000, argv: ["crewhaus", "hangar"], at: old };
+    const cases: ReadonlyArray<readonly [string, Record<string, unknown>, LeaseProbe]> = [
+      [
+        "another program",
+        { ...held, host: "here" },
+        fakeOps({ 100: { start: 1_000, line: "vim notes.md" } }),
+      ],
+      ["a moved start time", { ...held, host: "here" }, fakeOps({ 100: { start: 50_000 } })],
+      [
+        "another host",
+        { ...held, host: "there" },
+        fakeOps({ 100: { start: 1_000, line: "crewhaus hangar" } }),
+      ],
+      ["a gone holder", { ...held, host: "here" }, fakeOps({})],
+      [
+        "no command line recorded",
+        { pid: 100, pidStartTimeMs: 1_000, host: "here" },
+        fakeOps({ 100: { start: 1_000 } }),
+      ],
+      [
+        "one letter of a live process's command line",
+        { pid: 100, pidStartTimeMs: 1_000, argv: ["d"], host: "here" },
+        fakeOps({ 100: { start: 1_000, line: "/usr/sbin/sshd -D" } }),
+      ],
+      [
+        "a command line that is not a manager's",
+        { pid: 100, pidStartTimeMs: 1_000, argv: ["vim", "notes.md"], host: "here" },
+        fakeOps({ 100: { start: 1_000, line: "vim notes.md" } }),
+      ],
+      [
+        "a manager's words only inside other words",
+        { ...held, host: "here" },
+        fakeOps({ 100: { start: 1_000, line: "vim crewhaus hangar.md" } }),
+      ],
+    ];
+    const taken: string[] = [];
+    for (const [name, lease, probe] of cases) {
+      const files = pumpFiles();
+      writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
+      plant(files, lease);
+      const pump = createLogPump({ ...files, pid: 200, host: "here", probe });
+      if (pump.pumpOnce().held && replayRunEvents(files.eventsFile).length === 1) taken.push(name);
+    }
+    expect(taken).toEqual(cases.map(([name]) => name));
   });
 
   test("a pump that takes the lease after another moved the cursor reads it again", () => {
@@ -444,8 +596,8 @@ describe("the pump lease", () => {
     writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
     const probe = probeOf({ 100: 1_000, 200: 2_000 });
     // Built while nothing was pumped: its in-memory cursor is at 0.
-    const late = createLogPump({ ...files, pid: 200, probe });
-    const first = createLogPump({ ...files, pid: 100, probe });
+    const late = createLogPump({ ...files, pid: 200, probe, argv: MANAGER });
+    const first = createLogPump({ ...files, pid: 100, probe, argv: MANAGER });
     expect(first.pumpOnce().events).toHaveLength(1);
     expect(late.pumpOnce().held).toBe(false);
     appendFileSync(files.logFile, `${EVENT({ turn: 2 })}\n`);
@@ -457,10 +609,10 @@ describe("the pump lease", () => {
   test("reconcile without the lease cuts nothing; close releases it, and only its own", () => {
     const files = pumpFiles();
     writeFileSync(files.logFile, `${EVENT({ turn: 1 })}\n`);
-    const holder = createLogPump({ ...files, pid: 100, probe: LIVE });
+    const holder = createLogPump({ ...files, pid: 100, probe: LIVE, argv: MANAGER });
     holder.pumpOnce();
     appendFileSync(files.eventsFile, `${EVENT({ turn: 99 })}\n`);
-    const other = createLogPump({ ...files, pid: 200, probe: LIVE });
+    const other = createLogPump({ ...files, pid: 200, probe: LIVE, argv: MANAGER });
     other.reconcile();
     expect(replayRunEvents(files.eventsFile).map((e) => e["turn"])).toEqual([1, 99]);
     other.close();
@@ -479,5 +631,129 @@ describe("the pump lease", () => {
     const persisted = replayRunEvents(files.eventsFile);
     expect(persisted).toHaveLength(2);
     for (const line of persisted) expect(line["ingestedAt"]).toBe("2026-11-14T00:00:00.000Z");
+  });
+});
+
+describe("what the pump persists", () => {
+  test("per-token stream events reach the caller but not the events file", () => {
+    const files = pumpFiles();
+    const tokens = Array.from({ length: 1000 }, (_, i) =>
+      JSON.stringify({ kind: "model_stream_token", runId: "run_0123456789abcdef", index: i }),
+    ).join("\n");
+    const structural = [
+      EVENT({ turn: 1 }),
+      JSON.stringify({ kind: "tool_stream_chunk", runId: "run_0123456789abcdef", chunk: "x" }),
+      EVENT({ turn: 2 }),
+      EVENT({ turn: 3 }),
+    ].join("\n");
+    writeFileSync(files.logFile, `${tokens}\n${structural}\n`);
+    const pump = createLogPump({ ...files, maxChunkBytes: 4 * 1024 * 1024 });
+    const out = pump.pumpOnce();
+    expect(out.events).toHaveLength(1004);
+    const persisted = replayRunEvents(files.eventsFile);
+    expect(persisted.map((e) => e["turn"])).toEqual([1, 2, 3]);
+    expect(pump.cursor().eventsBytes).toBe(statSize(files.eventsFile));
+  });
+});
+
+describe("the run index", () => {
+  const ONE = `run_${"0".repeat(25)}1`;
+  const TWO = `run_${"0".repeat(25)}2`;
+  const EXEC = "run_00000000000000c1";
+  const ev = (run: string, turn: number, pad = ""): string =>
+    JSON.stringify({ kind: "turn_end", runId: run, turn, ...(pad !== "" ? { pad } : {}) });
+
+  function harnessFiles() {
+    const dir = tempDir();
+    mkdirSync(join(dir, ".crewhaus", "run", "logs"), { recursive: true });
+    const at = (suffix: string) => join(dir, ".crewhaus", "run", "logs", `${EXEC}${suffix}`);
+    return {
+      dir,
+      logFile: at(".log"),
+      eventsFile: at(".events.jsonl"),
+      cursorFile: at(".cursor"),
+      index: at(".runs.jsonl"),
+    };
+  }
+  const indexLines = (path: string): Array<{ run: string; off: number }> =>
+    readFileSync(path, "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l));
+  const lineAt = (path: string, off: number): Record<string, unknown> => {
+    const text = readFileSync(path).subarray(off).toString("utf8");
+    return JSON.parse(text.slice(0, text.indexOf("\n")));
+  };
+
+  test("each canonical run's first persisted event gets one index line pointing at it", () => {
+    const f = harnessFiles();
+    writeFileSync(
+      f.logFile,
+      `${[ev(ONE, 1), "prose", ev(ONE, 2), ev(TWO, 1), EVENT({ turn: 9 }), ev(TWO, 2)].join("\n")}\n`,
+    );
+    const pump = createLogPump({
+      logFile: f.logFile,
+      eventsFile: f.eventsFile,
+      cursorFile: f.cursorFile,
+    });
+    pump.pumpOnce();
+    appendFileSync(f.logFile, `${ev(ONE, 3)}\n`);
+    pump.pumpOnce();
+    const index = indexLines(f.index);
+    expect(index.map((e) => e.run)).toEqual([ONE, TWO]);
+    for (const entry of index) {
+      expect(lineAt(f.eventsFile, entry.off)).toMatchObject({ runId: entry.run, turn: 1 });
+    }
+  });
+
+  test("a link planted at the index is never written through; the run is read by scan", () => {
+    const f = harnessFiles();
+    const outside = join(tempDir(), "kept.txt");
+    writeFileSync(outside, "ORIGINAL\n");
+    symlinkSync(outside, f.index);
+    writeFileSync(f.logFile, `${ev(ONE, 1)}\n`);
+    const pump = createLogPump({
+      logFile: f.logFile,
+      eventsFile: f.eventsFile,
+      cursorFile: f.cursorFile,
+      root: f.dir,
+    });
+    expect(pump.pumpOnce().events).toHaveLength(1);
+    expect(readFileSync(outside, "utf8")).toBe("ORIGINAL\n");
+    const read = runEventsAt(f.dir, EXEC, { run: ONE, env: {} });
+    expect(read).toMatchObject({ present: true, from: "scan" });
+    expect(read.entries.map((entry) => entry.event["turn"])).toEqual([1]);
+  });
+
+  test("after reconcile cuts the events file, entries past the cut are ignored and written again once", () => {
+    const f = harnessFiles();
+    writeFileSync(f.logFile, `${ev(ONE, 1)}\n`);
+    const first = createLogPump({
+      logFile: f.logFile,
+      eventsFile: f.eventsFile,
+      cursorFile: f.cursorFile,
+    });
+    first.pumpOnce();
+    const cut = statSize(f.eventsFile);
+    // The log goes on; a manager that died wrote events and an index line past its cursor.
+    appendFileSync(f.logFile, `${ev(TWO, 1)}\n`);
+    appendFileSync(f.eventsFile, `${ev(ONE, 7, "x".repeat(40))}\n`);
+    const stale = statSize(f.eventsFile);
+    appendFileSync(f.eventsFile, `${ev(TWO, 1)}\n`);
+    appendFileSync(f.index, `${JSON.stringify({ run: TWO, off: stale, at: "t" })}\n`);
+    first.close();
+    const second = createLogPump({
+      logFile: f.logFile,
+      eventsFile: f.eventsFile,
+      cursorFile: f.cursorFile,
+    });
+    second.reconcile();
+    expect(statSize(f.eventsFile)).toBe(cut);
+    second.pumpOnce();
+    second.pumpOnce();
+    const twos = indexLines(f.index).filter((e) => e.run === TWO);
+    // The stale line and one written again, at the run's first event as it is now.
+    expect(twos.map((e) => e.off)).toEqual([stale, cut]);
+    expect(lineAt(f.eventsFile, cut)).toMatchObject({ runId: TWO, turn: 1 });
   });
 });

@@ -67,7 +67,7 @@ import {
   type RunLedgerEntry,
   appendRunLedger,
   defaultPortProbe,
-  readRunLedger,
+  readRunLedgerView,
   readRunfile,
 } from "@crewhaus/harness-supervisor";
 import { HttpError } from "./http";
@@ -223,18 +223,32 @@ function jobsOfKind(ctx: M3Context, kind: string): { live: JobRecord[]; past: Jo
 }
 
 /** Ledger rows of one run kind, newest first. A folded read — never a store
- *  `list()` that compacts. */
-function ledgerRows(harnessDir: string, kind: RunKind): RunLedgerEntry[] {
-  let all: RunLedgerEntry[];
+ *  `list()` that compacts. `truncated` when the ledger read stopped short of its
+ *  oldest rows. */
+function ledgerRows(
+  harnessDir: string,
+  kind: RunKind,
+): { readonly rows: RunLedgerEntry[]; readonly truncated: boolean } {
+  let view: ReturnType<typeof readRunLedgerView>;
   try {
-    all = readRunLedger(harnessDir);
+    view = readRunLedgerView(harnessDir);
   } catch {
-    return [];
+    return { rows: [], truncated: false };
   }
-  return all
+  const rows = view.entries
     .filter((row) => row.kind === kind)
     .reverse()
     .slice(0, MAX_RUNTIME_ROWS);
+  return { rows, truncated: view.truncated };
+}
+
+/** A panel's `ledger` rows and whether the ledger read stopped short (`ledgerTruncated`). */
+function ledgerFields(
+  harnessDir: string,
+  kind: RunKind,
+): { readonly ledger: RunLedgerEntry[]; readonly ledgerTruncated: boolean } {
+  const read = ledgerRows(harnessDir, kind);
+  return { ledger: read.rows, ledgerTruncated: read.truncated };
 }
 
 /** One job rendered for a runtime panel. */
@@ -509,7 +523,7 @@ export const mcpServers: M3Handler = async (ctx) => {
     port,
     health,
     runs: [...live, ...past].map(runtimeRun),
-    ledger: ledgerRows(dir, "mcp-server"),
+    ...ledgerFields(dir, "mcp-server"),
     supervision: supervisionOf(live),
     cliTwin:
       specFile === null
@@ -737,7 +751,7 @@ export const dev: M3Handler = (ctx) => {
     blocked: daemon.held,
     blockedReason: daemon.reason,
     runs: [...live, ...past].map(runtimeRun),
-    ledger: ledgerRows(dir, "job"),
+    ...ledgerFields(dir, "job"),
     supervision: supervisionOf(live),
     cliTwin: specFile === null ? null : runtimeOpTwin(dir, devArgv(specFile, false)),
   };

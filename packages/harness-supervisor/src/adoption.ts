@@ -245,6 +245,7 @@ export function adoptRunning(harnessDir: string, options: AdoptOptions): Adoptio
     eventsFile: runEventsPath(harnessDir, runfile.runId),
     cursorFile: runCursorPath(harnessDir, runfile.runId),
     lockFile: runPumpLockPath(harnessDir, runfile.runId),
+    root: harnessDir,
     probe: options.ops,
     scrub,
     ...(options.now !== undefined ? { now: options.now } : {}),

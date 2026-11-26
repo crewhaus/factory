@@ -37,11 +37,13 @@ import {
   type RunRefusal,
   caughtUpModel,
   harnessesOfRun,
+  rerunInputOf,
   runAdapterFor,
   runRefOf,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { RUN_LEDGER_NAME, readPrunedRuns, runEventsPath } from "@crewhaus/harness-supervisor";
+import { readHarnessEnvFiles } from "../env-file";
 import type { V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
@@ -66,7 +68,7 @@ function servedRun(record: LedgerRecord, harness: string): Record<string, unknow
 }
 
 /** One run's rows among a harness's newest lines, newest first, and who started it. */
-type RunFound = {
+export type RunFound = {
   readonly entry: HangarHarnessEntry;
   readonly dir: string;
   readonly rows: readonly LedgerRecord[];
@@ -75,7 +77,7 @@ type RunFound = {
 };
 
 /** A run's rows in one harness's newest lines, newest first; empty when none is there. */
-function rowsIn(dir: string, runId: string): LedgerRecord[] {
+export function rowsIn(dir: string, runId: string): LedgerRecord[] {
   try {
     return readPage(runsLedger(dir), { limit: RUN_LOOKUP_LINES })
       .items.map((item) => item.record)
@@ -225,7 +227,8 @@ export function startedRunIn(entry: HangarHarnessEntry, by: string, credential: 
   }
 }
 
-function notFound(): V1Error {
+/** The 404 for a run this Home has not, or the caller may not see. */
+export function notFound(): V1Error {
   return new V1Error({
     status: 404,
     code: "not_found",
@@ -236,7 +239,7 @@ function notFound(): V1Error {
 }
 
 /** The run the request's `{run}` names, or 404. An execution id names no run here. */
-function runOf(ctx: V1Context): RunFound & { readonly runId: string } {
+export function runOf(ctx: V1Context): RunFound & { readonly runId: string } {
   const runId = String(ctx.params["run"]);
   if (EXECUTION_RUN_ID_RE.test(runId)) throw notFound();
   const found = findRun(ctx.deps, runId, ctx.query["harness"]);
@@ -490,10 +493,44 @@ const result: V1Handler = async (ctx) => {
 // Commands
 // ---------------------------------------------------------------------------
 
+/** Starting a run again reads the recorded one's request: that needs `h.read.content`. */
+function requireContentForFrom(ctx: V1Context, entry: HangarHarnessEntry): void {
+  if (typeof ctx.body["from"] !== "string") return;
+  if (ctx.access.authorize("h.read.content", { harness: entry.id }).allow) return;
+  throw new V1Error({
+    status: 403,
+    code: "forbidden",
+    reason: "permission",
+    needs: "h.read.content",
+    message: "Starting a run again from a recorded one needs h.read.content on this harness.",
+  });
+}
+
+/**
+ * `runs.create`'s input: the body's, or, with `from`, the recorded request of that run of
+ * this harness (its input file, else its seed message), which needs `h.read.content` too.
+ * Another harness's run, or one this harness does not record, is 404.
+ */
+function createInputOf(
+  ctx: V1Context,
+  entry: HangarHarnessEntry,
+  dir: string,
+): { readonly input: string; readonly attemptOf?: string } {
+  const from = ctx.body["from"];
+  if (typeof from !== "string") return { input: String(ctx.body["input"]) };
+  requireContentForFrom(ctx, entry);
+  if (rowsIn(dir, from).length === 0) throw notFound();
+  const rerun = rerunInputOf(dir, from, {
+    envVars: readHarnessEnvFiles(dir).vars,
+    now: ctx.deps.now(),
+  });
+  if (!rerun.ok) throw refusalError(rerun.refusal);
+  return { input: rerun.input, attemptOf: from };
+}
+
 const create: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
   const dir = liveDirOr409(entry);
-  const input = String(ctx.body["input"]);
   const subject = typeof ctx.body["subject"] === "string" ? ctx.body["subject"] : undefined;
   const admission = ctx.body["admission"] === "queue" ? "queue" : "reject";
   if (
@@ -508,6 +545,7 @@ const create: V1Handler = async (ctx) => {
       message: "Naming who a run serves needs h.subject.assert on this harness.",
     });
   }
+  requireContentForFrom(ctx, entry);
   // A work item of this harness, by its id or a ref that names this harness by id or slug.
   const work = workOfBody(ctx, entry);
   // The harness is the target: a repeat under the same key fingerprints alike.
@@ -515,6 +553,7 @@ const create: V1Handler = async (ctx) => {
   // A retry is answered with the run it started, whatever would be refused now.
   const replay = await replayedCommand(ctx, command);
   if (replay !== undefined) return createdReplay(replay, entry, dir);
+  const { input, attemptOf } = createInputOf(ctx, entry, dir);
   const runId = mintRunId();
   const plan = await runAdapterFor(entry.target).createRun({
     harnessDir: dir,
@@ -525,6 +564,7 @@ const create: V1Handler = async (ctx) => {
     ...(subject !== undefined ? { subject } : {}),
     admission,
     ...(work !== undefined ? { work } : {}),
+    ...(attemptOf !== undefined ? { attemptOf } : {}),
     home: await homeFor(ctx, entry),
   });
   if (!plan.ok) throw refusalError(plan.refusal);

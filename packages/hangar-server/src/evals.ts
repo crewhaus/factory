@@ -176,6 +176,9 @@ export type EvalSampleView = {
   /** Transcript lines, capped + torn-tolerant. */
   readonly transcript: readonly unknown[];
   readonly transcriptTruncated: boolean;
+  /** The sample's trace events (`events.jsonl`), capped + torn-tolerant. */
+  readonly events: readonly unknown[];
+  readonly eventsTruncated: boolean;
 };
 
 const textField = (record: unknown, key: string): string | undefined => {
@@ -229,6 +232,18 @@ export function evalSampleView(
     }
   };
   const transcript = readJsonlCapped(join(sampleDir, "transcript.jsonl"), MAX_JSONL_LINES);
+  // Contained per file: a link out of the harness reads as no events.
+  const eventsPath = resolveInside(harnessDir, [
+    ".crewhaus",
+    "evals",
+    runId,
+    sampleId,
+    "events.jsonl",
+  ]);
+  const events =
+    eventsPath === undefined
+      ? { objects: [] as unknown[], truncated: false }
+      : readJsonlCapped(eventsPath, MAX_JSONL_LINES);
   const grades = readJson("grades.json");
   const meta = readJson("meta.json");
   return {
@@ -239,6 +254,8 @@ export function evalSampleView(
     meta,
     transcript: transcript.objects,
     transcriptTruncated: transcript.truncated,
+    events: events.objects,
+    eventsTruncated: events.truncated,
   };
 }
 

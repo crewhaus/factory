@@ -5736,13 +5736,15 @@ describe("the release notes name what the run pump's lease changes for every har
         eventsFile: join(dir, "logs", "run.events.jsonl"),
         cursorFile: join(dir, "logs", "run.cursor"),
       };
-      // Both pids alive on this host, with fixed start times: neither lease is breakable.
+      // Both pids alive on this host, with fixed start times, each a manager's command
+      // line: neither lease is breakable.
       const probe = {
         isAlive: (pid: number) => pid === 100 || pid === 200,
         startTimeMs: (pid: number) => (pid === 100 ? 1_000 : pid === 200 ? 2_000 : undefined),
       };
-      const first = createLogPump({ ...files, pid: 100, probe });
-      const second = createLogPump({ ...files, pid: 200, probe });
+      const argv = ["crewhaus", "hangar"];
+      const first = createLogPump({ ...files, pid: 100, probe, argv });
+      const second = createLogPump({ ...files, pid: 200, probe, argv });
       writeFileSync(
         files.logFile,
         `${JSON.stringify({ kind: "turn_end", runId: "run_0123456789abcdef", turn: 1 })}\n`,
