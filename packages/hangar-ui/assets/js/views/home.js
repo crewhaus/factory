@@ -7,19 +7,34 @@
  * fails on its own: a slow or failed read in one never blanks the others.
  * Every card ends in "See all", the page its row owns.
  *
- * Home reads only what the panels need, through `api`: the inboxes' counts
- * and newest items, each harness's process picture, and the last day of the
- * activity digest. It never imports another screen's module.
+ * Home reads only what the panels need: Home's inbox (`attention.list`), each
+ * harness's process picture, and the last day of the activity digest. The
+ * inbox's items read in the inbox's own words (`views/attention.js`), so an
+ * item says the same thing on Home as on the Needs-you page.
+ *
+ * Above the panels, the status line (`home.status`): the harnesses counted by
+ * what they are doing, in words, each part a link to its list. A count Home
+ * cannot know is not printed. It is read again on each event of Home's fleet
+ * stream and when the tab comes back, patched in place, and a new item that
+ * needs you is said politely, at most once every few seconds.
+ *
+ * A list Home read only part of says so in a muted note: the harnesses whose
+ * requests could not be read, more items waiting than were read, and older
+ * changes that were not shown. Counts stay as shown.
  */
 
 import { api } from "../api.js";
 import { HOME_PANELS } from "../destinations.js";
 import { clear, dot, el, skeleton } from "../dom.js";
-import { hrefFleet, hrefGlobal, hrefHarness } from "../router.js";
+import { hrefFleet, hrefHarness } from "../router.js";
+import { openRunStream } from "../runview/stream.js";
 import { activityHref, procRow } from "../supervision.js";
 import { emptyFor } from "../ui/empty.js";
+import { announce } from "../ui/live.js";
 import { timeEl } from "../ui/time.js";
-import { dirTail, normalizeRows, unreachableNames, unreachableNote } from "../util.js";
+import { dirTail, normalizeRows } from "../util.js";
+import { call } from "../v1.js";
+import { BANDS, itemIdOf, nameOf, partialNotes, textOf } from "./attention.js";
 import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 
 const DAY_MS = 86_400_000;
@@ -50,10 +65,153 @@ export async function renderHome(root, ctx = {}) {
   }
   if (ctx.signal?.aborted) return;
   clear(root);
+  const line = el("nav", { class: "home-status", "aria-label": "Your harnesses at a glance" });
+  root.appendChild(line);
   const grid = el("div", { class: "home-panels" });
   root.appendChild(grid);
   const harnesses = rows.filter((row) => row.missingSince === null);
-  await Promise.all(HOME_PANELS.map((row) => mountPanel(grid, row, { ...ctx, harnesses })));
+  await Promise.all([
+    mountStatusLine(line, ctx),
+    ...HOME_PANELS.map((row) => mountPanel(grid, row, { ...ctx, harnesses })),
+  ]);
+}
+
+/** The status line's parts, in order: `{key, text, href}`. Absent counts are left out. Pure. */
+export function statusLineParts(status) {
+  const counts =
+    status && typeof status.counts === "object" && status.counts !== null ? status.counts : {};
+  const n = (key) => (typeof counts[key] === "number" && counts[key] >= 0 ? counts[key] : null);
+  const parts = [];
+  const harnesses = n("harnesses");
+  if (harnesses !== null) {
+    parts.push({
+      key: "harnesses",
+      text: `${harnesses} harness${harnesses === 1 ? "" : "es"}`,
+      href: hrefFleet("harnesses"),
+    });
+  }
+  const rows = [
+    ["needsYou", (c) => `${c} need${c === 1 ? "s" : ""} you`, hrefFleet("home", "needs-you")],
+    ["working", (c) => `${c} working`, hrefFleet("home", "working")],
+    ["paused", (c) => `${c} paused`, hrefFleet("harnesses", null, { state: "paused" })],
+    [
+      "notResponding",
+      (c) => `${c} not responding`,
+      hrefFleet("harnesses", null, { state: "not-responding" }),
+    ],
+    ["waitingForBudget", (c) => `${c} waiting for budget`, hrefFleet("harnesses", "spend")],
+  ];
+  for (const [key, words, href] of rows) {
+    const count = n(key);
+    if (count !== null && count > 0) parts.push({ key, text: words(count), href });
+  }
+  return parts;
+}
+
+/** Why a count is not shown, one line each, from the answer's notes. Pure. */
+export function statusLineNotes(status) {
+  const notes = Array.isArray(status?.notes) ? status.notes : [];
+  return notes
+    .map((note) => (note && typeof note.note === "string" ? note.note : null))
+    .filter((note) => note !== null);
+}
+
+/**
+ * Patch the status line in place: one node per part, kept by its key, so a part that
+ * stays keeps its node (and the focus on it) while its words and link change; only parts
+ * that appear or go are added or removed. `nodes` holds the nodes across patches.
+ */
+export function patchStatusLine(line, parts, notes, nodes = new Map()) {
+  const want = [];
+  const keep = (key, make) => {
+    let node = nodes.get(key);
+    if (node === undefined) {
+      node = make();
+      nodes.set(key, node);
+    }
+    want.push(node);
+    return node;
+  };
+  parts.forEach((part, i) => {
+    if (i > 0) {
+      keep(`sep:${part.key}`, () =>
+        el("span", { class: "home-status-sep", "aria-hidden": "true", text: " · " }),
+      );
+    }
+    const link = keep(`part:${part.key}`, () => el("a", { class: "home-status-part" }));
+    if (link.textContent !== part.text) link.textContent = part.text;
+    if (link.getAttribute("href") !== part.href) link.setAttribute("href", part.href);
+    link.dataset.key = part.key;
+  });
+  for (const note of notes) {
+    keep(`note:${note}`, () => el("span", { class: "muted home-status-note", text: note }));
+  }
+  const wanted = new Set(want);
+  for (const child of [...line.childNodes]) {
+    if (!wanted.has(child)) line.removeChild(child);
+  }
+  for (const [key, node] of nodes) {
+    if (!wanted.has(node)) nodes.delete(key);
+  }
+  want.forEach((node, i) => {
+    const at = line.childNodes[i];
+    if (at !== node) line.insertBefore(node, at ?? null);
+  });
+  return nodes;
+}
+
+/** How long a polite "needs you" announcement waits before another. */
+const ANNOUNCE_GAP_MS = 5_000;
+
+/** Draw the status line, then keep it current from the fleet stream and the tab's return. */
+async function mountStatusLine(line, ctx) {
+  let lastNeeds = null;
+  let lastAnnounced = 0;
+  const nodes = new Map();
+  const draw = async () => {
+    const answer = await call("home.status");
+    if (ctx.signal?.aborted) return;
+    if (!answer.ok) {
+      patchStatusLine(line, [], ["The status of your harnesses could not be read."], nodes);
+      return;
+    }
+    patchStatusLine(line, statusLineParts(answer.body), statusLineNotes(answer.body), nodes);
+    const needs = answer.body?.counts?.needsYou;
+    if (typeof needs === "number" && lastNeeds !== null && needs > lastNeeds) {
+      const now = Date.now();
+      if (now - lastAnnounced >= ANNOUNCE_GAP_MS) {
+        lastAnnounced = now;
+        const more = needs - lastNeeds;
+        announce(`${more} new item${more === 1 ? "" : "s"} need${more === 1 ? "s" : ""} you`);
+      }
+    }
+    if (typeof needs === "number") lastNeeds = needs;
+  };
+  await draw();
+  if (ctx.signal?.aborted || typeof document === "undefined") return;
+  let pending = false;
+  const again = () => {
+    if (pending || ctx.signal?.aborted) return;
+    pending = true;
+    void draw().finally(() => {
+      pending = false;
+    });
+  };
+  const stream = openRunStream({
+    path: "/api/v1/events",
+    onFrame: (frame) => {
+      if (frame.event !== "heartbeat") again();
+    },
+    onEnd: () => {},
+  });
+  const onVisible = () => {
+    if (document.hidden !== true) again();
+  };
+  document.addEventListener("visibilitychange", onVisible);
+  ctx.signal?.addEventListener("abort", () => {
+    stream.close();
+    document.removeEventListener("visibilitychange", onVisible);
+  });
 }
 
 /** One card: its heading, its body, and its "See all". */
@@ -133,124 +291,106 @@ export function newestFirst(items, field, n = PANEL_ITEMS) {
     .slice(0, n);
 }
 
+/** How many items a band holds, in words. */
+const BAND_WORDS = Object.freeze({
+  decide: (n) => `${n} to decide`,
+  fix: (n) => `${n} to fix`,
+  consider: (n) => `${n} to consider`,
+});
+
 /**
- * What needs you, from the two inbox reads. Pure. A read that failed is
- * passed as `null` and is not zero: its count is `null` and its name is in
- * `failed`, so nothing downstream can print "0 waiting" or "nothing needs
- * you" for a list nobody could read. A harness whose approvals could not be
- * read is named in `unreachable`, so its approvals are unknown, never 0.
- * `{ approvals: [...top], review: [...top], pending, open, failed, unreachable }`.
+ * What needs you, from Home's inbox (`attention.list`). Pure. A read that
+ * failed is passed as `null` and is not zero: `failed` is true and no band is
+ * counted, so nothing downstream can print "nothing needs you" for a list
+ * nobody could read. Each band is counted as the list shows it; a list read
+ * only in part says so in `notes`. Each item links to its own card on the
+ * Needs-you page. `{ bands, items, notes, failed, empty }`.
  */
-export function needsYouModel(approvalsPayload, reviewPayload) {
-  const read = (payload) => payload !== null && typeof payload === "object";
-  const a = read(approvalsPayload) ? approvalsPayload : null;
-  const r = read(reviewPayload) ? reviewPayload : null;
-  const approvals = (Array.isArray(a?.approvals) ? a.approvals : []).filter(
-    (row) => row?.status === "pending",
+export function needsYouModel(list) {
+  if (list === null || typeof list !== "object") {
+    return { bands: [], items: [], notes: [], failed: true, empty: null };
+  }
+  const all = (Array.isArray(list.items) ? list.items : []).filter(
+    (item) => item !== null && typeof item === "object",
   );
-  const review = (Array.isArray(r?.items) ? r.items : []).filter((row) => row?.status === "open");
-  const failed = [];
-  if (a === null) failed.push("approvals");
-  if (r === null) failed.push("review");
-  return {
-    approvals: newestFirst(approvals, "createdAt"),
-    review: newestFirst(review, "ts"),
-    pending: a === null ? null : typeof a.pending === "number" ? a.pending : approvals.length,
-    open: r === null ? null : typeof r.open === "number" ? r.open : review.length,
-    failed,
-    unreachable: unreachableNames(a),
-  };
+  const names = list.names ?? [];
+  const bands = BANDS.map((band) => ({
+    id: band.id,
+    label: band.label,
+    count: all.filter((item) => item.band === band.id).length,
+  }));
+  const items = all.slice(0, PANEL_ITEMS).map((item) => {
+    const harness = typeof item.harness === "string" ? item.harness : undefined;
+    return {
+      text: textOf(item.title),
+      band: String(item.band ?? ""),
+      where: harness === undefined ? "" : nameOf(names, harness),
+      since: item.since,
+      href: hrefFleet("home", "needs-you", { item: itemIdOf(item.ref) }),
+    };
+  });
+  const empty =
+    list.empty !== null && typeof list.empty === "object" && typeof list.empty.remedy === "string"
+      ? { reason: String(list.empty.reason ?? ""), remedy: list.empty.remedy }
+      : null;
+  return { bands, items, notes: partialNotes(list), failed: false, empty };
 }
 
-/** True only when both inboxes answered in full and neither holds anything. Pure. */
+/** The muted note under the changes when older ones were left out, or null. Pure. */
+export function olderChangesNote(payload) {
+  return payload && typeof payload === "object" && payload.truncated === true
+    ? "Older changes not shown"
+    : null;
+}
+
+/** True only when the inbox answered in full and holds nothing. Pure. */
 export function nothingNeedsYou(model) {
-  return (
-    model.failed.length === 0 &&
-    (model.unreachable ?? []).length === 0 &&
-    model.approvals.length === 0 &&
-    model.review.length === 0 &&
-    model.pending === 0 &&
-    model.open === 0
-  );
+  return !model.failed && model.notes.length === 0 && model.bands.every((b) => b.count === 0);
 }
 
-/** The summary line, from the inboxes that answered only. Pure; null when neither did. */
+/** The summary line, each band with something in it, in band order. Pure; null when none. */
 export function needsYouSummary(model) {
-  const parts = [];
-  const unreachable = model.unreachable ?? [];
-  const where =
-    unreachable.length <= 1
-      ? unreachable[0]
-      : `${unreachable.slice(0, -1).join(", ")} and ${unreachable[unreachable.length - 1]}`;
-  if (model.pending !== null && unreachable.length > 0) {
-    // Approvals some harness holds are unknown: the count is never said as complete.
-    if (model.pending > 0) {
-      parts.push(`${model.pending} approval${model.pending === 1 ? "" : "s"} waiting elsewhere`);
-    }
-    parts.push(`Approvals of ${where} unknown`);
-  } else if (model.pending !== null) {
-    parts.push(`${model.pending} approval${model.pending === 1 ? "" : "s"} waiting`);
-  }
-  if (model.open !== null) {
-    parts.push(`${model.open} review item${model.open === 1 ? "" : "s"} open`);
-  }
+  const parts = model.bands
+    .filter((band) => band.count > 0)
+    .map((band) => BAND_WORDS[band.id]?.(band.count) ?? `${band.count} ${band.label}`);
   return parts.length === 0 ? null : parts.join(" · ");
 }
 
-const INBOX_SUBJECTS = Object.freeze({
-  approvals: "the approvals list",
-  review: "the review list",
-});
-
-/** Home's "Needs you": pending approvals and open review items, newest first. */
+/** Home's "Needs you": the inbox's bands counted, and its first items, each linking to its card. */
 export async function renderNeedsYouPanel(root, ctx = {}) {
-  const [approvals, review] = await Promise.allSettled([api.approvals(), api.review()]);
-  if (approvals.status === "rejected" && review.status === "rejected") throw approvals.reason;
+  const answer = await call("attention.list", { query: { limit: "500" } });
   if (ctx.signal?.aborted) return;
-  const model = needsYouModel(
-    approvals.status === "fulfilled" ? approvals.value : null,
-    review.status === "fulfilled" ? review.value : null,
-  );
+  if (!answer.ok && answer.status !== 403) throw new Error(answer.error.message);
   clear(root);
-  if (nothingNeedsYou(model)) {
-    root.appendChild(nothing("Nothing needs you right now."));
+  if (!answer.ok) {
+    root.appendChild(emptyFor({ cause: "no-access", detail: answer.error.message }));
     return;
   }
-  const items = [
-    ...model.approvals.map((row) =>
-      el("li", { class: "home-item" }, [
-        el("a", {
-          href: hrefGlobal("approvals"),
-          text: `Approve or deny: ${String(row.toolName)}`,
-        }),
-        el("span", { class: "muted", text: String(row.specName ?? "") }),
-        timeEl(row.createdAt),
-      ]),
-    ),
-    ...model.review.map((row) =>
-      el("li", { class: "home-item" }, [
-        el("a", {
-          href: hrefGlobal("review"),
-          text: `Review: ${String(row.kind).replace(/_/g, " ")}`,
-        }),
-        el("span", { class: "muted", text: String(row.specName ?? "") }),
-        timeEl(row.ts),
-      ]),
-    ),
-  ];
+  const model = needsYouModel(answer.body);
+  if (nothingNeedsYou(model)) {
+    root.appendChild(
+      nothing(
+        model.empty?.reason === "no-access" ? model.empty.remedy : "Nothing needs you right now.",
+      ),
+    );
+    return;
+  }
   const summary = needsYouSummary(model);
   if (summary !== null) root.appendChild(el("p", { class: "muted home-summary", text: summary }));
-  if (model.unreachable.length > 0) {
-    root.appendChild(el("p", { class: "muted", text: unreachableNote(model.unreachable) }));
+  for (const note of model.notes) {
+    root.appendChild(el("p", { class: "muted home-note", text: note }));
   }
-  if (items.length > 0) root.appendChild(itemList(items));
-  for (const source of model.failed) {
+  if (model.items.length > 0) {
     root.appendChild(
-      emptyFor({
-        cause: "connection-failed",
-        subject: INBOX_SUBJECTS[source],
-        onAction: retryInto(root, ctx, renderNeedsYouPanel, INBOX_SUBJECTS[source]),
-      }),
+      itemList(
+        model.items.map((item) =>
+          el("li", { class: "home-item" }, [
+            el("a", { href: item.href, text: item.text }),
+            el("span", { class: "muted", text: item.where }),
+            timeEl(item.since),
+          ]),
+        ),
+      ),
     );
   }
 }
@@ -333,8 +473,10 @@ export async function renderChangesPanel(root, ctx = {}) {
     5,
   );
   clear(root);
+  const older = olderChangesNote(payload);
   if (items.length === 0) {
     root.appendChild(nothing("No changes in the last day."));
+    if (older !== null) root.appendChild(el("p", { class: "muted home-note", text: older }));
     return;
   }
   root.appendChild(
@@ -350,4 +492,5 @@ export async function renderChangesPanel(root, ctx = {}) {
       }),
     ),
   );
+  if (older !== null) root.appendChild(el("p", { class: "muted home-note", text: older }));
 }

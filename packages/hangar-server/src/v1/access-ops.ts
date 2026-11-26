@@ -232,7 +232,17 @@ const devicesList: V1Handler = async (ctx) => {
   const snapshot = snapshotOf(ctx);
   const mine = !manages(ctx);
   const fold = foldSignIn(ctx.deps.hangarRoot);
-  const devices = fold.ok ? [...fold.devices.values()] : [];
+  // Sign-in records that cannot be read list no device: never an empty list.
+  if (!fold.ok) {
+    throw new V1Error({
+      status: 503,
+      code: "unavailable",
+      reason: "sign_in_unreadable",
+      message:
+        "Home's sign-in records cannot be read, so its devices cannot be listed. Run `crewhaus access members` on this computer to see why.",
+    });
+  }
+  const devices = [...fold.devices.values()];
   const items = listDevices(devices, readUsage(ctx.deps.hangarRoot)).filter(
     (d) => !mine || d.principal === ctx.access.caller.principal,
   );

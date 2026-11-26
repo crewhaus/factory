@@ -44,16 +44,44 @@ import {
   rollupLine,
   sortRows,
 } from "../util.js";
+import { call } from "../v1.js";
 import { HOME_WIDE, twinGroup, writeTwin } from "./control.js";
+import {
+  GROUP_BY,
+  groupByOf,
+  groupHarnesses,
+  mergeOverviews,
+  railGroupsModel,
+} from "./library-group.js";
 import { renderOnboarding, shouldOnboard } from "./onboarding.js";
 
 const state = {
   sortKey: "name",
   sortDir: "asc",
   // {kind:"all"} | {kind:"group",name} | {kind:"smart",id} | {kind:"hidden"}
+  //   | {kind:"bucket",by,key}
   filter: { kind: "all" },
   query: "",
+  // How the rail groups the rows: by group, owner or purpose (`?by=`).
+  by: "group",
+  // Each harness's owner and purpose, by id, from one `harnesses.list` read.
+  overviews: [],
+  // That read's answer, or null before it is made: a failed read groups nothing.
+  overviewAnswer: null,
 };
+
+/** Read each harness's owner and purpose once, keeping a failed answer as one. */
+async function readOverviews() {
+  let answer;
+  try {
+    answer = await call("harnesses.list", { query: { limit: "500" } });
+  } catch (err) {
+    answer = { ok: false, error: { message: err instanceof Error ? err.message : String(err) } };
+  }
+  state.overviewAnswer = answer;
+  state.overviews =
+    answer?.ok === true && Array.isArray(answer.body?.items) ? answer.body.items : [];
+}
 
 /**
  * Run one registry write; on failure surface a toast (a write must NEVER
@@ -87,7 +115,16 @@ export async function renderLibrary(root, ctx = {}) {
   // First paint from the plain (cache-only) feed — instant, stale-labeled
   // via each row's cachedAt — then a background ?hydrate=1 refetch replaces
   // the rows with freshly computed rollups.
-  const [feedRes, groupsRes] = await Promise.allSettled([api.harnesses(), api.groups()]);
+  state.by = groupByOf(ctx.route);
+  if (state.filter.kind === "bucket" && state.filter.by !== state.by)
+    state.filter = { kind: "all" };
+  state.overviewAnswer = null;
+  state.overviews = [];
+  const [feedRes, groupsRes] = await Promise.allSettled([
+    api.harnesses(),
+    api.groups(),
+    state.by === "group" ? Promise.resolve(null) : readOverviews(),
+  ]);
   if (feedRes.status === "rejected") throw feedRes.reason;
   const rows = normalizeRows(feedRes.value);
   // HM-12: an empty Library on a machine with no scan roots is FIRST BOOT,
@@ -205,6 +242,13 @@ function applyFilter(rows, nowMs) {
   } else if (state.filter.kind === "smart") {
     const smart = deriveSmartGroups(rows, nowMs).find((g) => g.id === state.filter.id);
     out = smart ? smart.rows.filter((r) => r.hidden !== true) : [];
+  } else if (state.filter.kind === "bucket" && state.overviewAnswer?.ok === true) {
+    const { by, key } = state.filter;
+    const bucket = groupHarnesses(mergeOverviews(out, state.overviews), by).find(
+      (b) => b.key === key,
+    );
+    const ids = new Set((bucket?.rows ?? []).map((r) => r.id));
+    out = out.filter((r) => ids.has(r.id));
   }
   if (state.query !== "") {
     const q = state.query.toLowerCase();
@@ -235,7 +279,9 @@ function draw(root, rows, groups, opts = {}) {
     const view = views.get(root);
     draw(root, view?.rows ?? rows, view?.groups ?? groups, { hydrating: false });
   };
-  const reload = () => renderLibrary(root);
+  // A reload keeps the grouping unless it names another.
+  const reload = (ctx) =>
+    renderLibrary(root, ctx?.route !== undefined ? ctx : { route: { query: { by: state.by } } });
   clear(root);
 
   const layout = el("div", { class: "lib" });
@@ -286,8 +332,44 @@ function draw(root, rows, groups, opts = {}) {
   });
 }
 
+/**
+ * The labelled "Group by" select: its choice is kept in the address as `?by=`. A change
+ * regroups the rows already read (reading owners and purposes once, the first time one
+ * is asked for) and puts focus back on the select, so arrow keys go on choosing.
+ */
+function groupBySelect(redraw) {
+  const id = "lib-group-by";
+  const select = el(
+    "select",
+    { class: "input", id, "aria-describedby": `${id}-hint` },
+    GROUP_BY.map((row) =>
+      el("option", { value: row.id, selected: row.id === state.by, text: row.label }),
+    ),
+  );
+  select.addEventListener("change", async () => {
+    const by = select.value;
+    state.by = GROUP_BY.some((row) => row.id === by) ? by : "group";
+    state.filter = { kind: "all" };
+    const hash = state.by === "group" ? "#/harnesses" : `#/harnesses?by=${state.by}`;
+    window.history.replaceState(window.history.state, "", hash);
+    if (state.by !== "group" && state.overviewAnswer?.ok !== true) await readOverviews();
+    redraw();
+    document.getElementById(id)?.focus();
+  });
+  return el("div", { class: "rail-group-by" }, [
+    el("label", { for: id, text: "Group by" }),
+    select,
+    el("span", {
+      class: "sr-only",
+      id: `${id}-hint`,
+      text: "Changes the list of groups beside the harnesses.",
+    }),
+  ]);
+}
+
 function renderRail(rows, groups, nowMs, redraw, reload) {
   const rail = el("aside", { class: "rail", "aria-label": "groups" });
+  rail.appendChild(groupBySelect(redraw));
   const item = (label, count, active, color, onClick) => {
     const btn = el(
       "button",
@@ -319,6 +401,42 @@ function renderRail(rows, groups, nowMs, redraw, reload) {
   }
 
   const shown = rows.filter((r) => r.hidden !== true);
+  if (state.by !== "group") {
+    // Owners or purposes, from the overview list: a row without one has its own bucket.
+    rail.appendChild(
+      el("div", { class: "rail-head", text: state.by === "owner" ? "Owners" : "Purposes" }),
+    );
+    const model = railGroupsModel(shown, state.overviewAnswer, state.by);
+    if (model.note !== undefined) rail.appendChild(el("p", { class: "muted", text: model.note }));
+    if (model.failed === true) {
+      rail.appendChild(
+        el("button", {
+          class: "btn btn-ghost",
+          type: "button",
+          text: "Try again",
+          onClick: async () => {
+            await readOverviews();
+            redraw();
+            document.getElementById("lib-group-by")?.focus();
+          },
+        }),
+      );
+      return rail;
+    }
+    for (const bucket of model.buckets) {
+      const active =
+        state.filter.kind === "bucket" &&
+        state.filter.by === state.by &&
+        state.filter.key === bucket.key;
+      rail.appendChild(
+        item(bucket.heading, bucket.rows.length, active, null, () => {
+          state.filter = { kind: "bucket", by: state.by, key: bucket.key };
+          redraw();
+        }),
+      );
+    }
+    return rail;
+  }
   if (groups.length > 0) rail.appendChild(el("div", { class: "rail-head", text: "Groups" }));
   for (const g of groups) {
     const count = shown.filter((r) => r.groups.includes(g.name)).length;

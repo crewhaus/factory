@@ -444,3 +444,83 @@ describe("GET /api/search", () => {
     }
   }, 20_000);
 });
+
+describe("the controls the menu proposes", () => {
+  test("pause and resume run the API's own controls, each with a twin that names the harness", () => {
+    const harnesses = [{ id: "hrn_1", specName: "support-bot", dir: "/h/support" }];
+    const pause = matchActions("pause support", harnesses);
+    expect(pause).toHaveLength(1);
+    expect(pause[0]?.operation).toBe("controls.pause");
+    expect(pause[0]?.params).toEqual({ id: "hrn_1" });
+    expect(pause[0]?.cliTwin).toBe("crewhaus daemon pause '/h/support'");
+    const resume = matchActions("resume support", harnesses);
+    expect(resume[0]?.operation).toBe("controls.resume");
+    // Finishing current work stays the one process drain: one verb, one action.
+    const drain = matchActions("drain support", harnesses);
+    expect(drain.map((a) => [a.route, a.operation])).toEqual([["procDrain", undefined]]);
+  });
+
+  test("through search: offered only where the caller holds h.control", async () => {
+    const { v1Home } = await import("./__test__/v1-home");
+    const home = await v1Home();
+    try {
+      const a = await home.harness("paws-alpha");
+      const b = await home.harness("paws-bravo");
+      const operator = await home.member("Ozzie", "operator", { scope: `harness:${a.id}` });
+      const viewer = await home.member("Vinnie", "viewer");
+      const search = async (secret: string | undefined, q: string) => {
+        const res = await home.call("GET", `/api/search?q=${encodeURIComponent(q)}`, {
+          ...(secret !== undefined ? { secret } : {}),
+        });
+        expect(res.status).toBe(200);
+        return res.body["actions"] as Array<{ operation?: string; params: { id: string } }>;
+      };
+      const operatorPause = await search(operator.secret, "pause paws");
+      expect(operatorPause.map((x) => [x.operation, x.params.id])).toEqual([
+        ["controls.pause", a.id],
+      ]);
+      expect(await search(viewer.secret, "pause paws")).toEqual([]);
+      const ownerPause = await search(undefined, "pause paws");
+      expect(ownerPause.map((x) => x.params.id).sort()).toEqual([a.id, b.id].sort());
+      // The process verbs keep their own reach.
+      expect((await search(operator.secret, "drain paws-alpha")).length).toBe(1);
+    } finally {
+      await home.t.stop();
+    }
+  }, 30_000); // two members' device sign-ins
+
+  test("a harness row in the results names its owner when Home knows one", async () => {
+    const { v1Home } = await import("./__test__/v1-home");
+    const { mkdirSync, realpathSync } = await import("node:fs");
+    const home = await v1Home();
+    try {
+      const owned = await home.harness("owned-row");
+      const unowned = await home.harness("owned-not");
+      const olga = await home.member("Olga", "owner");
+      const control = join(owned.dir, ".crewhaus", "run", "control");
+      mkdirSync(control, { recursive: true });
+      writeFileSync(
+        join(control, "approvers.json"),
+        `${JSON.stringify({
+          v: 1,
+          epoch: 1,
+          generatedAt: new Date().toISOString(),
+          harness: owned.id,
+          owner: olga.principal,
+          governedSince: new Date(Date.now() - DAY).toISOString(),
+          members: [],
+          links: [],
+          accessRoot: realpathSync(home.t.hangarRoot),
+        })}\n`,
+      );
+      const res = await home.call("GET", "/api/search?q=owned");
+      const harnessRows = (res.body["entries"] as OmniEntry[]).filter((e) => e.kind === "harness");
+      const byId = new Map(harnessRows.map((e) => [e.harnessId, e]));
+      expect(byId.get(owned.id)?.owner).toBe("Olga");
+      expect(byId.has(unowned.id)).toBe(true);
+      expect(byId.get(unowned.id)?.owner).toBeUndefined();
+    } finally {
+      await home.t.stop();
+    }
+  }, 30_000); // a member's device sign-in
+});

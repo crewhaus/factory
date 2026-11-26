@@ -21,6 +21,8 @@
 
 import { ROUTES, buildPath, m3RouteKeys } from "./routes.js";
 import { createSseParser } from "./supervision.js";
+import { reportReach } from "./ui/connectivity.js";
+import { actionKey } from "./v1.js";
 
 const SESSION_KEY = "hangar.session";
 
@@ -92,22 +94,30 @@ function authHeaders(accept) {
 
 /** One request, reported as `{ status, body }` — no throwing on a non-2xx.
  *  401 still fires the unauthorized handler, and the request is sent once
- *  more when that signed the tab in again. */
-async function rawRequest(method, path, body, replayed = false) {
+ *  more when that signed the tab in again. A write a person starts carries one
+ *  `Idempotency-Key`, the same one when it is sent again, so Home answers a
+ *  repeat with the receipt it already wrote. */
+async function rawRequest(method, path, body, replayed = false, key = undefined) {
   const headers = authHeaders("application/json");
   const init = { method, headers };
   if (body !== undefined) {
     headers["content-type"] = "application/json";
     init.body = JSON.stringify(body);
   }
+  const idempotency = key ?? (method === "GET" || method === "HEAD" ? undefined : actionKey());
+  if (idempotency !== undefined) headers["Idempotency-Key"] = idempotency;
   let res;
   try {
     res = await fetch(path, init);
   } catch (err) {
+    reportReach(false);
     throw new ApiError(0, `network error: ${err instanceof Error ? err.message : String(err)}`);
   }
+  reportReach(true);
   if (res.status === 401) {
-    if ((await signedInAgain()) && !replayed) return rawRequest(method, path, body, true);
+    if ((await signedInAgain()) && !replayed) {
+      return rawRequest(method, path, body, true, idempotency);
+    }
     throw new ApiError(401, "unauthorized");
   }
   if (res.status === 404 || res.status === 204) return { status: res.status, body: null };

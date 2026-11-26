@@ -1,7 +1,9 @@
 /**
  * Home's panels answer honestly when one of their reads fails: a list nobody
  * could read is never counted as zero, and "Nothing needs you right now." is
- * said only when both inboxes answered and both are empty.
+ * said only when Home's inbox answered in full and holds nothing. Its items
+ * read in the inbox's own words and link to their own card on the Needs-you
+ * page, and a list read only in part says so.
  */
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -9,72 +11,118 @@ import {
   needsYouModel,
   needsYouSummary,
   nothingNeedsYou,
+  olderChangesNote,
+  statusLineNotes,
+  statusLineParts,
   workingModel,
 } from "../assets/js/views/home.js";
 
-const approval = { status: "pending", toolName: "Bash", createdAt: "2026-11-12T10:00:00Z" };
-const reviewItem = { status: "open", kind: "spec_change", ts: "2026-11-12T09:00:00Z" };
+const A = "hrn_000000000000000a";
+const B = "hrn_000000000000000b";
+const att = (n: number) => `home/attention/att_${String(n).padStart(26, "0")}`;
 
-describe("needsYouModel", () => {
-  test("both inboxes empty: nothing needs you", () => {
-    const model = needsYouModel({ approvals: [], pending: 0 }, { items: [], open: 0 });
-    expect(model.failed).toEqual([]);
+/** An inbox item as `attention.list` serves it. */
+const item = (over: Record<string, unknown> = {}) => ({
+  ref: att(1),
+  kind: "permission",
+  band: "decide",
+  harness: A,
+  source: { kind: "approval", id: "appr_00000000000000a1" },
+  title: { template: "permission.ask", params: { tool: "SendMessage" } },
+  whyNow: { template: "why.waiting", params: { runs: 1 } },
+  affected: { runs: [], count: 0 },
+  evidence: [],
+  choices: [],
+  requiredClass: "operator",
+  state: "open",
+  evidenceRev: "0123456789abcdef",
+  since: "2026-11-12T10:00:00Z",
+  freshness: { asOf: "2026-11-12T10:00:00Z", mode: "projection" },
+  ...over,
+});
+
+const checkpoint = item({
+  ref: att(7),
+  kind: "checkpoint",
+  source: { kind: "checkpoint", id: "run_1" },
+  title: { template: "checkpoint.waiting", params: { node: "review" } },
+});
+
+describe("needsYouModel, from Home's inbox", () => {
+  test("a checkpoint item, a list cut short and an unreadable harness: the item and both notes", () => {
+    const model = needsYouModel({
+      items: [checkpoint, item({ ref: att(2), band: "fix", kind: "run-failures" })],
+      snapshotAt: "x",
+      truncated: { reason: "harness_capped", verb: "crewhaus inbox list --json" },
+      unreachable: [B],
+      names: [
+        { id: A, name: "support-bot" },
+        { id: B, name: "release-bot" },
+      ],
+    });
+    expect(model.failed).toBe(false);
+    expect(model.items[0]).toEqual({
+      text: "A graph run is paused before review",
+      band: "decide",
+      where: "support-bot",
+      since: "2026-11-12T10:00:00Z",
+      href: `#/home/needs-you?item=att_${"7".padStart(26, "0")}`,
+    });
+    expect(model.notes).toEqual([
+      "Couldn't read the requests of release-bot: its sessions folder is outside its folder.",
+      "Some harnesses have more items than were read. To see them all, run crewhaus inbox list --json",
+    ]);
+    // The counts stay as shown, and a list read in part is never "nothing".
+    expect(needsYouSummary(model)).toBe("1 to decide · 1 to fix");
+    expect(nothingNeedsYou(model)).toBe(false);
+  });
+
+  test("a list read in full: neither note", () => {
+    const model = needsYouModel({ items: [checkpoint], snapshotAt: "x" });
+    expect(model.notes).toEqual([]);
+    expect(model.items.map((i: { text: string }) => i.text)).toEqual([
+      "A graph run is paused before review",
+    ]);
+    expect(needsYouSummary(model)).toBe("1 to decide");
+  });
+
+  test("a list cut at its page names no harness and still says so", () => {
+    const model = needsYouModel({
+      items: [checkpoint],
+      snapshotAt: "x",
+      truncated: { reason: "page_limit" },
+    });
+    expect(model.notes).toEqual(["More items are waiting than this list shows."]);
+  });
+
+  test("an empty inbox read in full: nothing needs you", () => {
+    const model = needsYouModel({
+      items: [],
+      snapshotAt: "x",
+      empty: { reason: "no-data", remedy: "Nothing needs you right now." },
+    });
     expect(nothingNeedsYou(model)).toBe(true);
-    expect(needsYouSummary(model)).toBe("0 approvals waiting · 0 review items open");
+    expect(needsYouSummary(model)).toBeNull();
   });
 
-  test("a harness whose approvals cannot be read: not 'nothing', and its approvals unknown, never 0", () => {
-    const unreachableHarnesses = [{ id: "hrn_000000000000000a", specName: "linked" }];
-    const model = needsYouModel(
-      { approvals: [], pending: 0, unreachableHarnesses },
-      { items: [], open: 0 },
-    );
-    expect(model.unreachable).toEqual(["linked"]);
+  test("an empty list with an unreadable harness is not 'nothing'", () => {
+    const model = needsYouModel({ items: [], snapshotAt: "x", unreachable: [A] });
     expect(nothingNeedsYou(model)).toBe(false);
-    expect(needsYouSummary(model)).toBe("Approvals of linked unknown · 0 review items open");
-    expect(needsYouSummary(model)).not.toContain("0 approvals");
-    const more = needsYouModel(
-      { approvals: [approval], pending: 1, unreachableHarnesses },
-      { items: [], open: 0 },
-    );
-    expect(needsYouSummary(more)).toBe(
-      "1 approval waiting elsewhere · Approvals of linked unknown · 0 review items open",
-    );
+    expect(model.notes[0]).toContain(A);
   });
 
-  test("approvals unread and review empty: not 'nothing', and no approvals count", () => {
-    const model = needsYouModel(null, { items: [], open: 0 });
-    expect(model.failed).toEqual(["approvals"]);
-    expect(model.pending).toBeNull();
-    expect(nothingNeedsYou(model)).toBe(false);
-    expect(needsYouSummary(model)).toBe("0 review items open");
-  });
-
-  test("approvals unread and review holding items: the summary names review only", () => {
-    const model = needsYouModel(null, { items: [reviewItem, reviewItem], open: 2 });
-    expect(model.review.length).toBe(2);
-    expect(needsYouSummary(model)).toBe("2 review items open");
-    expect(needsYouSummary(model)).not.toContain("approval");
-  });
-
-  test("review unread: its count is unknown, not zero", () => {
-    const model = needsYouModel({ approvals: [approval], pending: 1 }, null);
-    expect(model.failed).toEqual(["review"]);
-    expect(model.open).toBeNull();
-    expect(nothingNeedsYou(model)).toBe(false);
-    expect(needsYouSummary(model)).toBe("1 approval waiting");
-  });
-
-  test("both unread: no summary at all", () => {
-    const model = needsYouModel(null, null);
-    expect(model.failed).toEqual(["approvals", "review"]);
+  test("an inbox nobody could read: failed, no count and never 'nothing'", () => {
+    const model = needsYouModel(null);
+    expect(model.failed).toBe(true);
     expect(needsYouSummary(model)).toBeNull();
     expect(nothingNeedsYou(model)).toBe(false);
   });
 
-  test("a count above the listed items is not 'nothing'", () => {
-    const model = needsYouModel({ approvals: [], pending: 3 }, { items: [], open: 0 });
-    expect(nothingNeedsYou(model)).toBe(false);
+  test("Home lists at most three items, in the order the inbox gives them", () => {
+    const items = [1, 2, 3, 4].map((n) => item({ ref: att(n) }));
+    const model = needsYouModel({ items, snapshotAt: "x" });
+    expect(model.items.map((i: { href: string }) => i.href.slice(-2))).toEqual(["01", "02", "03"]);
+    expect(needsYouSummary(model)).toBe("4 to decide");
   });
 });
 
@@ -96,5 +144,50 @@ describe("workingModel", () => {
   test("every read answered: nothing unchecked", () => {
     const model = workingModel([], [], 0);
     expect(model).toEqual({ working: [], unchecked: 0 });
+  });
+});
+
+describe("older changes Home did not read say so", () => {
+  test("a digest cut short says older changes are not shown; a whole one says nothing", () => {
+    expect(olderChangesNote({ items: [], truncated: true })).toBe("Older changes not shown");
+    expect(olderChangesNote({ items: [], truncated: false })).toBeNull();
+    expect(olderChangesNote(null)).toBeNull();
+  });
+});
+
+describe("Home's status line", () => {
+  test("names each count in words, links each part, and leaves out what it cannot know", () => {
+    const parts = statusLineParts({
+      counts: {
+        harnesses: 4,
+        needsYou: 1,
+        working: 2,
+        paused: 1,
+        notResponding: 1,
+        waitingForBudget: 1,
+      },
+    });
+    expect(parts.map((p: { text: string }) => p.text)).toEqual([
+      "4 harnesses",
+      "1 needs you",
+      "2 working",
+      "1 paused",
+      "1 not responding",
+      "1 waiting for budget",
+    ]);
+    expect(parts.map((p: { href: string }) => p.href)).toEqual([
+      "#/harnesses",
+      "#/home/needs-you",
+      "#/home/working",
+      "#/harnesses?state=paused",
+      "#/harnesses?state=not-responding",
+      "#/harnesses/spend",
+    ]);
+    // A count that is absent (unknown) or zero is not printed.
+    const unknown = statusLineParts({ counts: { harnesses: 2, working: 0 } });
+    expect(unknown.map((p: { text: string }) => p.text)).toEqual(["2 harnesses"]);
+    expect(
+      statusLineNotes({ counts: {}, notes: [{ count: "needsYou", note: "Not counted." }] }),
+    ).toEqual(["Not counted."]);
   });
 });

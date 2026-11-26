@@ -47,6 +47,11 @@ export type OpenSessionOptions = {
    * a failure, whoever produced it.
    */
   readonly expectedStatuses?: readonly ExpectedStatus[];
+  /**
+   * Join through an invite link instead of the boot link: the session opens the link,
+   * types `name` on the join screen and joins as the member the invite makes.
+   */
+  readonly invite?: { readonly link: string; readonly name: string };
 };
 
 export type ExpectedStatus = { readonly pathname: string; readonly status: number };
@@ -145,7 +150,7 @@ export async function signInPath(home: HomeAddress): Promise<string> {
 
 let traceCounter = 0;
 
-/** Open a context, sign in through the real boot path, and wait for it to settle. */
+/** Open a context, sign in through the real boot path (or join from an invite), and wait for it to settle. */
 export async function openSession(
   home: HomeAddress,
   opts: OpenSessionOptions = {},
@@ -238,7 +243,17 @@ export async function openSession(
     }
   });
 
-  await page.goto(`${home.url}${await signInPath(home)}`);
+  if (opts.invite === undefined) {
+    await page.goto(`${home.url}${await signInPath(home)}`);
+  } else {
+    route = "join";
+    await page.goto(opts.invite.link);
+    const joining = page.getByRole("heading", { name: "Join Home" });
+    await joining.waitFor({ timeout: 10_000 });
+    await page.getByLabel("Your name").fill(opts.invite.name);
+    await page.getByRole("button", { name: "Join Home" }).click();
+    await joining.waitFor({ state: "detached", timeout: 10_000 });
+  }
   await settle(page, route);
 
   const session: Session = {

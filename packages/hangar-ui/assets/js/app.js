@@ -24,6 +24,7 @@ import { parseRoute, startRouter, withoutInspect } from "./router.js";
 import {
   afterRoute,
   drawNav,
+  guardedImport,
   loadNavCounts,
   markReady,
   mountRoute,
@@ -105,8 +106,8 @@ function dispatch(route) {
     }
     // `?inspect=<ref>` opens the inspector over the page it drew; no inspect, none open.
     if (outcome === "done" && route.view !== "inspect-ref") {
-      void import("./inspect/panel.js").then((panel) =>
-        panel.inspectAfterRoute(route, document.getElementById("view")),
+      void guardedImport(() => import("./inspect/panel.js")).then((panel) =>
+        panel?.inspectAfterRoute(route, document.getElementById("view")),
       );
     }
     return outcome;
@@ -150,7 +151,9 @@ function installKeyboard() {
       document.querySelector("#view > aside.inspector") !== null
     ) {
       event.preventDefault();
-      void import("./inspect/panel.js").then((panel) => panel.closeInspector());
+      void guardedImport(() => import("./inspect/panel.js")).then((panel) =>
+        panel?.closeInspector(),
+      );
     }
   });
 }
@@ -311,8 +314,8 @@ async function boot() {
         pageOf() === drawnPage
       ) {
         const opener = document.activeElement;
-        void import("./inspect/panel.js").then((panel) =>
-          panel.inspectAfterRoute(route, document.getElementById("view"), { opener }),
+        void guardedImport(() => import("./inspect/panel.js")).then((panel) =>
+          panel?.inspectAfterRoute(route, document.getElementById("view"), { opener }),
         );
         return;
       }

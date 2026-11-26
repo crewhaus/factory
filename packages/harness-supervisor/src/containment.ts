@@ -11,11 +11,9 @@
  *      stop `../` traversal; the realpath check additionally stops a symlink
  *      planted inside a harness tree from walking the read outside it.
  *
- * The containment check resolves the deepest PRESENT ancestor of the target
- * (so probing a not-yet-created file still validates): a link counts as
- * present whether or not its target exists, and must resolve, so a link to
- * nothing is never treated as a name that is free to create. Containment is
- * decided by `relative()`, never by a string prefix.
+ * A path that does not exist yet, a link to nothing included, resolves only to
+ * a place inside the root, so a save never creates or writes a file outside the
+ * harness. Containment is decided by `relative()`, never by a string prefix.
  *
  * It moved here from `@crewhaus/hangar-server` (which still re-exports it,
  * for one release) together with run detail, which reads through it: a

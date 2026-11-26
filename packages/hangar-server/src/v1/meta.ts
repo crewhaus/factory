@@ -17,12 +17,15 @@ import {
   PERMISSIONS,
   PERMISSION_DECLS,
   PROTOCOL_ID,
+  isId,
   parseId,
   parseRef,
 } from "@crewhaus/control-contract";
 import { ruleLabelOf } from "@crewhaus/control-contract/delegation";
 import {
+  actionDecisionState,
   foldStates,
+  readActionDecisions,
   readDelegations,
   readDeployments,
   readStandingRules,
@@ -31,6 +34,7 @@ import {
 import { specRevision } from "@crewhaus/ir/policy";
 import { foldApprovals } from "../approvals";
 import type { RefResolver, V1Context, V1Handler } from "./context";
+import { peopleReleased } from "./decisions";
 import { V1Error } from "./errors";
 import {
   type FoundCommand,
@@ -240,10 +244,33 @@ const resolveExec: RefResolver = async (ctx, ref) => {
   };
 };
 
+/**
+ * A decision's ref: a tool approval or a merge or rollout decision. A decision about a
+ * person that the caller may not see answers the same 404 as one that does not exist.
+ */
 const resolveDecision: RefResolver = async (ctx, ref) => {
-  const { dir } = harnessDirOf(ctx, ref.scope);
+  const { id, dir } = harnessDirOf(ctx, ref.scope);
+  if (isId("dec", ref.id)) {
+    const actions = readActionDecisions(dir);
+    const row = actions.state === "present" ? actions.rows.find((r) => r.id === ref.id) : undefined;
+    if (row === undefined) throw notFound("decision");
+    const state = actionDecisionState(row, ctx.deps.now());
+    return {
+      status: 200,
+      body: {
+        kind: "decision",
+        ...hrefOf(ctx, `${ref.scope}/decision/${ref.id}`),
+        rev: `${state}:${row.subject.revision}`,
+        summary: `A ${state} ${row.kind} decision`,
+      },
+      scrubDir: dir,
+    };
+  }
   const record = foldApprovals(dir).approvals.find((a) => a.id === ref.id);
   if (record === undefined) throw notFound("decision");
+  if (!peopleReleased(ctx, id, ref.id, (record as { sensitivity?: unknown }).sensitivity)) {
+    throw notFound("decision");
+  }
   const digest =
     typeof record.bindingDigest === "string" ? `:${record.bindingDigest.slice(0, 12)}` : "";
   const state =

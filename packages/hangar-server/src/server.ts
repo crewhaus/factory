@@ -248,7 +248,7 @@ import {
   defaultNotificationSinks,
   deriveEvents,
 } from "./notifications";
-import { OMNI_LIMIT, type OmniIndex, createOmniIndex } from "./omnibox";
+import { OMNI_LIMIT, type OmniIndex, createOmniIndex, harnessOwnerLookup } from "./omnibox";
 import {
   DEMOS_DIR_ENV,
   REGISTRY_MANAGE,
@@ -3056,7 +3056,22 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       const limitRaw = Number.parseInt(url.searchParams.get("limit") ?? "", 10);
       const limit =
         Number.isFinite(limitRaw) && limitRaw > 0 ? Math.min(limitRaw, 100) : OMNI_LIMIT;
-      return json(maskDeep(omni.search(q, indexHarnesses(), limit), fleetScrub()));
+      const harnesses = indexHarnesses();
+      const access = currentRequestAccess();
+      const read = signIn.snapshot();
+      const names = new Map<string, string>();
+      if (read.state === "present") {
+        for (const [id, subject] of Object.entries(read.snapshot.subjects.principals)) {
+          const name = (subject as { readonly displayName?: unknown }).displayName;
+          if (typeof name === "string" && name.trim() !== "") names.set(id, name);
+        }
+      }
+      // An action is offered only where the caller holds what it needs.
+      const answer = omni.search(q, harnesses, limit, {
+        ownerOf: harnessOwnerLookup(harnesses, names),
+        allowed: (permission, harness) => access?.authorize(permission, { harness }).allow === true,
+      });
+      return json(maskDeep(answer, fleetScrub()));
     }
 
     if (head === "notifications" && rest.length === 0) {
@@ -3465,6 +3480,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       : {}),
     controlClient: control,
     controlTarget: async (entry) => controlTarget(await processFor(entry)),
+    processProbe: processes.ops,
     observedControlTarget: async (entry) => {
       const { handle, observed } = observedFor(entry);
       return controlTarget(handle, observed);

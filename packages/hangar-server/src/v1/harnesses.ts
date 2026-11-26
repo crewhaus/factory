@@ -3,6 +3,11 @@
  * how it is. A row's records part comes from the harness's overview read model, caught up
  * in memory, or a bounded fold of its records when there is none (no read writes a
  * projection); a fleet list counts only the harnesses the caller may read.
+ *
+ * A row also names the purpose its spec declares (`intent.purpose`) and its owner's
+ * display name, each absent when there is none to show. One harness's row says what the
+ * caller may do there (`you`), from Home's access records, so a control the caller may
+ * not use is shown with its reason instead of failing when pressed.
  */
 import {
   APPROVAL_ID_RE,
@@ -28,8 +33,12 @@ import {
   servedOverview,
 } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
+import { parseYamlOnly } from "@crewhaus/spec-patch/commit";
 import { pendingApprovalsOf } from "../approvals";
+import { ATTENTION_PROJECTION, attentionCountsOf } from "./attention";
+import { readSpecText } from "./budget";
 import type { DaemonStatus, V1Context, V1Handler } from "./context";
+import { type DecidedByReader, decidedByReader } from "./decided-by";
 import { V1Error } from "./errors";
 import { emptyOf, fleetSnapshot } from "./lists";
 import { harnessOf, liveDirOf, visibleHarnesses } from "./resolve";
@@ -39,7 +48,12 @@ export function heartbeatOf(dir: string): Partial<Heartbeat> | undefined {
   return readHeartbeat(dir);
 }
 
-async function displayOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string | undefined) {
+/** A harness's display state: what its operator record and its daemon say now. Reads only. */
+export async function displayOf(
+  ctx: V1Context,
+  entry: HangarHarnessEntry,
+  dir: string | undefined,
+) {
   if (dir === undefined) {
     return { state: "disconnected" as HarnessDisplayState, enforcement: "enforced" as const };
   }
@@ -67,12 +81,47 @@ async function displayOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string 
   };
 }
 
+/** The most of a purpose a row carries: what the spec's `intent.purpose` allows. */
+const PURPOSE_MAX = 500;
+
+/** The purpose a harness's spec declares, trimmed; `undefined` when none or unreadable. */
+export function purposeOf(dir: string): string | undefined {
+  const text = readSpecText(dir);
+  if (text === undefined) return undefined;
+  let doc: unknown;
+  try {
+    doc = parseYamlOnly(text);
+  } catch {
+    return undefined;
+  }
+  const intent = (doc as { intent?: unknown } | null)?.intent;
+  if (typeof intent !== "object" || intent === null) return undefined;
+  const purpose = (intent as { purpose?: unknown }).purpose;
+  if (typeof purpose !== "string") return undefined;
+  const trimmed = purpose.trim();
+  return trimmed === "" || trimmed.length > PURPOSE_MAX ? undefined : trimmed;
+}
+
+/** The permissions behind each control a harness's header offers, by the key `you` answers. */
+export const YOU_PERMISSIONS = {
+  control: "h.control",
+  deploy: "h.deploy",
+  retire: "h.retire",
+  accessView: "h.access.view",
+  budgetExtend: "h.budget.extend",
+  delegationPropose: "h.delegation.propose",
+} as const;
+
 /**
  * One harness's overview row: its records' part from the overview read model, caught up
  * (or folded on the spot when there is none), and what the daemon is doing now. A missing
  * folder says only that its operator state is unknown.
  */
-export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
+export async function overviewOf(
+  ctx: V1Context,
+  entry: HangarHarnessEntry,
+  names: DecidedByReader = decidedByReader(ctx),
+) {
   const dir = liveDirOf(entry);
   const now = ctx.deps.now();
   const model =
@@ -101,14 +150,24 @@ export async function overviewOf(ctx: V1Context, entry: HangarHarnessEntry) {
     for (const { area, projection: other } of ctx.projections) {
       if (other.overview !== true || area === "core") continue;
       const read = readModel(ctx.deps.hangarRoot, entry.id, dir, other, now);
-      const shown = other.served === undefined ? read.state : other.served(read.state, dir, now);
+      // Attention counts the Advisor's findings Home gathered too, so every band is whole.
+      const shown =
+        other === (ATTENTION_PROJECTION as unknown)
+          ? attentionCountsOf(ctx.deps.hangarRoot, entry.id, dir, read.state, now)
+          : other.served === undefined
+            ? read.state
+            : other.served(read.state, dir, now);
       areas[area] = { ...((areas[area] as object | undefined) ?? {}), [other.name]: shown };
     }
   }
+  const ownerLabel = names.labelOf(owner);
+  const purpose = dir === undefined ? undefined : purposeOf(dir);
   return {
     id: entry.id,
     slug: entry.slug ?? entry.specName,
     ...(typeof owner === "string" ? { owner } : {}),
+    ...(ownerLabel !== undefined ? { ownerLabel } : {}),
+    ...(purpose !== undefined ? { purpose } : {}),
     createdAt: entry.registeredAt,
     display: await displayOf(ctx, entry, dir),
     ...(approvalsUnreachable ? withoutCount(records) : records),
@@ -154,7 +213,8 @@ const list: V1Handler = async (ctx) => {
   const snapshotAt = fleetSnapshot(epochOf(ctx));
   const visible = [...visibleHarnesses(ctx.deps)].sort((a, b) => (a.id < b.id ? -1 : 1));
   const items = [];
-  for (const entry of visible.slice(0, limit)) items.push(await overviewOf(ctx, entry));
+  const names = decidedByReader(ctx);
+  for (const entry of visible.slice(0, limit)) items.push(await overviewOf(ctx, entry, names));
   const total = ctx.deps.registry.list().filter((e) => e.archived === undefined).length;
   return {
     status: 200,
@@ -177,7 +237,16 @@ const list: V1Handler = async (ctx) => {
 
 const get: V1Handler = async (ctx) => {
   const entry = harnessOf(ctx);
-  return { status: 200, body: await overviewOf(ctx, entry), scrubDir: liveDirOf(entry) };
+  // What the header offers: each control, by whether Home's access records allow it here.
+  const you: Record<string, boolean> = {};
+  for (const [key, permission] of Object.entries(YOU_PERMISSIONS)) {
+    you[key] = ctx.access.authorize(permission, { harness: entry.id }).allow;
+  }
+  return {
+    status: 200,
+    body: { ...(await overviewOf(ctx, entry)), you },
+    scrubDir: liveDirOf(entry),
+  };
 };
 
 const NOT_RUNNING = "The daemon is not running, so it cannot say what this build supports.";

@@ -9,13 +9,16 @@ import { crashAfterPrCreated } from "./crash-after-pr-created.journey";
 import { crawl } from "./crawl.journey";
 import { deepLinks } from "./deep-links.journey";
 import { exportJourney } from "./export.journey";
+import { invite } from "./invite.journey";
 import type { Journey } from "./journey";
 import { keyboardTour } from "./keyboard-tour.journey";
 import { legacyRedirects } from "./legacy-redirects.journey";
 import { liveFeed } from "./live-feed.journey";
 import { navigation } from "./navigation.journey";
+import { operatorControls } from "./operator-controls.journey";
 import { pluginGrant } from "./plugin-grant.journey";
 import { pluginPane } from "./plugin-pane.journey";
+import { roles } from "./roles.journey";
 import { runThenConsole } from "./run-then-console.journey";
 import { sessionSelfTest } from "./session-self-test.journey";
 import { signIn } from "./sign-in.journey";
@@ -52,4 +55,7 @@ export const JOURNEYS: readonly Journey[] = [
   exportJourney,
   stewardDeliversPr,
   crashAfterPrCreated,
+  operatorControls,
+  invite,
+  roles,
 ];

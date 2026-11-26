@@ -33,6 +33,7 @@
 import { existsSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { APPROVAL_TTL_MS, emptyModel, harnessAttention, refreshModel } from "@crewhaus/attention";
+import { readApproverProjection } from "@crewhaus/control-records";
 import { harnessEnvFacts } from "@crewhaus/harness-supervisor";
 import { APPROVALS_FILENAME } from "./approvals";
 import { MAX_JSONL_LINES, SAFE_SEGMENT_RE, SESSION_JSON_RE } from "./constants";
@@ -75,6 +76,11 @@ export type OmniEntry = {
   readonly source: string;
   /** When this entry's harness was indexed (ISO time). */
   readonly indexedAt: string;
+  /**
+   * A harness's owner, by display name, added when a search answers and never kept in
+   * the index: the index does not follow Home's access records. Absent when none.
+   */
+  readonly owner?: string;
 };
 
 /**
@@ -95,6 +101,11 @@ export type OmniAction = {
    * (see `mask.ts`); widening it is not.
    */
   readonly route: string;
+  /**
+   * A versioned-API operation the console runs in place of `route`, through the same
+   * receipted request as the button beside it. Absent for a `route` action.
+   */
+  readonly operation?: string;
   readonly params: Readonly<Record<string, string>>;
   /** The exact command that does the same thing in a terminal. */
   readonly cliTwin: string;
@@ -212,6 +223,8 @@ export function matchActions(
   query: string,
   harnesses: readonly ActionHarness[],
   limit = 5,
+  /** Whether the caller holds a provider's permission on a harness; absent allows all. */
+  allowed: (permission: string, harness: string) => boolean = () => true,
 ): readonly OmniAction[] {
   const q = query.trim().toLowerCase();
   const spaceAt = q.indexOf(" ");
@@ -221,7 +234,9 @@ export function matchActions(
   if (rest === "") return [];
   const action = ACTION_VERBS.find((a) => a.verb === verb);
   if (action === undefined) return [];
+  const { permission } = action;
   return harnesses
+    .filter((h) => permission === undefined || allowed(permission, h.id))
     .map((h) => ({ h, score: Math.max(scoreMatch(h.specName, rest), scoreMatch(h.dir, rest)) }))
     .filter((row) => row.score > 0)
     .sort((a, b) => b.score - a.score || a.h.specName.localeCompare(b.h.specName))
@@ -230,6 +245,7 @@ export function matchActions(
       id: `${action.verb}:${h.id}`,
       label: action.label(h.specName),
       route: action.route,
+      ...(action.operation !== undefined ? { operation: action.operation } : {}),
       params: { id: h.id },
       cliTwin: action.cli(h.dir),
       confirm: true as const,
@@ -508,13 +524,55 @@ export function buildHarnessEntries(
   return out;
 }
 
+/**
+ * Each harness's owner by display name, read when a search answers: the owner the
+ * harness's approver list names, and the name Home's access records give that principal.
+ * A harness with no list, or an owner with no name, has none.
+ */
+export function harnessOwnerLookup(
+  harnesses: readonly { readonly id: string; readonly dir: string }[],
+  names: ReadonlyMap<string, string>,
+): (harnessId: string) => string | undefined {
+  const dirs = new Map(harnesses.map((h) => [h.id, h.dir] as const));
+  const seen = new Map<string, string | undefined>();
+  return (harnessId) => {
+    if (seen.has(harnessId)) return seen.get(harnessId);
+    const dir = dirs.get(harnessId);
+    let label: string | undefined;
+    if (dir !== undefined) {
+      try {
+        const read = readApproverProjection(dir);
+        const owner = read.state === "present" ? read.projection.owner : undefined;
+        label = typeof owner === "string" ? names.get(owner) : undefined;
+      } catch {
+        label = undefined;
+      }
+    }
+    seen.set(harnessId, label);
+    return label;
+  };
+}
+
 // ---------------------------------------------------------------------------
 // The index
 // ---------------------------------------------------------------------------
 
+/** What a search knows about its caller, beside the index. */
+export type OmniSearchOptions = {
+  /** A harness's owner, by display name, or `undefined` when none is known. */
+  readonly ownerOf?: (harnessId: string) => string | undefined;
+  /** Whether the caller holds `permission` on a harness, for the actions it may be offered. */
+  readonly allowed?: (permission: string, harness: string) => boolean;
+};
+
 export type OmniIndex = {
   /** Query. Builds only what is stale; returns ranked entries + actions. */
-  search(query: string, harnesses: readonly IndexHarness[], limit?: number): OmniResults;
+  search(
+    query: string,
+    harnesses: readonly IndexHarness[],
+    limit?: number,
+    options?: OmniSearchOptions,
+  ): OmniResults;
   /** Cached entry count, for the "built lazily" assertion. */
   size(): number;
   /** Drop a harness's cached entries (used when it is removed). */
@@ -538,7 +596,7 @@ export function createOmniIndex(
     harnesses.reduce((n, harness) => n + (cache.get(harness.id)?.entries.length ?? 0), 0);
 
   return {
-    search: (query, harnesses, limit = OMNI_LIMIT) => {
+    search: (query, harnesses, limit = OMNI_LIMIT, options = {}) => {
       const q = typeof query === "string" ? query.trim() : "";
       if (q === "") {
         return { query: "", entries: [], actions: [], indexed: 0, size: sizeOf(harnesses) };
@@ -557,10 +615,19 @@ export function createOmniIndex(
           all.push(...hit.entries);
         }
       }
+      const { ownerOf, allowed } = options;
+      const ranked = rankEntries(all, q, limit);
       return {
         query: q,
-        entries: rankEntries(all, q, limit),
-        actions: matchActions(q, harnesses),
+        entries:
+          ownerOf === undefined
+            ? ranked
+            : ranked.map((entry) => {
+                if (entry.kind !== "harness" || entry.harnessId === null) return entry;
+                const owner = ownerOf(entry.harnessId);
+                return owner === undefined ? entry : { ...entry, owner };
+              }),
+        actions: matchActions(q, harnesses, 5, allowed),
         indexed,
         size: sizeOf(harnesses),
       };

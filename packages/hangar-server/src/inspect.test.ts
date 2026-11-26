@@ -1912,3 +1912,199 @@ describe("the settings write, on the harness's own settings file only", () => {
     }
   });
 });
+
+describe("the inspector serves and compares only the bytes of the file it checked", () => {
+  /** No 16-character run of `key` appears anywhere in `body`. */
+  const expectNoKeyRun = (label: string, key: string, body: Record<string, unknown>): void => {
+    const answered = JSON.stringify(body);
+    for (let i = 0; i + 16 <= key.length; i++) {
+      const piece = key.slice(i, i + 16);
+      expect(`${label} ${piece}: ${answered.includes(piece)}`).toBe(`${label} ${piece}: false`);
+    }
+  };
+
+  test("an identity file is answered only as its projection, whatever its name and however its text ends", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const foreignKey = `MC4CAQAwBQYDK2Vw${"Q".repeat(20)}${"W".repeat(20)}`;
+      // Minified, its member name spelled with an escape, and cut short.
+      const minified = JSON.stringify({
+        schemaVersion: 1,
+        agentId: "c".repeat(64),
+        privateKey: foreignKey,
+      }).replace('"privateKey"', '"\\u0070rivateKey"');
+      const cut = minified.slice(0, minified.indexOf(foreignKey) + 30);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      writeFileSync(join(dir, "notes", "foreign.txt"), cut);
+      // A `.txt` link to a torn `.json`.
+      writeFileSync(join(dir, "notes", "torn.json"), cut);
+      symlinkSync("torn.json", join(dir, "notes", "torn.txt"));
+      const id = await register(t, dir);
+      for (const path of ["notes/foreign.txt", "notes/torn.txt"]) {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent(path)}`,
+        );
+        expect(`${path}: ${status}`).toBe(`${path}: 200`);
+        expect(`${path}: ${body["text"]}`).toBe(`${path}: null`);
+        expect(body["note"]).toBe(IDENTITY_NOTE_TEXT);
+        expectNoKeyRun(path, foreignKey, body);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("a read whose file is put back between its open and its approval serves no byte of what it opened", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const token = ["put", "back", "swap", "marker"].join("-");
+      mkdirSync(join(dir, ".crewhaus", "run"), { recursive: true });
+      writeFileSync(join(dir, ".crewhaus", "run", "control-token"), `${token}\n`);
+      mkdirSync(join(dir, "notes"), { recursive: true });
+      const swap = join(dir, "notes", "swap.md");
+      writeFileSync(swap, "plain notes\n");
+      const id = await register(t, dir);
+      const phases: string[] = [];
+      _setInspectOpenHookForTest((resolved, at) => {
+        if (resolved !== swap) return;
+        phases.push(at);
+        rmSync(swap, { force: true });
+        if (at === "before-open") symlinkSync("../.crewhaus/run/control-token", swap);
+        else writeFileSync(swap, "plain notes\n");
+      });
+      try {
+        const { status, body } = await t.api(
+          `/api/h/${id}/inspect/raw?path=${encodeURIComponent("notes/swap.md")}`,
+        );
+        expect(phases).toEqual(["before-open", "before-approval"]);
+        expect(JSON.stringify(body)).not.toContain(token);
+        if (status === 200) expect(body["text"] ?? "").toBe("");
+        else expect(status).toBe(403);
+      } finally {
+        _setInspectOpenHookForTest(undefined);
+      }
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("an entry that is a link to nothing outside the harness answers that it is not readable here", async () => {
+    if (process.platform === "win32") return;
+    const t = bootTestServer({ now: () => NOW });
+    try {
+      const dir = inspectHarness(t);
+      const nowhere = join(t.workspace, "nothing-here", "gone.json");
+      symlinkSync(nowhere, join(dir, ".crewhaus", "scope-audit", "gone.json"));
+      const id = await register(t, dir);
+      const { status, body } = await t.api(`/api/h/${id}/inspect/scope-audit/gone.json`);
+      expect(status).toBe(200);
+      expect(body["present"]).toBe(false);
+      expect(body["note"]).toBe(
+        '"gone.json" resolves outside the harness directory and is not readable from here',
+      );
+      expect(existsSync(nowhere)).toBe(false);
+    } finally {
+      await t.stop();
+    }
+  });
+
+  test("the settings write shows and compares only the bytes of the file it checked", async () => {
+    if (process.platform === "win32") return;
+    const { v1Home } = await import("./__test__/v1-home");
+    const home = await v1Home({ now: () => NOW });
+    try {
+      const a = await home.harness("settings-own");
+      const b = await home.harness("settings-other");
+      const marker = ["other", "harness", "hook", "marker"].join("-");
+      const bSettings = {
+        permissions: { allow: ["Bash(*)"], deny: [] },
+        hooks: [{ event: "PreToolUse", command: `echo ${marker}` }],
+      };
+      const bPath = join(b.dir, ".crewhaus", "settings.json");
+      mkdirSync(join(b.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(bPath, `${JSON.stringify(bSettings, null, 2)}\n`);
+      const aPath = join(a.dir, ".crewhaus", "settings.json");
+      mkdirSync(join(a.dir, ".crewhaus"), { recursive: true });
+      const aText = `${JSON.stringify({ permissions: { allow: ["Read"], deny: [] } }, null, 2)}\n`;
+      writeFileSync(aPath, aText);
+      const maintainer = await home.member("Mia", "maintainer", { scope: `harness:${a.id}` });
+      let swaps = 0;
+      _setInspectOpenHookForTest((resolved, at) => {
+        if (resolved !== aPath || at !== "before-open") return;
+        swaps++;
+        rmSync(aPath, { force: true });
+        symlinkSync(bPath, aPath);
+      });
+      try {
+        // B's security keys, and only a non-security key changed.
+        const res = await home.call("PUT", `/api/h/${a.id}/inspect/settings`, {
+          secret: maintainer.secret,
+          body: { settings: { ...bSettings, model: "other" }, dryRun: true },
+        });
+        expect(swaps).toBe(1);
+        expect(res.status).toBe(409);
+        expect(JSON.stringify(res.body)).toContain("is not this harness's own settings file");
+        expect(JSON.stringify(res.body)).not.toContain(marker);
+        expect(JSON.stringify(res.body)).not.toContain("Bash(*)");
+      } finally {
+        _setInspectOpenHookForTest(undefined);
+      }
+      expect(readFileSync(bPath, "utf8")).toContain(marker);
+    } finally {
+      await home.t.stop();
+    }
+  }, 20_000); // a member's device sign-in and a live server
+
+  test("the settings write compares only this harness's own settings file, not another file inside it", async () => {
+    if (process.platform === "win32") return;
+    const { v1Home } = await import("./__test__/v1-home");
+    const home = await v1Home({ now: () => NOW });
+    try {
+      const a = await home.harness("settings-inside");
+      const marker = ["inside", "copy", "hook", "marker"].join("-");
+      const copied = {
+        permissions: { allow: ["Bash(*)"], deny: [] },
+        hooks: [{ event: "PreToolUse", command: `echo ${marker}` }],
+      };
+      const copyPath = join(a.dir, "notes", "settings-copy.json");
+      mkdirSync(join(a.dir, "notes"), { recursive: true });
+      const copyText = `${JSON.stringify(copied, null, 2)}\n`;
+      writeFileSync(copyPath, copyText);
+      const aPath = join(a.dir, ".crewhaus", "settings.json");
+      mkdirSync(join(a.dir, ".crewhaus"), { recursive: true });
+      writeFileSync(
+        aPath,
+        `${JSON.stringify({ permissions: { allow: ["Read"], deny: [] } }, null, 2)}\n`,
+      );
+      const maintainer = await home.member("Mo", "maintainer", { scope: `harness:${a.id}` });
+      let swaps = 0;
+      _setInspectOpenHookForTest((resolved, at) => {
+        if (resolved !== aPath || at !== "before-open") return;
+        swaps++;
+        rmSync(aPath, { force: true });
+        symlinkSync(copyPath, aPath);
+      });
+      try {
+        // The copy's security keys, and only a non-security key changed.
+        const res = await home.call("PUT", `/api/h/${a.id}/inspect/settings`, {
+          secret: maintainer.secret,
+          body: { settings: { ...copied, model: "other" }, dryRun: true },
+        });
+        expect(swaps).toBe(1);
+        expect(res.status).toBe(409);
+        expect(JSON.stringify(res.body)).toContain("is not this harness's own settings file");
+        expect(JSON.stringify(res.body)).not.toContain(marker);
+        expect(JSON.stringify(res.body)).not.toContain("Bash(*)");
+      } finally {
+        _setInspectOpenHookForTest(undefined);
+      }
+      expect(readFileSync(copyPath, "utf8")).toBe(copyText);
+    } finally {
+      await home.t.stop();
+    }
+  }, 20_000); // a member's device sign-in and a live server
+});

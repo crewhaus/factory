@@ -49,6 +49,12 @@ export type ListQuery = {
   readonly cursor?: string;
 };
 
+/** `decisions.list`'s query: a page, optionally of one harness, optionally only what waits. */
+export type DecisionListQuery = ListQuery & {
+  readonly harness?: string;
+  readonly state?: "pending";
+};
+
 export type StreamQuery = {
   readonly after?: string;
 };

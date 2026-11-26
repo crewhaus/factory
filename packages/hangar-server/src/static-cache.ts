@@ -6,8 +6,10 @@
  * browser keeps its copy and asks each time whether it is still current: a
  * matching `If-None-Match` is answered 304 with no body and the same
  * headers. A new release changes the body, so it changes the tag, and the
- * browser fetches the new file — a console that loads its screens lazily
- * never mixes modules from two releases.
+ * browser fetches the new file: revalidation keeps each file current. The
+ * console's own version check keeps one open tab from mixing two releases: when
+ * Home's version changes under it, the next screen it opens loads the page
+ * whole.
  *
  * The shell page keeps `cache-control: no-store` and no tag. It is the asset
  * served for `/`, and any other address that serves that same asset object,

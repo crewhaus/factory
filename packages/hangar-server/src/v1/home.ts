@@ -14,6 +14,9 @@
  *   job. The archive is never sent to a browser.
  * - `exports.list` names the archives Home wrote for a harness; nothing is opened.
  *
+ * Home's own reads (`home.status`, `home.spend`, `home.harnessAccess`) are in
+ * `./home-reads.ts`.
+ *
  * Every answer passes the router's one masker, like every other answer.
  */
 import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, statSync } from "node:fs";
@@ -34,6 +37,7 @@ import { reachableSessionRoot } from "../sessions";
 import type { HomeAreaRuntime } from "./areas";
 import type { RefResolver, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
+import { homeHarnessAccess, homeSpend, homeStatus } from "./home-reads";
 import { hrefOf } from "./meta";
 import { harnessOf, liveDirOf, liveDirOr409 } from "./resolve";
 import { acceptedAnswer, submitCommand } from "./submit";
@@ -402,6 +406,9 @@ export const HOME_HANDLERS: Readonly<Record<string, V1Handler>> = {
   "exports.evalResults": exportEvalResults,
   "exports.harness": exportHarness,
   "exports.list": listExports,
+  "home.status": homeStatus,
+  "home.spend": homeSpend,
+  "home.harnessAccess": homeHarnessAccess,
 };
 
 export const HOME_HOME: HomeAreaRuntime = {

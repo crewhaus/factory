@@ -238,7 +238,10 @@ describe.skipIf(process.platform === "win32")(
           method: "POST",
           body: JSON.stringify({}),
         });
-        expect(grant.status).toBeGreaterThanOrEqual(400);
+        expect([grant.status, grant.body["error"]]).toEqual([
+          409,
+          "this harness's sessions folder is outside the harness",
+        ]);
         expect(treeHashes(b)).toEqual(before);
 
         // Moved there by the override instead, the folder is ignored the same way.

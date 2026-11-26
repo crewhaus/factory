@@ -1,6 +1,8 @@
 /**
  * Controls through the API: each submits the operation's own command kind. Pause,
- * resume, disable and enable write the operator record inline (the daemon reads it);
+ * resume, disable and enable write the operator record inline, then ask a running
+ * harness to apply it now and report what it answered, in the CLI's words: confirmed,
+ * within a second, when it starts, or recorded but not enforced by an older build;
  * start, stop, restart and drain are carried out by the control service's executors
  * through Home's supervisor. Retire is a dry run by default: it lists the steps and hands
  * back a nonce, bound to this harness and this caller for ten minutes, that the real run
@@ -30,9 +32,36 @@ function operatorControl(kind: OperatorControlKind): V1Handler {
       target: `home/harness/${entry.id}`,
       ledger: { harness: dir },
       effect: async (receipt) => {
+        // Adopt before acting: a supervisor Home holds records the port it sees in the
+        // runfile, and Home asks the port it holds.
+        let held: { readonly controlPort?: number | undefined } | undefined;
+        try {
+          held = await ctx.deps.controlTarget?.(entry);
+        } catch {
+          held = undefined;
+        }
+        const client = ctx.deps.controlClient;
+        const probe = ctx.deps.processProbe;
         const answer = await applyOperatorControl(
-          { receipt, harnessDir: dir, now: ctx.deps.now },
-          { kind, ...(ctx.body["quiet"] === true ? { quiet: true } : {}) },
+          {
+            receipt,
+            harnessDir: dir,
+            now: ctx.deps.now,
+            ...(probe !== undefined ? { probe } : {}),
+          },
+          {
+            kind,
+            ...(ctx.body["quiet"] === true ? { quiet: true } : {}),
+            ...(client !== undefined
+              ? {
+                  reload: (target) =>
+                    client.reload({
+                      ...target,
+                      controlPort: held?.controlPort ?? target.controlPort,
+                    }),
+                }
+              : {}),
+          },
         );
         return { settle: answer.settle, value: answer.line };
       },

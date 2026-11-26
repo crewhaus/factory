@@ -7,7 +7,7 @@ export const DECISION_OPERATIONS = [
     method: "GET",
     path: "/api/v1/decisions",
     permission: "home.read",
-    request: "listQuery",
+    request: "decisionListQuery",
     response: "decisionList",
     cliTwin: null,
     noTwinReason: "`crewhaus approvals list` reads one harness, not the whole workspace.",

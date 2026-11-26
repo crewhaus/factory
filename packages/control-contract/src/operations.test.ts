@@ -215,7 +215,15 @@ const CORE_ROWS = [
     "streamQuery",
     "eventFrame",
   ],
-  ["decisions.list", "GET", "/api/v1/decisions", "home.read", "none", "listQuery", "decisionList"],
+  [
+    "decisions.list",
+    "GET",
+    "/api/v1/decisions",
+    "home.read",
+    "none",
+    "decisionListQuery",
+    "decisionList",
+  ],
   ["decisions.get", "GET", "/api/v1/decisions/{ref}", "h.read", "none", "noBody", "decision"],
   [
     "decisions.resolve",

@@ -271,3 +271,148 @@ describe("the evalrun and session refs", () => {
     expect(readFileSync(join(root, `${sess}.json`), "utf8")).toContain("lastTurnIndex");
   });
 });
+
+// ---------------------------------------------------------------------------
+// Home's own reads: its status line, this period's spend, and who works on a harness
+// ---------------------------------------------------------------------------
+
+describe("Home's own reads", () => {
+  const PERIOD = "budget:\n  usd: 5\n  period: {every: month, usd: 10}";
+  let reads: V1Home;
+  let spendA: { id: string; dir: string };
+  let spendB: { id: string; dir: string };
+  let unpriced: { id: string; dir: string };
+  let opal: { principal: string; secret: string };
+
+  beforeAll(async () => {
+    const { append } = await import("@crewhaus/control-records");
+    const { budgetLedger, periodOf } = await import("@crewhaus/control-records/budget");
+    reads = await v1Home();
+    spendA = await reads.harness("spend-a", { specExtra: PERIOD });
+    spendB = await reads.harness("spend-b", { specExtra: PERIOD });
+    unpriced = await reads.harness("spend-unpriced", { specExtra: PERIOD });
+    const periodId = periodOf({ every: "month", usdMicros: 10_000_000 }, Date.now()).periodId;
+    const at = new Date().toISOString();
+    const settle = (dir: string, usdMicros: number | null, extra: Record<string, unknown> = {}) => {
+      const written = append(budgetLedger(dir, periodId), {
+        v: 1,
+        at,
+        op: "settle",
+        id: `res_${Math.random().toString(16).slice(2, 10)}`,
+        usdMicros,
+        ...extra,
+      });
+      if (!written.ok) throw new Error(written.reason);
+    };
+    settle(spendA.dir, 2_000_000);
+    settle(spendB.dir, 7_000_000);
+    settle(unpriced.dir, null, { unpriced: true });
+    opal = await reads.member("Opal", "operator", { scope: `harness:${spendA.id}` });
+  }, 60_000);
+
+  afterAll(async () => {
+    await reads?.t.stop();
+  });
+
+  test("home.status answers every field the status line reads", async () => {
+    const res = await reads.call("GET", "/api/v1/home/status");
+    expect(res.status).toBe(200);
+    expect(responseOf("home.status")?.safeParse(res.body).success).toBe(true);
+    const host = res.body["host"] as Record<string, unknown>;
+    expect(host["reachedBy"]).toBe("loopback");
+    expect(host["loopback"]).toBe(true);
+    expect(typeof host["name"]).toBe("string");
+    expect(res.body["service"]).toEqual({ installed: "unknown" });
+    const counts = res.body["counts"] as Record<string, number>;
+    for (const field of ["harnesses", "needsYou", "working", "paused", "notResponding"]) {
+      expect(`${field} ${typeof counts[field]}`).toBe(`${field} number`);
+    }
+    expect(counts["harnesses"]).toBe(3);
+    expect(counts["waitingForBudget"]).toBe(0);
+  });
+
+  test("home.status counts only the harnesses the caller may read, and a harness waiting for budget", async () => {
+    const { controlPaths } = await import("@crewhaus/control-records");
+    const { periodOf } = await import("@crewhaus/control-records/budget");
+    const periodId = periodOf({ every: "month", usdMicros: 10_000_000 }, Date.now()).periodId;
+    const file = join(spendB.dir, controlPaths(spendB.dir).budgetStateFile);
+    mkdirSync(join(file, ".."), { recursive: true });
+    writeFileSync(
+      file,
+      `${JSON.stringify({
+        v: 1,
+        periodId,
+        exhaustedAt: new Date().toISOString(),
+        renewsAt: new Date(Date.now() + 86_400_000).toISOString(),
+      })}\n`,
+    );
+    try {
+      const owner = await reads.call("GET", "/api/v1/home/status");
+      expect((owner.body["counts"] as Record<string, number>)["waitingForBudget"]).toBe(1);
+      const operator = await reads.call("GET", "/api/v1/home/status", { secret: opal.secret });
+      expect(operator.status).toBe(200);
+      const counts = operator.body["counts"] as Record<string, number>;
+      expect(counts["harnesses"]).toBe(1);
+      expect(counts["waitingForBudget"]).toBe(0);
+    } finally {
+      rmSync(file, { force: true });
+    }
+  });
+
+  test("home.spend adds up only the harnesses the caller may read; unknown cost is never $0", async () => {
+    const owner = await reads.call("GET", "/api/v1/spend");
+    expect(owner.status).toBe(200);
+    expect(responseOf("home.spend")?.safeParse(owner.body).success).toBe(true);
+    const rows = owner.body["rows"] as Record<string, unknown>[];
+    expect(rows.map((r) => r["harness"]).sort()).toEqual(
+      [spendA.id, spendB.id, unpriced.id].sort(),
+    );
+    const unknownRow = rows.find((r) => r["harness"] === unpriced.id);
+    expect(unknownRow?.["unknownCalls"]).toBe(1);
+    expect(unknownRow?.["spentUsdMicros"]).toBe(0);
+    const totals = owner.body["totals"] as Record<string, unknown>;
+    expect(totals["spentUsdMicros"]).toBe(9_000_000);
+    expect(totals["unknownCalls"]).toBe(1);
+    expect(totals["lowerBound"]).toBe(true);
+    for (const row of rows) {
+      for (const field of ["harness", "name", "present", "note", "verb"]) {
+        expect(`${field} ${field in row}`).toBe(`${field} true`);
+      }
+      expect(row["capUsdMicros"]).toBe(10_000_000);
+      expect(typeof row["renewsAt"]).toBe("string");
+    }
+    // An operator on A only: B's spend changes no total.
+    const operator = await reads.call("GET", "/api/v1/spend", { secret: opal.secret });
+    expect(operator.status).toBe(200);
+    expect((operator.body["rows"] as Record<string, unknown>[]).map((r) => r["harness"])).toEqual([
+      spendA.id,
+    ]);
+    const mine = operator.body["totals"] as Record<string, unknown>;
+    expect(mine["spentUsdMicros"]).toBe(2_000_000);
+    expect(mine["harnesses"]).toBe(1);
+    expect(mine["lowerBound"]).toBeUndefined();
+  });
+
+  test("home.harnessAccess names who may work on the harness, and asks for h.access.view", async () => {
+    const res = await reads.call("GET", `/api/v1/harnesses/${spendA.id}/access`);
+    expect(res.status).toBe(200);
+    expect(responseOf("home.harnessAccess")?.safeParse(res.body).success).toBe(true);
+    const members = res.body["members"] as Record<string, unknown>[];
+    const named = members.find((m) => m["principal"] === opal.principal);
+    expect(named?.["name"]).toBe("Opal");
+    expect(named?.["grants"]).toEqual([{ role: "operator", scope: "harness" }]);
+    expect(members.some((m) => m["principal"] === reads.owner)).toBe(true);
+    expect(JSON.stringify(res.body)).not.toContain("subjectRef");
+    const other = await reads.call("GET", `/api/v1/harnesses/${spendB.id}/access`);
+    expect(
+      (other.body["members"] as Record<string, unknown>[]).some(
+        (m) => m["principal"] === opal.principal,
+      ),
+    ).toBe(false);
+    const refused = await reads.call("GET", `/api/v1/harnesses/${spendA.id}/access`, {
+      secret: opal.secret,
+    });
+    expect(refused.status).toBe(403);
+    expect((refused.body["error"] as Record<string, unknown>)["needs"]).toBe("h.access.view");
+  });
+});

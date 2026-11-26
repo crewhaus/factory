@@ -841,6 +841,23 @@ describe("the list", () => {
     ]);
   });
 
+  test("a list read only in part says so with the command that reads it all; a whole one does not", () => {
+    const capped = listNotes({
+      items: [item({ kind: "checkpoint" })],
+      truncated: { reason: "harness_capped", verb: "crewhaus inbox list --json" },
+      unreachable: [A],
+      names: [{ id: A, name: "release-bot" }],
+    });
+    expect(capped).toEqual([
+      "Couldn't read the requests of release-bot: its sessions folder is outside its folder.",
+      "Some harnesses have more items than were read. To see them all, run crewhaus inbox list --json",
+    ]);
+    expect(listNotes({ items: [item()], truncated: { reason: "page_limit" } })).toEqual([
+      "More items are waiting than this list shows.",
+    ]);
+    expect(listNotes({ items: [item()] })).toEqual([]);
+  });
+
   test("an empty list says why, by Home's reason, and an unreadable one names no command", () => {
     const unreachable = emptyOptsOf({
       items: [],

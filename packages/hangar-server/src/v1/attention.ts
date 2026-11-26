@@ -18,6 +18,7 @@
  */
 import {
   type AdvisorFinding,
+  type AttentionModel,
   type AttentionProjection,
   type HarnessAttention,
   advisorSnapshotRecord,
@@ -25,6 +26,7 @@ import {
   assembleInbox,
   attentionEventOf,
   attentionListBody,
+  overviewOf as attentionOverviewOf,
   attentionProjection,
   harnessAttention,
   metricsOf,
@@ -88,6 +90,28 @@ export function harnessAttentionOf(
     },
     { facts: HOME_FACTS, ...(advisor !== undefined ? { advisor } : {}) },
   );
+}
+
+/**
+ * A harness's open items by band, as its overview row shows them: counted with the
+ * Advisor's findings Home gathered for it, so `fix` and `consider` include them, and
+ * with no `decide` count when its approvals cannot be read here, never a zero.
+ */
+export function attentionCountsOf(
+  hangarRoot: string,
+  hrn: string,
+  dir: string,
+  state: unknown,
+  now: number,
+): Record<string, unknown> {
+  const advisor = readAdvisorSnapshot(hangarRoot, hrn);
+  const counts = attentionOverviewOf(state as AttentionModel, dir, now, {
+    facts: HOME_FACTS,
+    ...(advisor !== undefined ? { advisor } : {}),
+  });
+  if (counts.unreachable !== true) return counts;
+  const { decide: _unknown, ...rest } = counts;
+  return rest;
 }
 
 function invalid(reason: string, message: string): V1Error {

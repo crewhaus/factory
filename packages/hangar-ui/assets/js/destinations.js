@@ -39,6 +39,7 @@ export const HOME_PANELS = Object.freeze([
 export const HARNESS_VIEWS = Object.freeze([
   { id: "health", title: "Health", describe: "Every harness's health score, worst first.", load: () => import("./views/health.js"), render: (m, root, ctx) => m.renderHealthBoard(root, ctx) },
   { id: "feedback", title: "Feedback", describe: "Ratings and comments across every harness.", load: () => import("./views/feedback.js"), render: (m, root, ctx) => m.renderFeedbackBoard(root, ctx) },
+  { id: "spend", title: "Spend", describe: "This period's spending of every harness, against its limit.", load: () => import("./views/spend.js"), render: (m, root, ctx) => m.renderSpend(root, ctx) },
 ]);
 
 /** People's pages. None yet: the index says where profiles are kept. */
@@ -52,6 +53,7 @@ export const PEOPLE_PAGES = Object.freeze([]);
 export const CONNECTION_KINDS = Object.freeze([
   { id: "credentials", title: "Credentials", describe: "Which keys each harness has, provider by provider. Values are never shown.", load: () => import("./views/creds.js"), render: (m, root, ctx) => m.renderCredentialsMatrix(root, ctx) },
   { id: "thredz", title: "Thredz", describe: "The Thredz workspaces your harnesses share.", load: () => import("./views/thredz.js"), render: (m, root, ctx) => m.renderThredzGlobal(root, ctx) },
+  { id: "hosts", title: "Hosts", describe: "The computer Home runs on, how it is reached, and whether it starts again after a restart.", load: () => import("./views/access.js"), render: (m, root, ctx) => m.renderHosts(root, ctx) },
 ]);
 
 /** The Settings pages, in menu order. */
@@ -62,6 +64,7 @@ export const SETTINGS_PAGES = Object.freeze([
   { id: "home", title: "Home settings", describe: "Read-only mode for this Home.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderHomeSettings(root, ctx) },
   { id: "account", title: "Your account", describe: "Sign this browser out, or allow a sign-in from another computer.", load: () => import("./views/settings.js"), render: (m, root, ctx) => m.renderAccountSettings(root, ctx) },
   { id: "plugins", title: "Plugins", describe: "What each installed plugin asks for, and what you allow it.", load: () => import("./views/plugins.js"), render: (m, root, ctx) => m.renderPluginSettings(root, ctx) },
+  { id: "access", title: "Access", describe: "Who can sign in to this Home, what they can do, and the apps and scripts that use it.", load: () => import("./views/access.js"), render: (m, root, ctx) => m.renderAccess(root, ctx) },
 ]);
 
 /**

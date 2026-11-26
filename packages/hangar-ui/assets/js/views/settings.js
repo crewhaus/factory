@@ -34,6 +34,7 @@ import {
 import { hrefFleet, hrefHarness } from "../router.js";
 import { signOut } from "../sign-in.js";
 import { fmtRelativeTime } from "../util.js";
+import { renderYourAccess } from "./access.js";
 import { HOME_WIDE, writeTwin } from "./control.js";
 
 /** kind → the sentence the rule row shows. Mirrors the server's KIND_LABELS;
@@ -104,6 +105,9 @@ export function renderAccountSettings(root) {
   clear(root);
   root.appendChild(signOutCard());
   root.appendChild(otherComputerCard());
+  const access = el("div", { class: "your-access" });
+  root.appendChild(access);
+  void renderYourAccess(access);
 }
 
 // ---------------------------------------------------------------------------
