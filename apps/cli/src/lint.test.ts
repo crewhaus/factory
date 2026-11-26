@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type CheckStagesOptions, runCheckStages } from "@crewhaus/compile-service";
 import {
   KNOWN_TOOLS as COMPILER_KNOWN_TOOLS,
   type IrNode,
@@ -19,6 +20,7 @@ import {
   recordFromCall,
   verifyDocument,
 } from "@crewhaus/provability";
+import { specSchemaIdentity } from "@crewhaus/spec/identity";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
 import { rateLimitStatus } from "@crewhaus/tool-codehost";
 import { INFORMATIONAL_COMPILE_WARNING_CODES } from "./compile-warnings";
@@ -1613,5 +1615,69 @@ describe("a spending period below the per-run cap", () => {
       const result = runLint(budgeted(period), noTools);
       expect(result.findings.some((f) => f.rule === "budget-period-below-run-cap")).toBe(false);
     }
+  });
+});
+
+/**
+ * `lint --format json` answers from the shared check pipeline. The fixtures in
+ * `__fixtures__/lint-json/` were captured from lint before it moved onto that
+ * pipeline; `ok` and `findings` must still match them byte for byte, and the
+ * schema, issue and unknown-key keys follow.
+ */
+describe("lint --format json over the shared check pipeline", () => {
+  const FIXTURES = join(import.meta.dir, "__fixtures__", "lint-json");
+
+  test("ok and findings are byte-equal to the captured output, and the new keys follow them", () => {
+    const names = readdirSync(FIXTURES)
+      .filter((f) => f.endsWith(".yaml"))
+      .sort();
+    for (const name of names) {
+      const yaml = readFileSync(join(FIXTURES, name), "utf8");
+      const captured = readFileSync(join(FIXTURES, name.replace(/\.yaml$/, ".json")), "utf8");
+      const printed = JSON.parse(formatLintJson(runLint(yaml, noTools))) as Record<string, unknown>;
+      expect(Object.keys(printed), name).toEqual([
+        "ok",
+        "findings",
+        "schema",
+        "issues",
+        "unknownKeys",
+      ]);
+      expect(
+        `${JSON.stringify({ ok: printed["ok"], findings: printed["findings"] }, null, 2)}\n`,
+        name,
+      ).toBe(captured);
+      expect(printed["schema"], name).toEqual(specSchemaIdentity());
+    }
+    // Every kind of finding is among them: each error kind, warnings, a
+    // permission rule, provability and the budget-period note.
+    expect(names.length).toBe(12);
+  });
+
+  test("issues lists every issue and unknownKeys each unknown setting, where findings keep parse's one message", () => {
+    const yaml = `${validCli}future_block: {}\nmcp_servers: { docs: { transport: stdio } }\n`;
+    const result = runLint(yaml, noTools);
+    expect(result.findings.map((f) => f.rule)).toEqual(["parse"]);
+    const printed = JSON.parse(formatLintJson(result)) as {
+      issues: Array<{ code: string }>;
+      unknownKeys: unknown[];
+    };
+    expect(printed.issues.length).toBeGreaterThan(1);
+    expect(printed.unknownKeys).toEqual([["future_block"]]);
+  });
+
+  test("runLint runs the shared stages exactly once", () => {
+    let runs = 0;
+    const counted = (text: string, opts: CheckStagesOptions) => {
+      runs += 1;
+      return runCheckStages(text, opts);
+    };
+    const result = runLint(
+      readFileSync(join(FIXTURES, "tools.yaml"), "utf8"),
+      noTools,
+      undefined,
+      counted,
+    );
+    expect(runs).toBe(1);
+    expect(result.check.errors.some((e) => e.code === "tool")).toBe(true);
   });
 });

@@ -33,6 +33,7 @@ import {
   edgeGatedLeaves,
   enforcedRowFor,
   pathsOverlap,
+  placementFor,
   readCheckedIn,
   releasedNewerThan,
   safetySubKeys,
@@ -359,11 +360,8 @@ describe("a Cloudflare Worker build agrees with the edge allow-list", () => {
     for (const probe of FEATURE_PROBES) {
       const record = CHECKED_IN.features[probe.feature];
       for (const shape of cfShapes) {
-        const placement = probe.place?.(shape) ?? {
-          path: probe.feature,
-          snippet: probe.snippet,
-          ...(probe.base !== undefined ? { base: probe.base } : {}),
-        };
+        // The placement the Worker build compiles, its `edge` pair included.
+        const placement = placementFor(probe, shape, `${shape}@cf-worker`);
         const admission = edgeAdmission(placement.snippet);
         if (admission === undefined) continue;
         const cell = record?.cells[`${shape}@cf-worker`];

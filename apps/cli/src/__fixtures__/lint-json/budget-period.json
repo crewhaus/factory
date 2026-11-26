@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "budget.period.usd ($2) is below budget.usd ($5), so a run can use up the period's limit before it reaches its own cap.",
+      "path": "budget.period.usd",
+      "severity": "info",
+      "rule": "budget-period-below-run-cap"
+    }
+  ]
+}

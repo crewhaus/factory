@@ -4,7 +4,10 @@ import {
   declaredPricingKey,
   resolvePricing,
 } from "@crewhaus/cost-tracker";
-import type { IrDeclaredPricing, IrModelPrice, IrModelProfiles } from "@crewhaus/ir";
+import { CompilerError } from "@crewhaus/errors";
+import type { IrDeclaredPricing, IrModelPrice, IrModelProfiles, IrNode } from "@crewhaus/ir";
+import { enumerateModelSlots } from "@crewhaus/ir/slots";
+import { declaredPriceKeyRefusal } from "@crewhaus/spec/model-price";
 
 /**
  * The structural pin: a declared price is a pricing-table row, both ways, so
@@ -76,4 +79,26 @@ export function lowerDeclaredPricing(registry: IrModelProfiles): {
   const declaredPricing: Record<string, IrModelPrice> = {};
   for (const model of sorted) declaredPricing[model] = rows.get(model) as IrModelPrice;
   return { declaredPricing };
+}
+
+/**
+ * A declared price names one model, in the lowered IR too: refused with a
+ * `CompilerError` when any model slot (`@crewhaus/ir/slots`: an inline pool
+ * candidate, a step, node or role model, a judge, compaction, …) would be
+ * priced by a declared row it does not name. The parse check
+ * (`modelPriceKeyIssues`) sees the `models:` profiles only; this sees every
+ * slot, by the same rule. A spec that declares no price is not read.
+ */
+export function assertDeclaredPricesNameOneModel(ir: IrNode): void {
+  const registry = (ir as { readonly models?: IrModelProfiles }).models;
+  if (registry === undefined) return;
+  const priced = Object.entries(registry).filter(([, p]) => p.price !== undefined);
+  if (priced.length === 0) return;
+  const uses = enumerateModelSlots(ir)
+    .filter((slot) => slot.kind !== "federation")
+    .map((slot) => ({ label: slot.label, model: slot.model }));
+  for (const [name, profile] of priced) {
+    const refusal = declaredPriceKeyRefusal(`models.${name}.price`, profile.model, uses);
+    if (refusal !== undefined) throw new CompilerError(refusal);
+  }
 }

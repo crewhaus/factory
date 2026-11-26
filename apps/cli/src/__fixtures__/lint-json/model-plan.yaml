@@ -1,0 +1,13 @@
+name: pooled
+target: cli
+evaluation:
+  grader: { type: llm_judge, criteria: is it good?, model: claude-haiku-4-5 }
+  threshold: 0.7
+agent:
+  model: claude-haiku-4-5
+  instructions: hi
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-opus-4-8, tags: [strong] }
+    policy: heuristic

@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "mcp_servers key \"bad__name\" contains \"__\", which also separates the server from the tool in mcp__<server>__<tool>, so two servers' tool names can collide. Rename it, e.g. \"bad-name\", and rename the permission rules, hooks and rate_limits that name bad__name__… or mcp__bad__name__… to match.",
+      "path": "mcp_servers.bad__name",
+      "severity": "warning",
+      "rule": "mcp-server-name"
+    },
+    {
+      "message": "mcp_servers.thredz is user-declared, so the thredz: block does not synthesize a server — your explicit entry wins (explicit beats implicit). The thredz: knobs still drive the wiring (aliases, goal mirror), but api_key/base_url/visibility only apply through YOUR server's env; it must speak the thredz-mcp v0.2.0 tool contract.",
+      "path": "mcp_servers.thredz",
+      "severity": "warning",
+      "rule": "thredz-override"
+    },
+    {
+      "message": "mcp_servers key \"bad__name\" contains \"__\", which also separates the server from the tool in mcp__<server>__<tool>, so two servers' tool names can collide. Rename it, e.g. \"bad-name\", and rename the permission rules, hooks and rate_limits that name bad__name__… or mcp__bad__name__… to match.",
+      "path": "mcp_servers.bad__name",
+      "severity": "warning",
+      "rule": "mcp-server-name"
+    }
+  ]
+}

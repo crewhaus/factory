@@ -673,6 +673,9 @@ export function auditModelSlots(
   const out: ModelAuditFinding[] = [];
 
   for (const slot of slots) {
+    // A federation slot names a peer's URL, not a model: nothing to price,
+    // resolve or retire.
+    if (slot.kind === "federation") continue;
     // A price the spec declares for this model is the one every run uses.
     const declared = opts.declared?.[slot.model];
     const declaredFinding: ModelAuditFinding | undefined =

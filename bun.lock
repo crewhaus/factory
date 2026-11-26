@@ -33,6 +33,7 @@
         "@crewhaus/cloud-adapter-heroku": "workspace:*",
         "@crewhaus/cloud-adapter-railway": "workspace:*",
         "@crewhaus/cloud-adapter-render": "workspace:*",
+        "@crewhaus/compile-service": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
@@ -595,6 +596,27 @@
       "version": "0.8.3",
       "dependencies": {
         "@anthropic-ai/sdk": "^0.96.0",
+      },
+    },
+    "packages/compile-service": {
+      "name": "@crewhaus/compile-service",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/smoke-harness": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/target-cf-worker-cli": "workspace:*",
+        "@crewhaus/target-cf-worker-graph": "workspace:*",
+        "@crewhaus/target-cf-worker-workflow": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/compiler-worker": "workspace:*",
+        "@crewhaus/justification-judge-claude": "workspace:*",
       },
     },
     "packages/compiler": {
@@ -1340,6 +1362,7 @@
         "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/compile-service": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
@@ -4314,6 +4337,8 @@
     "@crewhaus/compaction-curator": ["@crewhaus/compaction-curator@workspace:packages/compaction-curator"],
 
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
+
+    "@crewhaus/compile-service": ["@crewhaus/compile-service@workspace:packages/compile-service"],
 
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 

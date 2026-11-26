@@ -179,7 +179,12 @@ import {
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 import { lowerBudgetPeriod } from "./lower/budget-period";
 import { lowerDelegation } from "./lower/delegation";
-import { lowerDeclaredPricing, lowerModelPrice, priceOverridesTable } from "./lower/model-price";
+import {
+  assertDeclaredPricesNameOneModel,
+  lowerDeclaredPricing,
+  lowerModelPrice,
+  priceOverridesTable,
+} from "./lower/model-price";
 import { lowerPlugins } from "./lower/plugins";
 import { lowerRepositories } from "./lower/repositories";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
@@ -300,7 +305,7 @@ export type LowerOptions = {
  * `formal.image` with no lean4 checker to run it) and
  * `"provability-research-rung-unreachable"` (a research floor of `checked` /
  * `proven`, which no report can meet) — all five remediable, so `crewhaus
- * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
+ * compile --strict` escalates them (packages/compile-service/src/compile-warnings.ts lists
  * the informational codes that it does not), and the cf-worker edge's three
  * informational notices: `"edge-permission-mode"` (a worker reads mode
  * `auto` as `default`), `"edge-tool-needs-allow"` (a wired builtin whose
@@ -311,7 +316,7 @@ export type LowerOptions = {
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged. A
  * warning code added from 0.9.0 is classified on purpose in
- * apps/cli/src/compile-warnings.ts, as informational or failing `--strict`.
+ * packages/compile-service/src/compile-warnings.ts, as informational or failing `--strict`.
  * From 0.9.0, on the shapes whose loops read `compaction:`, two informational
  * notes: `"compaction-curate-lexical"` (curation is on and a memory embedder is
  * declared; the pass drops only exact repeats and does not use it) and
@@ -6514,6 +6519,7 @@ export function lowerWithWarnings(
   const ctx = createLowerContext(expanded, opts);
   const ir = lowerWithContext(expanded, ctx);
   noteSelfJudge(expanded, ir, ctx);
+  assertDeclaredPricesNameOneModel(ir);
   return { ir, warnings: ctx.warnings };
 }
 

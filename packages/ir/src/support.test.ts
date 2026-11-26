@@ -423,15 +423,49 @@ describe("the shipped manifest", () => {
       code: "channel-plugins-at-start",
     });
     expect(descriptor("channel")).toEqual({ supported: true });
-    // A cli Worker build is refused at compile: the offline scope check cannot
-    // verify the host tool the grant names.
-    expect(status("cli@cf-worker")).toBe("rejected");
-    expect(cells["cli@cf-worker"]?.reason).toContain('tool "Fetch"');
+    // A cli Worker build loads no plugins, so a grant to one is accepted and
+    // unused there, exactly as the plugin list itself is.
+    expect(cells["cli@cf-worker"]).toMatchObject({
+      status: "unwired",
+      code: "accepted-but-unwired",
+    });
+    const plugins = SUPPORT_MANIFEST.features["plugins"]?.cells["cli@cf-worker"];
+    expect(plugins?.status).toBe("unwired");
+    expect(cells["cli@cf-worker"]?.reason).toBe(plugins?.reason as string);
     expect(descriptor("cli@cf-worker")).toMatchObject({ supported: false, verb: null });
     const others = SUPPORT_MANIFEST.shapes.filter((s) => s !== "cli" && s !== "channel");
     for (const variant of [...others, "workflow@cf-worker", "graph@cf-worker"]) {
       expect(status(variant), variant).toBe("rejected");
     }
+  });
+
+  test("a loop-detection escalation reads wired on every Worker build, as the edge allow-list says", () => {
+    const cells = SUPPORT_MANIFEST.features["limits.loop_detection.escalation"]?.cells ?? {};
+    const edge = SUPPORT_MANIFEST.variants["cf-worker"];
+    expect(edge).toEqual(["cli", "workflow", "graph"]);
+    for (const shape of edge) {
+      expect(cells[`${shape}@cf-worker`], shape).toMatchObject({
+        status: "wired",
+        via: ["bundle"],
+      });
+    }
+    // The local builds still compare `justify` against `warn`.
+    expect(cells["cli"]).toMatchObject({ status: "wired", via: ["bundle", "interpreter"] });
+    expect(cells["workflow"]).toMatchObject({ status: "wired", via: ["bundle"] });
+    expect(cells["graph"]).toMatchObject({ status: "wired", via: ["bundle"] });
+  });
+
+  test("no Worker cell tells a reader to compile without strict, which no Worker build offers", () => {
+    let scanned = 0;
+    for (const record of Object.values(SUPPORT_MANIFEST.features)) {
+      for (const shape of SUPPORT_MANIFEST.variants["cf-worker"]) {
+        const cell = record.cells[`${shape}@cf-worker`];
+        if (cell === undefined) continue;
+        scanned += 1;
+        expect(cell.reason ?? "").not.toContain("strict: true");
+      }
+    }
+    expect(scanned).toBe(Object.keys(SUPPORT_MANIFEST.features).length * 3);
   });
 
   test("a Cloudflare Worker build's safety cells are refused or enforced, never unused", () => {

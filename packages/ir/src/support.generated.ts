@@ -4127,9 +4127,8 @@ export const SUPPORT_MANIFEST: SupportManifest = {
           since: "0.9.0",
         },
         "cli@cf-worker": {
-          status: "rejected",
-          reason:
-            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          status: "wired",
+          via: ["bundle"],
           since: "0.9.0",
         },
         workflow: {
@@ -4138,9 +4137,8 @@ export const SUPPORT_MANIFEST: SupportManifest = {
           since: "0.9.0",
         },
         "workflow@cf-worker": {
-          status: "rejected",
-          reason:
-            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          status: "wired",
+          via: ["bundle"],
           since: "0.9.0",
         },
         channel: {
@@ -4154,9 +4152,8 @@ export const SUPPORT_MANIFEST: SupportManifest = {
           since: "0.9.0",
         },
         "graph@cf-worker": {
-          status: "rejected",
-          reason:
-            "cf-worker target cannot enforce 1 safety setting(s) this spec declares:\n  limits.loop_detection.escalation: justify needs the intent gate, which a worker does not run — use warn or abort\nRemove them, or keep them in a spec you compile without --emit-as cf-worker.",
+          status: "wired",
+          via: ["bundle"],
           since: "0.9.0",
         },
         managed: {
@@ -6033,9 +6030,10 @@ export const SUPPORT_MANIFEST: SupportManifest = {
           since: "0.9.0",
         },
         "cli@cf-worker": {
-          status: "rejected",
+          status: "unwired",
+          code: "accepted-but-unwired",
           reason:
-            '[strict] 1 scope finding(s) — refusing to emit: tool "Fetch" is an outward-reaching sink by name but its scope cannot be verified "external" at compile time (dynamic/MCP sinks must be vetted, not assumed). Set scope: "external" on each tool, or compile without { strict: true } to bypass the gate.',
+            "plugins is accepted on a cli spec but the cf-worker edge does not wire it — the worker loads no plugins. Compile without --emit-as to use it, or remove the setting",
           since: "0.9.0",
         },
         workflow: {

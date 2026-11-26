@@ -160,6 +160,11 @@ const DECLARED_PRICING_VECTORS: ReadonlyArray<
   ["local/", undefined],
   ["local/m@", undefined],
   ["vertex/llama", undefined],
+  // A host prefix is the host table's own key, never an inherited name.
+  ["constructor/o9-preview", undefined],
+  ["__proto__/o9-preview", undefined],
+  ["toString/o9-preview", undefined],
+  ["hasOwnProperty/o9-preview", undefined],
 ];
 
 describe("declared prices", () => {
