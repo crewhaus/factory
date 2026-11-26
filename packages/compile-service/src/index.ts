@@ -33,7 +33,7 @@ export {
   emitCfWorkerBundle,
 } from "./cf-worker-emit";
 export {
-  type CheckSpecCredential,
+  type CheckSpecModelAccess,
   type CheckSpecError,
   type CheckSpecOptions,
   type CheckSpecResult,

@@ -227,20 +227,70 @@ describe("a declared price names one model", () => {
     );
   });
 
-  test("the families: local, azure, a compatible host and openai; nothing else has one", () => {
+  test("the families: every prefix that shares a pricing key with another, and Bedrock as one", () => {
     expect(priceFamilyOf(`local/q@${LOCAL}`)).toBe("local");
     expect(priceFamilyOf("azure/gpt-4o")).toBe("azure");
     expect(priceFamilyOf("openrouter/meta/llama-4")).toBe("openrouter");
     expect(priceFamilyOf("openai/gpt-4o")).toBe("openai");
-    for (const other of [
-      "claude-opus-4-7",
-      "gemini/gemini-2.5-pro",
-      "bedrock/x",
-      "$p",
-      "cheapest",
-    ]) {
+    expect(priceFamilyOf("claude-opus-4-7")).toBe("anthropic");
+    expect(priceFamilyOf("vertex/claude-sonnet-4-5")).toBe("vertex");
+    expect(priceFamilyOf("gemini/gemini-2.5-pro")).toBe("gemini");
+    expect(priceFamilyOf("vertex/gemini-2.5-pro")).toBe("vertex");
+    expect(priceFamilyOf("bedrock/us.anthropic.claude-sonnet-4-5-v1:0")).toBe("bedrock");
+    expect(priceFamilyOf("bedrock/anthropic.claude-sonnet-4-5-v1:0")).toBe("bedrock");
+    for (const other of ["gpt-5", "vertex/llama", "$p", "cheapest", "constructor/gpt-4o"]) {
       expect(priceFamilyOf(other), other).toBeUndefined();
     }
+  });
+
+  test("a Vertex Claude price beside a direct Claude profile with its key is refused, naming both", () => {
+    const issues = refusals(
+      withModels({
+        v: { model: "vertex/claude-sonnet-4-5", price: FREE },
+        direct: { model: "claude-sonnet-4-5" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.v.price: models.v.price: vertex/claude-sonnet-4-5 is priced as anthropic claude-sonnet-4-5, and so is models.direct (claude-sonnet-4-5); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a direct Claude price beside a Vertex profile with its key is refused the same way", () => {
+    const issues = refusals(
+      withModels({
+        direct: { model: "claude-sonnet-4-5", price: FREE },
+        v: { model: "vertex/claude-sonnet-4-5" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.direct.price: models.direct.price: claude-sonnet-4-5 is priced as anthropic claude-sonnet-4-5, and so is models.v (vertex/claude-sonnet-4-5); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a Vertex Gemini price beside a gemini/ profile with its key is refused, naming both", () => {
+    const issues = refusals(
+      withModels({
+        v: { model: "vertex/gemini-2.5-pro", price: FREE },
+        g: { model: "gemini/gemini-2.5-pro" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.v.price: models.v.price: vertex/gemini-2.5-pro is priced as gemini gemini-2.5-pro, and so is models.g (gemini/gemini-2.5-pro); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a Vertex price alone over the table parses, and two Bedrock regions of one model share a price", () => {
+    const price = { input_per_1m: 1, output_per_1m: 1 };
+    expect(refusals(withModels({ v: { model: "vertex/claude-sonnet-4-5", price } }))).toEqual([]);
+    expect(refusals(withModels({ v: { model: "vertex/gemini-2.5-pro", price } }))).toEqual([]);
+    expect(
+      refusals(
+        withModels({
+          us: { model: "bedrock/us.anthropic.claude-sonnet-4-5-v1:0", price },
+          eu: { model: "bedrock/eu.anthropic.claude-sonnet-4-5-v1:0" },
+        }),
+      ),
+    ).toEqual([]);
   });
 
   test("the refusal comes after every older issue: an earlier error is still the one parseSpec throws", () => {

@@ -7,8 +7,9 @@
  * schema does not know, the lowering's refusal, the compiler's tool errors,
  * the warnings `crewhaus compile` prints (each marked informational or not),
  * the IR passes' findings, what this release's compiler does with each
- * setting the spec declares, the credentials each model slot needs (names and
- * presence only, never a value) and the schema that answered. A spec with a
+ * setting the spec declares, what each model slot needs to reach its provider
+ * (`modelAccess`: env names and presence only, never a value) and the schema
+ * that answered. A spec with a
  * setting this schema does not know, or newer than it, is read-only, with the
  * reason.
  *
@@ -58,7 +59,13 @@ export type CheckSpecWarning = CompileWarning & {
   readonly informational: boolean;
 };
 
-export type CheckSpecCredential = {
+/**
+ * What one model slot needs to reach its provider: env names, and presence
+ * when asked, never a value. Home serves this result through its masker,
+ * which redacts by key name, so no key here is named like a credential
+ * (`hangar-server`'s `check-spec-mask.test.ts` holds that).
+ */
+export type CheckSpecModelAccess = {
   /** The slot's label in the model walk (`agent.model`, `compaction.model`, …). */
   readonly slot: string;
   /** The provider the slot's model runs on, or `unknown`. */
@@ -87,7 +94,8 @@ export type CheckSpecResult = {
   /** One finding per IR pass that refused the IR. */
   readonly passes: ReadonlyArray<{ readonly pass: string; readonly message: string }>;
   readonly features: HarnessFeatureSupport["features"];
-  readonly credentials: ReadonlyArray<CheckSpecCredential>;
+  /** One row per model slot the walk lists, a federated peer aside. */
+  readonly modelAccess: ReadonlyArray<CheckSpecModelAccess>;
   /** Set when this schema cannot edit the spec safely: why, and which keys. */
   readonly readOnly?: { readonly reason: string; readonly keys: ReadonlyArray<string> };
 };
@@ -185,9 +193,9 @@ function warningsOf(stages: CheckStages): CheckSpecWarning[] {
   return out;
 }
 
-function credentialsOf(stages: CheckStages, env: CheckSpecOptions["env"]): CheckSpecCredential[] {
+function modelAccessOf(stages: CheckStages, env: CheckSpecOptions["env"]): CheckSpecModelAccess[] {
   if (stages.ir === undefined) return [];
-  const out: CheckSpecCredential[] = [];
+  const out: CheckSpecModelAccess[] = [];
   for (const slot of enumerateModelSlots(stages.ir)) {
     // A federation slot names a peer's URL, not a model with a credential.
     if (slot.kind === "federation") continue;
@@ -296,7 +304,7 @@ export function checkResultOf(
     warnings,
     passes,
     features,
-    credentials: credentialsOf(stages, opts.env),
+    modelAccess: modelAccessOf(stages, opts.env),
     ...(readOnly !== undefined ? { readOnly } : {}),
   };
 }

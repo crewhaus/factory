@@ -1,7 +1,7 @@
 /**
  * `checkSpec` answers every problem a draft has in one result: every issue at
- * once, the settings the schema does not know, the credentials every model
- * slot needs, and never a throw for anything a spec can contain.
+ * once, the settings the schema does not know, what every model slot needs
+ * to reach its provider, and never a throw for anything a spec can contain.
  */
 import { describe, expect, test } from "bun:test";
 import { collectSpecModels } from "@crewhaus/preflight";
@@ -93,7 +93,7 @@ describe("settings the schema does not know, and a newer spec", () => {
   });
 });
 
-describe("credentials: every model slot, by name and presence", () => {
+describe("modelAccess: what every model slot needs, by name and presence", () => {
   const YAML = [
     CLI,
     "compaction:",
@@ -105,7 +105,7 @@ describe("credentials: every model slot, by name and presence", () => {
 
   test("the compaction and judge slots are listed with their env names, which preflight's spec walk misses", () => {
     const result = checkSpec(YAML);
-    expect(result.credentials).toEqual([
+    expect(result.modelAccess).toEqual([
       {
         slot: "agent.model",
         provider: "anthropic",
@@ -131,21 +131,21 @@ describe("credentials: every model slot, by name and presence", () => {
   test("presence is read from names only when an env is given, and never carries a value", () => {
     const value = "x";
     const result = checkSpec(YAML, { env: { OPENAI_API_KEY: value } });
-    const present = Object.fromEntries(result.credentials.map((c) => [c.slot, c.present]));
+    const present = Object.fromEntries(result.modelAccess.map((c) => [c.slot, c.present]));
     expect(present).toEqual({
       "agent.model": false,
       "compaction.model": true,
       "security.justification.model": false,
     });
     expect(JSON.stringify(result)).not.toContain(`"${value}"`);
-    for (const c of checkSpec(YAML).credentials) expect("present" in c).toBe(false);
+    for (const c of checkSpec(YAML).modelAccess) expect("present" in c).toBe(false);
   });
 
-  test("a federated sub-agent's peer is no credential row", () => {
+  test("a federated sub-agent's peer has no model-access row", () => {
     const yaml = `${CLI}  sub_agents:\n    peer:\n      description: remote\n      instructions: go\n      federation:\n        url: https://peer.example.com\n`;
     const result = checkSpec(yaml);
     expect(result.ok).toBe(true);
-    expect(result.credentials.map((c) => c.slot)).toEqual(["agent.model"]);
+    expect(result.modelAccess.map((c) => c.slot)).toEqual(["agent.model"]);
   });
 });
 
@@ -165,7 +165,7 @@ describe("never a throw for anything a spec can contain", () => {
         JSON.stringify(yaml),
       ).toEqual([code]);
       expect(result.features).toEqual([]);
-      expect(result.credentials).toEqual([]);
+      expect(result.modelAccess).toEqual([]);
     }
   });
 

@@ -1,15 +1,23 @@
 /**
  * A declared price names one model in the lowered harness too: the lowering
- * refuses a price that a step, node, role or pool candidate would also be
- * priced by under another family, which the parse check cannot see, and a
- * spec whose prices name only their own models keeps the table's price for
- * every other model.
+ * refuses a price that a step, node, role, pool candidate or the agent itself
+ * would also be priced by under another family (a local model beside
+ * `openai/`, Vertex beside a direct Claude or `gemini/` string), which the
+ * parse check cannot see, and a spec whose prices name only their own models
+ * keeps the table's price for every other model.
  */
 import { describe, expect, test } from "bun:test";
-import { DEFAULT_PRICING, mergeDeclaredPricing, resolvePricing } from "@crewhaus/cost-tracker";
+import {
+  DEFAULT_PRICING,
+  declaredPricingKey,
+  mergeDeclaredPricing,
+  resolvePricing,
+} from "@crewhaus/cost-tracker";
 import { CompilerError } from "@crewhaus/errors";
 import type { IrV0 } from "@crewhaus/ir";
 import { parseSpec } from "@crewhaus/spec";
+// The router is not a compiler dependency; the test reads its parse by path.
+import { parseModelString } from "../../model-router/src/parse";
 import { compile, lower, lowerWithWarnings } from "./index";
 
 const LOCAL = "http://127.0.0.1:11434/v1";
@@ -101,6 +109,58 @@ describe("a declared price names one model, in the lowered harness", () => {
     );
   });
 
+  test("a free Vertex Claude price beside a direct Claude agent is refused before anything is built", () => {
+    const yaml = [
+      "name: a",
+      "target: cli",
+      "models:",
+      `  p: {model: vertex/claude-sonnet-4-5, price: ${FREE}}`,
+      "agent:",
+      "  model: claude-sonnet-4-5",
+      "  instructions: Help.",
+      "",
+    ].join("\n");
+    expect(loweringRefusal(yaml)).toBe(
+      "models.p.price: vertex/claude-sonnet-4-5 is priced as anthropic claude-sonnet-4-5, and so is agent.model (claude-sonnet-4-5); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    );
+    expect(() => compile(yaml)).toThrow("and so is agent.model (claude-sonnet-4-5)");
+  });
+
+  test("a Vertex Gemini price beside an inline gemini/ step with its key is refused, naming the step", () => {
+    const yaml = [
+      "name: wf",
+      "target: workflow",
+      "model: claude-opus-4-7",
+      "models:",
+      `  v: {model: vertex/gemini-2.5-pro, price: ${FREE}}`,
+      "steps:",
+      "  - name: draft",
+      "    instructions: Write.",
+      "    model: gemini/gemini-2.5-pro",
+      "",
+    ].join("\n");
+    expect(loweringRefusal(yaml)).toBe(
+      "models.v.price: vertex/gemini-2.5-pro is priced as gemini gemini-2.5-pro, and so is steps[0].model (gemini/gemini-2.5-pro); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    );
+  });
+
+  test("a Vertex price used only by Vertex compiles, with the notice that it replaces the table's", () => {
+    const yaml = [
+      "name: a",
+      "target: cli",
+      "models:",
+      "  p: {model: vertex/claude-sonnet-4-5, price: {input_per_1m: 1, output_per_1m: 1}}",
+      "agent:",
+      "  model: $p",
+      "  instructions: Help.",
+      "",
+    ].join("\n");
+    const { warnings } = lowerWithWarnings(parseSpec(yaml));
+    expect(warnings.filter((w) => w.path === "models.p.price").map((w) => w.code)).toEqual([
+      "model-price-overrides-table",
+    ]);
+  });
+
   test("two endpoints of one local model share the declared price", () => {
     const yaml = [
       "name: a",
@@ -136,4 +196,37 @@ describe("a declared price names one model, in the lowered harness", () => {
     const yaml = `name: a\ntarget: cli\nagent: {model: openai/gpt-4o, instructions: Help.}\nmodels:\n  local: {model: "local/gpt-4o@${LOCAL}"}\n`;
     expect(loweringRefusal(yaml)).toBe("");
   });
+});
+
+describe("a model string names a known host exactly", () => {
+  test.each(["constructor", "__proto__", "toString"])(
+    "a %s/ prefix is no host: the router refuses it, or the lowering refuses the price on its key",
+    (prefix) => {
+      const used = `${prefix}/my-model`;
+      let routed: string | undefined;
+      let reason = "";
+      try {
+        routed = parseModelString(used).providerId;
+      } catch (err) {
+        reason = (err as Error).message;
+      }
+      const yaml = [
+        "name: a",
+        "target: cli",
+        "models:",
+        `  mine: {model: "local/my-model@${LOCAL}", price: ${FREE}}`,
+        "agent:",
+        `  model: ${used}`,
+        "  instructions: Help.",
+        "",
+      ].join("\n");
+      const refusal = loweringRefusal(yaml);
+      // A string the router would send somewhere is one the price check reads.
+      expect(routed === undefined || refusal.includes("models.mine.price"), used).toBe(true);
+      expect(routed).toBeUndefined();
+      expect(reason).toContain(`model "${used}": unrecognised model string`);
+      // The pricing twin reads the same set of hosts.
+      expect(declaredPricingKey(used)).toBeUndefined();
+    },
+  );
 });
