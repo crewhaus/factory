@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "rule": "provability-no-source-tool",
+      "severity": "warning",
+      "path": "provability.level",
+      "message": "provability.level: grounded needs a source the run read, a result of a tool on provability.execution.allow, or a proof, and this spec can produce none of them: no tool that reads a source (no file, web, HTTP, document or code-host tool, no mcp_servers, no knowledge: block), none of its tools on that list, and no ProofCheck. So no claim can meet the floor, and an answer fails the gate unless every claim in it is a declared assumption. Add a source-reading tool (e.g. read, webFetch, all-web), or set level: cited."
+    }
+  ]
+}

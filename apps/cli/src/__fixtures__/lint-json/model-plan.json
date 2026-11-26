@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "evaluation.grader.model: the judge model \"claude-haiku-4-5\" is also a serving arm of agent.model / model_pool — a model grading its own output is a measurement-integrity hazard; point the judge at a stronger, independent model (or set evaluation.allow_self_judge: true to accept it)",
+      "path": "evaluation.grader.model",
+      "severity": "warning",
+      "rule": "model-plan:self-judge"
+    }
+  ]
+}

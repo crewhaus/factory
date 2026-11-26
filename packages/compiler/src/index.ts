@@ -299,7 +299,7 @@ export type LowerOptions = {
  * `formal.image` with no lean4 checker to run it) and
  * `"provability-research-rung-unreachable"` (a research floor of `checked` /
  * `proven`, which no report can meet) — all five remediable, so `crewhaus
- * compile --strict` escalates them (apps/cli/src/compile-warnings.ts lists
+ * compile --strict` escalates them (packages/compile-service/src/compile-warnings.ts lists
  * the informational codes that it does not), and the cf-worker edge's three
  * informational notices: `"edge-permission-mode"` (a worker reads mode
  * `auto` as `default`), `"edge-tool-needs-allow"` (a wired builtin whose
@@ -310,7 +310,7 @@ export type LowerOptions = {
  * (dot-joined), `message` the human explanation. Additive: every existing
  * `compile()` consumer that only reads `.files` keeps working unchanged. A
  * warning code added from 0.9.0 is classified on purpose in
- * apps/cli/src/compile-warnings.ts, as informational or failing `--strict`.
+ * packages/compile-service/src/compile-warnings.ts, as informational or failing `--strict`.
  * From 0.9.0, on the shapes whose loops read `compaction:`, two informational
  * notes: `"compaction-curate-lexical"` (curation is on and a memory embedder is
  * declared; the pass drops only exact repeats and does not use it) and

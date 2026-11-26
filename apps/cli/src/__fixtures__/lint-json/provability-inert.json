@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "provability: level: off turns the gate off, so provability.threshold has no effect — nothing is verified and no proof bundle is written. Set a level (cited | grounded | checked | proven) to turn the gate on, or delete the other keys.",
+      "path": "provability",
+      "severity": "warning",
+      "rule": "provability-inert-block"
+    }
+  ]
+}

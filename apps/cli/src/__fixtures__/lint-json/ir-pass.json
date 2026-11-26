@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "findings": [
+    {
+      "message": "graph node \"b\" is unreachable from entry \"a\"",
+      "path": "ir-pass:wellFormednessCheck",
+      "severity": "error",
+      "rule": "ir-pass:wellFormednessCheck"
+    }
+  ]
+}

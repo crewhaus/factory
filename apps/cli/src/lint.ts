@@ -1,20 +1,22 @@
 import {
-  type CompileWarning,
+  type CheckSpecResult,
+  type CheckStages,
+  type CheckStagesOptions,
+  checkResultOf,
+  runCheckStages,
+} from "@crewhaus/compile-service";
+import {
   type IrNode,
   KNOWN_TOOLS,
   type LocatedRuleProblem,
   type PermissionRuleCheckOptions,
-  checkShapeTools,
-  collectCompileWarnings,
   lower,
-  lowerWithWarnings,
   permissionRuleFindings,
   permissionRuleProblemsOf,
   provabilityOf,
   sandboxOnlyProvabilityCheckers,
   thredzToolNamesOf,
 } from "@crewhaus/compiler";
-import { CrewhausError } from "@crewhaus/errors";
 import { wantsProofCheckTools } from "@crewhaus/evaluation-service";
 import type { IrPermissions, IrProvability } from "@crewhaus/ir";
 import { DEFAULT_PIPELINE, type IrPass } from "@crewhaus/ir-passes";
@@ -24,14 +26,7 @@ import {
   emptyRuleSet,
   evaluate,
 } from "@crewhaus/permission-engine";
-import {
-  type Spec,
-  SpecParseError,
-  mcpServerNameWarnings,
-  parseSpec,
-  parseSpecIssues,
-  specJsonSchema,
-} from "@crewhaus/spec";
+import { type Spec, parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
 import { type Splice, applySplices, scalarSplice } from "@crewhaus/spec-patch/minimal-diff";
 import { auditToolScopes } from "@crewhaus/tool-builder";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
@@ -46,7 +41,6 @@ import {
 import { specPermissionRuleLists } from "@crewhaus/tool-permission-matcher";
 import { RUNTIME_TOOL_NAMES, THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import { type Document, type Scalar, isAlias, isMap, isScalar, isSeq, parseDocument } from "yaml";
-import { auditModelPlan } from "./model-plan-lint";
 import { auditSpecToolNames, collectToolNames } from "./scope-audit";
 
 /**
@@ -93,85 +87,85 @@ export type LintResult = {
   readonly spec?: Spec;
   /** The lowered IR when lowering succeeded. */
   readonly ir?: IrNode;
+  /** `checkSpec`'s answer, built from the same run of the shared stages. */
+  readonly check: CheckSpecResult;
 };
 
 /**
  * Run the lint pipeline. `resolveTool` maps a tool NAME (either the camelCase
  * spec key or its registered PascalCase name) to a `RegisteredTool`, or
  * undefined — injected so this stays pure. `passes` defaults to the published
- * `DEFAULT_PIPELINE` and is overridable for tests.
+ * `DEFAULT_PIPELINE` and is overridable for tests. `stages` is the shared
+ * check pipeline (`runCheckStages`), injectable so a test can count its runs.
+ *
+ * The shared stages run ONCE, through `@crewhaus/compile-service`'s
+ * `runCheckStages`, the same function `checkSpec` answers from; lint adds its
+ * own stages (the narrowing lists, the tool-scope audit through the injected
+ * resolver, the permission rules, the provability rules) in between, so its
+ * findings keep the order they always had. `check` is `checkSpec`'s result
+ * built from that same run.
  */
 export function runLint(
   yamlText: string,
   resolveTool: (name: string) => RegisteredTool | undefined,
   passes: ReadonlyArray<IrPass> = DEFAULT_PIPELINE,
+  stages: (yamlText: string, opts: CheckStagesOptions) => CheckStages = runCheckStages,
 ): LintResult {
   const findings: LintFinding[] = [];
+  const run = stages(yamlText, { passes });
+  // A shared stage that threw where it should not have: lint has always let
+  // such an error out, and still does.
+  const [failure] = run.failures;
+  if (failure !== undefined) throw failure.error;
+  const check = checkResultOf(yamlText, run);
 
   // Stage 1 — parse. A parse failure is terminal: without a spec there is
   // nothing to lower or audit.
-  let spec: Spec;
-  try {
-    spec = parseSpec(yamlText);
-  } catch (err) {
-    const message = err instanceof SpecParseError ? err.message : (err as Error).message;
+  if (run.parseFailure !== undefined || run.spec === undefined) {
+    const message = run.parseFailure?.message ?? "the spec did not parse";
     findings.push({ message, path: "<spec>", severity: "error", rule: "parse" });
-    return { ok: false, findings };
+    return { ok: false, findings, check };
   }
+  const spec = run.spec;
 
   // Stage 2 — lower. lower() can throw CompilerError (e.g. a malformed
   // credential env-ref); treat as terminal for the IR-pass stage. The
   // lowering's own warnings are kept for Stage 8 (`lower()` is exactly
   // `lowerWithWarnings().ir`, so the IR is the same either way).
-  let ir: IrNode;
-  let loweredWarnings: ReadonlyArray<CompileWarning>;
-  try {
-    const lowered = lowerWithWarnings(spec);
-    ir = lowered.ir;
-    loweredWarnings = lowered.warnings;
-  } catch (err) {
-    const message = err instanceof CrewhausError ? err.message : (err as Error).message;
+  if (run.lowerFailure !== undefined || run.ir === undefined) {
+    const message = run.lowerFailure?.message ?? "the spec did not lower";
     findings.push({ message, path: "<lower>", severity: "error", rule: "lower" });
-    return { ok: false, findings, spec };
+    return { ok: false, findings, spec, check };
   }
+  const ir = run.ir;
 
-  // Stage 3 — IR passes, COLLECT-ALL. Run each pass independently so one pass's
-  // violation doesn't hide the others'. Validating passes
-  // (transactionPolicyEnforcement, wellFormednessCheck) throw IrPassError; the
-  // rewriting passes are pure and never throw. We discard rewritten IR (lint
-  // never emits) — only the thrown violations matter.
-  for (const pass of passes) {
-    try {
-      pass(ir);
-    } catch (err) {
-      const message = err instanceof CrewhausError ? err.message : (err as Error).message;
-      findings.push({
-        message,
-        path: `ir-pass:${pass.name || "anonymous"}`,
-        severity: "error",
-        rule: `ir-pass:${pass.name || "anonymous"}`,
-      });
-    }
+  // Stage 3 — IR passes, COLLECT-ALL: each pass ran independently, so one
+  // pass's violation doesn't hide the others'. The rewritten IR is discarded
+  // (lint never emits); only the violations matter.
+  for (const f of run.passFindings) {
+    findings.push({
+      message: f.message,
+      path: `ir-pass:${f.pass}`,
+      severity: "error",
+      rule: `ir-pass:${f.pass}`,
+    });
   }
 
   // Stage 3b — the compiler's own per-shape tool check (shape-reach#6): a
   // name that is not a builtin, or a builtin this spec's shape cannot run,
   // is an error worded exactly as `crewhaus compile` words it; a builtin that
   // compiles but can never succeed, or a sub-agent tool its parent never
-  // registers, is a warning. Before this, lint said "clean" for tool lists
-  // compile rejected.
-  const shapeTools = checkShapeTools(ir);
-  for (const e of shapeTools.errors) {
+  // registers, is a warning.
+  for (const e of run.shapeTools.errors) {
     findings.push({ message: e.message, path: e.path, severity: "error", rule: "tool" });
   }
-  for (const w of shapeTools.warnings) {
+  for (const w of run.shapeTools.warnings) {
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
   // Stage 3c — the spec-key warnings compile prints: a key the shape accepts
   // but does not wire (`tools:` on onchain, `tool_config:` on voice) is
-  // `accepted-but-unwired`, which fails `compile --strict`. Lint said "clean"
-  // for those specs.
-  for (const w of collectCompileWarnings(spec)) {
+  // `accepted-but-unwired`, which fails `compile --strict`.
+  for (const w of run.compileWarnings) {
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
   // A typo in a list that narrows a site's tools (a sub-agent's, a model
@@ -196,16 +190,11 @@ export function runLint(
 
   // Stage 5 — v0.3.0 Goal 3 (design §4.1): a user-declared
   // `mcp_servers.thredz` next to a `thredz:` block WINS over the compiler's
-  // synthesis (explicit beats implicit). That is deliberate — the vendored
-  // -server escape hatch — but worth a warning so nobody wonders why their
-  // `base_url`/`visibility` knobs stopped applying.
-  const specThredz = (spec as { thredz?: unknown }).thredz;
-  const specMcp = (spec as { mcp_servers?: Record<string, unknown> }).mcp_servers;
-  if (specThredz !== undefined && specThredz !== false && specMcp?.["thredz"] !== undefined) {
+  // synthesis (explicit beats implicit), which is worth a warning.
+  if (run.thredzOverride !== undefined) {
     findings.push({
-      message:
-        "mcp_servers.thredz is user-declared, so the thredz: block does not synthesize a server — your explicit entry wins (explicit beats implicit). The thredz: knobs still drive the wiring (aliases, goal mirror), but api_key/base_url/visibility only apply through YOUR server's env; it must speak the thredz-mcp v0.2.0 tool contract.",
-      path: "mcp_servers.thredz",
+      message: run.thredzOverride.message,
+      path: run.thredzOverride.path,
       severity: "warning",
       rule: "thredz-override",
     });
@@ -214,7 +203,7 @@ export function runLint(
   // Stage 5b — 0.7.1: an mcp_servers key with `__` in it, or `_` at either
   // end, makes `mcp__<server>__<tool>` ambiguous. 0.7.0 ran such keys, so the
   // spec still parses; `compile` prints the same warning.
-  for (const w of mcpServerNameWarnings(spec)) {
+  for (const w of run.mcpServerNames) {
     findings.push({
       message: w.message,
       path: w.path,
@@ -228,7 +217,7 @@ export function runLint(
   // blocks (warning), profile tools ⊆ the shape's resolved toolset (warning),
   // roster references that name no roster member (error, a drift guard behind
   // the spec cross-field checks and the modelPlanIntegrity ir-pass).
-  for (const f of auditModelPlan(ir)) {
+  for (const f of run.modelPlan) {
     findings.push({ message: f.message, path: f.path, severity: f.severity, rule: f.rule });
   }
 
@@ -255,7 +244,7 @@ export function runLint(
   // same words rather than saying "clean"; then the lint-only rules, which
   // describe valid specs unlikely to do what their author meant. The
   // self-judging waiver is Stage 6's `provability-self-judge`.
-  for (const w of loweredWarnings) {
+  for (const w of run.loweredWarnings) {
     if (!w.code.startsWith("provability-")) continue;
     findings.push({ message: w.message, path: w.path, severity: "warning", rule: w.code });
   }
@@ -263,18 +252,17 @@ export function runLint(
 
   // Stage 9 — a spending period below the per-run cap (#514): valid, and worth
   // knowing, since the period then ends a run before the run's own cap does.
-  const budget = "budget" in spec ? spec.budget : undefined;
-  if (budget?.period !== undefined && budget.period.usd < budget.usd) {
+  if (run.budgetPeriod !== undefined) {
     findings.push({
-      message: `budget.period.usd ($${budget.period.usd}) is below budget.usd ($${budget.usd}), so a run can use up the period's limit before it reaches its own cap.`,
-      path: "budget.period.usd",
+      message: run.budgetPeriod.message,
+      path: run.budgetPeriod.path,
       severity: "info",
-      rule: "budget-period-below-run-cap",
+      rule: run.budgetPeriod.code,
     });
   }
 
   // Warnings inform; only errors gate (`ok` drives the CLI exit code).
-  return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir };
+  return { ok: findings.every((f) => f.severity !== "error"), findings, spec, ir, check };
 }
 
 /**
@@ -1260,7 +1248,22 @@ export function formatLintText(result: LintResult): string {
   return `${lines.join("\n")}\n`;
 }
 
-/** Render the lint findings as `{ findings: LintFinding[] }` JSON for editors/CI. */
+/**
+ * Render the lint result as JSON for editors/CI: `ok` and `findings` first, as
+ * they always were, then the schema that answered (`schema`), every schema or
+ * cross-field issue (`issues`) and each setting the schema does not know
+ * (`unknownKeys`), from the same check.
+ */
 export function formatLintJson(result: LintResult): string {
-  return `${JSON.stringify({ ok: result.ok, findings: result.findings }, null, 2)}\n`;
+  return `${JSON.stringify(
+    {
+      ok: result.ok,
+      findings: result.findings,
+      schema: result.check.schema,
+      issues: result.check.issues,
+      unknownKeys: result.check.unknownKeys,
+    },
+    null,
+    2,
+  )}\n`;
 }

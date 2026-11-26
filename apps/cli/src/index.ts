@@ -2523,6 +2523,7 @@ async function runLintCommand(args: ParsedArgs): Promise<void> {
         "  --format json   structured {message,path,severity,rule} findings for editors/CI.\n" +
         "                  IR passes are fail-fast per pass; json mode runs each pass\n" +
         "                  independently (collect-all) so one violation doesn't hide others.\n" +
+        "                  Also prints schema (which schema answered), issues and unknownKeys.\n" +
         "  --fix           apply mechanical fixes: a tools: list typo → nearest match,\n" +
         "                  a credential compile rejects ($slack_token) → $UPPER_SNAKE_CASE,\n" +
         "                  an unsafe name → sanitised. Only those fields change; text\n" +

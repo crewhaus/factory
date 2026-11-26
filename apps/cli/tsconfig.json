@@ -23,6 +23,7 @@
     { "path": "../../packages/boundary-classifier" },
     { "path": "../../packages/canary-controller" },
     { "path": "../../packages/compiler" },
+    { "path": "../../packages/compile-service" },
     { "path": "../../packages/control-contract" },
     { "path": "../../packages/control-records" },
     { "path": "../../packages/control-service" },

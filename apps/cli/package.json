@@ -47,6 +47,7 @@
     "@crewhaus/cloud-adapter-railway": "workspace:*",
     "@crewhaus/cloud-adapter-render": "workspace:*",
     "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/compile-service": "workspace:*",
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/control-service": "workspace:*",
