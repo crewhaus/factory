@@ -411,7 +411,9 @@ export function auditPermissions(input: AuditPermissionsInput): PermissionAuditR
         (p) =>
           p.code !== "argument-not-scoped" &&
           p.code !== "builtin-not-reached" &&
-          p.code !== "tool-not-known",
+          p.code !== "tool-not-known" &&
+          // A rule the bounded checks stopped at was not checked: not dead.
+          p.code !== "rule-not-checked",
       )
       .map((p) => `${p.type} ${p.pattern}`),
   );

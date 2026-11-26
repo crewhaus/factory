@@ -51,6 +51,65 @@ const MCP_LIST: Rule[] = [
   ...MCP_SERVERS.map((s) => deny(`mcp__${s}_admin__delete_everything`)),
   deny("mcp__github__delete_repo"),
 ];
+/** The MCP servers other than `linear`. */
+const OTHER_SERVERS = MCP_SERVERS.filter((s) => s !== "linear");
+/**
+ * 92 rules in the common allow-first layout: one server's wildcard allow,
+ * 45 read tools of other servers allowed by name, 45 write tools of other
+ * servers asked for by name, then a deny the first allow beats.
+ */
+const MCP_NAMED_LIST: Rule[] = [
+  allow("mcp__linear__*"),
+  ...Array.from({ length: 45 }, (_, i) =>
+    allow(`mcp__${OTHER_SERVERS[i % OTHER_SERVERS.length]}__read_${i}`),
+  ),
+  ...Array.from({ length: 45 }, (_, i) =>
+    ask(`mcp__${OTHER_SERVERS[i % OTHER_SERVERS.length]}__write_${i}`),
+  ),
+  deny("mcp__linear__delete_project"),
+];
+/**
+ * 421 rules: MCP_LIST's 20 wildcard server allows, 200 admin read tools
+ * allowed by name, 200 admin write tools asked for by name, then a deny the
+ * first allow beats.
+ */
+const MCP_LONG_LIST: Rule[] = [
+  ...MCP_SERVERS.map((s) => allow(`mcp__${s}__*`)),
+  ...Array.from({ length: 200 }, (_, i) =>
+    allow(`mcp__${MCP_SERVERS[i % MCP_SERVERS.length]}_admin__read_${i}`),
+  ),
+  ...Array.from({ length: 200 }, (_, i) =>
+    ask(`mcp__${MCP_SERVERS[i % MCP_SERVERS.length]}_admin__write_${i}`),
+  ),
+  deny("mcp__github__delete_repo"),
+];
+/** Six verbs an MCP server's tools commonly start with. */
+const MCP_VERBS = ["get", "list", "search", "read", "fetch", "describe"];
+/**
+ * 258 rules: each of the 20 servers' tools allowed by six verb wildcards,
+ * 137 tools asked for by name, then a deny the first `get_*` allow beats.
+ */
+const MCP_VERB_LIST: Rule[] = [
+  ...MCP_SERVERS.flatMap((s) => MCP_VERBS.map((v) => allow(`mcp__${s}__${v}_*`))),
+  ...Array.from({ length: 137 }, (_, i) =>
+    ask(`mcp__${MCP_SERVERS[i % MCP_SERVERS.length]}__update_${i}`),
+  ),
+  deny("mcp__github__get_secret"),
+];
+/**
+ * 841 rules: the 20 server wildcards, 820 tools asked for by name, then a
+ * deny the first allow beats.
+ */
+const MCP_WIDE_LIST: Rule[] = [
+  ...MCP_SERVERS.map((s) => allow(`mcp__${s}__*`)),
+  ...Array.from({ length: 820 }, (_, i) =>
+    ask(`mcp__${MCP_SERVERS[i % MCP_SERVERS.length]}_admin__write_${i}`),
+  ),
+  deny("mcp__github__delete_repo"),
+];
+/** `n` distinct characters no glob reads specially (CJK ideographs). */
+const distinctChars = (n: number, from = 0x4e00): string =>
+  Array.from({ length: n }, (_, i) => String.fromCharCode(from + i)).join("");
 const shadowed = (rules: Rule[]) =>
   shadowedPermissionRules([{ path: "permissions.rules", rules }]).map((p) => [
     `${p.type} ${p.pattern}`,
@@ -285,15 +344,21 @@ describe("the rule-order check does a bounded amount of work", () => {
     spies.push(spy);
     return spy;
   };
-  /** `n` bare allows and `n` denies, alternating, no tool pattern including another. */
+  /** `n` bare wildcard allows and `n` denies, alternating, no tool pattern including another. */
   const alternating = (n: number): Rule[] =>
-    Array.from({ length: n }, (_, i) => [allow(`A${i}x`), deny(`B${i}y`)]).flat();
+    Array.from({ length: n }, (_, i) => [allow(`A${i}x*`), deny(`B${i}y`)]).flat();
+  /** The budget the comparisons charged, read from the spy's first call. */
+  const chargedBy = (calls: ReturnType<typeof countComparisons>, steps: number): number => {
+    const budget = calls.mock.calls[0]?.[2] as InclusionBudget | undefined;
+    expect(budget).toBeDefined();
+    return steps - (budget?.steps ?? steps);
+  };
   const notes = (found: ReturnType<typeof shadowedPermissionRules>) =>
     found.filter((p) => p.code === "order-not-checked");
 
   test("the rule-order check compares a bounded number of rule pairs and names the list where it stopped", () => {
-    const rules = alternating(500);
-    expect(rules.length).toBe(1000);
+    const rules = alternating(600);
+    expect(rules.length).toBe(1200);
     const lists: PermissionRuleList[] = [
       { path: "permissions.rules", rules },
       // A later list is not checked, and gets no second note.
@@ -309,10 +374,12 @@ describe("the rule-order check does a bounded amount of work", () => {
     expect(note?.code).toBe("order-not-checked");
     expect(note?.list).toBe("permissions.rules");
     expect(note?.shadowedBy).toBeUndefined();
-    // The 64th deny is the first whose comparisons (1 + 2 + … + 64) pass 2,048.
-    expect(`${note?.type} ${note?.pattern}`).toBe("alwaysDeny B63y");
+    // The k-th deny is compared with the k wildcard allows above it. The
+    // 512th is the first whose comparisons (1 + 2 + … + 512) pass 131,072:
+    // the denies before it make 130,816.
+    expect(`${note?.type} ${note?.pattern}`).toBe("alwaysDeny B511y");
     expect(note?.message).toBe(
-      'rule "alwaysDeny B63y" in permissions.rules: the rule-order check does a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for an allow above them that always matches first.',
+      'rule "alwaysDeny B511y" in permissions.rules: the rule-order check does a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for an allow above them that always matches first.',
     );
     // The pair bound stopped it, not the automaton work: with no step bound
     // the same list makes the same comparisons and stops at the same rule.
@@ -330,10 +397,13 @@ describe("the rule-order check does a bounded amount of work", () => {
     const found = shadowedPermissionRules([{ path: "permissions.rules", rules }], {
       limits: { pairs: 10 },
     });
+    // `Bash` names one tool, so `Bash(rm **)` is found by that name, at no
+    // pair. Each B{k}y is compared with the k + 1 wildcard allows above it:
+    // B0y to B3y make the 10 comparisons, and B4y is where the check stops.
     expect(calls).toHaveBeenCalledTimes(10);
     expect(found.map((p) => [p.code, `${p.type} ${p.pattern}`])).toEqual([
       ["shadowed-by-allow", "alwaysDeny Bash(rm **)"],
-      ["order-not-checked", "alwaysDeny B3y"],
+      ["order-not-checked", "alwaysDeny B4y"],
     ]);
     // In a plan-mode spec the note is the same note.
     const plan = shadowedPermissionRules([{ path: "permissions.rules", rules }], {
@@ -368,7 +438,7 @@ describe("the rule-order check does a bounded amount of work", () => {
         { path: "agent.sub_agents.fixer.permissions.allow", rules: [allow(long("a"))] },
         { path: "agent.sub_agents.fixer.permissions.deny", rules: [deny(long("b"))] },
       ],
-      { limits: { steps: 500 } },
+      { limits: { steps: 4000 } },
     );
     expect(found.map((p) => [p.code, p.list, p.pattern])).toEqual([
       ["order-not-checked", "agent.sub_agents.fixer.permissions.deny", long("b")],
@@ -421,6 +491,24 @@ describe("the rule-order check does a bounded amount of work", () => {
       // MCP-style names: a bare allow for each of 20 servers, an ask and a
       // deny on each server's admin tools, then a deny the first allow beats.
       [{ path: "permissions.rules", rules: MCP_LIST }],
+      // MCP tools allowed and asked for by name, in the allow-first layout.
+      [{ path: "permissions.rules", rules: MCP_NAMED_LIST }],
+      [{ path: "permissions.rules", rules: MCP_LONG_LIST }],
+      // Verb wildcards for each server above named asks, and server
+      // wildcards above many named asks.
+      [{ path: "permissions.rules", rules: MCP_VERB_LIST }],
+      [{ path: "permissions.rules", rules: MCP_WIDE_LIST }],
+      // A sub-agent's named MCP allows read before its denies.
+      [
+        {
+          path: "agent.sub_agents.a.permissions.allow",
+          rules: MCP_NAMED_LIST.filter((r) => r.type === "alwaysAllow"),
+        },
+        {
+          path: "agent.sub_agents.a.permissions.deny",
+          rules: MCP_NAMED_LIST.filter((r) => r.type !== "alwaysAllow").map((r) => deny(r.pattern)),
+        },
+      ],
       // The compiler's edge-reading fixture, as a plain spec object.
       specPermissionRuleLists({
         agent: {
@@ -455,7 +543,108 @@ describe("the rule-order check does a bounded amount of work", () => {
       hits += bounded.length;
     }
     expect(table[table.length - 1]?.length).toBe(3);
-    expect(hits).toBeGreaterThanOrEqual(10);
+    expect(hits).toBeGreaterThanOrEqual(15);
+  });
+
+  test("a list of MCP tools named one by one is checked in full, and a named allow costs no comparison", () => {
+    expect(MCP_NAMED_LIST.length).toBe(92);
+    const calls = countComparisons();
+    const found = shadowedPermissionRules([{ path: "permissions.rules", rules: MCP_NAMED_LIST }]);
+    expect(found.map((p) => [p.code, `${p.type} ${p.pattern}`, p.shadowedBy])).toEqual([
+      ["shadowed-by-allow", "alwaysDeny mcp__linear__delete_project", "mcp__linear__*"],
+    ]);
+    // Each of the 46 asks and denies is compared with the one wildcard allow.
+    expect(calls.mock.calls.length).toBeLessThanOrEqual(46);
+    // 421 rules: 200 asks below 20 wildcard allows, and the deny the first
+    // beats, within the pair bound.
+    calls.mockClear();
+    const long = shadowedPermissionRules([{ path: "permissions.rules", rules: MCP_LONG_LIST }]);
+    expect(long.map((p) => [p.code, `${p.type} ${p.pattern}`, p.shadowedBy])).toEqual([
+      ["shadowed-by-allow", "alwaysDeny mcp__github__delete_repo", "mcp__github__*"],
+    ]);
+    expect(calls.mock.calls.length).toBe(200 * 20 + 1);
+    expect(calls.mock.calls.length).toBeLessThan(RULE_ORDER_LIMITS.pairs);
+    // 258 rules of verb wildcards above named asks, and 841 of server
+    // wildcards above named asks: the deny at the end is found in each.
+    for (const [rules, denied, by] of [
+      [MCP_VERB_LIST, "mcp__github__get_secret", "mcp__github__get_*"],
+      [MCP_WIDE_LIST, "mcp__github__delete_repo", "mcp__github__*"],
+    ] as const) {
+      calls.mockClear();
+      const found = shadowedPermissionRules([{ path: "permissions.rules", rules }]);
+      expect(found.map((p) => [p.code, `${p.type} ${p.pattern}`, p.shadowedBy])).toEqual([
+        ["shadowed-by-allow", `alwaysDeny ${denied}`, by],
+      ]);
+      expect(calls.mock.calls.length).toBeLessThan(RULE_ORDER_LIMITS.pairs);
+    }
+    expect(MCP_VERB_LIST.length).toBe(258);
+    expect(MCP_WIDE_LIST.length).toBe(841);
+  });
+
+  test("a literal allow is compared by its name and costs no pair", () => {
+    const rules = [
+      ...Array.from({ length: 3000 }, (_, i) => allow(`mcp__gh__read_${i}`)),
+      ...Array.from({ length: 3000 }, (_, i) => deny(`mcp__gh__write_${i}`)),
+    ];
+    const calls = countComparisons();
+    expect(shadowedPermissionRules([{ path: "permissions.rules", rules }])).toEqual([]);
+    expect(calls).toHaveBeenCalledTimes(0);
+  }, 20_000); // 6,000 rules: CI runners are slower on allocation-heavy work
+
+  test("the first allow that covers a deny is the one named", () => {
+    const calls = countComparisons();
+    expect(shadowed([allow("mcp__gh__*"), allow("mcp__gh__a"), deny("mcp__gh__a")])).toEqual([
+      ["alwaysDeny mcp__gh__a", "mcp__gh__*"],
+    ]);
+    calls.mockClear();
+    expect(shadowed([allow("mcp__gh__a"), allow("mcp__gh__*"), deny("mcp__gh__a")])).toEqual([
+      ["alwaysDeny mcp__gh__a", "mcp__gh__a"],
+    ]);
+    expect(calls).toHaveBeenCalledTimes(0);
+    expect(shadowed([allow("mcp__gh__a"), deny("mcp__gh__*")])).toEqual([]);
+    expect(calls).toHaveBeenCalledTimes(0);
+    // An allow written with escapes names the same tool.
+    expect(shadowed([allow("R\\ead"), deny("Read(secrets/**)")])).toEqual([
+      ["alwaysDeny Read(secrets/**)", "R\\ead"],
+    ]);
+    expect(calls).toHaveBeenCalledTimes(0);
+  });
+
+  test("a literal allow covers a deny exactly when automaton inclusion says it does", () => {
+    const globs = [
+      "Read",
+      "R\\ead",
+      "Rea",
+      "Bash",
+      "Bash*",
+      "R*",
+      "R\\*",
+      "R\\*x",
+      "Re?d",
+      "*ead",
+      "*",
+      "**",
+      "mcp__gh__a",
+      "mcp\\_\\_gh\\_\\_a",
+      "mcp__gh__*",
+      "mcp__*",
+      "gh__a",
+      "gh__*",
+    ];
+    let literalHits = 0;
+    let hits = 0;
+    for (const a of globs) {
+      for (const d of globs) {
+        const found = shadowed([allow(a), deny(d)]).length > 0;
+        expect({ a, d, found }).toEqual({ a, d, found: globIncludedIn(d, a) });
+        if (found) {
+          hits++;
+          if (compilePattern(a)._toolRe.isLiteral) literalHits++;
+        }
+      }
+    }
+    expect(literalHits).toBeGreaterThanOrEqual(10);
+    expect(hits).toBeGreaterThan(literalHits);
   });
 
   test("a list of MCP-style names is checked in full under the default bounds", () => {
@@ -467,16 +656,20 @@ describe("the rule-order check does a bounded amount of work", () => {
     ]);
   });
 
-  test("building each pattern's automaton is charged to the step bound", () => {
-    // One long allow above short denies: each comparison builds the long
-    // pattern again, and that alone spends the bound within a few pairs.
+  test("each pattern's automaton is built once and charged once, and the step bound stops a list of distinct long patterns", () => {
+    // Ten distinct long wildcard allows above a short deny: their text is
+    // charged as each is read (about 100,000 steps), and each is built, and
+    // charged, for its own comparison, which spends the rest within a few
+    // pairs.
     const rules = [
-      allow(`z${"b".repeat(5000)}`),
-      ...Array.from({ length: 50 }, (_, i) => deny(`z${i}`)),
+      ...Array.from({ length: 10 }, (_, i) =>
+        allow(`z${String.fromCharCode(0x61 + i).repeat(5000)}*`),
+      ),
+      deny("z0"),
     ];
     const calls = countComparisons();
     const found = shadowedPermissionRules([{ path: "permissions.rules", rules }], {
-      limits: { steps: 20_000 },
+      limits: { steps: 115_000 },
     });
     expect(calls.mock.calls.length).toBeGreaterThan(0);
     expect(calls.mock.calls.length).toBeLessThanOrEqual(4);
@@ -485,7 +678,118 @@ describe("the rule-order check does a bounded amount of work", () => {
     const budget: InclusionBudget = { steps: 1_000_000 };
     expect(globIncludedIn("a", `a${"b".repeat(1000)}`, budget)).toBe(false);
     expect(1_000_000 - budget.steps).toBeGreaterThanOrEqual(1000);
+    // A later comparison with the same budget reuses it.
+    const before = budget.steps;
+    expect(globIncludedIn("c", `a${"b".repeat(1000)}`, budget)).toBe(false);
+    expect(before - budget.steps).toBeLessThan(100);
   });
+
+  test("a deny with no wildcard is read through the allow's automaton, and each state it visits is charged", () => {
+    // A 5,000-character name read through 100 `**` and an `x`: every
+    // character re-closes the allow's 200 looping states.
+    const allowGlob = `${"**".repeat(100)}x`;
+    const name = "a".repeat(5000);
+    const budget: InclusionBudget = { steps: 1e12 };
+    expect(globIncludedIn(name, allowGlob, budget)).toBe(false);
+    expect(globIncludedIn(`${name}x`, allowGlob, budget)).toBe(true);
+    // Twice 5,000 characters, each closure visiting about 200 states (the
+    // builds alone are about 5,200).
+    expect(1e12 - budget.steps).toBeGreaterThanOrEqual(2 * 5000 * 150);
+    // And it is the answer automaton inclusion gives.
+    for (const [inner, outer] of [
+      ["mcp__gh__a", "mcp__gh__*"],
+      ["mcp__gl__a", "mcp__gh__*"],
+      ["Bash", "B*sh"],
+      ["a/b", "*"],
+      ["a/b", "**"],
+      ["Read", "R?ad"],
+    ] as const) {
+      expect({ inner, outer, budgeted: globIncludedIn(inner, outer, { steps: 1e12 }) }).toEqual({
+        inner,
+        outer,
+        budgeted: globIncludedIn(inner, outer),
+      });
+    }
+  });
+
+  test("a long wildcard allow above many short denies is built once", () => {
+    const steps = 1e12;
+    const rules = [
+      allow(`z${"b".repeat(5000)}*`),
+      ...Array.from({ length: 50 }, (_, i) => deny(`z${i}`)),
+    ];
+    const calls = countComparisons();
+    expect(
+      shadowedPermissionRules([{ path: "permissions.rules", rules }], { limits: { steps } }),
+    ).toEqual([]);
+    expect(calls).toHaveBeenCalledTimes(50);
+    // The allow builds to 5,003 states, once. Each deny builds to at most 4,
+    // joins two alphabets of at most 3 letters, and settles within its first
+    // few characters: well under 200 steps each. Each rule's text is charged
+    // a few steps a character as it is read.
+    const text = rules.reduce((n, r) => n + 3 * r.pattern.length + 1, 0);
+    expect(chargedBy(calls, steps)).toBeLessThan(2 * 5000 + text + 50 * 200);
+  });
+
+  test("every per-comparison cost is paid for by the steps charged", () => {
+    // A wildcard allow with a 3,000-letter alphabet above 100 denies of one
+    // character and a `*`, which it does not cover: each comparison settles
+    // on the deny's own character, so joining the two alphabets is most of
+    // its work.
+    const steps = 1e12;
+    const rules = [
+      allow(`*${distinctChars(3000)}`),
+      ...Array.from({ length: 100 }, (_, i) => deny(`${String.fromCharCode(0x3041 + i)}*`)),
+    ];
+    const RealUint8 = globalThis.Uint8Array;
+    let allocated = 0;
+    class Counted extends RealUint8 {
+      constructor(...args: ConstructorParameters<typeof RealUint8>) {
+        super(...args);
+        allocated += this.length;
+      }
+    }
+    const realAdd = Set.prototype.add;
+    let added = 0;
+    const calls = countComparisons();
+    globalThis.Uint8Array = Counted as typeof RealUint8;
+    Set.prototype.add = function <T>(this: Set<T>, value: T) {
+      added++;
+      return realAdd.call(this, value);
+    };
+    let found: ReturnType<typeof shadowedPermissionRules>;
+    try {
+      found = shadowedPermissionRules([{ path: "permissions.rules", rules }], {
+        limits: { steps },
+      });
+    } finally {
+      Set.prototype.add = realAdd;
+      globalThis.Uint8Array = RealUint8;
+    }
+    expect(found).toEqual([]);
+    expect(calls).toHaveBeenCalledTimes(100);
+    const charged = chargedBy(calls, steps);
+    // The calls ran: every comparison joined the allow's 3,000 letters.
+    expect(added).toBeGreaterThan(100 * 3000);
+    expect(added).toBeLessThanOrEqual(charged);
+    expect(allocated).toBeGreaterThan(3000);
+    expect(allocated).toBeLessThanOrEqual(charged);
+  });
+
+  test("each symbol read is charged", () => {
+    // 300 distinct characters and a `*` against `x`: each of its 300 state
+    // sets reads every one of the 304 symbols.
+    const budget: InclusionBudget = { steps: 1e12 };
+    expect(globIncludedIn(`${distinctChars(300)}*`, "x", budget)).toBe(false);
+    expect(1e12 - budget.steps).toBeGreaterThanOrEqual(100_000);
+  });
+
+  test("each state a closure visits is charged", () => {
+    // 200 `**` after a `?`: every symbol read re-closes about 400 states.
+    const budget: InclusionBudget = { steps: 1e12 };
+    expect(globIncludedIn(`?${"**".repeat(200)}${distinctChars(200)}`, "x", budget)).toBe(false);
+    expect(1e12 - budget.steps).toBeGreaterThanOrEqual(20_000_000);
+  }, 20_000); // 24M steps of closures by construction: slow on CI runners
 
   test("a comparison's working arrays are all paid for by the steps it is charged", () => {
     // Counts the elements of every typed array the comparison allocates,
@@ -519,6 +823,25 @@ describe("the rule-order check does a bounded amount of work", () => {
       }
     }
   });
+
+  test("each rule's text is charged as it is read, so long rules reach the step bound", () => {
+    // No allow, so no comparison: only the rules' text is read.
+    const pattern = `Nn${"a".repeat(100_000)}`;
+    const rules = Array.from({ length: 200 }, () => deny(pattern));
+    const calls = countComparisons();
+    const found = shadowedPermissionRules([{ path: "permissions.rules", rules }]);
+    expect(calls).toHaveBeenCalledTimes(0);
+    expect(found.map((p) => p.code)).toEqual(["order-not-checked"]);
+    // A thousand ordinary rules stay under it.
+    const ordinary = Array.from({ length: 1000 }, (_, i) =>
+      i % 2 === 0
+        ? deny(`Bash(git push origin feature-${i}-${"x".repeat(i % 20)}*)`)
+        : allow(`Read(src/m${i}/**)`),
+    );
+    expect(
+      notes(shadowedPermissionRules([{ path: "permissions.rules", rules: ordinary }])),
+    ).toEqual([]);
+  }, 20_000); // 200 rules of 100,000 characters compiled: slow on CI runners
 
   test("globIncludedIn with a budget: the same answer while it lasts, false once it is spent", () => {
     expect(globIncludedIn("mcp__gh__a", "mcp__gh__*")).toBe(true);

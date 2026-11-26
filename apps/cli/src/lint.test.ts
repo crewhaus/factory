@@ -520,15 +520,15 @@ permissions:
   });
 
   test("the rule-order check compares a bounded number of rule pairs and names the list where it stopped", () => {
-    // 500 allow/deny pairs that shadow nothing: past the bound, one note.
-    const yaml = `${validCli}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+    // 600 allow/deny pairs that shadow nothing: past the bound, one note.
+    const yaml = `${validCli}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch* }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(600)}`;
     const found = runLint(yaml, noTools).findings.filter((f) =>
       f.rule.startsWith("permission-rule:"),
     );
     expect(found.map((f) => [f.rule, f.path])).toEqual([
       ["permission-rule:order-not-checked", "permissions.rules[alwaysDeny Read]"],
     ]);
-  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+  }, 20_000); // 1,200 rules: CI runners are slower on allocation-heavy work
 
   // The findings themselves are the compiler's (permission-rules.test.ts
   // there); the CLI hands them its live tools and the edge reading.

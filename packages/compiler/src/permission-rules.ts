@@ -19,6 +19,7 @@
 import type { IrNode } from "@crewhaus/ir";
 import {
   type PermissionRuleProblem,
+  RULE_PROBLEM_LIMITS,
   type RuleToolDescriptor,
   permissionRuleProblems,
   shadowedPermissionRules,
@@ -149,7 +150,9 @@ export type PermissionRuleCheckOptions = {
  * else by the builtin manifest, so the check sees the same declarations the
  * runtime will; the tools a `thredz:` block registers are known in a spec
  * that has one. For a worker's build (`opts.edge`), the shape's rules are
- * read in the worker's order.
+ * read in the worker's order. The per-rule checks of every list share one
+ * bound on their work, and the rule-order check has its own: where either
+ * stops, one note says so.
  */
 export function permissionRuleProblemsOf(
   spec: unknown,
@@ -177,8 +180,18 @@ export function permissionRuleProblemsOf(
     thredz.length === 0 ? KNOWN_TOOLS : [...KNOWN_TOOLS, ...thredz.map((name) => ({ name }))];
   const mcpServers = Object.keys(node.mcp_servers ?? {});
   const out: LocatedRuleProblem[] = [];
+  // One bound for every list of the spec: once the rule checks have done
+  // their bounded amount of work, one note names where they stopped, and no
+  // later list is checked.
+  const budget = { steps: RULE_PROBLEM_LIMITS.steps };
   for (const list of lists) {
-    for (const p of permissionRuleProblems({ rules: list.rules, granted, known, mcpServers })) {
+    for (const p of permissionRuleProblems({
+      rules: list.rules,
+      granted,
+      known,
+      mcpServers,
+      budget,
+    })) {
       out.push({ ...p, list: list.path, path: `${list.path}[${p.type} ${p.pattern}]` });
     }
   }
@@ -202,15 +215,17 @@ export function permissionRuleProblemsOf(
  * never escalates them: a `builtin-not-reached` note is about a rule that
  * still fires (on a declared MCP server's tools), a `tool-not-known` one about
  * a name a plugin or custom tool may still supply, a
- * `shadowed-outside-plan` one about a rule a plan-mode spec still fires, and
- * an `order-not-checked` one names where the rule-order check, which does a
- * bounded amount of work, stopped.
+ * `shadowed-outside-plan` one about a rule a plan-mode spec still fires, an
+ * `order-not-checked` one names where the rule-order check, which does a
+ * bounded amount of work, stopped, and a `rule-not-checked` one names where
+ * the per-rule checks, which do too, stopped.
  */
 export const PERMISSION_RULE_NOTES: ReadonlySet<string> = new Set([
   "builtin-not-reached",
   "tool-not-known",
   "shadowed-outside-plan",
   "order-not-checked",
+  "rule-not-checked",
 ]);
 
 /**
