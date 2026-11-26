@@ -65,6 +65,7 @@ export {
   type ContainedFd,
   type ContainedRead,
   type OpenForReadOptions,
+  _setOpenHooksForTest,
   openForRead,
   openForReadFd,
   openForReadSync,

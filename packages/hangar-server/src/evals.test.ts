@@ -15,6 +15,7 @@ import {
   runCorpusPartial,
   runCorpusResumed,
 } from "./__test__/eval-corpus";
+import { MAX_JSONL_LINES } from "./constants";
 import {
   evalHealth,
   evalHealthyFlag,
@@ -303,6 +304,23 @@ describe("a sample's page and its run's table say the same thing", () => {
     const view = evalSampleView(dir, RUN, "s1");
     expect(view?.verdict).toBe("error");
     expect(view?.note).toContain("invoker failed on s1");
+  }, 20_000); // loads the whole eval runner
+
+  test("a sample serves its trace events, capped and saying so", async () => {
+    const dir = harness();
+    await runCorpusEval(dir, { s1: "pass" }, { runId: RUN });
+    const sample = join(evalsDirOf(dir), RUN, "s1");
+    writeFileSync(join(sample, "events.jsonl"), `${JSON.stringify({ kind: "turn_start" })}\n`);
+    const one = evalSampleView(dir, RUN, "s1");
+    expect(one?.events).toEqual([{ kind: "turn_start" }]);
+    expect(one?.eventsTruncated).toBe(false);
+    const lines = Array.from({ length: MAX_JSONL_LINES + 5 }, (_, i) =>
+      JSON.stringify({ kind: "turn_end", turn: i }),
+    );
+    writeFileSync(join(sample, "events.jsonl"), `${lines.join("\n")}\n`);
+    const many = evalSampleView(dir, RUN, "s1");
+    expect(many?.events).toHaveLength(MAX_JSONL_LINES);
+    expect(many?.eventsTruncated).toBe(true);
   }, 20_000); // loads the whole eval runner
 
   test("with nothing recorded about it, a sample claims no verdict", async () => {

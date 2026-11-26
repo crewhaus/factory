@@ -851,6 +851,7 @@ describe("every job route carries what it checked into the job's start-time chec
         "v1/meta.ts me",
         "v1/meta.ts resolvePrincipal",
         "v1/runs.ts create",
+        "v1/runs.ts requireContentForFrom",
       ].sort(),
     );
     // A bare `ctx.authorize(P)` that does not note the need: two, both in the spec editor's

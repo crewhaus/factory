@@ -152,7 +152,12 @@ describe("healthz + version + static", () => {
     const bare = boot();
     const builtin = await bare.fetchRaw("/");
     expect(builtin.status).toBe(200);
-    expect(await builtin.text()).toContain("Hangar manager API");
+    const text = await builtin.text();
+    expect(text).toContain("Hangar manager API");
+    // Every route it lists is served: none is described as a stub.
+    expect(text).not.toContain("501");
+    expect(text).not.toContain("stub");
+    expect(text).toContain("/api/v1/runs/:run/{inspect,timeline,request,export,raw}");
   });
 });
 

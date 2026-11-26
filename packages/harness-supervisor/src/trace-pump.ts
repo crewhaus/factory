@@ -44,7 +44,9 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
+import { CANONICAL_RUN_ID_RE } from "@crewhaus/control-contract";
+import { argvMatchesCommandLine, startTimesMatch } from "./process-ops";
 import { type Scrubber, noopScrubber, scrubDeep } from "./scrub";
 import { START_TIME_TOLERANCE_MS } from "./types";
 
@@ -279,6 +281,17 @@ export type LogPumpOptions = {
   readonly pid?: number;
   /** The host this pump records as its holder's. Default: this machine. */
   readonly host?: string;
+  /**
+   * The holder's command line as the OS shows it, recorded on the lease so another pump
+   * can tell this process from another program that later took its pid. Default:
+   * {@link ownCommandArgv}.
+   */
+  readonly argv?: readonly string[];
+  /**
+   * The execution's run index (`<exec>.runs.jsonl`): where each canonical run's first event
+   * sits in the events file. Default: beside the events file.
+   */
+  readonly runIndexFile?: string;
 };
 
 export const DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024;
@@ -291,6 +304,8 @@ export const DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024;
 export type LeaseProbe = {
   readonly isAlive: (pid: number) => boolean | undefined;
   readonly startTimeMs: (pid: number) => number | undefined;
+  /** The running process's command line; absent or `undefined` when it cannot be told. */
+  readonly commandLine?: (pid: number) => string | undefined;
 };
 
 /** One run's pump lease: who holds it. No field is named like a credential. */
@@ -302,10 +317,38 @@ export type PumpLease = {
   readonly at: string;
   /** This pump's own id, so two pumps in one process are told apart. */
   readonly pump: string;
+  /** The holder's command line, as the OS shows it (see {@link ownCommandArgv}). */
+  readonly argv?: readonly string[];
 };
+
+/**
+ * This process's command line as the OS shows it: the executable's name, then the
+ * arguments after the script. A compiled `crewhaus` reads `bun` and an embedded path for
+ * its first two `process.argv` entries, neither of which the OS command line holds, so the
+ * whole of `process.argv` would never match; the executable's name and the arguments
+ * after the script appear, in order, for a compiled manager and a Bun-run one alike.
+ */
+export function ownCommandArgv(): readonly string[] {
+  return commandArgvOf(process.execPath, process.argv);
+}
+
+/** {@link ownCommandArgv} for a process with this executable path and `process.argv`. */
+export function commandArgvOf(execPath: string, argv: readonly string[]): readonly string[] {
+  return [basename(execPath), ...argv.slice(2)];
+}
+
+/** How many command-line words a lease records, at most. */
+const LEASE_ARGV_MAX = 64;
 
 /** A lease that cannot be read is a writer mid-write for at most this long. */
 export const PUMP_LEASE_TORN_GRACE_MS = 60_000;
+
+/**
+ * How long a supervisor's pump may find its run's lease held by another process before
+ * the supervisor says so: a warning, and `traceCapture: "held-elsewhere"` on the
+ * execution's ledger row, which the run's event stream reports.
+ */
+export const PUMP_HELD_REPORT_MS = 30_000;
 
 /** The default probe: `kill(pid, 0)` decides life; no start time is known. */
 export const PUMP_LEASE_PROBE: LeaseProbe = {
@@ -320,6 +363,7 @@ export const PUMP_LEASE_PROBE: LeaseProbe = {
     }
   },
   startTimeMs: () => undefined,
+  commandLine: () => undefined,
 };
 
 /** The lease file a pump uses when none is named: `<run>.pump.lock` beside its cursor. */
@@ -383,41 +427,58 @@ export function readPumpLease(lockFile: string): PumpLease | undefined {
   if (typeof r["host"] !== "string" || typeof r["pump"] !== "string") return undefined;
   if (typeof r["at"] !== "string") return undefined;
   const start = r["pidStartTimeMs"];
+  const argv = r["argv"];
+  const words =
+    Array.isArray(argv) &&
+    argv.length <= LEASE_ARGV_MAX &&
+    argv.every((word): word is string => typeof word === "string")
+      ? argv
+      : undefined;
   return {
     v: 1,
     pid,
-    ...(typeof start === "number" ? { pidStartTimeMs: start } : {}),
+    ...(typeof start === "number" && Number.isFinite(start) ? { pidStartTimeMs: start } : {}),
     host: r["host"],
     at: r["at"],
     pump: r["pump"],
+    ...(words !== undefined ? { argv: words } : {}),
   };
 }
 
 /**
- * Whether a lease's holder is provably gone: on this host, its pid is not alive, or its
- * start time moved (the pid was reused). A lease from another host, or one whose probe
- * would not say, is held. Its age never frees it: a pump runs as long as its run does.
+ * Whether a lease may be broken: a lease is kept only while a crewhaus manager provably
+ * holds it. That is, the lease names this host; its pid is alive (or the platform would
+ * not say); it records the holder's start time and command line; and the process now
+ * running under that pid started at that time and runs that command, as far as the
+ * platform can tell. A lease that records no start time or no command line, another
+ * host's lease (it cannot be probed from here), a pid that now has another start time, and
+ * a pid that now runs another program may all be broken. When the platform would not say
+ * the start time or the command line, that check is passed: two live managers must never
+ * both write. Its age never frees it: a pump runs as long as its run does.
  */
-export function pumpLeaseHolderDead(
+export function pumpLeaseUnproven(
   lease: PumpLease,
   probe: LeaseProbe,
   host: string = hostname(),
   toleranceMs: number = START_TIME_TOLERANCE_MS,
 ): boolean {
-  if (lease.host !== host) return false;
+  if (lease.host !== host) return true;
   if (probe.isAlive(lease.pid) === false) return true;
-  if (lease.pidStartTimeMs !== undefined) {
-    const observed = probe.startTimeMs(lease.pid);
-    if (observed !== undefined && Math.abs(observed - lease.pidStartTimeMs) > toleranceMs) {
-      return true;
-    }
+  if (lease.pidStartTimeMs === undefined) return true;
+  const argv = (lease.argv ?? []).filter((word) => word !== "");
+  if (argv.length === 0) return true;
+  const observed = probe.startTimeMs(lease.pid);
+  if (observed !== undefined && !startTimesMatch(observed, lease.pidStartTimeMs, toleranceMs)) {
+    return true;
   }
+  const line = probe.commandLine?.(lease.pid);
+  if (line !== undefined && !argvMatchesCommandLine(line, argv)) return true;
   return false;
 }
 
 /**
- * Whether the lease file may be removed: there is none, its holder is provably gone, or
- * it cannot be read and is older than {@link PUMP_LEASE_TORN_GRACE_MS} (no writer is
+ * Whether the lease file may be removed: there is none, no live crewhaus manager provably
+ * holds it ({@link pumpLeaseUnproven}), or it cannot be read and is older than {@link PUMP_LEASE_TORN_GRACE_MS} (no writer is
  * still writing it).
  */
 export function pumpLeaseBreakable(
@@ -427,7 +488,7 @@ export function pumpLeaseBreakable(
   host: string = hostname(),
 ): boolean {
   const lease = readPumpLease(lockFile);
-  if (lease !== undefined) return pumpLeaseHolderDead(lease, probe, host);
+  if (lease !== undefined) return pumpLeaseUnproven(lease, probe, host);
   try {
     return now - statSync(lockFile).mtimeMs > PUMP_LEASE_TORN_GRACE_MS;
   } catch {
@@ -454,6 +515,59 @@ function createPumpLease(lockFile: string, lease: PumpLease): boolean {
   return true;
 }
 
+/**
+ * The per-token stream events: they reach the live feed and are never persisted, so a
+ * long answer does not fill the events file one token at a time.
+ */
+export const EPHEMERAL_EVENT_KINDS: ReadonlySet<string> = new Set([
+  "model_stream_token",
+  "tool_stream_chunk",
+]);
+
+/** The run index beside an events file: `<exec>.events.jsonl` → `<exec>.runs.jsonl`. */
+export function runIndexPathFor(eventsFile: string): string {
+  return eventsFile.endsWith(".events.jsonl")
+    ? `${eventsFile.slice(0, -".events.jsonl".length)}.runs.jsonl`
+    : `${eventsFile}.runs.jsonl`;
+}
+
+/** A run index is a line per run; past this it is not one. */
+export const RUN_INDEX_MAX_BYTES = 4 * 1024 * 1024;
+
+/** One run index line: a canonical run, and where its first event sits in the events file. */
+export type RunIndexEntry = { readonly run: string; readonly off: number; readonly at: string };
+
+/** A run index's text parsed: well-formed entries only, in file order. */
+export function parseRunIndex(text: string): RunIndexEntry[] {
+  const out: RunIndexEntry[] = [];
+  for (const line of text.split("\n")) {
+    if (line.trim() === "") continue;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof raw !== "object" || raw === null) continue;
+    const r = raw as Record<string, unknown>;
+    const run = r["run"];
+    const off = r["off"];
+    if (typeof run !== "string" || !CANONICAL_RUN_ID_RE.test(run)) continue;
+    if (typeof off !== "number" || !Number.isSafeInteger(off) || off < 0) continue;
+    out.push({ run, off, at: typeof r["at"] === "string" ? r["at"] : "" });
+  }
+  return out;
+}
+
+/** The runs an index names below `eventsBytes`: what is already indexed and still there. */
+function indexedRuns(runIndexFile: string, eventsBytes: number): Set<string> {
+  const text = readSmallRecord(runIndexFile, RUN_INDEX_MAX_BYTES);
+  const out = new Set<string>();
+  if (text === undefined) return out;
+  for (const entry of parseRunIndex(text)) if (entry.off < eventsBytes) out.add(entry.run);
+  return out;
+}
+
 export type LogPump = {
   /** Consume everything new, persist events, advance the cursor. */
   pumpOnce(): PumpResult;
@@ -475,11 +589,18 @@ export type LogPump = {
  * a timer, a watcher, or a test loop.
  *
  * Only the pump that holds the run's lease (`<run>.pump.lock`, an exclusive
- * create naming its pid, start time, host and its own id) appends events and
- * writes the cursor, so two managers over one run never write an event twice.
- * A lease is broken only for a provably gone holder (see
- * {@link pumpLeaseHolderDead}). A pump that takes the lease reads the cursor
- * file again first: another pump may have moved it since.
+ * create naming its pid, start time, command line, host and its own id) appends
+ * events and writes the cursor, so two managers over one run never write an event
+ * twice. A lease is kept only while a crewhaus manager provably holds it (see
+ * {@link pumpLeaseUnproven}). A pump that takes the lease reads the cursor file
+ * again first: another pump may have moved it since.
+ *
+ * Per-token stream events (`model_stream_token`, `tool_stream_chunk`) reach the
+ * caller's live feed but are not persisted. The first persisted event of each
+ * canonical run (`run_` and 26 characters) gets a line in the execution's run index
+ * (`<exec>.runs.jsonl`, `{run, off, at}`), `off` being its byte offset in the events
+ * file; the set of indexed runs is read back from the index whenever the lease is
+ * taken, counting only entries below the events file's size.
  */
 export function createLogPump(options: LogPumpOptions): LogPump {
   const scrub = options.scrub ?? noopScrubber;
@@ -489,15 +610,19 @@ export function createLogPump(options: LogPumpOptions): LogPump {
   const probe = options.probe ?? PUMP_LEASE_PROBE;
   const ownPid = options.pid ?? process.pid;
   const ownHost = options.host ?? hostname();
+  const ownArgv = (options.argv ?? ownCommandArgv()).slice(0, LEASE_ARGV_MAX);
+  const runIndexFile = options.runIndexFile ?? runIndexPathFor(options.eventsFile);
   const ownId = randomBytes(8).toString("hex");
   let held = false;
+  /** The canonical runs the index already names, read back when the lease is taken. */
+  let indexed = new Set<string>();
   let cursor: PumpCursor = readCursor(options.cursorFile) ?? {
     logOffset: 0,
     eventsBytes: 0,
     updatedAt: "",
   };
 
-  /** Hold the lease, taking it when it is free or its holder is provably gone. */
+  /** Hold the lease, taking it when it is free or no live manager provably holds it. */
   const holdLease = (): boolean => {
     if (held) {
       // Still ours? A holder whose lease was broken stops writing at once.
@@ -512,6 +637,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       host: ownHost,
       at: new Date(now()).toISOString(),
       pump: ownId,
+      argv: ownArgv,
     };
     let taken = createPumpLease(lockFile, lease);
     if (!taken && pumpLeaseBreakable(lockFile, probe, now(), ownHost)) {
@@ -526,6 +652,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
     held = true;
     // Another pump may have advanced the cursor since this one read it.
     cursor = readCursor(options.cursorFile) ?? cursor;
+    indexed = indexedRuns(runIndexFile, currentEventsBytes());
     return true;
   };
 
@@ -541,12 +668,33 @@ export function createLogPump(options: LogPumpOptions): LogPump {
   };
 
   const persistEvents = (events: ReadonlyArray<Record<string, unknown>>): number => {
-    if (events.length === 0) return currentEventsBytes();
+    const kept = events.filter((e) => !EPHEMERAL_EVENT_KINDS.has(String(e["kind"])));
+    if (kept.length === 0) return currentEventsBytes();
     mkdirSync(dirname(options.eventsFile), { recursive: true, mode: 0o700 });
     // When the line reached the events file: a reader's clock for what it was handed.
     const ingestedAt = new Date(now()).toISOString();
-    const text = events.map((e) => `${JSON.stringify({ ...e, ingestedAt })}\n`).join("");
-    appendFileSync(options.eventsFile, text, { mode: 0o600 });
+    const base = currentEventsBytes();
+    const lines: string[] = [];
+    const firsts: string[] = [];
+    let off = base;
+    for (const e of kept) {
+      const line = `${JSON.stringify({ ...e, ingestedAt })}\n`;
+      const run = e["runId"];
+      if (typeof run === "string" && CANONICAL_RUN_ID_RE.test(run) && !indexed.has(run)) {
+        indexed.add(run);
+        firsts.push(`${JSON.stringify({ run, off, at: ingestedAt })}\n`);
+      }
+      lines.push(line);
+      off += Buffer.byteLength(line, "utf8");
+    }
+    appendFileSync(options.eventsFile, lines.join(""), { mode: 0o600 });
+    if (firsts.length > 0) {
+      try {
+        appendFileSync(runIndexFile, firsts.join(""), { mode: 0o600 });
+      } catch {
+        // A reader without an index entry scans the events file instead.
+      }
+    }
     return currentEventsBytes();
   };
 
@@ -651,6 +799,9 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       } finally {
         closeSync(fd);
       }
+      // Index entries past the cut no longer count: their runs are indexed again as their
+      // events are derived again.
+      indexed = indexedRuns(runIndexFile, cursor.eventsBytes);
     },
     close: releaseLease,
   };

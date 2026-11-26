@@ -18,7 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mintId, mintRunId } from "@crewhaus/control-contract";
+import { EXIT_FOR_ERROR, mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, controlPaths, runsLedger } from "@crewhaus/control-records";
 import type { ApiRunInput } from "@crewhaus/harness-supervisor";
 import {
@@ -31,6 +31,8 @@ import { RUNS_SCHEMA } from "./arg-schemas";
 import { directControl } from "./daemon-cmd";
 import { readRunInputRecord, resolveRunsResumeTarget } from "./runs";
 import { CLI_FAMILY, runRunsCommand } from "./runs-cmd";
+
+const EXIT_INVALID = EXIT_FOR_ERROR.invalid;
 
 let base: string;
 let dir: string;
@@ -224,6 +226,58 @@ describe("crewhaus runs list, show and create", () => {
     const view = JSON.parse(shown.lines.join("\n")) as Record<string, unknown>;
     expect(view).toMatchObject({ id: body.run.id, state: "queued", trigger: "api" });
     expect(shown.lines.join("\n")).not.toContain("quarterly");
+  });
+
+  test("create --from starts a run again with the recorded input and names the run it repeats", async () => {
+    const starts: ApiRunInput[] = [];
+    mkdirSync(join(dir, "dist"), { recursive: true });
+    writeFileSync(join(dir, "dist", "agent.ts"), "// bundle\n");
+    writeFileSync(
+      join(dir, "dist", "package.json"),
+      JSON.stringify({
+        name: "crewhaus-compiled-bundle",
+        crewhaus: { specHash: "x", compiledWith: "0.9.0" },
+      }),
+    );
+    const source = mintRunId();
+    plant({ id: source, state: "queued", cmd: mintId("cmd") });
+    const inputs = join(dir, controlPaths(dir).inputsDir);
+    mkdirSync(inputs, { recursive: true });
+    writeFileSync(join(inputs, `${source}.txt`), "Summarise the quarterly report.", {
+      mode: 0o600,
+    });
+    const control = directControl({ env, cwd: dir });
+    const deps = {
+      env,
+      cwd: dir,
+      control: () => control,
+      home: () => ({
+        startRunJob: async (_d: string, apiRun: ApiRunInput) => {
+          starts.push(apiRun);
+          return { ok: true as const, runId: "run_0000000000000001", pid: 1 };
+        },
+      }),
+    };
+    const created = await runRunsCommand(["create", dir, "--from", source, "--json"], deps);
+    expect(created.exitCode).toBe(0);
+    const body = JSON.parse(created.lines.join("\n")) as { run: { id: string } };
+    const queued = ledgerRows().find((row) => row["id"] === body.run.id);
+    expect(queued).toMatchObject({ state: "queued", attemptOf: source });
+    expect(readFileSync(join(inputs, `${body.run.id}.txt`), "utf8")).toBe(
+      "Summarise the quarterly report.",
+    );
+    expect(starts).toHaveLength(1);
+    // Both sources of input are refused together, naming both.
+    const file = join(base, "input.txt");
+    writeFileSync(file, "x");
+    const both = await runRunsCommand(
+      ["create", dir, "--from", source, "--input-file", file],
+      deps,
+    );
+    expect(both.exitCode).toBe(EXIT_INVALID);
+    expect(both.lines.join("\n")).toContain("--input-file or --from");
+    const unknown = await runRunsCommand(["create", dir, "--from", mintRunId()], deps);
+    expect(unknown.exitCode).toBe(56);
   });
 
   test("refusals exit by their code", async () => {

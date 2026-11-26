@@ -1337,6 +1337,10 @@ describe("the versioned API: every served operation, for every role and credenti
       if (name === "ref") return `${world.a}/decision/appr_00000000000000a1`;
       // A plugin is named by the manifest name grammar, not an id.
       if (name === "plugin") return "notes-pane";
+      // A step, a model call and a session each have their own grammar.
+      if (name === "action") return "tool:0000000000000104";
+      if (name === "call") return "1";
+      if (name === "sess") return "sess_00000000000000a1";
       return `${name}_${ULID_SAMPLE}`;
     });
   }

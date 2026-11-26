@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { EXIT_CODES } from "@crewhaus/errors";
 import { buildReport } from "@crewhaus/preflight";
@@ -19,6 +19,7 @@ import {
   runDir,
   runEventsPath,
   runLogPath,
+  runPumpLockPath,
   writeRunfile,
 } from "./runfiles";
 import { type SpawnPlan, buildSpawnPlan } from "./spawn-contracts";
@@ -31,7 +32,7 @@ import {
   createFakeClock,
   createFakeProcessOps,
 } from "./testkit";
-import { replayRunEvents } from "./trace-pump";
+import { PUMP_HELD_REPORT_MS, replayRunEvents } from "./trace-pump";
 import { RUNFILE_VERSION } from "./types";
 
 const roots: string[] = [];
@@ -84,6 +85,7 @@ type SetupOptions = {
   /** Record the bundle as the active deployment (default true): automatic starts run
    *  only the active build. */
   active?: boolean;
+  warn?: (line: string) => void;
 };
 
 function setup(target: string, options: SetupOptions = {}): Harness {
@@ -116,6 +118,7 @@ function setup(target: string, options: SetupOptions = {}): Harness {
     ...(options.ports !== undefined ? { ports: options.ports } : {}),
     ...(options.ownerPid !== undefined ? { ownerPid: options.ownerPid } : {}),
     ...(options.prepare !== undefined ? { prepare: options.prepare } : {}),
+    ...(options.warn !== undefined ? { warn: options.warn } : {}),
   });
   const events: SupervisorEvent[] = [];
   supervisor.subscribe((event) => events.push(event));
@@ -1467,5 +1470,63 @@ describe("liveChild", () => {
     for (let i = 0; i < 3; i += 1) h.supervisor.liveChild();
     expect(h.ops.last()?.signals).toEqual([]);
     expect(readRunfile(h.dir)).toEqual(before);
+  });
+});
+
+describe("a pump lease another process holds", () => {
+  /** A live manager elsewhere holds the run's lease, provably. */
+  function heldElsewhere(h: Harness, runId: string): void {
+    h.ops.register(4242, 1_000, "crewhaus hangar");
+    writeFileSync(
+      runPumpLockPath(h.dir, runId),
+      JSON.stringify({
+        v: 1,
+        pid: 4242,
+        pidStartTimeMs: 1_000,
+        argv: ["crewhaus", "hangar"],
+        host: hostname(),
+        at: new Date(h.clock.now()).toISOString(),
+        pump: "elsewhere",
+      }),
+    );
+  }
+  const captureOf = (h: Harness, runId: string) =>
+    readRunLedger(h.dir).find((row) => row.runId === runId);
+
+  test("held past the bound: warned once, and the execution's row says so", async () => {
+    const warnings: string[] = [];
+    const h = setup("channel", { warn: (line) => warnings.push(line) });
+    await h.supervisor.start();
+    const runId = readRunfile(h.dir)?.runId as string;
+    heldElsewhere(h, runId);
+    h.ops.last()?.writeLog(`${JSON.stringify({ kind: "turn_end", runId: "run_x" })}\n`);
+    h.clock.advance(PUMP_HELD_REPORT_MS - 500);
+    expect(captureOf(h, runId)?.traceCapture).toBeUndefined();
+    expect(warnings.filter((w) => w.includes("pump lease"))).toEqual([]);
+    h.clock.advance(1_000);
+    h.clock.advance(PUMP_HELD_REPORT_MS);
+    expect(warnings.filter((w) => w.includes("pump lease"))).toHaveLength(1);
+    expect(captureOf(h, runId)).toMatchObject({ traceCapture: "held-elsewhere" });
+    expect(typeof captureOf(h, runId)?.traceCaptureSince).toBe("string");
+    // The other manager goes; this one takes the lease and says so.
+    rmSync(runPumpLockPath(h.dir, runId));
+    h.clock.advance(250);
+    expect(captureOf(h, runId)).toMatchObject({ traceCapture: "captured" });
+    expect(replayRunEvents(runEventsPath(h.dir, runId)).map((e) => e["kind"])).toEqual([
+      "turn_end",
+    ]);
+  });
+
+  test("held for less than the bound: nothing is said", async () => {
+    const warnings: string[] = [];
+    const h = setup("channel", { warn: (line) => warnings.push(line) });
+    await h.supervisor.start();
+    const runId = readRunfile(h.dir)?.runId as string;
+    heldElsewhere(h, runId);
+    h.clock.advance(PUMP_HELD_REPORT_MS - 1_000);
+    rmSync(runPumpLockPath(h.dir, runId));
+    h.clock.advance(PUMP_HELD_REPORT_MS);
+    expect(warnings.filter((w) => w.includes("pump lease"))).toEqual([]);
+    expect(captureOf(h, runId)?.traceCapture).toBeUndefined();
   });
 });

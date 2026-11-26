@@ -139,7 +139,7 @@ describe("reading starts at the run's first byte", () => {
 });
 
 describe("only the session root's own files are read", () => {
-  test("a session log that is a link out of the sessions folder is refused, saying why", () => {
+  test("a session log that is a link out of the sessions folder is refused as a link, saying why", () => {
     const b = new LogBuilder();
     simpleRun(b, runId(1), 0x100);
     const outside = harnessWith({ log: b.text() });
@@ -149,7 +149,7 @@ describe("only the session root's own files are read", () => {
     expect(answer).toMatchObject({
       ok: false,
       code: "unsupported",
-      message: "the session log leads out of the sessions folder",
+      message: "the session log is a link, which is not read",
     });
   });
 

@@ -7,6 +7,7 @@
  *   runs.jsonl           append-only run ledger (open record + close patch)
  *   logs/<runId>.log     captured child stdout+stderr
  *   logs/<runId>.events.jsonl   extracted TraceEvents (scrubbed)
+ *   logs/<runId>.runs.jsonl     where each canonical run's first event is in it
  *   logs/<runId>.cursor  the pump's byte-exact resume point
  *   control-token        minted control.v1 bearer, 0600
  *   gateway-jwt-secret   a managed daemon's generated signing secret, 0600, replaced each boot
@@ -85,6 +86,14 @@ export function runLogPath(harnessDir: string, runId: string): string {
 /** The durable extracted-events file for a run. */
 export function runEventsPath(harnessDir: string, runId: string): string {
   return join(logsDir(harnessDir), `${runId}.events.jsonl`);
+}
+
+/**
+ * An execution's run index: one `{run, off, at}` line per canonical run, `off` being
+ * where that run's first event sits in the execution's events file.
+ */
+export function runIndexPath(harnessDir: string, runId: string): string {
+  return join(logsDir(harnessDir), `${runId}.runs.jsonl`);
 }
 
 /** The pump's resume cursor for a run. */
@@ -433,43 +442,75 @@ export function patchRunLedger(harnessDir: string, patch: RunLedgerPatch): void 
 /** How much of the run ledger one read takes at a time. */
 const LEDGER_CHUNK_BYTES = 64 * 1024;
 
+/** The most bytes of the run ledger one read takes: its newest bytes. */
+export const RUN_LEDGER_READ_MAX_BYTES = 16 * 1024 * 1024;
+
 /**
- * The run ledger's text, opened only as a regular file inside the harness
+ * The run ledger's newest text, opened only as a regular file inside the harness
  * (a link at its name is followed only while it stays inside) and without
- * blocking, then read to the size its descriptor reports. Anything else
- * reads as empty.
+ * blocking, then read to the size its descriptor reports, at most `maxBytes` of
+ * it: from `size - maxBytes`, with the first, partial line left out, and
+ * `truncated` said. Anything else reads as empty.
  */
-function readLedgerText(harnessDir: string): string {
+function readLedgerText(
+  harnessDir: string,
+  maxBytes: number,
+): { readonly text: string; readonly truncated: boolean } {
   const opened = openRecordFd(harnessDir, join(runDir(harnessDir), RUN_LEDGER_NAME), true);
-  if (!opened.ok) return "";
+  if (!opened.ok) return { text: "", truncated: false };
   try {
     const size = opened.stats.size;
+    const from = Math.max(0, size - maxBytes);
     const decoder = new TextDecoder();
-    const chunk = new Uint8Array(Math.min(LEDGER_CHUNK_BYTES, Math.max(size, 1)));
+    const chunk = new Uint8Array(Math.min(LEDGER_CHUNK_BYTES, Math.max(size - from, 1)));
     let text = "";
-    for (let at = 0; at < size; ) {
+    for (let at = from; at < size; ) {
       const got = readAt(opened.fd, chunk, Math.min(chunk.length, size - at), at);
       if (got === 0) break;
       text += decoder.decode(chunk.subarray(0, got), { stream: true });
       at += got;
     }
-    return text + decoder.decode();
+    text += decoder.decode();
+    if (from === 0) return { text, truncated: false };
+    // The window starts inside a line, or at the start of one it cannot tell apart.
+    const nl = text.indexOf("\n");
+    return { text: nl === -1 ? "" : text.slice(nl + 1), truncated: true };
   } catch {
-    return "";
+    return { text: "", truncated: false };
   } finally {
     closeSync(opened.fd);
   }
 }
 
+/** The run ledger as read: its folded rows, and whether older bytes were left unread. */
+export type RunLedgerView = {
+  readonly entries: RunLedgerEntry[];
+  /** The ledger is larger than one read takes: its oldest rows are not here. */
+  readonly truncated: boolean;
+};
+
 /**
- * Read the ledger, folded by `runId` (later lines win) and ordered by first
- * appearance. Torn lines are skipped, never fatal — a manager killed
- * mid-append leaves a partial final line and the rest of the history must
- * still read. A ledger that is not a regular file inside the harness reads
- * as no rows.
+ * Read the ledger's newest {@link RUN_LEDGER_READ_MAX_BYTES}, folded by `runId`
+ * (later lines win) and ordered by first appearance, and say whether older bytes
+ * were left unread. Torn lines are skipped, never fatal — a manager killed
+ * mid-append leaves a partial final line and the rest of the history must still
+ * read. A ledger that is not a regular file inside the harness reads as no rows.
+ * A view: never a source for rewriting the ledger while `truncated`.
  */
+export function readRunLedgerView(
+  harnessDir: string,
+  maxBytes: number = RUN_LEDGER_READ_MAX_BYTES,
+): RunLedgerView {
+  const read = readLedgerText(harnessDir, maxBytes);
+  return { entries: foldLedgerText(read.text), truncated: read.truncated };
+}
+
+/** {@link readRunLedgerView}'s rows alone. */
 export function readRunLedger(harnessDir: string): RunLedgerEntry[] {
-  const text = readLedgerText(harnessDir);
+  return readRunLedgerView(harnessDir).entries;
+}
+
+function foldLedgerText(text: string): RunLedgerEntry[] {
   const byId = new Map<string, RunLedgerEntry>();
   for (const line of text.split("\n")) {
     if (line.trim() === "") continue;
@@ -494,8 +535,17 @@ export function readRunLedger(harnessDir: string): RunLedgerEntry[] {
 
 /** The most recent ledger entries, newest last (file order). */
 export function recentRuns(harnessDir: string, limit: number): RunLedgerEntry[] {
-  const all = readRunLedger(harnessDir);
-  return limit >= all.length ? all : all.slice(all.length - limit);
+  return recentRunsView(harnessDir, limit).entries;
+}
+
+/** {@link recentRuns}, saying whether the ledger read stopped short of its oldest rows. */
+export function recentRunsView(harnessDir: string, limit: number): RunLedgerView {
+  const view = readRunLedgerView(harnessDir);
+  const all = view.entries;
+  return {
+    entries: limit >= all.length ? all : all.slice(all.length - limit),
+    truncated: view.truncated,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -549,8 +599,8 @@ const LEDGER_COMPACT_FACTOR = 3;
 /**
  * Enforce retention over `logs/`: keep the newest `policy.runs` runs, and
  * drop further runs from the oldest end until the retained log bytes fit
- * `policy.bytes`. A run's `.log`, `.events.jsonl`, and `.cursor` files are
- * removed together — they are one artifact.
+ * `policy.bytes`. A run's `.log`, `.events.jsonl`, `.runs.jsonl` and `.cursor`
+ * files are removed together — they are one artifact.
  *
  * `keepRunIds` protects live runs from a prune triggered by a burst of
  * short-lived siblings.
@@ -569,7 +619,8 @@ export function pruneRuns(
 ): PruneResult {
   const dir = logsDir(harnessDir);
   if (!existsSync(dir)) return { removedRuns: [], removedBytes: 0, compactedLedger: false };
-  const ledger = readRunLedger(harnessDir);
+  const ledgerView = readRunLedgerView(harnessDir);
+  const ledger = ledgerView.entries;
   // Ledger order is authoritative (append order = chronological); runs with
   // captured files but no ledger entry sort first (older/orphaned).
   const ledgerOrder = new Map(ledger.map((e, i) => [e.runId, i]));
@@ -620,7 +671,7 @@ export function pruneRuns(
   }
   let removedBytes = 0;
   for (const id of evict) {
-    for (const suffix of [".log", ".events.jsonl", ".cursor"]) {
+    for (const suffix of [".log", ".events.jsonl", ".runs.jsonl", ".cursor"]) {
       const path = join(dir, `${id}${suffix}`);
       try {
         removedBytes += statSync(path).size;
@@ -630,7 +681,7 @@ export function pruneRuns(
         // Absent sibling file — nothing to remove.
       }
     }
-    // A pump lease goes with its run only when its holder is provably gone.
+    // A pump lease goes with its run only when no live manager provably holds it.
     const lock = runPumpLockPath(harnessDir, id);
     if (existsSync(lock) && pumpLeaseBreakable(lock, probe, now())) {
       try {
@@ -643,7 +694,12 @@ export function pruneRuns(
   }
 
   let compactedLedger = false;
-  if (evict.length > 0 && ledger.length > policy.runs * LEDGER_COMPACT_FACTOR) {
+  // A ledger read only in part is never rewritten from that part.
+  if (
+    evict.length > 0 &&
+    !ledgerView.truncated &&
+    ledger.length > policy.runs * LEDGER_COMPACT_FACTOR
+  ) {
     const evicted = new Set(evict);
     const kept = ledger.filter((e) => !evicted.has(e.runId));
     atomicWrite(
@@ -727,9 +783,9 @@ export function readPrunedRuns(
   return out;
 }
 
-/** `run_x.log` / `run_x.events.jsonl` / `run_x.cursor` → `run_x`. */
+/** `run_x.log` / `run_x.events.jsonl` / `run_x.runs.jsonl` / `run_x.cursor` → `run_x`. */
 function runIdOfCaptureFile(name: string): string | undefined {
-  for (const suffix of [".events.jsonl", ".cursor", ".log"]) {
+  for (const suffix of [".events.jsonl", ".runs.jsonl", ".cursor", ".log"]) {
     if (name.endsWith(suffix)) {
       const id = name.slice(0, -suffix.length);
       return RUN_ID_RE.test(id) ? id : undefined;

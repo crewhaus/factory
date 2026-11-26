@@ -908,7 +908,7 @@ describe("rows, pinned", () => {
     ]);
     expect(declared).toEqual([
       ["controls.retire", "confirmName,nonce"],
-      ["runs.create", "input,subject,work"],
+      ["runs.create", "input,from,subject,work"],
       ["decisions.resolve", "expect,note"],
       ["rules.create", "tool,pattern,reason"],
       ["access.scopedTokens.mint", "subject"],
@@ -1059,10 +1059,36 @@ describe("path params", () => {
         "psn",
         "pcl",
         "plugin",
+        "action",
+        "call",
+        "sess",
       ].sort(),
     );
     expect(isPathParam("nope", ["x"])).toBe(false);
     expect(isPathParam("constructor", ["x"])).toBe(false);
+  });
+
+  test("{action}: a step to explain, its kind and its 16-hex span id", () => {
+    expect(isPathParam("action", ["tool:0000000000000104"])).toBe(true);
+    expect(isPathParam("action", ["turn:abcdef0123456789"])).toBe(true);
+    expect(isPathParam("action", [`tool:${"a".repeat(15)}`])).toBe(false);
+    expect(isPathParam("action", ["flag:0000000000000104"])).toBe(false);
+    expect(isPathParam("action", ["tool:0000000000000104", "x"])).toBe(false);
+  });
+
+  test("{call}: a model call's number, or all", () => {
+    expect(isPathParam("call", ["1"])).toBe(true);
+    expect(isPathParam("call", ["all"])).toBe(true);
+    expect(isPathParam("call", ["0"])).toBe(false);
+    expect(isPathParam("call", ["12345678"])).toBe(false);
+    expect(isPathParam("call", ["1", "2"])).toBe(false);
+  });
+
+  test("{sess}: a session id", () => {
+    expect(isPathParam("sess", ["sess_0123456789abcdef"])).toBe(true);
+    expect(isPathParam("sess", [`sess_${"a".repeat(15)}`])).toBe(false);
+    expect(isPathParam("sess", ["sess_0123456789ABCDEF"])).toBe(false);
+    expect(isPathParam("sess", ["sess_0123456789abcdef", "x"])).toBe(false);
   });
 
   test("{h}: a harness id or a slug", () => {

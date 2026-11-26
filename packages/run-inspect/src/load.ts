@@ -15,6 +15,7 @@ import {
   containedSessionRoot,
   readDecisionLog,
 } from "@crewhaus/session-store";
+import { type ExecutionRead, readExecution } from "./exec";
 import {
   type ReadObserver,
   type SessionLine,
@@ -29,6 +30,15 @@ import { type InspectGap, type InspectRefusal, type InspectSubject, refusal } fr
 /** The most bytes of one session log a read takes by default. */
 export const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
 
+/**
+ * The most run-ledger rows one load reads, newest first: past it the older rows are left
+ * unread and a `truncated` gap says so. The decision log's read takes as many.
+ */
+export const LEDGER_SCAN_MAX_ROWS = 100_000;
+
+/** How many run-ledger rows one page of the scan reads. */
+const LEDGER_PAGE_ROWS = 1000;
+
 /** One run-ledger row, as written. */
 export type RunRow = Readonly<Record<string, unknown>>;
 
@@ -36,10 +46,12 @@ export type RunRow = Readonly<Record<string, unknown>>;
 export type DecisionEntry = { readonly id: string; readonly line: DecisionLogLine };
 
 /**
- * How the run's lines are told apart: by their `run` stamp; by position between run
+ * How the run's lines are told apart: by their `run` field; by position between run
  * rows when run records were off; or not at all, for a session written before them.
+ * `unread`: no line was read (the log is gone, or holds nothing from the run's place
+ * on), so there is nothing to tell apart.
  */
-export type RunMode = "stamped" | "records-off" | "legacy";
+export type RunMode = "stamped" | "records-off" | "legacy" | "unread";
 
 /** A run's records, read. Build one with {@link loadRun} or {@link loadedRunFromText}. */
 export type LoadedRun = {
@@ -48,8 +60,11 @@ export type LoadedRun = {
   readonly session: string;
   readonly run?: string;
   readonly mode: RunMode;
-  /** The byte range of the session log that is the run's, when lines carry no `run`. */
-  readonly window: { readonly from: number; readonly to?: number };
+  /**
+   * The byte range of the session log that is the run's, when lines carry no `run`;
+   * `previous` is where the session's run before it starts, when one is recorded.
+   */
+  readonly window: { readonly from: number; readonly to?: number; readonly previous?: number };
   /** Every line read, in file order. */
   readonly lines: readonly SessionLine[];
   /** Wake-marker candidates the look-behind found below the read. */
@@ -65,6 +80,8 @@ export type LoadedRun = {
   /** The runs the session's lines and rows name, in order. */
   readonly sessionRuns: readonly string[];
   readonly decisions: readonly DecisionEntry[];
+  /** The supervised execution's events for the run, when an execution is named and read. */
+  readonly executionEvents?: ExecutionRead;
   /** What the read could not take in. */
   readonly gaps: readonly InspectGap[];
   /** Where reading the session log started. */
@@ -90,25 +107,74 @@ export type LoadRunInput = {
   readonly maxBytes?: number;
   /** Told of every read of the session log. */
   readonly onRead?: ReadObserver;
+  /** The most run-ledger rows to read; {@link LEDGER_SCAN_MAX_ROWS} when absent. */
+  readonly ledgerScanMaxRows?: number;
+  /**
+   * The run rows the load needs, grouped by run, oldest first, when the caller already
+   * holds them (a caught-up read model): the run ledger is then not read at all.
+   */
+  readonly byRun?: ReadonlyMap<string, readonly RunRow[]>;
 };
 
 type LedgerScan = {
-  readonly byRun: ReadonlyMap<string, RunRow[]>;
+  readonly byRun: ReadonlyMap<string, readonly RunRow[]>;
   readonly unreadable: number;
+  /** Older rows were left unread at the cap. */
+  readonly truncated: boolean;
 };
 
-/** Every run row, grouped by run, oldest first. */
-function scanLedger(harnessDir: string): LedgerScan {
+/** A row a run enters the ledger with: nothing about the run is older. */
+function isEntryRow(row: RunRow): boolean {
+  const state = row["state"];
+  return (
+    state === "queued" ||
+    state === "preparing" ||
+    state === "running" ||
+    typeof row["sessionAt"] === "number"
+  );
+}
+
+/**
+ * The run rows, grouped by run, oldest first, read newest first a page at a time, at most
+ * `maxRows`. For a run id, reading stops once the run's oldest row is read and a whole
+ * page after it holds no row of the run's session: the rows a load of that run needs are
+ * all newer.
+ */
+function scanLedger(harnessDir: string, maxRows: number, run: string | undefined): LedgerScan {
   const ledger = runsLedger(harnessDir);
   const newestFirst: RunRow[] = [];
   let unreadable = 0;
+  let truncated = false;
   let before: CursorPosition | undefined;
+  let session: string | undefined;
+  let sawOldest = false;
   for (;;) {
-    const page = readPage(ledger, { limit: 1000, ...(before !== undefined ? { before } : {}) });
-    for (const item of page.items) newestFirst.push(item.record);
+    const room = maxRows - newestFirst.length;
+    if (room <= 0) {
+      truncated = true;
+      break;
+    }
+    const page = readPage(ledger, {
+      limit: Math.min(LEDGER_PAGE_ROWS, room),
+      ...(before !== undefined ? { before } : {}),
+    });
+    const settledBefore = sawOldest;
+    let sessionRows = 0;
+    for (const item of page.items) {
+      const row = item.record;
+      newestFirst.push(row);
+      if (run === undefined) continue;
+      if (row["id"] === run) {
+        if (session === undefined && typeof row["session"] === "string") session = row["session"];
+        if (isEntryRow(row)) sawOldest = true;
+      } else if (session !== undefined && row["session"] === session) {
+        sessionRows += 1;
+      }
+    }
     unreadable += page.gaps.length;
     if (page.next === undefined) break;
     before = page.next;
+    if (settledBefore && sessionRows === 0) break;
   }
   const byRun = new Map<string, RunRow[]>();
   for (const row of newestFirst.reverse()) {
@@ -118,7 +184,7 @@ function scanLedger(harnessDir: string): LedgerScan {
     rows.push(row);
     byRun.set(id, rows);
   }
-  return { byRun, unreadable };
+  return { byRun, unreadable, truncated };
 }
 
 function sessionOf(rows: readonly RunRow[]): string | undefined {
@@ -193,33 +259,80 @@ type Assembled = {
   readonly run: string | undefined;
   readonly lines: readonly SessionLine[];
   readonly rows: readonly RunRow[];
-  readonly byRun: ReadonlyMap<string, RunRow[]>;
+  readonly byRun: ReadonlyMap<string, readonly RunRow[]>;
   readonly sessionRuns: readonly string[];
 };
 
-/** Which run, how its lines are told apart, and its byte window. */
+/** Where the session's runs other than `run` start, from their rows. */
+function otherStarts(input: Assembled): number[] {
+  const out: number[] = [];
+  for (const [other, otherRows] of input.byRun) {
+    if (other === input.run || sessionOf(otherRows) !== input.session) continue;
+    const at = sessionAtOf(otherRows);
+    if (at !== undefined) out.push(at);
+  }
+  return out;
+}
+
+/**
+ * Which run, how its lines are told apart, and its byte window. A run is stamped when any
+ * line read carries its id, its own stamp or not; `unread` when no line was read.
+ */
 function shape(input: Assembled): {
   readonly mode: RunMode;
-  readonly window: { readonly from: number; readonly to?: number };
+  readonly window: { readonly from: number; readonly to?: number; readonly previous?: number };
 } {
   const { run, lines, rows } = input;
   if (run === undefined) return { mode: "legacy", window: { from: 0 } };
-  if (lines.some((line) => stampedRun(line) === run)) {
-    return { mode: "stamped", window: { from: sessionAtOf(rows) ?? 0 } };
-  }
   const from = sessionAtOf(rows) ?? 0;
-  let to: number | undefined;
-  for (const [other, otherRows] of input.byRun) {
-    if (other === run || sessionOf(otherRows) !== input.session) continue;
-    const at = sessionAtOf(otherRows);
-    if (at !== undefined && at > from && (to === undefined || at < to)) to = at;
+  if (lines.length === 0) return { mode: "unread", window: { from } };
+  if (lines.some((line) => line.run === run || stampedRun(line) === run)) {
+    return { mode: "stamped", window: { from } };
   }
-  return { mode: "records-off", window: { from, ...(to !== undefined ? { to } : {}) } };
+  let to: number | undefined;
+  let previous: number | undefined;
+  for (const at of otherStarts(input)) {
+    if (at > from && (to === undefined || at < to)) to = at;
+    if (at < from && (previous === undefined || at > previous)) previous = at;
+  }
+  return {
+    mode: "records-off",
+    window: {
+      from,
+      ...(to !== undefined ? { to } : {}),
+      ...(previous !== undefined ? { previous } : {}),
+    },
+  };
+}
+
+/** The row's trigger, as the summary reads it: the newest row's, else the first's. */
+function rowTriggerOf(rows: readonly RunRow[]): Readonly<Record<string, unknown>> | undefined {
+  const trigger = rows.at(-1)?.["trigger"] ?? rows[0]?.["trigger"];
+  return typeof trigger === "object" && trigger !== null && !Array.isArray(trigger)
+    ? (trigger as Readonly<Record<string, unknown>>)
+    : undefined;
+}
+
+/** The supervised execution a run's stamp or rows name: a supervisor's run id. */
+function executionNamed(
+  run: string | undefined,
+  lines: readonly SessionLine[],
+  rows: readonly RunRow[],
+): string | undefined {
+  if (run === undefined) return undefined;
+  const stamp = lines.find((line) => stampedRun(line) === run);
+  const fromStamp = stamp !== undefined ? payloadOf(stamp)["execution"] : undefined;
+  if (typeof fromStamp === "string") return fromStamp;
+  for (const row of rows) {
+    const execution = row["execution"];
+    if (typeof execution === "string") return execution;
+  }
+  return undefined;
 }
 
 function continuationOf(
   run: string | undefined,
-  byRun: ReadonlyMap<string, RunRow[]>,
+  byRun: ReadonlyMap<string, readonly RunRow[]>,
 ): LoadedRun["continuation"] {
   if (run === undefined) return undefined;
   for (const [id, rows] of byRun) {
@@ -234,14 +347,18 @@ function continuationOf(
 }
 
 /**
- * Read a run's records: its rows from the run ledger, its session log from the row's
- * `sessionAt` (a session id reads the whole log), and the decision log of the session
- * root. The session root is the one `containedSessionRoot` answers for the harness; a
- * root outside the harness is refused.
+ * Read a run's records: its rows from the run ledger (newest first, at most
+ * {@link LEDGER_SCAN_MAX_ROWS}, or none when the caller hands them in), its session log
+ * from the row's `sessionAt` (a session id reads the whole log), the decision log of the
+ * session root, and, when the run names a supervised execution, that execution's events
+ * for the run. The session root is the one `containedSessionRoot` answers for the
+ * harness; a root outside the harness is refused, and the session log is opened only as
+ * a file proven inside it.
  *
- * A run whose stamp says an operator's wake started it, read from `sessionAt`, also gets
- * a look-behind: at most 64 KiB backward from `sessionAt`, stopping at the previous
- * `run_stamp`, keeping only wake markers. No other run reads below `sessionAt`.
+ * A run whose stamp (or, with run records off, whose row) says an operator's wake started
+ * it, read from `sessionAt`, also gets a look-behind: at most 64 KiB backward from
+ * `sessionAt`, stopping at the previous `run_stamp`, keeping only wake markers. No other
+ * run reads below `sessionAt`.
  */
 export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
   const { harnessDir, ref, now } = input;
@@ -272,9 +389,17 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
       "CREWHAUS_SESSION_DIR",
     );
   }
-  const ledger = scanLedger(harnessDir);
+  const ledger: LedgerScan =
+    input.byRun !== undefined
+      ? { byRun: input.byRun, unreadable: 0, truncated: false }
+      : scanLedger(
+          harnessDir,
+          input.ledgerScanMaxRows ?? LEDGER_SCAN_MAX_ROWS,
+          byRunRef ? ref : undefined,
+        );
   const gaps: InspectGap[] = [];
   if (ledger.unreadable > 0) gaps.push({ reason: "torn", count: ledger.unreadable });
+  if (ledger.truncated) gaps.push({ reason: "truncated" });
 
   let session: string;
   let readFrom = 0;
@@ -331,9 +456,12 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
       readTo = forward.end;
       const own = pinnedRun ?? input.run;
       const stamp = lines.find((line) => stampedRun(line) === own);
-      const trigger = payloadOf(stamp ?? ({ payload: {} } as SessionLine))["trigger"] as
-        | { synthetic?: unknown }
-        | undefined;
+      // The stamp's trigger; with run records off, the row's.
+      const trigger = (
+        stamp !== undefined
+          ? payloadOf(stamp)["trigger"]
+          : rowTriggerOf(own !== undefined ? (ledger.byRun.get(own) ?? []) : [])
+      ) as { synthetic?: unknown } | undefined;
       if (from > 0 && trigger?.synthetic === true) {
         markers = scanBackForWakeMarkers(opened.fd, from, WAKE_LOOK_BEHIND_BYTES, input.onRead);
       }
@@ -369,6 +497,11 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
     .map((entry) => ({ id: `d:${entry.at.seg}:${entry.at.off}`, line: entry.line }));
 
   const continuation = continuationOf(run, ledger.byRun);
+  const execution = executionNamed(run, lines, rows);
+  const executionEvents =
+    execution !== undefined && run !== undefined
+      ? readExecution(harnessDir, execution, run)
+      : undefined;
   return {
     ok: true,
     subject: run !== undefined ? { kind: "run", run, session } : { kind: "legacy", session },
@@ -382,6 +515,7 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
     ...(continuation !== undefined ? { continuation } : {}),
     sessionRuns,
     decisions,
+    ...(executionEvents !== undefined ? { executionEvents } : {}),
     gaps,
     readFrom,
     readTo,

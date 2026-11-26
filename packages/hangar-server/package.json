@@ -42,6 +42,7 @@
     "@crewhaus/plugin-sdk": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
     "@crewhaus/routing-store": "workspace:*",
+    "@crewhaus/run-inspect": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec": "workspace:*",
     "@crewhaus/spec-changelog": "workspace:*",

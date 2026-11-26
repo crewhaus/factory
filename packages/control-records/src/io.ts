@@ -1,7 +1,8 @@
 /**
  * The one place this package opens and reads a record file, so a test can count
- * the work. tool-safety's own hooks are not reachable from `./fs`, so the count
- * is taken here, one step before them.
+ * the work. The count is taken here, one step before tool-safety's own open hooks
+ * (`_setOpenHooksForTest` in `./fs`), which a test uses to change a directory between
+ * the check and the open.
  */
 import { type Stats, lstatSync, readSync } from "node:fs";
 import { type AcquireFileLockOptions, withFileLock } from "@crewhaus/infra-utils";

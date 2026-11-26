@@ -468,6 +468,8 @@ export type QueueManagedRunOptions = {
    * picks it up again.
    */
   readonly workItem?: string;
+  /** The run this one starts again, on its `queued` row. */
+  readonly attemptOf?: string;
   readonly now?: () => number;
   readonly env?: Readonly<Record<string, string | undefined>>;
 };
@@ -518,6 +520,9 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
   if (opts.workItem !== undefined && !isId("wi", opts.workItem)) {
     return { ok: false, reason: "workItem must be a work item id (wi_…)" };
   }
+  if (opts.attemptOf !== undefined && !CANONICAL_RUN_ID_RE.test(opts.attemptOf)) {
+    return { ok: false, reason: "attemptOf must be a crewhaus run id: run_ and 26 characters" };
+  }
   const now = opts.now ?? Date.now;
   const record: QueuedInput = {
     v: 1,
@@ -558,6 +563,7 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
     ...(opts.byCredential !== undefined ? { byCredential: opts.byCredential } : {}),
     ...(opts.deployment !== undefined ? { deployment: opts.deployment } : {}),
     ...(opts.cmd !== undefined ? { cmd: opts.cmd } : {}),
+    ...(opts.attemptOf !== undefined ? { attemptOf: opts.attemptOf } : {}),
   });
   if (!queued.ok) {
     rmSync(file, { force: true });

@@ -119,6 +119,7 @@ import {
 } from "./start-decision";
 import {
   type LogPump,
+  PUMP_HELD_REPORT_MS,
   createLogPump,
   parseAnnouncedControlPort,
   readLogTail,
@@ -501,6 +502,10 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
   let controlPort: number | undefined;
   let pump: LogPump | undefined;
   let pumpTimer: unknown;
+  /** Since when the current pump has found its lease held by another process. */
+  let heldElsewhereSince: number | undefined;
+  /** Whether that has been reported for the current run. */
+  let heldReported = false;
   let restartTimer: unknown;
   let nextRestartAtMs: number | undefined;
   let operatorStop = false;
@@ -624,9 +629,41 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     }
   };
 
+  /**
+   * Note whether this pump holds the run's lease. Held by another process for longer than
+   * {@link PUMP_HELD_REPORT_MS}: warned once, and the execution's ledger row says
+   * `traceCapture: "held-elsewhere"`; taking the lease after that says `captured`.
+   */
+  const noteLease = (id: string, held: boolean): void => {
+    if (held) {
+      heldElsewhereSince = undefined;
+      if (!heldReported) return;
+      heldReported = false;
+      patchRunLedger(options.harnessDir, { runId: id, traceCapture: "captured" });
+      return;
+    }
+    const now = clock.now();
+    heldElsewhereSince ??= now;
+    if (heldReported || now - heldElsewhereSince < PUMP_HELD_REPORT_MS) return;
+    heldReported = true;
+    warn(
+      `trace capture for ${id}: another process holds its pump lease, so this manager is not recording its events`,
+    );
+    try {
+      patchRunLedger(options.harnessDir, {
+        runId: id,
+        traceCapture: "held-elsewhere",
+        traceCaptureSince: new Date(heldElsewhereSince).toISOString(),
+      });
+    } catch (err) {
+      warn(`trace capture for ${id} not recorded: ${toError(err).message}`);
+    }
+  };
+
   const drainPump = (): void => {
     if (pump === undefined || runId === undefined) return;
     const result = pump.pumpOnce();
+    noteLease(runId, result.held);
     if (result.prose === "" && result.events.length === 0) return;
     noteControlAnnouncement(result.prose);
     for (const event of result.events) {
@@ -1000,6 +1037,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
 
   const startPump = (id: string, spawnEnv: Record<string, string>): void => {
     if (options.scrub === undefined) scrub = createEnvScrubber(spawnEnv);
+    heldElsewhereSince = undefined;
+    heldReported = false;
     pump = createLogPump({
       logFile: runLogPath(options.harnessDir, id),
       eventsFile: runEventsPath(options.harnessDir, id),
@@ -1678,6 +1717,8 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
     pid = result.runfile.pid;
     startedAt = result.runfile.startedAt;
     adopted = true;
+    heldElsewhereSince = undefined;
+    heldReported = false;
     pump = result.pump;
     // A runfile only ever describes a daemon-kind run, so this IS the run
     // kind — and recording it is what makes a clean stop of an adopted run

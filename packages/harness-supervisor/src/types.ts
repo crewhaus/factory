@@ -183,6 +183,14 @@ export type RunLedgerEntry = {
   readonly logFile: string;
   /** True when the stop escalated past the grace period to SIGKILL. */
   readonly forced?: boolean;
+  /**
+   * Whether this manager's pump writes the execution's trace events: `held-elsewhere`
+   * once another process has held its pump lease for a while, `captured` once this
+   * manager takes it again.
+   */
+  readonly traceCapture?: "captured" | "held-elsewhere";
+  /** When the lease was first found held elsewhere, for `held-elsewhere`. */
+  readonly traceCaptureSince?: string;
 };
 
 /** A closing/annotating append against an existing `runId`. */

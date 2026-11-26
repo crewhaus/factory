@@ -8,12 +8,15 @@
  * what is missing is named, never dropped. {@link loadRun} is the only part that reads
  * files: bounded, contained to the harness's session root, and read-only.
  *
- * It never calls a model, never spawns, and never masks: a head masks at its exit, and
- * prints through {@link terminalSafe}.
+ * It never calls a model, never spawns, and never masks: a head masks at its exit, after
+ * {@link beforeMask} gets a view ready for it, and prints through {@link terminalSafe}.
+ * {@link foldInspectModel} is the content-free read model a server keeps of the run
+ * ledger, so a read need not scan it.
  */
 export {
   DEFAULT_MAX_BYTES,
   type DecisionEntry,
+  LEDGER_SCAN_MAX_ROWS,
   type LoadedRun,
   type LoadRunInput,
   type RunMode,
@@ -22,12 +25,31 @@ export {
   loadedRunFromText,
 } from "./load";
 export {
+  type ExecutionRead,
+  TRACE_ENTRY_KINDS,
+  executionEntries,
+  executionGaps,
+  readExecution,
+} from "./exec";
+export {
+  INSPECT_MODEL_MAX,
+  type InspectModel,
+  type InspectRunSkeleton,
+  childrenFromModel,
+  emptyInspectModel,
+  foldInspectModel,
+  rowsFromModel,
+  runsOfWork,
+} from "./projection";
+export {
   type ReadObserver,
   type SessionLine,
   WAKE_LOOK_BEHIND_BYTES,
 } from "./lines";
 export {
   type ApprovalLater,
+  type BeforeMaskOptions,
+  COST_NOT_RECORDED_WORDS,
   COST_NOT_TRACKED_WORDS,
   COST_UNKNOWN_WORDS,
   type CheckView,
@@ -68,10 +90,21 @@ export {
   WHY_NOTE,
   type WhyAction,
   type WhyRecord,
+  beforeMask,
+  flatText,
+  ownValue,
   statusWord,
   terminalSafe,
 } from "./model";
-export { DETAIL_OUTCOMES, ENTRY_KINDS, type EntryKind, LINE_KINDS, importanceOf } from "./taxonomy";
+export {
+  DETAIL_OUTCOMES,
+  ENTRY_KINDS,
+  type EntryKind,
+  LINE_KINDS,
+  importanceOf,
+  lineKindOf,
+} from "./taxonomy";
+export { runLinesOf } from "./records";
 export { foldSummary } from "./fold-summary";
 export {
   TIMELINE_DEFAULT_LIMIT,

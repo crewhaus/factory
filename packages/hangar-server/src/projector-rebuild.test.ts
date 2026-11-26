@@ -111,6 +111,7 @@ describe("the read models", () => {
   test("every composed projection rebuilt from records answers the same, apart from when", async () => {
     expect(PROJECTIONS.map((p) => p.name).sort()).toEqual([
       "attention",
+      "inspect",
       "overview",
       "runs",
       "work",

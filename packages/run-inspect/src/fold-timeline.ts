@@ -1,4 +1,3 @@
-import type { SessionLine } from "./lines";
 /**
  * The run's timeline: one entry per thing that happened, newest first, each under its
  * span, key events or everything recorded. A tool call and its result are one entry;
@@ -7,12 +6,16 @@ import type { SessionLine } from "./lines";
  * `detail`, and it is whole: a reader masks it first and only then cuts it short, so a
  * cut never leaves part of a secret the masker would have matched whole.
  */
+import { executionEntries } from "./exec";
+import type { SessionLine } from "./lines";
 import type { LoadedRun } from "./load";
 import {
   type InspectRefusal,
   STATUS_WORDS,
   type TimelineEntry,
   type TimelinePage,
+  flatText,
+  ownValue,
   refusal,
 } from "./model";
 import {
@@ -29,9 +32,10 @@ import {
   str,
   textOf,
   triggerOf,
+  wakeMarkerId,
   wakeOf,
 } from "./records";
-import { type EntryKind, LINE_KINDS, groupOf, importanceOf } from "./taxonomy";
+import { type EntryKind, groupOf, importanceOf, lineKindOf } from "./taxonomy";
 
 export const TIMELINE_DEFAULT_LIMIT = 50;
 export const TIMELINE_MAX_LIMIT = 500;
@@ -117,12 +121,12 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
     case "span_closed": {
       const info = index.spans.get(str(p["span"]) ?? line.span ?? "");
       if (info?.kind === "run") {
-        const state = info.status !== undefined ? SPAN_STATUS_STATE[info.status] : undefined;
+        const state = ownValue(SPAN_STATUS_STATE, info.status);
         return {
           ...base,
           entryKind: "run-end",
           kind: "run-end",
-          title: `Run ended: ${(state !== undefined ? STATUS_WORDS[state] : undefined) ?? "status unknown"}`,
+          title: `Run ended: ${ownValue(STATUS_WORDS, state) ?? "status unknown"}`,
           sensitivity: "internal",
         };
       }
@@ -149,8 +153,13 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
     case "user_message": {
       const control = rec(p["control"]);
       if (control?.["synthetic"] === true) {
-        const reason = str(control["reason"]);
-        const by = str(control["by"]);
+        // A wake marker is this run's only when it is the one its wake was read from; a
+        // session written before run records shows every marker it holds.
+        if (index.loaded.mode !== "legacy" && line.id !== wakeMarkerId(index)) return undefined;
+        const rawReason = str(control["reason"]);
+        const rawBy = str(control["by"]);
+        const reason = rawReason !== undefined ? flatText(rawReason) : undefined;
+        const by = rawBy !== undefined ? flatText(rawBy) : undefined;
         return {
           ...base,
           entryKind: "operator-wake",
@@ -229,7 +238,7 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         entryKind: "check",
         kind: "check",
         outcome,
-        title: `${GATE_WORDS[gate] ?? "Check"}: ${outcome}`,
+        title: `${ownValue(GATE_WORDS, gate) ?? "Check"}: ${outcome}`,
         ...(reason !== undefined ? { detail: reason } : {}),
         sensitivity: "internal",
       };
@@ -317,9 +326,9 @@ function draftOf(index: RunIndex, line: SessionLine): Draft | undefined {
         sensitivity: "internal",
       };
     default: {
-      const kind = LINE_KINDS[line.kind];
-      if (kind === undefined) {
-        if (Object.hasOwn(LINE_KINDS, line.kind)) return undefined;
+      const kind = lineKindOf(line.kind);
+      if (kind === "merged") return undefined;
+      if (kind === "unknown") {
         return {
           ...base,
           entryKind: "other",
@@ -344,8 +353,7 @@ export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & 
   const session: Array<TimelineEntry & { atMs: number }> = [];
   // An operator's wake: its marker is unscoped and precedes the run, and is the one
   // unscoped line attributed to it.
-  const wake = wakeOf(index);
-  const markerId = wake?.state === "reconstructed" ? wake.refs[0] : undefined;
+  const markerId = wakeMarkerId(index);
   const marker = [...index.loaded.markers, ...index.loaded.lines].find(
     (line) => line.id === markerId,
   );
@@ -378,6 +386,12 @@ export function timelineEntries(index: RunIndex): ReadonlyArray<TimelineEntry & 
       (entry) => entry.id.startsWith("s:") && Number(entry.id.slice(2)) > off,
     );
     session.splice(at === -1 ? session.length : at, 0, entryOf(draft));
+  }
+  // The execution's events the session log has no line for, at their place in time.
+  const have = new Set(index.lines.map((line) => line.kind));
+  for (const entry of executionEntries(index.loaded.executionEvents, have, index.rootSpan)) {
+    const at = session.findIndex((other) => other.atMs > entry.atMs);
+    session.splice(at === -1 ? session.length : at, 0, entry);
   }
   // An approval's later outcomes, at their place in time.
   const seen = new Set<string>();
@@ -419,6 +433,8 @@ export type TimelineOptions = {
   readonly limit?: number;
   /** An entry id: the page starts after it, older. */
   readonly before?: string;
+  /** An entry id: only the entries newer than it, newest first. Never with `before`. */
+  readonly after?: string;
 };
 
 /** A page of the run's timeline, newest first. */
@@ -431,20 +447,23 @@ export function timelineOf(
     TIMELINE_MAX_LIMIT,
     Math.max(1, Math.floor(options.limit ?? TIMELINE_DEFAULT_LIMIT)),
   );
+  if (options.before !== undefined && options.after !== undefined) {
+    return refusal("invalid", "page the timeline before an entry or after one, not both");
+  }
   const all = [...timelineEntries(index)].reverse();
-  let start = 0;
-  if (options.before !== undefined) {
-    const at = all.findIndex((entry) => entry.id === options.before);
+  const anchor = options.before ?? options.after;
+  let rest = all;
+  if (anchor !== undefined) {
+    const at = all.findIndex((entry) => entry.id === anchor);
     if (at === -1) {
       return refusal(
         "invalid",
-        `no entry ${options.before.slice(0, 40)} in this run's timeline`,
+        `no entry ${flatText(anchor).slice(0, 40)} in this run's timeline`,
         "crewhaus runs inspect <run> --timeline full",
       );
     }
-    start = at + 1;
+    rest = options.before !== undefined ? all.slice(at + 1) : all.slice(0, at);
   }
-  const rest = all.slice(start);
   const shown = view === "key" ? rest.filter((entry) => entry.importance === "key") : rest;
   const page = shown.slice(0, limit).map(({ atMs: _atMs, ...entry }) => entry);
   const last = page.at(-1);

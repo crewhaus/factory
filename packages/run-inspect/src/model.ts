@@ -5,34 +5,22 @@
  * Field names are chosen so the dispatch-site masker, which redacts by key name, never
  * hides one by accident: no name ends in `key`, `token`, `secret` or `password`, and
  * none is `auth`, `headers` or `env`. A test walks every view over the fixtures.
+ *
+ * Every table here, and every table a fold reads with a recorded value, is an own-key
+ * lookup: a recorded name never resolves to a property of a built-in object.
  */
+import type { InspectGapReason as InspectGapReasonOf } from "@crewhaus/control-contract";
 
-/** Why part of a run cannot be shown. Closed. */
-export const INSPECT_GAP_REASONS = Object.freeze([
-  "before-0.9",
-  "records-off",
-  "advisor-off",
-  "cost-off",
-  "not-supervised",
-  "pruned",
-  "evicted",
-  "truncated",
-  "torn",
-  "unfinished",
-  "diverged",
-  "no-access",
-  "unsupported",
-  "not-recorded",
-] as const);
+/** Why part of a run cannot be shown. Closed: the control contract's list. */
+export { INSPECT_GAP_REASONS } from "@crewhaus/control-contract";
 
-export type InspectGapReason = (typeof INSPECT_GAP_REASONS)[number];
+export type InspectGapReason = InspectGapReasonOf;
 
 /**
- * The reasons a later reader produces, never these folds: prune markers and stream
- * resets come with the supervisor's records, and viewer rights with the serving layer.
+ * The reasons a later reader produces, never these folds: stream resets come with the
+ * run stream, and viewer rights with the serving layer.
  */
 export const GAPS_PRODUCED_ELSEWHERE: readonly InspectGapReason[] = Object.freeze([
-  "pruned",
   "diverged",
   "no-access",
 ]);
@@ -76,6 +64,7 @@ export const RECONSTRUCTION_RULES = Object.freeze([
   "records-off-by-run-row",
   "span-by-position",
   "zero-cost-with-tokens",
+  "execution-scan",
 ] as const);
 
 export type ReconstructionRule = (typeof RECONSTRUCTION_RULES)[number];
@@ -159,7 +148,15 @@ export const STATUS_WORDS: Readonly<Record<string, string>> = Object.freeze({
 export const UNKNOWN_STATUS_WORD = "Status unknown";
 
 export function statusWord(state: string | undefined): string {
-  return (state !== undefined ? STATUS_WORDS[state] : undefined) ?? UNKNOWN_STATUS_WORD;
+  return ownValue(STATUS_WORDS, state) ?? UNKNOWN_STATUS_WORD;
+}
+
+/** `table[key]` when `key` is the table's own, else `undefined`: never an inherited name. */
+export function ownValue<T>(
+  table: Readonly<Record<string, T>>,
+  key: string | undefined,
+): T | undefined {
+  return key !== undefined && Object.hasOwn(table, key) ? table[key] : undefined;
 }
 
 /** What started a run. */
@@ -192,12 +189,17 @@ export type CostView = {
   readonly usdMicros: number | null;
   /** The cost lines summed. */
   readonly lines: number;
-  readonly unknown?: "unpriced" | "zero-cost-with-tokens";
+  /**
+   * Why it is unknown: a model with no price, a call that reports tokens and costs
+   * nothing, or a cost line that records no amount.
+   */
+  readonly unknown?: "unpriced" | "zero-cost-with-tokens" | "not-recorded";
   /** "$0.04", "Cost unknown — a model has no price", "Cost not tracked". */
   readonly words: string;
 };
 
 export const COST_UNKNOWN_WORDS = "Cost unknown — a model has no price";
+export const COST_NOT_RECORDED_WORDS = "Cost unknown";
 export const COST_NOT_TRACKED_WORDS = "Cost not tracked";
 
 /** What a run ran under. */
@@ -215,8 +217,8 @@ export type RevisionsView = {
 export type RelatedRun = {
   readonly run: string;
   readonly session?: string;
-  /** Where the link is recorded: the child's stamp, or the parent's helper start. */
-  readonly via: "stamp" | "helper";
+  /** Where the link is recorded: the child's stamp, the parent's helper start, or the child's run row. */
+  readonly via: "stamp" | "helper" | "row";
   readonly name?: string;
 };
 
@@ -251,6 +253,12 @@ export type InspectSummary = {
   readonly children: readonly RelatedRun[];
   /** The supervised execution whose trace events hold more. */
   readonly execution: Provenance<{ readonly id: string }>;
+  /** What the execution's trace events held for this run, when an execution is named. */
+  readonly trace?: {
+    readonly present: boolean;
+    readonly events: number;
+    readonly truncated: boolean;
+  };
   /** The session's runs, when the subject was named by its session. */
   readonly runs?: readonly SessionRunView[];
   readonly gaps: readonly InspectGap[];
@@ -275,7 +283,10 @@ export type EntryGroup =
  * mask it before cutting it short.
  */
 export type TimelineEntry = {
-  /** `s:<byte offset>` for a session-log line, `d:<segment>:<offset>` for a decision-log line. */
+  /**
+   * `s:<byte offset>` for a session-log line, `d:<segment>:<offset>` for a decision-log
+   * line, `x:<byte offset>` for an execution's trace event.
+   */
   readonly id: string;
   readonly at: string;
   readonly kind: string;
@@ -290,6 +301,8 @@ export type TimelineEntry = {
   readonly sensitivity: "internal" | "restricted";
   /** The session turn, for messages, answers and tool calls. */
   readonly turn?: Provenance<number>;
+  /** How the entry was attributed to the run, when that was pieced together. */
+  readonly rule?: ReconstructionRule;
 };
 
 export type TimelinePage = {
@@ -482,9 +495,123 @@ export type ContextList = {
 
 /**
  * `s` with the characters that drive a terminal removed: C0 controls other than
- * newline and tab, DEL, and C1 controls. Print every string through it.
+ * newline and tab, DEL, C1 controls, and the format characters (`\p{Cf}`: bidirectional
+ * overrides, zero-width marks). Print every string through it.
  */
 export function terminalSafe(s: string): string {
   // biome-ignore lint/suspicious/noControlCharactersInRegex: these are the characters it removes
-  return s.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
+  return s.replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]|\p{Cf}/gu, "");
+}
+
+/**
+ * Free text for a fixed line: every control, format and line or paragraph separator
+ * (`\p{Cc}\p{Cf}\p{Zl}\p{Zp}`) becomes a space, and runs of white space collapse to one.
+ * The control protocol's rule for operator text.
+ */
+export function flatText(s: string): string {
+  return s
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** How {@link beforeMask} recognises a secret's key, and what replaces its value. */
+export type BeforeMaskOptions = {
+  readonly isSecretName: (name: string) => boolean;
+  readonly redacted: string;
+};
+
+/** A JSON text a string holds is walked only this deep. */
+const JSON_TEXT_DEPTH = 64;
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: these are the characters it removes
+const UNSEEN_RE = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]|\p{Cf}/gu;
+
+function looksLikeJsonText(s: string): boolean {
+  const t = s.trimStart();
+  return t.startsWith("{") || t.startsWith("[");
+}
+
+/** Replace each value under a secret's name inside parsed JSON; `changed` says whether one was. */
+function redactParsed(
+  value: unknown,
+  options: BeforeMaskOptions,
+  depth: number,
+): { readonly value: unknown; readonly changed: boolean } {
+  if (depth > JSON_TEXT_DEPTH) return { value, changed: false };
+  if (typeof value === "string") {
+    // A JSON text's own strings are rejoined too: an escaped control splits a value the
+    // same way a raw one does.
+    const inner = jsonTextRedacted(value.replace(UNSEEN_RE, ""), options, depth + 1);
+    return { value: inner, changed: inner !== value };
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = value.map((item) => {
+      const r = redactParsed(item, options, depth + 1);
+      changed ||= r.changed;
+      return r.value;
+    });
+    return { value: out, changed };
+  }
+  if (typeof value === "object" && value !== null) {
+    let changed = false;
+    const out: Record<string, unknown> = {};
+    for (const [raw, item] of Object.entries(value)) {
+      const key = raw.replace(UNSEEN_RE, "");
+      changed ||= key !== raw;
+      if (options.isSecretName(key) && item !== null && item !== undefined) {
+        out[key] = options.redacted;
+        changed = true;
+      } else {
+        const r = redactParsed(item, options, depth + 1);
+        changed ||= r.changed;
+        out[key] = r.value;
+      }
+    }
+    return { value: out, changed };
+  }
+  return { value, changed: false };
+}
+
+/** A string that holds a JSON object or array, its secrets' values replaced; else itself. */
+function jsonTextRedacted(s: string, options: BeforeMaskOptions, depth: number): string {
+  if (!looksLikeJsonText(s)) return s;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(s);
+  } catch {
+    return s;
+  }
+  if (typeof parsed !== "object" || parsed === null) return s;
+  const r = redactParsed(parsed, options, depth);
+  return r.changed ? JSON.stringify(r.value) : s;
+}
+
+/**
+ * Get a view ready for a masker that redacts by key name and by token shape. In every
+ * string, keys included, the controls (other than newline and tab) and the format
+ * characters are removed first, so a value split by one is whole again when the masker
+ * sees it; then a string that holds a JSON object or array has each value under a
+ * secret's name replaced with `redacted`, and is written back as JSON, so a credential
+ * inside a recorded tool result is redacted by its name like any other field. It masks
+ * nothing else: the head's own masker runs after it, and only then is anything cut short.
+ */
+export function beforeMask(view: unknown, options: BeforeMaskOptions): unknown {
+  const walk = (value: unknown, depth: number): unknown => {
+    if (typeof value === "string") {
+      return jsonTextRedacted(value.replace(UNSEEN_RE, ""), options, 0);
+    }
+    if (depth > JSON_TEXT_DEPTH * 4) return value;
+    if (Array.isArray(value)) return value.map((item) => walk(item, depth + 1));
+    if (typeof value === "object" && value !== null) {
+      const out: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value)) {
+        out[key.replace(UNSEEN_RE, "")] = walk(item, depth + 1);
+      }
+      return out;
+    }
+    return value;
+  };
+  return walk(view, 0);
 }

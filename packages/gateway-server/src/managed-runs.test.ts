@@ -1068,6 +1068,28 @@ describe("queued runs", () => {
     expect(rowsOf(s.harnessDir, plain).some((row) => "workItem" in row)).toBe(false);
   });
 
+  test("a run queued to start another again names it on its queued row; a malformed one is refused", () => {
+    const s = setup();
+    const attemptOf = mintRunId();
+    const id = queue(s.harnessDir, { attemptOf });
+    expect(rowsOf(s.harnessDir, id)[0]).toMatchObject({ state: "queued", attemptOf });
+    expect(rowsOf(s.harnessDir, queue(s.harnessDir))[0]).not.toHaveProperty("attemptOf");
+    const fresh = setup();
+    const answer = queueManagedRun({
+      harnessDir: fresh.harnessDir,
+      tenant: "tenant-a",
+      input: CLEAN,
+      by: "sys:scheduler",
+      env: {},
+      attemptOf: "run_0123456789abcdef",
+    });
+    expect(answer).toEqual({
+      ok: false,
+      reason: "attemptOf must be a crewhaus run id: run_ and 26 characters",
+    });
+    expect(inputsOf(fresh.harnessDir)).toEqual([]);
+  });
+
   test("a work item that is not a wi_ id is refused before any file is written", () => {
     const s = setup();
     const answer = queueManagedRun({

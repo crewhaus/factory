@@ -145,7 +145,7 @@ function refusalError(refusal: WorkCommandRefusal): V1Error {
   });
 }
 
-type Located = {
+export type Located = {
   readonly entry: HangarHarnessEntry;
   readonly dir: string;
   readonly wi: string;
@@ -169,7 +169,7 @@ function holds(dir: string, wi: string): boolean {
  * a bare `wi_…` with `?harness=`. Without either it is 422 `harness_needed` with the
  * harnesses the caller may read that hold it, never a guess.
  */
-function locate(ctx: V1Context): Located {
+export function locate(ctx: V1Context): Located {
   const raw = ctx.params["ref"] ?? "";
   const lookIn = (entry: HangarHarnessEntry | undefined, wi: string): Located | undefined => {
     const dir = entry === undefined ? undefined : liveDirOf(entry);

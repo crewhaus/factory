@@ -163,7 +163,8 @@ describe("operator wake", () => {
     if (!answer.ok) throw new Error(answer.message);
     const summary = foldSummary(answer);
     expect(summary.wake?.state).toBe("reconstructed");
-    expect(summary.wake?.value?.reason).toBe("\u001b[2Jclear the screen");
+    // Flattened onto one line: each control is a space, and the edges are trimmed.
+    expect(summary.wake?.value?.reason).toBe("[2Jclear the screen");
     const below = reads.filter(([position]) => position < sessionAt);
     expect(below.length).toBeGreaterThan(0);
     // Stopped at the previous stamp: no read starts a chunk's length or more below it.
@@ -173,7 +174,7 @@ describe("operator wake", () => {
     );
     // Printed, the reason and author carry no terminal control characters.
     const printed = terminalSafe(summary.wake?.value?.words ?? "");
-    expect(printed).toBe("operator wake: [2Jclear the screen (by ops2J)");
+    expect(printed).toBe("operator wake: [2Jclear the screen (by ops 2J)");
     expect(printed).not.toContain("\u001b");
     expect(printed).not.toContain("\u009b");
     // Nothing else from below the run is attributed to it.

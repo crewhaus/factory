@@ -16,6 +16,7 @@ import {
   HIDDEN_FOR_SAFETY,
   type InspectRefusal,
   type RecalledItemView,
+  flatText,
   notRecorded,
   refusal,
 } from "./model";
@@ -117,7 +118,9 @@ export function contextOfManifestLine(index: RunIndex, manifest: SessionLine): C
     const file = rec(raw) ?? {};
     return {
       path:
-        file["outside"] === true ? "(outside the working directory)" : (str(file["path"]) ?? ""),
+        file["outside"] === true
+          ? "(outside the working directory)"
+          : flatText(str(file["path"]) ?? ""),
       bytes: num(file["bytes"]) ?? 0,
     };
   });
@@ -189,6 +192,13 @@ export function contextOf(
   const manifest = index.manifests.find((line) => payloadOf(line)["call"] === call);
   if (manifest === undefined) {
     if (index.manifests.length === 0) {
+      if (index.loaded.mode === "unread") {
+        return refusal(
+          "not_found",
+          "none of this run's transcript was read: it was removed, or holds nothing from where the run starts",
+          `crewhaus runs show ${index.loaded.run ?? "<run>"}`,
+        );
+      }
       return refusal(
         "unsupported",
         "this run recorded no context for its model calls",

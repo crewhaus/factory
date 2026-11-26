@@ -26,7 +26,7 @@
  * copy; the UI joins to the detail routes for the rest.
  */
 import { readdirSync, statSync } from "node:fs";
-import { readRunLedger } from "@crewhaus/harness-supervisor";
+import { readRunLedgerView } from "@crewhaus/harness-supervisor";
 import { foldApprovals } from "./approvals";
 import { SESSION_JSON_RE } from "./constants";
 import { readJsonlCapped } from "./jsonl";
@@ -136,9 +136,12 @@ export function harnessActivity(
     push("session", at, "session activity", name.slice(0, -".json".length));
   }
 
-  // runs — the supervisor's folded ledger
+  // runs — the supervisor's folded ledger, its newest bytes
+  let ledgerCut = false;
   try {
-    for (const entry of readRunLedger(dir)) {
+    const ledger = readRunLedgerView(dir);
+    ledgerCut = ledger.truncated;
+    for (const entry of ledger.entries) {
       const closed = entry.endedAt !== undefined ? Date.parse(entry.endedAt) : Number.NaN;
       const opened = Date.parse(entry.startedAt);
       if (Number.isFinite(closed)) {
@@ -253,7 +256,7 @@ export function harnessActivity(
   }
 
   items.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
-  const truncated = items.length > MAX_ACTIVITY_PER_HARNESS;
+  const truncated = ledgerCut || items.length > MAX_ACTIVITY_PER_HARNESS;
   return {
     items: items.slice(0, MAX_ACTIVITY_PER_HARNESS),
     truncated,

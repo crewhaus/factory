@@ -6,10 +6,12 @@
  * reads the harness's run ledger, the session log and the decision log through
  * `@crewhaus/run-inspect`, and writes nothing: no identity, no lease, no lock.
  *
- * Everything printed is masked first, as `crewhaus daemon logs` masks: the harness's own
- * env values are scrubbed, credential-shaped tokens are masked, and a value under a
- * credential's key name is replaced. Only then is long content cut short, so a cut never
- * leaves part of a secret unmasked. Text output then has its terminal control
+ * Everything printed is masked first, as `crewhaus daemon logs` masks: control and format
+ * characters are taken out of every string and a JSON text's credential-named values are
+ * replaced (`beforeMask`), so a secret split by one is whole when it is matched; then the
+ * harness's own env values are scrubbed, credential-shaped tokens are masked, and a value
+ * under a credential's key name is replaced. Only then is long content cut short, so a
+ * cut never leaves part of a secret unmasked. Text output then has its terminal control
  * characters removed, and `--json` escapes the ones JSON leaves raw, so a tool's output
  * cannot drive the terminal it is read in.
  */
@@ -30,6 +32,8 @@ import {
   type TimelinePage,
   WHY_ACTION_RE,
   type WhyRecord,
+  beforeMask,
+  flatText,
   foldContext,
   foldSummary,
   foldTimeline,
@@ -64,11 +68,14 @@ function refused(answer: InspectRefusal): RunsOutput {
 }
 
 /**
- * A view as it may leave this process: the harness's env values scrubbed, token shapes
- * masked in every string, and every value under a credential's key name replaced.
+ * A view as it may leave this process: made ready for the masker (controls and format
+ * characters out, a JSON text's credential-named values replaced), then the harness's env
+ * values scrubbed, token shapes masked in every string, and every value under a
+ * credential's key name replaced.
  */
 export function maskedView(view: unknown, harnessDir: string): unknown {
-  const scrubbed = scrubDeep(view, harnessScrubber(harnessDir));
+  const ready = beforeMask(view, { isSecretName: isCredentialKey, redacted: REDACTED_VALUE });
+  const scrubbed = scrubDeep(ready, harnessScrubber(harnessDir));
   const walk = (value: unknown, underKey: boolean): unknown => {
     if (typeof value === "string") return underKey ? REDACTED_VALUE : maskCredentialTokens(value);
     if (Array.isArray(value)) return value.map((item) => walk(item, underKey));
@@ -128,7 +135,7 @@ function badge(field: Provenance<unknown> | undefined): string {
 }
 
 function oneLine(text: string, max = 200): string {
-  const flat = text.replace(/\s+/g, " ").trim();
+  const flat = flatText(text);
   return flat.length > max ? `${flat.slice(0, max)}…` : flat;
 }
 
@@ -170,12 +177,14 @@ function summaryLines(summary: InspectSummary, harnessFlag: string | undefined):
   ].filter((part): part is string => part !== undefined);
   const revisions = summary.revisions.value;
   const lines = [
-    `${summary.title}  —  ${status?.word ?? "Status unknown"}${badge(summary.status)}${status?.failureClass !== undefined ? ` (${status.failureClass})` : ""}`,
+    `${flatText(summary.title)}  —  ${status?.word ?? "Status unknown"}${badge(summary.status)}${status?.failureClass !== undefined ? ` (${status.failureClass})` : ""}`,
     subject,
     facts.join(" · "),
   ];
   if (summary.wake !== undefined) {
-    lines.push(`Operator wake    ${summary.wake.value?.words ?? ""}${badge(summary.wake)}`);
+    lines.push(
+      `Operator wake    ${flatText(summary.wake.value?.words ?? "")}${badge(summary.wake)}`,
+    );
   }
   if (revisions !== undefined) {
     lines.push(
@@ -184,7 +193,7 @@ function summaryLines(summary: InspectSummary, harnessFlag: string | undefined):
   }
   lines.push(
     `What was asked   ${summary.asked.value !== undefined ? `"${oneLine(summary.asked.value)}"` : "—"}${badge(summary.asked)}`,
-    `What happened    ${summary.happened.value ?? "—"}${badge(summary.happened)}`,
+    `What happened    ${summary.happened.value !== undefined ? flatText(summary.happened.value) : "—"}${badge(summary.happened)}`,
     `Outcome          ${summary.outcome.value !== undefined ? oneLine(summary.outcome.value) : "—"}${badge(summary.outcome)}`,
   );
   if (summary.parent !== undefined) lines.push(`Started by run   ${summary.parent}`);
@@ -228,7 +237,7 @@ function timelineLines(page: TimelinePage, ref: string): string[] {
       entry.span !== undefined && (entry.kind === "tool" || entry.kind === "answer")
         ? `  why: ${entry.kind}:${entry.span}`
         : "";
-    lines.push(`  ${entry.at}  ${entry.title}${action}`);
+    lines.push(`  ${flatText(entry.at)}  ${flatText(entry.title)}${action}`);
     if (entry.detail !== undefined && entry.detail !== "")
       lines.push(`      ${oneLine(entry.detail)}`);
   }
@@ -266,7 +275,7 @@ function whyLines(why: WhyRecord): string[] {
   const models = why.options.value?.models ?? [];
   const lines = [`Why did this happen? (${why.action})`];
   lines.push(
-    `What started it   ${started?.trigger.words ?? "not recorded"}${started?.wake !== undefined ? `; ${started.wake.words}` : ""}${started?.asked !== undefined ? `; asked "${oneLine(started.asked)}"` : ""}${badge(why.started)}`,
+    `What started it   ${flatText(started?.trigger.words ?? "not recorded")}${started?.wake !== undefined ? `; ${flatText(started.wake.words)}` : ""}${started?.asked !== undefined ? `; asked "${oneLine(started.asked)}"` : ""}${badge(why.started)}`,
   );
   lines.push(
     used !== undefined
@@ -328,7 +337,7 @@ function contextLines(context: ContextUsed): string[] {
     lines.push(`    ${block.kind} (${block.bytes} bytes${block.cached ? ", cached" : ""})`);
   }
   for (const file of context.files)
-    lines.push(`    project file ${file.path} (${file.bytes} bytes)`);
+    lines.push(`    project file ${flatText(file.path)} (${file.bytes} bytes)`);
   const recalled = context.recalled.value;
   if (recalled !== undefined && recalled !== null) {
     lines.push(

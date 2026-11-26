@@ -23,6 +23,7 @@
     "@crewhaus/harness-supervisor": "workspace:*",
     "@crewhaus/ir": "workspace:*",
     "@crewhaus/permission-engine": "workspace:*",
+    "@crewhaus/run-inspect": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/spec-patch": "workspace:*",
     "@crewhaus/tool-executor": "workspace:*",

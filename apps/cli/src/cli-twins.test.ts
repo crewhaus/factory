@@ -384,6 +384,9 @@ describe("the server's twins, by import", () => {
         correctionScope: "item",
         usd: "50",
         budgetReason: "planned-work",
+        action: "tool:0000000000000104",
+        call: "2",
+        sess: "sess_00000000000000a1",
       },
       {
         hrn: "hrn_0123456789abcdef",
@@ -409,6 +412,9 @@ describe("the server's twins, by import", () => {
         correctionScope: "all",
         usd: "12.5",
         budgetReason: "other",
+        action: "answer:00000000000001ff",
+        call: "all",
+        sess: "sess_0123456789abcdef",
       },
     ];
     const twins = [
@@ -430,8 +436,8 @@ describe("the server's twins, by import", () => {
     }
     // Thirty-nine operation twins, thirty-one command kinds and eight route rows, each
     // rendered twice: pause, resume, disable and enable are `crewhaus daemon` verbs. The
-    // inbox's three reads came later.
-    expect(checked).toBeGreaterThanOrEqual(156);
+    // inbox's three reads and the inspector's four came later.
+    expect(checked).toBeGreaterThanOrEqual(156 + 2 * 4);
   });
 });
 
