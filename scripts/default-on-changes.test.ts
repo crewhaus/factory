@@ -7033,8 +7033,8 @@ describe("runs record which knowledge they used, and re-read text is screened as
 
 describe("the permission rule-order check does a bounded amount of work", () => {
   test("a spec past the bound gets one permission-rule-note, and a bullet names it", () => {
-    // 500 allow/deny pairs that shadow nothing.
-    const yaml = `${ABSENT_CORPUS.cli}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+    // 600 allow/deny pairs that shadow nothing.
+    const yaml = `${ABSENT_CORPUS.cli}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch* }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(600)}`;
     const warnings = compile(yaml, { applyIrPasses: true, readme: false }).warnings;
     expect(warnings.map((w) => [w.code, w.path])).toEqual([
       ["permission-rule-note", "permissions.rules"],
@@ -7043,7 +7043,7 @@ describe("the permission rule-order check does a bounded amount of work", () => 
       (b) => b.includes("`permission-rule-note`") && b.includes("order"),
     );
     expect(bullets.length).toBe(1);
-  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+  }, 20_000); // 1,200 rules: CI runners are slower on allocation-heavy work
 });
 
 describe("0.9.0 — spend is never a guessed $0", () => {
@@ -7284,4 +7284,26 @@ describe("0.9.0 — spend is never a guessed $0", () => {
       ),
     ).toBe(true);
   });
+});
+
+describe("the permission rule checks do a bounded amount of work", () => {
+  test("a spec past the bound gets one permission-rule-note, and a bullet names it", async () => {
+    const { permissionRuleFindings } = await import("../packages/compiler/src/permission-rules");
+    // A deny that reaches no tool and no server: its matches against the
+    // known tools that hold an `a` and an `e` reach the checks' bound.
+    const pattern = `${"**".repeat(4000)}ae`;
+    const yaml = `${ABSENT_CORPUS.cli}tools: [webFetch]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "${pattern}" }\n`;
+    const spec = parseSpec(yaml);
+    const found = permissionRuleFindings(spec, lower(spec), undefined, { edge: true });
+    expect(found.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    expect(found[0]?.message).toBe(
+      `rule "alwaysDeny ${pattern}": the permission rule checks do a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for a tool name or argument that can never match.`,
+    );
+    const bullets = defaultOnBullets(changelog, LATER_HEADINGS).filter((b) =>
+      b.includes("rule's tool name and argument with a bounded amount of matching work"),
+    );
+    expect(bullets.length).toBe(1);
+  }, 20_000); // the whole bound's matching: slow on CI runners
 });

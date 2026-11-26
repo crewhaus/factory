@@ -35,10 +35,12 @@
  * Pure: plain data in, findings out.
  */
 import {
+  type CompiledPattern,
   type InclusionBudget,
   PatternParseError,
   compilePattern,
   globIncludedIn,
+  legacyMcpToolName,
   matchesToolName,
 } from "./index";
 
@@ -105,7 +107,15 @@ export type PermissionRuleProblemCode =
    * allow above them that always matches first. The findings it had already
    * shown are kept.
    */
-  | "order-not-checked";
+  | "order-not-checked"
+  /**
+   * INFORMATIONAL: the rule checks of {@link permissionRuleProblems} do a
+   * bounded amount of work (see {@link RULE_PROBLEM_LIMITS}) and reached that
+   * bound at this rule, so this rule, the rules after it and any later list
+   * sharing the bound were not checked for a tool name or argument that can
+   * never match. The findings it had already shown are kept.
+   */
+  | "rule-not-checked";
 
 export type PermissionRuleProblem = {
   readonly type: string;
@@ -125,7 +135,40 @@ export type PermissionRuleProblemsInput = {
   readonly known: ReadonlyArray<RuleToolDescriptor>;
   /** The MCP server names the spec declares. */
   readonly mcpServers: ReadonlyArray<string>;
+  /**
+   * The work the checks may still do, counted as {@link RULE_PROBLEM_LIMITS}
+   * counts it and spent by subtraction. Hand one object to the call for each
+   * list of a spec to bound them together: once it is spent, a later call
+   * checks nothing and adds no second note. Absent, the call gets its own
+   * `RULE_PROBLEM_LIMITS.steps`.
+   */
+  readonly budget?: { steps: number };
 };
+
+/**
+ * How much work the checks of one {@link permissionRuleProblems} call (or of
+ * every call sharing its `budget`) do at most. One step is one automaton
+ * state visited while a tool glob is matched against a name, one element of
+ * the working array each such match fills, one cell of a near-miss
+ * comparison, one known or granted tool, one name looked up, one declared
+ * MCP server read (with its name's length), or a few for each character of
+ * a rule's text read or compiled. A tool glob that is a literal name is
+ * looked up, not matched against each tool; a wildcard one is matched only
+ * against the tools that start with its fixed start, hold its letters and
+ * are no shorter than its shortest match, and once per budget for each
+ * distinct glob, however many rules or lists repeat it.
+ */
+export const RULE_PROBLEM_LIMITS = { steps: 1 << 24 } as const;
+
+/**
+ * Steps charged per character of a rule's text for the reads every rule gets:
+ * splitting it, and the declared servers it reaches.
+ */
+const RULE_TEXT_STEPS = 4;
+/** Steps charged per character of a pattern compiled: the rule, or a rewrite derived from it. */
+const COMPILE_STEPS = 4;
+/** Steps charged per character of a tool glob folded. */
+const FOLD_STEPS = 2;
 
 const GLOB_META = /[*?\\]/;
 const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*$/;
@@ -196,19 +239,43 @@ function withTool(pattern: string, tool: string): string {
   return arg === null ? tool : `${tool}(${arg})`;
 }
 
-/** Levenshtein distance, capped: anything past `cap` is reported as `cap + 1`. */
+/**
+ * Levenshtein distance, capped: anything past `cap` is reported as `cap + 1`.
+ * Only the cells within `cap` of the diagonal are worked out: a path through
+ * any other cell already costs more than `cap`, so the distance is exact
+ * whenever it is at most `cap`.
+ */
 function distance(a: string, b: string, cap: number): number {
-  if (Math.abs(a.length - b.length) > cap) return cap + 1;
-  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  const over = cap + 1;
+  if (Math.abs(a.length - b.length) > cap) return over;
+  let prev = new Array<number>(b.length + 1).fill(over);
+  let curr = new Array<number>(b.length + 1).fill(over);
+  /** A cell of row `i`, or `over` outside the band. */
+  const at = (row: number[], i: number, j: number): number =>
+    j < 0 || j > b.length || Math.abs(i - j) > cap ? over : (row[j] ?? over);
+  for (let j = 0; j <= Math.min(cap, b.length); j++) prev[j] = j;
   for (let i = 1; i <= a.length; i++) {
-    const curr = [i];
-    for (let j = 1; j <= b.length; j++) {
+    const hi = Math.min(b.length, i + cap);
+    for (let j = Math.max(0, i - cap); j <= hi; j++) {
+      if (j === 0) {
+        curr[0] = i;
+        continue;
+      }
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-      curr[j] = Math.min((prev[j] ?? 0) + 1, (curr[j - 1] ?? 0) + 1, (prev[j - 1] ?? 0) + cost);
+      curr[j] = Math.min(
+        at(prev, i - 1, j) + 1,
+        at(curr, i, j - 1) + 1,
+        at(prev, i - 1, j - 1) + cost,
+      );
     }
-    prev = curr;
+    [prev, curr] = [curr, prev];
   }
-  return prev[b.length] ?? cap + 1;
+  return Math.min(at(prev, a.length, b.length), over);
+}
+
+/** The cells {@link distance} works out for `a` against a name within `cap` of its length. */
+function distanceCells(a: string, cap: number): number {
+  return (a.length + 1) * (2 * cap + 1);
 }
 
 /**
@@ -365,6 +432,417 @@ function listNames(names: readonly string[]): string {
     : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
 }
 
+/** The budget of {@link permissionRuleProblems} ran out while a rule was being checked. */
+class RuleChecksSpent extends Error {}
+
+/** Which string of a tool a glob is matched against. */
+type ToolField = "name" | "key" | "foldedName" | "foldedKey";
+
+function fieldOf(tool: RuleToolDescriptor, field: ToolField): string | undefined {
+  switch (field) {
+    case "name":
+      return tool.name;
+    case "key":
+      return tool.key;
+    case "foldedName":
+      return fold(tool.name);
+    case "foldedKey":
+      return tool.key === undefined ? undefined : fold(tool.key);
+  }
+}
+
+/**
+ * At most how many automaton states a tool glob compiles to: no token of
+ * the grammar takes more than two states per character it is written with
+ * (a `*` takes two), plus the accepting state. A wildcard glob's match fills
+ * an array that long on every call.
+ */
+function automatonSizeBound(compiled: CompiledPattern): number {
+  return compiled._toolRe.isLiteral ? 1 : 2 * compiled.toolGlob.length + 1;
+}
+
+/** One bit for each UTF-16 code unit of `text`, by its value mod 32. */
+function lettersOf(text: string): number {
+  let bits = 0;
+  for (let i = 0; i < text.length; i++) bits |= 1 << (text.charCodeAt(i) & 31);
+  return bits;
+}
+
+/** What every string a tool glob matches has, read from the glob's text once. */
+type GlobFacts = {
+  /** The one string a glob with no wildcard matches, escapes resolved. */
+  readonly literal: string | undefined;
+  /**
+   * The text every string it matches starts with: what comes before its
+   * first wildcard, escapes resolved, less a final `/`, because a trailing
+   * `/**` also matches the text before its `/` (`Read/**` matches `Read`).
+   */
+  readonly start: string;
+  /**
+   * {@link lettersOf} its literal characters other than `/` (which a `/**`
+   * may stand in for): each is in every string it matches.
+   */
+  readonly letters: number;
+  /** Its literal characters other than `/`, and its `?`s: no string it matches is shorter. */
+  readonly minLength: number;
+};
+
+function globFacts(glob: string, isLiteral: boolean): GlobFacts {
+  let start = "";
+  let fixed = true;
+  let letters = 0;
+  let minLength = 0;
+  for (let i = 0; i < glob.length; i++) {
+    let ch = glob.charAt(i);
+    if (ch === "\\" && i + 1 < glob.length) {
+      i++;
+      ch = glob.charAt(i);
+    } else if (ch === "*" || ch === "?") {
+      fixed = false;
+      if (ch === "?") minLength++;
+      continue;
+    }
+    if (fixed) start += ch;
+    if (ch !== "/") {
+      letters |= 1 << (ch.charCodeAt(0) & 31);
+      minLength++;
+    }
+  }
+  if (isLiteral) return { literal: start, start, letters, minLength };
+  return {
+    literal: undefined,
+    start: start.endsWith("/") ? start.slice(0, -1) : start,
+    letters,
+    minLength,
+  };
+}
+
+/** One tool list's strings for one {@link ToolField}, read once per budget. */
+type FieldTable = {
+  /** Each tool's string, by position; absent when the tool has none. */
+  readonly values: ReadonlyArray<string | undefined>;
+  /** {@link lettersOf} each string, by position. */
+  readonly letters: Int32Array;
+  /** Each string, and its old MCP spelling, to the positions holding it. */
+  index?: ReadonlyMap<string, number[]>;
+  /** The same strings, sorted, with their positions. */
+  sorted?: ReadonlyArray<readonly [string, number]>;
+  /**
+   * What each wildcard tool glob reached, by its text: `all` when every
+   * tool was read, `first` when the read stopped at the first hit.
+   */
+  readonly reached: Map<string, { all?: readonly number[]; first?: readonly number[] }>;
+};
+
+/**
+ * The work {@link permissionRuleProblems} does, charged to its budget, and
+ * what it builds once for every call that shares that budget, the same tools
+ * and the same servers: each tool list's strings with their letters and an
+ * index by name, so a literal tool glob is a lookup; what each wildcard glob
+ * reached, so a glob repeated in another rule or list is matched once; the
+ * known names by length, so a near-miss search reads only the names within
+ * reach. A charge that spends the budget throws {@link RuleChecksSpent}, and
+ * the rule being checked is unchecked.
+ */
+class RuleWork {
+  private readonly tables = new Map<
+    ReadonlyArray<RuleToolDescriptor>,
+    Map<ToolField, FieldTable>
+  >();
+  private readonly factsOf = new WeakMap<CompiledPattern, GlobFacts>();
+  private poolOf: ReadonlyArray<RuleToolDescriptor> | undefined;
+  private knownNamesOf: ReadonlySet<string> | undefined;
+  private knownByLengthOf: ReadonlyMap<number, number[]> | undefined;
+  private serversOf: { readonly set: ReadonlySet<string>; readonly cost: number } | undefined;
+
+  constructor(
+    readonly budget: { steps: number },
+    readonly granted: ReadonlyArray<RuleToolDescriptor>,
+    readonly known: ReadonlyArray<RuleToolDescriptor>,
+    readonly mcpServers: ReadonlyArray<string>,
+  ) {}
+
+  /** Charge `steps`; throws once the budget is spent. */
+  spend(steps: number): void {
+    this.budget.steps -= steps;
+    if (this.budget.steps <= 0) throw new RuleChecksSpent();
+  }
+
+  /** {@link compilePattern}, charged by the length of what it compiles. */
+  compile(pattern: string): CompiledPattern {
+    this.spend(COMPILE_STEPS * pattern.length + 1);
+    return compilePattern(pattern);
+  }
+
+  /** {@link foldGlob}, charged by the glob's length. */
+  fold(glob: string): string {
+    this.spend(FOLD_STEPS * glob.length + 1);
+    return foldGlob(glob);
+  }
+
+  /**
+   * {@link matchesToolName}, with the states it visits and the array it
+   * fills charged. The budget is read first: a spent one answers nothing.
+   */
+  matches(compiled: CompiledPattern, value: string): boolean {
+    if (this.budget.steps <= 0) throw new RuleChecksSpent();
+    const work = { steps: 0 };
+    const answer = matchesToolName(compiled, value, work);
+    const tests = legacyMcpToolName(value) === undefined ? 1 : 2;
+    this.spend(work.steps + tests * automatonSizeBound(compiled));
+    return answer;
+  }
+
+  /** The granted tools, then the known ones. */
+  pool(): ReadonlyArray<RuleToolDescriptor> {
+    if (this.poolOf === undefined) {
+      this.spend(this.granted.length + this.known.length);
+      this.poolOf = [...this.granted, ...this.known];
+    }
+    return this.poolOf;
+  }
+
+  /** What every string the tool glob matches has, read once per compiled pattern. */
+  private facts(compiled: CompiledPattern): GlobFacts {
+    let facts = this.factsOf.get(compiled);
+    if (facts === undefined) {
+      this.spend(compiled.toolGlob.length + 1);
+      facts = globFacts(compiled.toolGlob, compiled._toolRe.isLiteral);
+      this.factsOf.set(compiled, facts);
+    }
+    return facts;
+  }
+
+  /**
+   * The positions in `tools` of the tools whose `field` the tool glob
+   * matches, in order (with `first`, at most the first). A literal glob
+   * matches one string, so its tools are looked up by that string and its
+   * pre-0.7.1 MCP spelling. A wildcard one is read once per budget for each
+   * distinct glob, and is matched only against the tools whose string, or
+   * its old spelling, starts with the glob's fixed start (see
+   * {@link GlobFacts}), is at least as long as the glob's shortest match and
+   * holds every one of its letters: no other can match it.
+   */
+  reaching(
+    compiled: CompiledPattern,
+    tools: ReadonlyArray<RuleToolDescriptor>,
+    field: ToolField,
+    first = false,
+  ): readonly number[] {
+    const facts = this.facts(compiled);
+    const table = this.table(tools, field);
+    if (facts.literal !== undefined) {
+      const hits = this.index(table).get(facts.literal) ?? [];
+      this.spend(1 + hits.length);
+      return first ? hits.slice(0, 1) : hits;
+    }
+    const held = table.reached.get(compiled.toolGlob);
+    const known = held?.all ?? (first ? held?.first : undefined);
+    if (known !== undefined) {
+      const out = first ? known.slice(0, 1) : known;
+      this.spend(1 + out.length);
+      return out;
+    }
+    const candidates = facts.start === "" ? undefined : this.startingWith(table, facts.start);
+    const count = candidates === undefined ? tools.length : candidates.length;
+    const out: number[] = [];
+    let stopped = false;
+    for (let i = 0; i < count; i++) {
+      const at = candidates === undefined ? i : (candidates[i] as number);
+      this.spend(1);
+      const value = table.values[at];
+      if (
+        value === undefined ||
+        value.length < facts.minLength ||
+        (facts.letters & ~(table.letters[at] as number)) !== 0
+      ) {
+        continue;
+      }
+      if (this.matches(compiled, value)) {
+        out.push(at);
+        if (first) {
+          stopped = true;
+          break;
+        }
+      }
+    }
+    const entry = held ?? {};
+    if (stopped) entry.first = out;
+    else entry.all = out;
+    table.reached.set(compiled.toolGlob, entry);
+    return out;
+  }
+
+  /** `tools`' strings for `field`, with their letters: read once per budget, charged by their length. */
+  private table(tools: ReadonlyArray<RuleToolDescriptor>, field: ToolField): FieldTable {
+    let byField = this.tables.get(tools);
+    if (byField === undefined) {
+      byField = new Map();
+      this.tables.set(tools, byField);
+    }
+    const held = byField.get(field);
+    if (held !== undefined) return held;
+    let cost = tools.length + 1;
+    for (const tool of tools) cost += tool.name.length + (tool.key?.length ?? 0);
+    this.spend(cost);
+    const values = tools.map((tool) => fieldOf(tool, field));
+    const letters = new Int32Array(values.length);
+    for (const [at, value] of values.entries()) {
+      if (value !== undefined) letters[at] = lettersOf(value);
+    }
+    const table: FieldTable = { values, letters, reached: new Map() };
+    byField.set(field, table);
+    return table;
+  }
+
+  /** Each string of `table`, and its old MCP spelling, to the positions holding it. */
+  private index(table: FieldTable): ReadonlyMap<string, number[]> {
+    if (table.index !== undefined) return table.index;
+    this.spend(table.values.length + 1);
+    const index = new Map<string, number[]>();
+    const add = (value: string, at: number) => {
+      const positions = index.get(value);
+      if (positions === undefined) index.set(value, [at]);
+      else positions.push(at);
+    };
+    for (const [at, value] of table.values.entries()) {
+      if (value === undefined) continue;
+      add(value, at);
+      const legacy = legacyMcpToolName(value);
+      if (legacy !== undefined) add(legacy, at);
+    }
+    table.index = index;
+    return index;
+  }
+
+  /**
+   * The positions in `table` whose string, or its old MCP spelling, starts
+   * with `start`, in order: a binary search of the strings, sorted once.
+   */
+  private startingWith(table: FieldTable, start: string): number[] {
+    let sorted = table.sorted;
+    if (sorted === undefined) {
+      const strings: Array<readonly [string, number]> = [];
+      for (const [at, value] of table.values.entries()) {
+        if (value === undefined) continue;
+        strings.push([value, at]);
+        const legacy = legacyMcpToolName(value);
+        if (legacy !== undefined) strings.push([legacy, at]);
+      }
+      this.spend((strings.length + 1) * Math.ceil(Math.log2(strings.length + 2)));
+      strings.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+      sorted = strings;
+      table.sorted = sorted;
+    }
+    // The first string not below `start`; every string that starts with it
+    // follows, together.
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if ((sorted[mid] as readonly [string, number])[0] < start) lo = mid + 1;
+      else hi = mid;
+    }
+    this.spend(1 + Math.ceil(Math.log2(sorted.length + 1)));
+    const found = new Set<number>();
+    for (let i = lo; i < sorted.length; i++) {
+      const [value, at] = sorted[i] as readonly [string, number];
+      if (!value.startsWith(start)) break;
+      this.spend(1);
+      found.add(at);
+    }
+    return [...found].sort((a, b) => a - b);
+  }
+
+  /** Whether a known tool is named exactly `name`. */
+  isKnownName(name: string): boolean {
+    if (this.knownNamesOf === undefined) {
+      this.spend(this.known.length + 1);
+      this.knownNamesOf = new Set(this.known.map((t) => t.name));
+    }
+    this.spend(1);
+    return this.knownNamesOf.has(name);
+  }
+
+  /**
+   * The known tools within `cap` of `name` by Levenshtein distance, as
+   * `{tool, name, d}`, in the order `known` lists them. Only the names
+   * whose length is within `cap` of `name`'s are compared; each comparison
+   * is charged its cells.
+   */
+  nearNames(
+    name: string,
+    cap: number,
+  ): Array<{ readonly tool: RuleToolDescriptor; readonly name: string; readonly d: number }> {
+    if (this.knownByLengthOf === undefined) {
+      this.spend(this.known.length + 1);
+      const byLength = new Map<number, number[]>();
+      for (const [at, tool] of this.known.entries()) {
+        const positions = byLength.get(tool.name.length);
+        if (positions === undefined) byLength.set(tool.name.length, [at]);
+        else positions.push(at);
+      }
+      this.knownByLengthOf = byLength;
+    }
+    const within: number[] = [];
+    for (let length = name.length - cap; length <= name.length + cap; length++) {
+      this.spend(1);
+      for (const at of this.knownByLengthOf.get(length) ?? []) within.push(at);
+    }
+    within.sort((a, b) => a - b);
+    const near: Array<{ tool: RuleToolDescriptor; name: string; d: number }> = [];
+    for (const at of within) {
+      const tool = this.known[at] as RuleToolDescriptor;
+      this.spend(1 + distanceCells(name, cap));
+      const d = distance(name, tool.name, cap);
+      if (d <= cap) near.push({ tool, name: tool.name, d });
+    }
+    return near;
+  }
+
+  private serverSet(): { readonly set: ReadonlySet<string>; readonly cost: number } {
+    if (this.serversOf === undefined) {
+      let cost = 0;
+      for (const server of this.mcpServers) cost += 1 + server.length;
+      this.spend(cost + 1);
+      this.serversOf = { set: new Set(this.mcpServers), cost };
+    }
+    return this.serversOf;
+  }
+
+  /** The declared MCP servers, for a read of them all, charged with each name's length. */
+  servers(): ReadonlySet<string> {
+    const servers = this.serverSet();
+    this.spend(servers.cost + 1);
+    return servers.set;
+  }
+
+  /** Whether `name` is a declared MCP server. */
+  isServer(name: string): boolean {
+    const servers = this.serverSet();
+    this.spend(1);
+    return servers.set.has(name);
+  }
+}
+
+/** The work state each budget object carries across the calls that share it. */
+const ruleWorkByBudget = new WeakMap<{ steps: number }, RuleWork>();
+
+function ruleWorkFor(input: PermissionRuleProblemsInput, budget: { steps: number }): RuleWork {
+  const held = ruleWorkByBudget.get(budget);
+  if (
+    held !== undefined &&
+    held.granted === input.granted &&
+    held.known === input.known &&
+    held.mcpServers === input.mcpServers
+  ) {
+    return held;
+  }
+  const work = new RuleWork(budget, input.granted, input.known, input.mcpServers);
+  ruleWorkByBudget.set(budget, work);
+  return work;
+}
+
 /**
  * The tools a rule that reaches none of them by name was written for: every
  * tool in `pool` whose spec key the glob matches, or whose name or key it
@@ -373,284 +851,340 @@ function listNames(names: readonly string[]): string {
  * tool that exists, not a misspelling of one.
  */
 function toolsMisspelled(
-  compiled: ReturnType<typeof compilePattern>,
+  compiled: CompiledPattern,
   toolGlob: string,
-  pool: readonly RuleToolDescriptor[],
+  pool: ReadonlyArray<RuleToolDescriptor>,
+  work: RuleWork,
 ): RuleToolDescriptor[] {
-  if (pool.some((t) => matchesToolName(compiled, t.name))) return [];
-  const folded = foldGlob(toolGlob);
-  let foldedCompiled: ReturnType<typeof compilePattern> | undefined;
+  if (work.reaching(compiled, pool, "name", true).length > 0) return [];
+  const folded = work.fold(toolGlob);
+  let foldedCompiled: CompiledPattern | undefined;
   try {
-    foldedCompiled = folded === "" ? undefined : compilePattern(folded);
-  } catch {
+    foldedCompiled = folded === "" ? undefined : work.compile(folded);
+  } catch (err) {
+    if (err instanceof RuleChecksSpent) throw err;
     foldedCompiled = undefined;
   }
+  const hits = new Set<number>(work.reaching(compiled, pool, "key"));
+  if (foldedCompiled !== undefined) {
+    for (const at of work.reaching(foldedCompiled, pool, "foldedName")) hits.add(at);
+    for (const at of work.reaching(foldedCompiled, pool, "foldedKey")) hits.add(at);
+  }
   const byName = new Map<string, RuleToolDescriptor>();
-  for (const t of pool) {
-    const hit =
-      (t.key !== undefined && matchesToolName(compiled, t.key)) ||
-      (foldedCompiled !== undefined &&
-        (matchesToolName(foldedCompiled, fold(t.name)) ||
-          (t.key !== undefined && matchesToolName(foldedCompiled, fold(t.key)))));
-    if (hit) byName.set(t.name, t);
+  for (const at of [...hits].sort((a, b) => a - b)) {
+    const t = pool[at] as RuleToolDescriptor;
+    byName.set(t.name, t);
   }
   return [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
-/** Every rule in `input.rules` that cannot do what it says, with the fix. */
+/**
+ * Every rule in `input.rules` that cannot do what it says, with the fix.
+ *
+ * The checks do a bounded amount of work ({@link RULE_PROBLEM_LIMITS}, or
+ * `input.budget`, which calls for a spec's lists share). When it is spent,
+ * the rule being checked gets one `rule-not-checked` note in place of its
+ * findings, and it, the rules after it and every later call sharing the
+ * budget are not checked; the findings already shown are kept.
+ */
 export function permissionRuleProblems(
   input: PermissionRuleProblemsInput,
 ): PermissionRuleProblem[] {
+  const budget = input.budget ?? { steps: RULE_PROBLEM_LIMITS.steps };
+  if (budget.steps <= 0) return [];
+  const work = ruleWorkFor(input, budget);
   const problems: PermissionRuleProblem[] = [];
-  const declaredServers = new Set(input.mcpServers);
   for (const rule of input.rules) {
-    let compiled: ReturnType<typeof compilePattern>;
+    const shown = problems.length;
     try {
-      compiled = compilePattern(rule.pattern);
+      checkRule(rule, input, work, problems);
     } catch (err) {
-      if (err instanceof PatternParseError) continue; // reported as malformed elsewhere
-      throw err;
-    }
-    const { tool: toolGlob, arg } = split(rule.pattern);
-    const report = (code: PermissionRuleProblemCode, message: string, suggestion?: string) =>
+      if (!(err instanceof RuleChecksSpent)) throw err;
+      // A spent budget's answers prove nothing: this rule is unchecked.
+      problems.length = shown;
       problems.push({
         type: rule.type,
         pattern: rule.pattern,
-        code,
-        message,
-        ...(suggestion !== undefined ? { suggestion } : {}),
+        code: "rule-not-checked",
+        message: `rule "${rule.type} ${rule.pattern}": the permission rule checks do a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for a tool name or argument that can never match.`,
       });
-
-    const matched = input.granted.filter((t) => matchesToolName(compiled, t.name));
-    if (matched.length === 0) {
-      // A glob that can still match a declared MCP server's tools is not
-      // dead: `*write*` fires on mcp__fs__write_file. When it also resembles
-      // a GRANTED builtin it does not reach, say so, name the builtin, and
-      // offer no rewrite — the rule means something already.
-      const reachable = mcpServersReached(toolGlob, declaredServers);
-      if (reachable.length > 0) {
-        // An exact name that addresses a declared server is an MCP rule: it
-        // names one tool, and `web__fetch` is not a misspelled WebFetch.
-        if (!GLOB_META.test(toolGlob)) continue;
-        const missed = toolsMisspelled(compiled, toolGlob, input.granted);
-        if (missed.length > 0) {
-          const names = missed.map((t) => t.name);
-          const one = names.length === 1;
-          report(
-            "builtin-not-reached",
-            `rule "${rule.pattern}" can match tools of the MCP server${reachable.length === 1 ? "" : "s"} ${listNames(reachable)}, but no granted builtin: a rule is matched against a tool's exact name, and it does not match ${listNames(names)}, whose ${one ? "key or spelling" : "keys or spellings"} it resembles. If it is meant for ${one ? "that tool" : "those tools"} too, add a rule that names ${one ? "it" : "them"}: ${listNames(names)}.`,
-          );
-        }
-        continue;
-      }
-      // Written with spec keys? The glob is tried against every tool's KEY,
-      // not only with its first letter capitalised: `codegraph*` reaches the
-      // keys codegraphSearch… whose names are CodeGraphSearch…, and `*script`
-      // reaches javascript, whose name is JavaScript.
-      const pool = [...input.granted, ...input.known];
-      const byName = new Map<string, RuleToolDescriptor>();
-      for (const t of pool) {
-        if (
-          t.key !== undefined &&
-          t.key !== t.name &&
-          matchesToolName(compiled, t.key) &&
-          !matchesToolName(compiled, t.name)
-        ) {
-          byName.set(t.name, t);
-        }
-      }
-      if (byName.size > 0) {
-        const names = [...byName.keys()].sort();
-        // A rewrite is offered only when one re-cased glob reaches exactly
-        // these tools by name, no more and no fewer.
-        const candidate = recasedGlob(toolGlob, names[0] as string);
-        let fixed: string | undefined;
-        if (candidate !== undefined) {
-          const next = withTool(rule.pattern, candidate);
-          const nextCompiled = compilePattern(next);
-          const reached = new Set(
-            pool.filter((t) => matchesToolName(nextCompiled, t.name)).map((t) => t.name),
-          );
-          if (reached.size === names.length && names.every((n) => reached.has(n))) fixed = next;
-        }
-        const shown = names.length > 6 ? [...names.slice(0, 5), `${names.length - 5} more`] : names;
-        const list =
-          shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
-        const advice =
-          fixed !== undefined
-            ? `Write "${fixed}".`
-            : `Name ${names.length === 1 ? "it" : "them"} by name: ${list}.`;
-        const only = names.length === 1 ? byName.get(names[0] as string) : undefined;
-        report(
-          "tool-key-not-name",
-          only !== undefined
-            ? `rule "${rule.pattern}" ${GLOB_META.test(toolGlob) ? `matches ${only.key}` : `names ${toolGlob}`}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${only.name}, so this rule never fires. ${advice}`
-            : `rule "${rule.pattern}" matches the keys a spec lists ${list} under, but a rule is matched against each tool's name, so this rule never fires. ${advice}`,
-          fixed,
-        );
-        continue;
-      }
-      // Written with a spec key the descriptors do not carry? Rules are
-      // matched against the registered name, which starts with a capital.
-      const capitalised = toolGlob.charAt(0).toUpperCase() + toolGlob.slice(1);
-      if (capitalised !== toolGlob) {
-        const fixed = withTool(rule.pattern, capitalised);
-        const fixedCompiled = compilePattern(fixed);
-        const hit = [...input.granted, ...input.known].find(
-          (t) => matchesToolName(fixedCompiled, t.name) && !matchesToolName(compiled, t.name),
-        );
-        if (hit !== undefined) {
-          report(
-            "tool-key-not-name",
-            hit.key !== undefined
-              ? `rule "${rule.pattern}" names ${toolGlob}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`
-              : `rule "${rule.pattern}" names ${toolGlob}, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`,
-            fixed,
-          );
-          continue;
-        }
-      }
-      if (toolGlob.startsWith("mcp__")) {
-        const rest = toolGlob.slice(5);
-        // A declared key may itself contain `__` (0.7.0 ran such keys), so
-        // the server is found by the keys, not by splitting the name.
-        if ([...declaredServers].some((s) => rest.startsWith(`${s}__`))) continue;
-        const server = rest.split("__")[0] ?? "";
-        if (server !== "" && !GLOB_META.test(server) && !declaredServers.has(server)) {
-          report(
-            "unknown-mcp-server",
-            `rule "${rule.pattern}" names the MCP server "${server}", which this spec does not declare, so it never fires. Declare it under mcp_servers, or remove the rule.`,
-          );
-        }
-        continue;
-      }
-      // Spelled another way? A rule is matched exactly, so REMOVEPATH,
-      // remove_path, `web fetch` and Codegraph* never fire on RemovePath,
-      // WebFetch or CodeGraphSearch (C146).
-      const misspelled = toolsMisspelled(compiled, toolGlob, pool);
-      if (misspelled.length > 0) {
-        const names = misspelled.map((t) => t.name);
-        const one = names.length === 1;
-        // Following a rewrite of an allow must not grant a tool that can
-        // change or delete things on a guess about the spelling.
-        const widens =
-          rule.type === "alwaysAllow" &&
-          misspelled.some((t) => t.destructive !== false || t.requiresSandbox !== false);
-        let fixed: string | undefined;
-        if (!GLOB_META.test(toolGlob)) {
-          if (one) fixed = withTool(rule.pattern, names[0] as string);
-        } else {
-          const candidate = recasedGlob(foldGlob(toolGlob), names[0] as string);
-          if (candidate !== undefined) {
-            const next = withTool(rule.pattern, candidate);
-            const nextCompiled = compilePattern(next);
-            const reached = new Set(
-              pool.filter((t) => matchesToolName(nextCompiled, t.name)).map((t) => t.name),
-            );
-            if (reached.size === names.length && names.every((n) => reached.has(n))) fixed = next;
-          }
-        }
-        const list = listNames(names);
-        const advice =
-          fixed !== undefined && widens
-            ? `${one ? `${list} is a tool that` : `${list} are tools that`} may change or delete things, so no fix is offered: write "${fixed}" only if you mean to allow ${one ? "it" : "them"}, or remove the rule.`
-            : widens
-              ? `${one ? `${list} is a tool that` : `${list} are tools that`} may change or delete things, so no fix is offered: name ${one ? "it" : "them"} only if you mean to allow ${one ? "it" : "them"}, or remove the rule.`
-              : fixed !== undefined
-                ? `Write "${fixed}".`
-                : `Name ${one ? "it" : "them"} by name: ${list}.`;
-        report(
-          "unknown-tool",
-          `rule "${rule.pattern}" matches no tool, so it never fires: a rule is matched against a tool's name exactly (case, "_", "-" and spaces count), and ${one ? `the name is ${list}` : `the names are ${list}`}. ${advice}`,
-          widens ? undefined : fixed,
-        );
-        continue;
-      }
-      if (!GLOB_META.test(toolGlob) && !input.known.some((t) => t.name === toolGlob)) {
-        const near = input.known
-          .map((t) => ({ tool: t, name: t.name, d: distance(toolGlob, t.name, 2) }))
-          .filter((c) => c.d <= 2)
-          .sort((a, b) => a.d - b.d || (a.name < b.name ? -1 : 1));
-        const best = near[0];
-        const tied = best === undefined ? [] : near.filter((c) => c.d === best.d);
-        if (best === undefined || tied.length > 1) {
-          // Known to nothing, and close to no one tool (or to several alike):
-          // say so, without a fix, and without calling it dead outright.
-          report(
-            "tool-not-known",
-            `rule "${rule.pattern}" names ${toolGlob}, which is no builtin and no tool the runtime adds${
-              tied.length > 1
-                ? ` (it is equally close to ${listNames(tied.map((c) => c.name))})`
-                : ""
-            }, so it never fires unless a plugin, a custom tool or an MCP server's "<server>__<tool>" spelling registers a tool by that name. Check the name, or remove the rule.`,
-          );
-        } else {
-          const fixed = withTool(rule.pattern, best.name);
-          const widens =
-            rule.type === "alwaysAllow" &&
-            (best.tool.destructive !== false || best.tool.requiresSandbox !== false);
-          if (widens) {
-            report(
-              "unknown-tool",
-              `rule "${rule.pattern}" matches no tool, so it never fires. The nearest name is ${best.name}, which may change or delete things, so it is not offered as the fix: write "${fixed}" only if you mean to allow ${best.name}, or remove the rule.`,
-            );
-          } else {
-            report(
-              "unknown-tool",
-              `rule "${rule.pattern}" matches no tool. Did you mean ${best.name}? Write "${fixed}".`,
-              fixed,
-            );
-          }
-        }
-      }
-      continue;
-    }
-
-    if (arg === null) continue;
-    // The argument half is checked against every granted tool the tool half
-    // reaches. It is a finding only when it is wrong for all of them.
-    let notScoped = 0;
-    let cannotMatch = 0;
-    for (const tool of matched) {
-      const declared = tool.operativeArgs;
-      if (declared === undefined) break;
-      if (declared.length === 0) {
-        notScoped++;
-        continue;
-      }
-      if (declared.every((a) => a.kind === "url") && !argGlobCanMatchUrl(arg)) {
-        // A deny or ask on an API root (a url that is its own service, as
-        // RateLimitStatus's baseUrl) also reads its host alone, and every
-        // string of a call as 0.7.0 did: `RateLimitStatus(ghe.example.com/**)`
-        // fires. Only an allow, which reads the URL alone, never matches.
-        if (rule.type !== "alwaysAllow" && declared.some(isApiRoot)) break;
-        cannotMatch++;
-        continue;
-      }
-      break;
-    }
-    const names = matched.map((t) => t.name).join(", ");
-    if (cannotMatch > 0 && notScoped + cannotMatch === matched.length) {
-      const fixedArg = withoutMethodPrefix(arg);
-      const fixed = fixedArg !== undefined ? `${toolGlob}(${fixedArg})` : undefined;
-      report(
-        "argument-cannot-match",
-        `rule "${rule.pattern}" can never match: a rule on ${names} is checked against its URL, and a URL starts with its scheme, such as https:. ${
-          fixed !== undefined
-            ? `Write "${fixed}".`
-            : `Write the URL pattern, e.g. "${toolGlob}(https://api.example.com/**)".`
-        }`,
-        fixed,
-      );
-    } else if (notScoped === matched.length) {
-      report(
-        "argument-not-scoped",
-        `rule "${rule.pattern}" has an argument pattern, but ${names} has no argument that says where it acts, so the pattern is checked against the text of each call, not a place. To cover every call, write "${toolGlob}".`,
-        toolGlob,
-      );
+      return problems;
     }
   }
   return problems;
+}
+
+/** The findings for one rule, added to `problems`; see {@link permissionRuleProblems}. */
+function checkRule(
+  rule: { readonly type: string; readonly pattern: string },
+  input: PermissionRuleProblemsInput,
+  work: RuleWork,
+  problems: PermissionRuleProblem[],
+): void {
+  // Every rule's text is read a few times (split, its fixed start and
+  // letters, the declared servers it reaches) and compiled once.
+  work.spend(RULE_TEXT_STEPS * rule.pattern.length + 1);
+  let compiled: CompiledPattern;
+  try {
+    compiled = work.compile(rule.pattern);
+  } catch (err) {
+    if (err instanceof PatternParseError) return; // reported as malformed elsewhere
+    throw err;
+  }
+  const { tool: toolGlob, arg } = split(rule.pattern);
+  const report = (code: PermissionRuleProblemCode, message: string, suggestion?: string) =>
+    problems.push({
+      type: rule.type,
+      pattern: rule.pattern,
+      code,
+      message,
+      ...(suggestion !== undefined ? { suggestion } : {}),
+    });
+
+  const matched = work
+    .reaching(compiled, input.granted, "name")
+    .map((at) => input.granted[at] as RuleToolDescriptor);
+  if (matched.length === 0) {
+    // A glob that can still match a declared MCP server's tools is not
+    // dead: `*write*` fires on mcp__fs__write_file. When it also resembles
+    // a GRANTED builtin it does not reach, say so, name the builtin, and
+    // offer no rewrite — the rule means something already.
+    const reachable = mcpServersReached(toolGlob, work.servers());
+    if (reachable.length > 0) {
+      // An exact name that addresses a declared server is an MCP rule: it
+      // names one tool, and `web__fetch` is not a misspelled WebFetch.
+      if (!GLOB_META.test(toolGlob)) return;
+      const missed = toolsMisspelled(compiled, toolGlob, input.granted, work);
+      if (missed.length > 0) {
+        const names = missed.map((t) => t.name);
+        const one = names.length === 1;
+        report(
+          "builtin-not-reached",
+          `rule "${rule.pattern}" can match tools of the MCP server${reachable.length === 1 ? "" : "s"} ${listNames(reachable)}, but no granted builtin: a rule is matched against a tool's exact name, and it does not match ${listNames(names)}, whose ${one ? "key or spelling" : "keys or spellings"} it resembles. If it is meant for ${one ? "that tool" : "those tools"} too, add a rule that names ${one ? "it" : "them"}: ${listNames(names)}.`,
+        );
+      }
+      return;
+    }
+    // Written with spec keys? The glob is tried against every tool's KEY,
+    // not only with its first letter capitalised: `codegraph*` reaches the
+    // keys codegraphSearch… whose names are CodeGraphSearch…, and `*script`
+    // reaches javascript, whose name is JavaScript.
+    const pool = work.pool();
+    const byName = new Map<string, RuleToolDescriptor>();
+    for (const at of work.reaching(compiled, pool, "key")) {
+      const t = pool[at] as RuleToolDescriptor;
+      if (t.key !== t.name && !work.matches(compiled, t.name)) byName.set(t.name, t);
+    }
+    if (byName.size > 0) {
+      const names = [...byName.keys()].sort();
+      // A rewrite is offered only when one re-cased glob reaches exactly
+      // these tools by name, no more and no fewer.
+      const candidate = recasedGlob(toolGlob, names[0] as string);
+      let fixed: string | undefined;
+      if (candidate !== undefined) {
+        const next = withTool(rule.pattern, candidate);
+        const nextCompiled = work.compile(next);
+        const reached = new Set(
+          work
+            .reaching(nextCompiled, pool, "name")
+            .map((at) => (pool[at] as RuleToolDescriptor).name),
+        );
+        if (reached.size === names.length && names.every((n) => reached.has(n))) fixed = next;
+      }
+      const shown = names.length > 6 ? [...names.slice(0, 5), `${names.length - 5} more`] : names;
+      const list =
+        shown.length === 1 ? shown[0] : `${shown.slice(0, -1).join(", ")} and ${shown.at(-1)}`;
+      const advice =
+        fixed !== undefined
+          ? `Write "${fixed}".`
+          : `Name ${names.length === 1 ? "it" : "them"} by name: ${list}.`;
+      const only = names.length === 1 ? byName.get(names[0] as string) : undefined;
+      report(
+        "tool-key-not-name",
+        only !== undefined
+          ? `rule "${rule.pattern}" ${GLOB_META.test(toolGlob) ? `matches ${only.key}` : `names ${toolGlob}`}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${only.name}, so this rule never fires. ${advice}`
+          : `rule "${rule.pattern}" matches the keys a spec lists ${list} under, but a rule is matched against each tool's name, so this rule never fires. ${advice}`,
+        fixed,
+      );
+      return;
+    }
+    // Written with a spec key the descriptors do not carry? Rules are
+    // matched against the registered name, which starts with a capital.
+    const capitalised = toolGlob.charAt(0).toUpperCase() + toolGlob.slice(1);
+    if (capitalised !== toolGlob) {
+      const fixed = withTool(rule.pattern, capitalised);
+      const fixedCompiled = work.compile(fixed);
+      let hit: RuleToolDescriptor | undefined;
+      for (const at of work.reaching(fixedCompiled, pool, "name")) {
+        const t = pool[at] as RuleToolDescriptor;
+        if (!work.matches(compiled, t.name)) {
+          hit = t;
+          break;
+        }
+      }
+      if (hit !== undefined) {
+        report(
+          "tool-key-not-name",
+          hit.key !== undefined
+            ? `rule "${rule.pattern}" names ${toolGlob}, the key a spec lists the tool under, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`
+            : `rule "${rule.pattern}" names ${toolGlob}, but a rule is matched against the tool's name, ${hit.name}, so this rule never fires. Write "${fixed}".`,
+          fixed,
+        );
+        return;
+      }
+    }
+    if (toolGlob.startsWith("mcp__")) {
+      const rest = toolGlob.slice(5);
+      // A declared key may itself contain `__` (0.7.0 ran such keys), so
+      // the server is found by the keys, not by splitting the name.
+      if ([...work.servers()].some((s) => rest.startsWith(`${s}__`))) return;
+      const server = rest.split("__")[0] ?? "";
+      if (server !== "" && !GLOB_META.test(server) && !work.isServer(server)) {
+        report(
+          "unknown-mcp-server",
+          `rule "${rule.pattern}" names the MCP server "${server}", which this spec does not declare, so it never fires. Declare it under mcp_servers, or remove the rule.`,
+        );
+      }
+      return;
+    }
+    // Spelled another way? A rule is matched exactly, so REMOVEPATH,
+    // remove_path, `web fetch` and Codegraph* never fire on RemovePath,
+    // WebFetch or CodeGraphSearch (C146).
+    const misspelled = toolsMisspelled(compiled, toolGlob, pool, work);
+    if (misspelled.length > 0) {
+      const names = misspelled.map((t) => t.name);
+      const one = names.length === 1;
+      // Following a rewrite of an allow must not grant a tool that can
+      // change or delete things on a guess about the spelling.
+      const widens =
+        rule.type === "alwaysAllow" &&
+        misspelled.some((t) => t.destructive !== false || t.requiresSandbox !== false);
+      let fixed: string | undefined;
+      if (!GLOB_META.test(toolGlob)) {
+        if (one) fixed = withTool(rule.pattern, names[0] as string);
+      } else {
+        const candidate = recasedGlob(work.fold(toolGlob), names[0] as string);
+        if (candidate !== undefined) {
+          const next = withTool(rule.pattern, candidate);
+          const nextCompiled = work.compile(next);
+          const reached = new Set(
+            work
+              .reaching(nextCompiled, pool, "name")
+              .map((at) => (pool[at] as RuleToolDescriptor).name),
+          );
+          if (reached.size === names.length && names.every((n) => reached.has(n))) fixed = next;
+        }
+      }
+      const list = listNames(names);
+      const advice =
+        fixed !== undefined && widens
+          ? `${one ? `${list} is a tool that` : `${list} are tools that`} may change or delete things, so no fix is offered: write "${fixed}" only if you mean to allow ${one ? "it" : "them"}, or remove the rule.`
+          : widens
+            ? `${one ? `${list} is a tool that` : `${list} are tools that`} may change or delete things, so no fix is offered: name ${one ? "it" : "them"} only if you mean to allow ${one ? "it" : "them"}, or remove the rule.`
+            : fixed !== undefined
+              ? `Write "${fixed}".`
+              : `Name ${one ? "it" : "them"} by name: ${list}.`;
+      report(
+        "unknown-tool",
+        `rule "${rule.pattern}" matches no tool, so it never fires: a rule is matched against a tool's name exactly (case, "_", "-" and spaces count), and ${one ? `the name is ${list}` : `the names are ${list}`}. ${advice}`,
+        widens ? undefined : fixed,
+      );
+      return;
+    }
+    if (!GLOB_META.test(toolGlob) && !work.isKnownName(toolGlob)) {
+      const near = work
+        .nearNames(toolGlob, 2)
+        .sort((a, b) => a.d - b.d || (a.name < b.name ? -1 : 1));
+      const best = near[0];
+      const tied = best === undefined ? [] : near.filter((c) => c.d === best.d);
+      if (best === undefined || tied.length > 1) {
+        // Known to nothing, and close to no one tool (or to several alike):
+        // say so, without a fix, and without calling it dead outright.
+        report(
+          "tool-not-known",
+          `rule "${rule.pattern}" names ${toolGlob}, which is no builtin and no tool the runtime adds${
+            tied.length > 1 ? ` (it is equally close to ${listNames(tied.map((c) => c.name))})` : ""
+          }, so it never fires unless a plugin, a custom tool or an MCP server's "<server>__<tool>" spelling registers a tool by that name. Check the name, or remove the rule.`,
+        );
+      } else {
+        const fixed = withTool(rule.pattern, best.name);
+        const widens =
+          rule.type === "alwaysAllow" &&
+          (best.tool.destructive !== false || best.tool.requiresSandbox !== false);
+        if (widens) {
+          report(
+            "unknown-tool",
+            `rule "${rule.pattern}" matches no tool, so it never fires. The nearest name is ${best.name}, which may change or delete things, so it is not offered as the fix: write "${fixed}" only if you mean to allow ${best.name}, or remove the rule.`,
+          );
+        } else {
+          report(
+            "unknown-tool",
+            `rule "${rule.pattern}" matches no tool. Did you mean ${best.name}? Write "${fixed}".`,
+            fixed,
+          );
+        }
+      }
+    }
+    return;
+  }
+
+  if (arg === null) return;
+  // The argument half is checked against every granted tool the tool half
+  // reaches. It is a finding only when it is wrong for all of them.
+  let notScoped = 0;
+  let cannotMatch = 0;
+  // Whether the argument can match a URL depends on the argument alone: it
+  // is read once, however many tools the rule reaches (its text is charged
+  // with the rule's).
+  let canMatchUrlOf: boolean | undefined;
+  const canMatchUrl = (): boolean => {
+    if (canMatchUrlOf === undefined) canMatchUrlOf = argGlobCanMatchUrl(arg);
+    return canMatchUrlOf;
+  };
+  for (const tool of matched) {
+    const declared = tool.operativeArgs;
+    if (declared === undefined) break;
+    work.spend(1 + declared.length);
+    if (declared.length === 0) {
+      notScoped++;
+      continue;
+    }
+    if (declared.every((a) => a.kind === "url") && !canMatchUrl()) {
+      // A deny or ask on an API root (a url that is its own service, as
+      // RateLimitStatus's baseUrl) also reads its host alone, and every
+      // string of a call as 0.7.0 did: `RateLimitStatus(ghe.example.com/**)`
+      // fires. Only an allow, which reads the URL alone, never matches.
+      if (rule.type !== "alwaysAllow" && declared.some(isApiRoot)) break;
+      cannotMatch++;
+      continue;
+    }
+    break;
+  }
+  const named = (): string => {
+    work.spend(matched.reduce((n, t) => n + t.name.length + 2, 1));
+    return matched.map((t) => t.name).join(", ");
+  };
+  if (cannotMatch > 0 && notScoped + cannotMatch === matched.length) {
+    const names = named();
+    const fixedArg = withoutMethodPrefix(arg);
+    const fixed = fixedArg !== undefined ? `${toolGlob}(${fixedArg})` : undefined;
+    report(
+      "argument-cannot-match",
+      `rule "${rule.pattern}" can never match: a rule on ${names} is checked against its URL, and a URL starts with its scheme, such as https:. ${
+        fixed !== undefined
+          ? `Write "${fixed}".`
+          : `Write the URL pattern, e.g. "${toolGlob}(https://api.example.com/**)".`
+      }`,
+      fixed,
+    );
+  } else if (notScoped === matched.length) {
+    const names = named();
+    report(
+      "argument-not-scoped",
+      `rule "${rule.pattern}" has an argument pattern, but ${names} has no argument that says where it acts, so the pattern is checked against the text of each call, not a place. To cover every call, write "${toolGlob}".`,
+      toolGlob,
+    );
+  }
 }
 
 /** One list of permission patterns a spec carries, each typed the way the engine applies it. */
@@ -768,13 +1302,20 @@ export type ShadowedRuleProblem = PermissionRuleProblem & {
 /**
  * How much work one {@link shadowedPermissionRules} call does at most, over
  * every list it reads. `pairs`: how many (deny or ask, allow above it) pairs
- * of tool patterns it compares. `steps`: how much automaton work those
- * comparisons do together, counted as {@link InclusionBudget} counts it, so
- * a few very long patterns are bounded as well as many short ones. `steps`
- * leaves room for `pairs` comparisons of long MCP-style names, so on a list
- * of ordinary rules the pair bound is the one that decides.
+ * of tool patterns it compares with automaton inclusion, which is a deny's
+ * comparison with each bare allow whose tool pattern holds a wildcard. An
+ * allow whose tool pattern is a literal name costs no pair: it covers a deny
+ * exactly when the deny names the same tool, which is a string comparison.
+ * `steps`: how much work the comparisons do together, counted as
+ * {@link InclusionBudget} counts it, plus a few steps for each character of
+ * each rule's text, which is compiled and read once, so a few very long
+ * patterns are bounded as well as many short ones. On a list of ordinary
+ * rules, MCP tool names included, neither bound is reached.
  */
-export const RULE_ORDER_LIMITS = { pairs: 2048, steps: 1 << 23 } as const;
+export const RULE_ORDER_LIMITS = { pairs: 1 << 17, steps: 1 << 23 } as const;
+
+/** Steps of {@link RULE_ORDER_LIMITS} charged per character of a rule's text, compiled and read once. */
+const ORDER_TEXT_STEPS = 2;
 
 /** Options for {@link shadowedPermissionRules}. */
 export type ShadowedRuleOptions = {
@@ -816,12 +1357,14 @@ export type ShadowedRuleOptions = {
  * order its rules are read in when they replace the parent's.
  *
  * The whole call does a bounded amount of work ({@link RULE_ORDER_LIMITS},
- * or `opts.limits`): at most `pairs` comparisons of a deny or ask with an
- * allow above it, and at most `steps` of automaton work across them. When a
- * bound is reached, the check stops there: the findings already shown are
- * kept, and one `order-not-checked` note names the rule and the list where
- * it stopped. Nothing after that rule is checked, in that list or a later
- * one.
+ * or `opts.limits`): at most `pairs` comparisons of a deny or ask with a
+ * wildcard allow above it, and at most `steps` of work across them and the
+ * reading of each rule's text. An allow that names one tool is compared by
+ * that name, at no pair, so on a list of ordinary rules the findings are
+ * those of a check with no bound. When a bound is reached, the check stops
+ * there: the findings already shown are kept, and one `order-not-checked`
+ * note names the rule and the list where it stopped. Nothing after that rule
+ * is checked, in that list or a later one.
  */
 export function shadowedPermissionRules(
   lists: ReadonlyArray<PermissionRuleList>,
@@ -903,10 +1446,15 @@ type OrderBudget = {
 
 /**
  * The deny and ask rules an earlier bare allow shadows, with the first such
- * allow. Each comparison spends one pair of `budget`, and its automaton work
- * spends `budget.inclusion`. When either bound is reached, `stoppedAt` is the
- * deny or ask being checked: it and every rule after it are unchecked, and
- * `hits` holds what was shown before it.
+ * allow. An allow whose tool pattern is a literal covers exactly the deny
+ * whose tool pattern is the same literal (escapes resolved): every wildcard
+ * matches more than one name. So the literal allows are looked up by name,
+ * at no pair, and only the wildcard allows above the first literal one that
+ * matches are compared by automaton inclusion. Each such comparison spends
+ * one pair of `budget`, and its automaton work spends `budget.inclusion`, as
+ * does each rule's text before it is read. When either bound is reached,
+ * `stoppedAt` is the rule being checked: it and every rule after it are
+ * unchecked, and `hits` holds what was shown before it.
  */
 function shadowsIn(
   rules: ReadonlyArray<{ readonly type: string; readonly pattern: string }>,
@@ -922,8 +1470,19 @@ function shadowsIn(
     readonly rule: { readonly type: string; readonly pattern: string };
     readonly allow: string;
   }> = [];
-  const bareAllows: Array<{ readonly pattern: string; readonly toolGlob: string }> = [];
-  for (const rule of rules) {
+  // The bare allows with a wildcard in their tool pattern, in order, each
+  // with its position among all the rules; and each literal one's tool name,
+  // with the first allow that names it.
+  const wildcardAllows: Array<{
+    readonly pattern: string;
+    readonly toolGlob: string;
+    readonly at: number;
+  }> = [];
+  const literalAllows = new Map<string, { readonly pattern: string; readonly at: number }>();
+  for (const [at, rule] of rules.entries()) {
+    // Each rule's text is compiled and read once, charged by its length.
+    budget.inclusion.steps -= ORDER_TEXT_STEPS * rule.pattern.length + 1;
+    if (budget.inclusion.steps <= 0) return { hits, stoppedAt: rule };
     let compiled: ReturnType<typeof compilePattern>;
     try {
       compiled = compilePattern(rule.pattern);
@@ -934,22 +1493,35 @@ function shadowsIn(
     }
     if (rule.type === "alwaysAllow") {
       if (compiled.argGlob === null) {
-        bareAllows.push({ pattern: rule.pattern, toolGlob: compiled.toolGlob });
+        if (!compiled._toolRe.isLiteral) {
+          wildcardAllows.push({ pattern: rule.pattern, toolGlob: compiled.toolGlob, at });
+        } else {
+          const name = literalPrefix(compiled.toolGlob);
+          if (!literalAllows.has(name)) literalAllows.set(name, { pattern: rule.pattern, at });
+        }
       }
       continue;
     }
     if (rule.type !== "alwaysDeny" && rule.type !== "alwaysAsk") continue;
-    for (const allow of bareAllows) {
+    const named = compiled._toolRe.isLiteral
+      ? literalAllows.get(literalPrefix(compiled.toolGlob))
+      : undefined;
+    let covering = named?.pattern;
+    for (const allow of wildcardAllows) {
+      // An allow below the first literal one that names this tool is never
+      // the first that covers it.
+      if (named !== undefined && allow.at > named.at) break;
       if (budget.pairs <= 0) return { hits, stoppedAt: rule };
       budget.pairs -= 1;
       const covered = globIncludedIn(compiled.toolGlob, allow.toolGlob, budget.inclusion);
       // A spent budget's `false` proves nothing: the rule is unchecked.
       if (budget.inclusion.steps <= 0) return { hits, stoppedAt: rule };
       if (covered) {
-        hits.push({ rule, allow: allow.pattern });
+        covering = allow.pattern;
         break;
       }
     }
+    if (covering !== undefined) hits.push({ rule, allow: covering });
   }
   return { hits };
 }

@@ -671,6 +671,36 @@ describe("permission audit", () => {
     expect(result.tools[0]?.decision).toBe("ask");
   });
 
+  test("a rule the bounded rule checks stopped at still decides the tools it matches", () => {
+    // 200 granted tools whose names end in `y`, and a deny whose matches
+    // against them spend the checks' bound: it is not checked, not dead.
+    const letters = (i: number): string => {
+      let out = "";
+      let n = i;
+      do {
+        out = String.fromCharCode(0x61 + (n % 25)) + out;
+        n = Math.floor(n / 25);
+      } while (n > 0);
+      return out;
+    };
+    const tools = Array.from({ length: 200 }, (_, i) => `tool${letters(i)}x`.padEnd(30, "y"));
+    const pattern = `${"**".repeat(4000)}y`;
+    const result = auditPermissions({
+      tools,
+      mode: "default",
+      askMode: "pause",
+      rules: [{ type: "alwaysDeny", pattern }],
+    });
+    expect(result.ruleProblems.map((p) => [p.code, p.pattern])).toEqual([
+      ["rule-not-checked", pattern],
+    ]);
+    expect(result.unusedRules).toEqual([]);
+    expect(result.tools.length).toBe(200);
+    expect(result.tools.every((t) => t.decision === "deny" && t.rule?.pattern === pattern)).toBe(
+      true,
+    );
+  }, 20_000); // 200 matches of an 8,000-state glob, twice: slow on CI runners
+
   test("a rule that matches nothing granted is reported as unused", () => {
     const result = auditPermissions({
       tools: ["read"],

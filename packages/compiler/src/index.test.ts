@@ -1653,8 +1653,8 @@ describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () 
   });
 
   test("the rule-order check compares a bounded number of rule pairs and names the list where it stopped", () => {
-    // 500 allow/deny pairs that shadow nothing: past the bound, one note.
-    const yaml = `${MINIMAL_SPEC}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+    // 600 allow/deny pairs that shadow nothing: past the bound, one note.
+    const yaml = `${MINIMAL_SPEC}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch* }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(600)}`;
     const warnings = compile(yaml, { applyIrPasses: true }).warnings;
     expect(warnings.map((w) => [w.code, w.path])).toEqual([
       ["permission-rule-note", "permissions.rules"],
@@ -1663,7 +1663,7 @@ describe("compile({ applyIrPasses: true }) — Section 28 ir-passes opt-in", () 
       true,
     );
     expect(compile(yaml).warnings).toEqual([]);
-  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+  }, 20_000); // 1,200 rules: CI runners are slower on allocation-heavy work
 });
 
 describe("lower — CLI banner + TUI block (Phase 3 §3.3 / Phase 2 M2.2)", () => {

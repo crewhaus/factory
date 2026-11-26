@@ -964,6 +964,13 @@ these on: they reach every harness that uses what each one names.
   `internal_error`. Sending the same request again starts a new run that
   spends again, so a client that retries a 429 should check `retryable` first.
 
+- **The permission rule checks do a bounded amount of work.** `crewhaus lint`,
+  `crewhaus compile` and the compiler worker's `POST /compile` check each
+  rule's tool name and argument with a bounded amount of matching work, shared
+  by every rule list of a spec. A spec that needs more gets one
+  `permission-rule-note` naming the rule where the checks stopped; that rule
+  and the rules after it are not checked.
+
 - **A graph run paused for a decision says so, and is resumed once.** A pause
   records in the run's `_meta.json` (`pendingHitl`) which checkpoint waits, and
   a resume clears it. A pause can be resumed once, and only where the run waits:

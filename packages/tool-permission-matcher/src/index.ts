@@ -465,8 +465,9 @@ const OTHER = 0x61;
  * one character class at a time, and a set of `inner`'s states that accepts
  * beside a set of `outer`'s that does not is a path `outer` misses. `false`
  * when working that out would take more than a bounded amount of work: an
- * allow that cannot be shown to cover every path grants nothing. With a
- * `budget` ({@link InclusionBudget}), the work is charged to it as that type
+ * allow that cannot be shown to cover every path grants nothing. With
+ * `prepared` (the two globs as {@link globIncludedIn} built them under a
+ * budget), the work is charged to that {@link InclusionBudget} as the type
  * counts it, and the answer is `false` once it is spent.
  */
 function automatonIncludedIn(
@@ -474,24 +475,35 @@ function automatonIncludedIn(
   outer: Automaton,
   visible: boolean,
   startsSegment = true,
-  budget?: InclusionBudget,
+  prepared?: PreparedPair,
 ): boolean {
+  const budget = prepared?.budget;
   const alphabet = new Set<number>([SLASH, DOT]);
-  for (const auto of [inner, outer]) {
-    for (const st of auto.states) if (st.t === "lit") alphabet.add(st.c);
+  if (prepared === undefined) {
+    for (const auto of [inner, outer]) {
+      for (const st of auto.states) if (st.t === "lit") alphabet.add(st.c);
+    }
+  } else {
+    // Each glob's letters were read once, when it was built. Joining them,
+    // with the two added above and the one added below, is charged here.
+    prepared.budget.steps -= prepared.inner.alphabet.length + prepared.outer.alphabet.length + 3;
+    if (prepared.budget.steps <= 0) return false;
+    for (const c of prepared.inner.alphabet) alphabet.add(c);
+    for (const c of prepared.outer.alphabet) alphabet.add(c);
   }
   let other = OTHER;
   while (alphabet.has(other)) other++;
   alphabet.add(other);
   // With a budget, closures are worked out by `closureWithin`, which visits
-  // only the states it reaches and charges each one to the budget.
+  // only the states it reaches and charges each one to the budget, in each
+  // glob's own working array.
   const counted =
-    budget === undefined
+    prepared === undefined
       ? undefined
       : {
-          budget,
-          inner: new Uint8Array(inner.states.length),
-          outer: new Uint8Array(outer.states.length),
+          budget: prepared.budget,
+          inner: prepared.inner.scratch,
+          outer: prepared.outer.scratch,
         };
   const first: readonly [number[], number[], boolean] =
     counted === undefined
@@ -545,14 +557,101 @@ function automatonIncludedIn(
 /**
  * Work a caller lets {@link globIncludedIn} do, shared across calls: each
  * call spends `steps` and leaves what is left. One step is one automaton
- * state touched once. Building a glob's automaton spends one step per state
- * (which also pays for reading its alphabet and for its working arrays).
- * Each character read from a pair of state sets spends one step plus one
- * per state in either set, and each closure worked out after it spends one
- * step per state it visits. Every other part of a call is bounded by what
- * these charges count, so the call's work grows with the steps it spends.
+ * state touched once. A glob's automaton is built once per budget object,
+ * and its build spends one step per state, once (which also pays for reading
+ * its alphabet and for its working array); a later call with the same budget
+ * and the same glob reuses it. When `inner` has no wildcard, a call reads
+ * its one string through `outer`'s automaton, and each closure worked out
+ * after a character spends one step per state it visits (which also pays for
+ * reading the next character from the states it found). Otherwise a call
+ * spends one step per letter of its two globs' alphabets, plus three, to
+ * join them; each character read from a pair of state sets spends one step
+ * plus one per state in either set, and each closure worked out after it
+ * spends one step per state it visits. Every other part of a call is bounded
+ * by what these charges count, so the work of the calls made with one budget
+ * grows with the steps they spend.
  */
 export type InclusionBudget = { steps: number };
+
+/** A glob's automaton, built under a budget, with what each call reuses. */
+type PreparedGlob = {
+  readonly automaton: Automaton;
+  /** The one string it matches, when it has no wildcard. */
+  readonly literal: string | undefined;
+  /** The characters its literals read, each once. */
+  readonly alphabet: ReadonlyArray<number>;
+  /**
+   * Zeroed, as long as its states: {@link closureWithin}'s working array,
+   * which it leaves zeroed again, so calls take turns with it.
+   */
+  readonly scratch: Uint8Array;
+};
+
+/** Two prepared globs and the budget a call charges, for {@link automatonIncludedIn}. */
+type PreparedPair = {
+  readonly budget: InclusionBudget;
+  readonly inner: PreparedGlob;
+  readonly outer: PreparedGlob;
+};
+
+/**
+ * The globs built under each budget, by their text. Every entry was paid for
+ * by its budget, so a cache holds no more than its budget was charged, and
+ * it goes when the budget does.
+ */
+const preparedGlobs = new WeakMap<InclusionBudget, Map<string, PreparedGlob>>();
+
+/**
+ * `glob`'s automaton under `budget`: built and charged one step per state the
+ * first time, reused after. Undefined when the build spends the budget.
+ */
+function preparedWithin(glob: string, budget: InclusionBudget): PreparedGlob | undefined {
+  let built = preparedGlobs.get(budget);
+  if (built === undefined) {
+    built = new Map();
+    preparedGlobs.set(budget, built);
+  }
+  const known = built.get(glob);
+  if (known !== undefined) return known;
+  const tokens = tokenizeGlob(glob);
+  const automaton = buildAutomaton(tokens);
+  budget.steps -= automaton.states.length;
+  if (budget.steps <= 0) return undefined;
+  const letters = new Set<number>();
+  for (const st of automaton.states) if (st.t === "lit") letters.add(st.c);
+  let literal: string | undefined = "";
+  for (const t of tokens) {
+    if (t.k !== "lit") {
+      literal = undefined;
+      break;
+    }
+    literal += String.fromCharCode(t.c);
+  }
+  const prepared: PreparedGlob = {
+    automaton,
+    literal,
+    alphabet: [...letters],
+    scratch: new Uint8Array(automaton.states.length),
+  };
+  built.set(glob, prepared);
+  return prepared;
+}
+
+/**
+ * Does `glob`'s automaton accept `text`? Each closure worked out spends one
+ * step per state it visits ({@link closureWithin}). That also pays for
+ * reading the next character from the states it found, and reading stops at
+ * the first character no state reads. `false` once `budget` is spent.
+ */
+function acceptsWithin(glob: PreparedGlob, text: string, budget: InclusionBudget): boolean {
+  const { automaton, scratch } = glob;
+  let set = closureWithin(automaton, [automaton.start], scratch, budget);
+  for (let i = 0; i < text.length; i++) {
+    if (budget.steps <= 0 || set.length === 0) return false;
+    set = stepWithin(automaton, set, text.charCodeAt(i), scratch, budget);
+  }
+  return budget.steps > 0 && set.includes(0);
+}
 
 /**
  * Does `outer` match every string `inner` matches? Both are globs in this
@@ -562,6 +661,8 @@ export type InclusionBudget = { steps: number };
  * With a `budget`, the call also stops once the budget is spent, and builds
  * nothing when it starts spent. A `false` that leaves `budget.steps <= 0`
  * proves nothing either way, so a caller reads the budget after the call.
+ * Calls made with one budget build each distinct glob once between them
+ * (see {@link InclusionBudget}).
  */
 export function globIncludedIn(inner: string, outer: string, budget?: InclusionBudget): boolean {
   if (budget === undefined) {
@@ -572,13 +673,18 @@ export function globIncludedIn(inner: string, outer: string, budget?: InclusionB
     );
   }
   if (budget.steps <= 0) return false;
-  const innerAutomaton = buildAutomaton(tokenizeGlob(inner));
-  budget.steps -= innerAutomaton.states.length;
-  if (budget.steps <= 0) return false;
-  const outerAutomaton = buildAutomaton(tokenizeGlob(outer));
-  budget.steps -= outerAutomaton.states.length;
-  if (budget.steps <= 0) return false;
-  return automatonIncludedIn(innerAutomaton, outerAutomaton, false, true, budget);
+  const innerGlob = preparedWithin(inner, budget);
+  if (innerGlob === undefined) return false;
+  const outerGlob = preparedWithin(outer, budget);
+  if (outerGlob === undefined) return false;
+  // A glob with no wildcard matches one string: `outer` matches all of it
+  // exactly when it matches that string.
+  if (innerGlob.literal !== undefined) return acceptsWithin(outerGlob, innerGlob.literal, budget);
+  return automatonIncludedIn(innerGlob.automaton, outerGlob.automaton, false, true, {
+    budget,
+    inner: innerGlob,
+    outer: outerGlob,
+  });
 }
 
 /**
@@ -942,11 +1048,18 @@ export function legacyMcpToolName(name: string): string | undefined {
  * its pre-0.7.1 spelling, so a rule written `github__*` still governs
  * `mcp__github__create_issue`. The alias runs one way only: `mcp__x__y` never
  * matches a tool that is not an MCP tool.
+ *
+ * `work`, when passed, has the automaton states each match visits added to
+ * `work.steps`, as {@link GlobMatcher}'s `test` counts them.
  */
-export function matchesToolName(compiled: CompiledPattern, toolName: string): boolean {
-  if (compiled._toolRe.test(toolName)) return true;
+export function matchesToolName(
+  compiled: CompiledPattern,
+  toolName: string,
+  work?: { steps: number },
+): boolean {
+  if (compiled._toolRe.test(toolName, work)) return true;
   const legacy = legacyMcpToolName(toolName);
-  return legacy !== undefined && compiled._toolRe.test(legacy);
+  return legacy !== undefined && compiled._toolRe.test(legacy, work);
 }
 
 // ---------------------------------------------------------------------------
@@ -2082,6 +2195,7 @@ export {
   type PermissionRuleProblemCode,
   type PermissionRuleProblemsInput,
   RULE_ORDER_LIMITS,
+  RULE_PROBLEM_LIMITS,
   type RuleToolDescriptor,
   type ShadowedRuleOptions,
   type ShadowedRuleProblem,

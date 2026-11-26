@@ -302,6 +302,42 @@ permissions:
     expect(await compileAs(keyRule, "local")).toEqual([]);
   });
 
+  test("POST /compile emitAs:cf-worker checks permission rules with a bounded amount of work, and says where it stopped", async () => {
+    // A deny that reaches no tool and no server: its matches against the
+    // known tools that hold an `a` and an `e` reach the checks' bound.
+    const pattern = `${"**".repeat(4000)}ae`;
+    const yaml = `
+name: edge
+target: cli
+agent:
+  model: claude-haiku-4-5-20251001
+  instructions: You are a helpful assistant.
+tools: [webFetch]
+permissions:
+  rules:
+    - { type: alwaysDeny, pattern: "${pattern}" }
+`;
+    const res = await worker.fetch(
+      request("/compile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ yaml, emitAs: "cf-worker" }),
+      }),
+      env,
+    );
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      bundle: { warnings?: Array<{ code: string; path: string; message: string }> };
+    };
+    const rules = (body.bundle.warnings ?? []).filter((w) => w.code.startsWith("permission-rule"));
+    expect(rules.map((w) => [w.code, w.path])).toEqual([
+      ["permission-rule-note", "permissions.rules"],
+    ]);
+    expect(rules[0]?.message).toBe(
+      `rule "alwaysDeny ${pattern}": the permission rule checks do a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for a tool name or argument that can never match.`,
+    );
+  }, 20_000); // the whole bound's matching: slow on CI runners
+
   test("POST /compile emitAs:cf-worker returns its warnings in the CLI edge path's order, the permission-rule findings last", async () => {
     const yaml = `
 name: edge

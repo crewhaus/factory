@@ -4,9 +4,10 @@
  * tools describe a listed tool, and that the module stays loadable inside a
  * Cloudflare Worker.
  */
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import * as matcher from "@crewhaus/tool-permission-matcher";
 import { THREDZ_TOOL_NAMES } from "@crewhaus/tool-registry-manifest/flags";
 import { type IrNode, lower, parseSpec } from "./index";
 import {
@@ -65,6 +66,7 @@ describe("permissionRuleFindings — what each finding says, and where", () => {
     expect([...PERMISSION_RULE_NOTES].sort()).toEqual([
       "builtin-not-reached",
       "order-not-checked",
+      "rule-not-checked",
       "shadowed-outside-plan",
       "tool-not-known",
     ]);
@@ -177,8 +179,8 @@ tools: [fetch]
 });
 
 describe("the rule-order check does a bounded amount of work", () => {
-  /** A cli spec whose `permissions.rules` holds 500 allow/deny pairs that shadow nothing. */
-  const longList = `${CLI}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(500)}`;
+  /** A cli spec whose `permissions.rules` holds 600 allow/deny pairs that shadow nothing. */
+  const longList = `${CLI}tools: [webFetch, read]\npermissions:\n  rules:\n${"    - { type: alwaysAllow, pattern: WebFetch* }\n    - { type: alwaysDeny, pattern: Read }\n".repeat(600)}`;
 
   test("a spec over the bound gets one note at the rule and list where the check stopped", () => {
     const found = findings(longList);
@@ -190,11 +192,216 @@ describe("the rule-order check does a bounded amount of work", () => {
     expect(permissionRuleProblemsOf(spec, lower(spec)).map((p) => [p.code, p.path])).toEqual([
       ["order-not-checked", "permissions.rules[alwaysDeny Read]"],
     ]);
-  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+  }, 20_000); // 1,200 rules: CI runners are slower on allocation-heavy work
 
   test("a worker's build does not check the order of permissions.rules", () => {
     expect(findings(longList, undefined, { edge: true })).toEqual([]);
-  }, 20_000); // 1,000 rules: CI runners are slower on allocation-heavy work
+  }, 20_000); // 1,200 rules: CI runners are slower on allocation-heavy work
+});
+
+describe("the per-rule checks do a bounded amount of work", () => {
+  /** A deny that reaches no tool and no server, whose matches against the known names holding an `a` and an `e` spend the bound. */
+  const LONG = `${"**".repeat(4000)}ae`;
+  /** A cli spec with these sub-agents (`name: deny pattern`). */
+  const withSubAgents = (denies: ReadonlyArray<readonly [string, string]>): string =>
+    `${CLI.replace(
+      "  instructions: hi\n",
+      `  instructions: hi\n  sub_agents:\n${denies
+        .map(
+          ([name, pattern]) =>
+            `    ${name}:\n      description: d\n      instructions: x\n      permissions:\n        allow: []\n        deny: ['${pattern}']\n`,
+        )
+        .join("")}`,
+    )}tools: [read]\n`;
+
+  test("one bound for a spec's lists: once a list spends it, one note, and no finding from a later list", () => {
+    const later = withSubAgents([["b", "webFetch"]]);
+    expect(said(findings(later))).toEqual([
+      ["permission-rule", "agent.sub_agents.b.permissions.deny", "webFetch"],
+    ]);
+    const found = findings(
+      withSubAgents([
+        ["a", LONG],
+        ["b", "webFetch"],
+      ]),
+    );
+    expect(said(found)).toEqual([
+      ["permission-rule-note", "agent.sub_agents.a.permissions.deny", `alwaysDeny ${LONG}`],
+    ]);
+    expect(found[0]?.message).toBe(
+      `rule "alwaysDeny ${LONG}": the permission rule checks do a bounded amount of work and stopped here, so this rule, the rules after it and any later list were not checked for a tool name or argument that can never match.`,
+    );
+  }, 20_000); // the whole bound's matching: slow on CI runners
+
+  test("ordinary specs get the findings of checks with no bound", () => {
+    const servers = [
+      "github",
+      "gitlab",
+      "slack",
+      "linear",
+      "notion",
+      "jira",
+      "asana",
+      "figma",
+      "stripe",
+      "sentry",
+    ];
+    const others = servers.filter((s) => s !== "linear");
+    const mcpServers = `mcp_servers:\n${servers
+      .map((s) => `  ${s}:\n    transport: sse\n    url: https://${s}.example.com/sse\n`)
+      .join("")}`;
+    const rules = (list: ReadonlyArray<readonly [string, string]>): string =>
+      `permissions:\n  rules:\n${list
+        .map(([type, pattern]) => `    - { type: ${type}, pattern: "${pattern}" }\n`)
+        .join("")}`;
+    // 92 rules: one server's wildcard allow, 45 tools of other servers
+    // allowed by name, 45 asked for by name, then a deny the first beats.
+    const mcpNamed = `${CLI}tools: [read]\n${mcpServers}${rules([
+      ["alwaysAllow", "mcp__linear__*"],
+      ...Array.from(
+        { length: 45 },
+        (_, i) => ["alwaysAllow", `mcp__${others[i % others.length]}__read_${i}`] as const,
+      ),
+      ...Array.from(
+        { length: 45 },
+        (_, i) => ["alwaysAsk", `mcp__${others[i % others.length]}__write_${i}`] as const,
+      ),
+      ["alwaysDeny", "mcp__linear__delete_project"],
+    ])}`;
+    // 300 rules of builtins and MCP tools, with typos among them.
+    const ordinaryRules: Array<readonly [string, string]> = [];
+    const typos = ["Reed", "webFetch", "REMOVEPATH", "Bassh", "mcp__nope__x", "read_file"];
+    for (let i = 0; i < 300; i++) {
+      const kind = i % 10;
+      ordinaryRules.push(
+        kind === 0
+          ? ["alwaysDeny", typos[(i / 10) % typos.length] as string]
+          : kind < 4
+            ? ["alwaysAllow", `mcp__${servers[i % servers.length]}__tool_${i}`]
+            : kind < 6
+              ? ["alwaysAsk", `Bash(git push ${i}*)`]
+              : kind < 8
+                ? ["alwaysDeny", `Read(secrets/${i}/**)`]
+                : ["alwaysAllow", `WebFetch(https://api${i}.example.com/**)`],
+      );
+    }
+    const ordinary = `${CLI}tools: [read, write, bash, webFetch, removePath]\n${mcpServers}${rules(
+      ordinaryRules,
+    )}`;
+    /** A cli spec with these sub-agents (`name`, their denies), and the tool `read`. */
+    const subAgents = (agents: ReadonlyArray<readonly [string, ReadonlyArray<string>]>): string =>
+      `${CLI.replace(
+        "  instructions: hi\n",
+        `  instructions: hi\n  sub_agents:\n${agents
+          .map(
+            ([name, denies]) =>
+              `    ${name}:\n      description: d\n      instructions: x\n      permissions:\n        allow: []\n        deny: [${denies.map((d) => `'${d}'`).join(", ")}]\n`,
+          )
+          .join("")}`,
+      )}tools: [read]\n`;
+    const words = [
+      "*production*",
+      "*billing*",
+      "*payroll*",
+      "*customer*",
+      "*secret*",
+      "*credential*",
+      "*invoice*",
+      "*refund*",
+      "*_admin",
+      "*_delete",
+      "*_drop",
+      "*_wipe",
+    ];
+    // 25 sub-agents that each deny the same 12 words, then one more whose
+    // deny is a spec key: 301 rules.
+    const sharedWords = subAgents([
+      ...Array.from({ length: 25 }, (_, i) => [`s${i}`, words] as const),
+      ["last", ["webFetch"]],
+    ]);
+    const actions = [
+      "*delete_database*",
+      "*drop_production_table*",
+      "*deploy_to_production*",
+      "*send_customer_email*",
+      "*rotate_credentials*",
+      "*force_push_branch*",
+    ];
+    const verbs = [
+      "delete",
+      "drop",
+      "deploy",
+      "send",
+      "rotate",
+      "push",
+      "wipe",
+      "purge",
+      "reset",
+      "revoke",
+      "transfer",
+      "publish",
+      "merge",
+      "close",
+      "archive",
+    ];
+    const nouns = [
+      "database",
+      "table",
+      "bucket",
+      "branch",
+      "invoice",
+      "account",
+      "cluster",
+      "secret",
+      "release",
+      "channel",
+    ];
+    // 20 sub-agents that each deny the same six actions, one with 150
+    // distinct ones, then one whose deny is a spec key: 271 rules.
+    const sharedActions = subAgents([
+      ...Array.from({ length: 20 }, (_, i) => [`a${i}`, actions] as const),
+      ["many", verbs.flatMap((v) => nouns.map((n) => `*${v}_${n}*`))],
+      ["last", ["webFetch"]],
+    ]);
+    const specs = [
+      `${CLI}tools: [webFetch]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: WebFetch }\n    - { type: alwaysDeny, pattern: "WebFetch(https://evil.example.net/**)" }\n    - { type: alwaysDeny, pattern: webFetch }\n`,
+      `${CLI}tools: [clipboardWrite]\npermissions:\n  rules:\n    - { type: alwaysDeny, pattern: "ClipboardWrite(*secret*)" }\n`,
+      `${CLI}tools: [read]\npermissions:\n  rules:\n    - { type: alwaysAllow, pattern: "NoSuchTool(**)" }\n`,
+      withSubAgents([["b", "webFetch"]]),
+      mcpNamed,
+      ordinary,
+      sharedWords,
+      sharedActions,
+    ];
+    const bounded = specs.map((yaml) => findings(yaml));
+    const real = matcher.permissionRuleProblems;
+    const unboundedCalls = spyOn(matcher, "permissionRuleProblems").mockImplementation((input) =>
+      real({ ...input, budget: { steps: Number.POSITIVE_INFINITY } }),
+    );
+    let unbounded: ReturnType<typeof findings>[];
+    try {
+      unbounded = specs.map((yaml) => findings(yaml));
+      expect(unboundedCalls.mock.calls.length).toBeGreaterThanOrEqual(specs.length);
+    } finally {
+      unboundedCalls.mockRestore();
+    }
+    expect(bounded).toEqual(unbounded);
+    const all = bounded.flat();
+    expect(all.some((w) => w.message.includes("bounded amount of work"))).toBe(false);
+    expect(said(bounded[4] ?? [])).toEqual([
+      ["permission-rule", "permissions.rules", "alwaysDeny mcp__linear__delete_project"],
+    ]);
+    // The typos and the shadowed deny are found, and so is the spec key
+    // after the shared wildcard denies.
+    expect(all.length).toBeGreaterThanOrEqual(32);
+    for (const at of [6, 7]) {
+      expect(said(bounded[at] ?? [])).toContainEqual([
+        "permission-rule",
+        "agent.sub_agents.last.permissions.deny",
+        "webFetch",
+      ]);
+    }
+  });
 });
 
 describe("the names a rule can reach", () => {
