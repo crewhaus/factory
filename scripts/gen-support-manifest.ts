@@ -24,7 +24,9 @@
  * and graph shapes are also built the way `crewhaus compile --emit-as
  * cf-worker` builds them, as `<shape>@cf-worker`: that build refuses every
  * safety setting the worker does not enforce, so such a cell reads `rejected`
- * with the refusal. A shape whose schema
+ * with the refusal. A probe that compares one value against another carries
+ * an `edge` pair the Worker admits, so its Worker cell says what that build
+ * does with the setting (`placementFor`). A shape whose schema
  * requires the probe's key (its own structure) gets a `wired` cell `via:
  * ["structure"]`, without a compile.
  *
@@ -541,15 +543,22 @@ function corpusObject(shape: Spec["target"]): SpecFragment {
   return Bun.YAML.parse(ABSENT_CORPUS[shape]) as SpecFragment;
 }
 
-/** Where the probe sits on a shape, and what each compile carries. */
-function placementFor(probe: FeatureProbe, shape: string): ProbePlacement {
-  return (
-    probe.place?.(shape) ?? {
-      path: probe.feature,
-      snippet: probe.snippet,
-      ...(probe.base !== undefined ? { base: probe.base } : {}),
-    }
-  );
+/**
+ * Where the probe sits on a shape, and what each compile carries, for one
+ * variant: a `<shape>@cf-worker` build uses the probe's `edge` snippet and
+ * base in place of the default placement, when the probe has one.
+ */
+export function placementFor(
+  probe: FeatureProbe,
+  shape: string,
+  variant: string = shape,
+): ProbePlacement {
+  const placed = probe.place?.(shape);
+  if (placed !== undefined) return placed;
+  const edge = variant.endsWith("@cf-worker") ? probe.edge : undefined;
+  const snippet = edge?.snippet ?? probe.snippet;
+  const base = edge !== undefined ? edge.base : probe.base;
+  return { path: probe.feature, snippet, ...(base !== undefined ? { base } : {}) };
 }
 
 export type GenerateOptions = {
@@ -607,12 +616,13 @@ export function shapeCells(
       }
       continue;
     }
-    const placement = placementFor(probe, shape);
-    const baseSpec = (
-      placement.base !== undefined ? mergeFragment(corpus, placement.base) : corpus
-    ) as SpecFragment;
-    const probeSpec = mergeFragment(baseSpec, placement.snippet) as SpecFragment;
     for (const variant of variantsOf(shape)) {
+      // Each variant compiles its own pair: a Worker build may probe another value.
+      const placement = placementFor(probe, shape, variant);
+      const baseSpec = (
+        placement.base !== undefined ? mergeFragment(corpus, placement.base) : corpus
+      ) as SpecFragment;
+      const probeSpec = mergeFragment(baseSpec, placement.snippet) as SpecFragment;
       let derived: DerivedCell;
       try {
         derived = deriveCell(

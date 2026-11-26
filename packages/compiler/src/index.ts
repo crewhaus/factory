@@ -179,7 +179,12 @@ import {
 import { partitionEdgeTools } from "@crewhaus/worker-runtime/tool-policy";
 import { lowerBudgetPeriod } from "./lower/budget-period";
 import { lowerDelegation } from "./lower/delegation";
-import { lowerDeclaredPricing, lowerModelPrice, priceOverridesTable } from "./lower/model-price";
+import {
+  assertDeclaredPricesNameOneModel,
+  lowerDeclaredPricing,
+  lowerModelPrice,
+  priceOverridesTable,
+} from "./lower/model-price";
 import { lowerPlugins } from "./lower/plugins";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { PERMISSION_RULE_NOTES } from "./permission-rules";
@@ -6479,6 +6484,7 @@ export function lowerWithWarnings(
   const ctx = createLowerContext(expanded, opts);
   const ir = lowerWithContext(expanded, ctx);
   noteSelfJudge(expanded, ir, ctx);
+  assertDeclaredPricesNameOneModel(ir);
   return { ir, warnings: ctx.warnings };
 }
 

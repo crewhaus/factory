@@ -12,6 +12,12 @@
  *   - `place(shape)` puts the setting where a shape's structure nests it (a
  *     model pool under `agent`, a workflow step, a graph node or a crew role),
  *     or answers `undefined` for the default placement at the feature's path;
+ *   - `edge` replaces the default placement's `snippet` and `base` on a
+ *     `<shape>@cf-worker` build, for a setting probed by value whose value the
+ *     Worker refuses (`limits.loop_detection.escalation: justify` there is
+ *     probed as `abort` against `warn`, so the cell says what the Worker does
+ *     with the values it admits); the refusal itself is pinned by the edge's
+ *     own safety tests;
  *   - `kind: "authoring"` records a decision and must change no compiled byte;
  *     `kind: "toolchain"` is read by a CLI verb from `crewhaus.yaml` rather
  *     than by the bundle, and names that verb's file in `readBy` (a test
@@ -53,6 +59,8 @@ export type FeatureProbe = {
   readonly snippet: SpecFragment;
   readonly base?: SpecFragment;
   readonly place?: (shape: string) => ProbePlacement | undefined;
+  /** On a `<shape>@cf-worker` build: the snippet and base the default placement uses instead. */
+  readonly edge?: { readonly snippet: SpecFragment; readonly base?: SpecFragment };
   /** For `kind: "toolchain"`: the repo file whose code reads the key. */
   readonly readBy?: string;
   /** For `kind: "toolchain"`: the shapes that file reads it for (all, when absent). */
@@ -359,10 +367,18 @@ export const FEATURE_PROBES: ReadonlyArray<FeatureProbe> = [
   setting("limits.loop_detection.window", { limits: { loop_detection: { window: 6 } } }),
   setting("limits.loop_detection.threshold", { limits: { loop_detection: { threshold: 4 } } }),
   // By value: `justify` against `warn`, so a build that reads it as `warn` fails here.
+  // A Worker build refuses `justify` (it runs no intent gate), so there the
+  // probe compares `abort`, a value it admits, against `warn`.
   setting(
     "limits.loop_detection.escalation",
     { limits: { loop_detection: { escalation: "justify" } } },
-    { base: { limits: { loop_detection: { escalation: "warn" } } } },
+    {
+      base: { limits: { loop_detection: { escalation: "warn" } } },
+      edge: {
+        snippet: { limits: { loop_detection: { escalation: "abort" } } },
+        base: { limits: { loop_detection: { escalation: "warn" } } },
+      },
+    },
   ),
   setting("limits.crew.max_activations", { limits: { crew: { max_activations: 5 } } }),
   setting("limits.crew.refusal_depth", { limits: { crew: { refusal_depth: 1 } } }),
@@ -478,10 +494,12 @@ export const FEATURE_PROBES: ReadonlyArray<FeatureProbe> = [
     toolchainShapes: ["cli"],
   },
   setting("plugins", { plugins: ["example-plugin"] }),
-  // The object form: a plugin and the host tools it may drive.
+  // The object form: a plugin and the host tools it may drive. The grant names
+  // a tool that is not outward by name, so a build's scope check has nothing
+  // to refuse and the cell says what the shape does with the grant.
   setting(
     "plugins.tools",
-    { plugins: [{ name: "example-plugin", tools: ["Fetch"] }] },
+    { plugins: [{ name: "example-plugin", tools: ["Read"] }] },
     { at: ["plugins.*.tools"] },
   ),
   setting("provability", { provability: { level: "cited" } }),

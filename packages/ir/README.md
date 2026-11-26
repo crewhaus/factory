@@ -30,8 +30,10 @@ languages. The package's main entry does not load it.
 A cell, per setting and shape (and per `<shape>@cf-worker` build), is one of:
 
 - `wired`: the setting changes what the harness does, in its compiled bundle,
-  in `crewhaus run`, or through a CLI verb that reads it (`via` says which;
-  `structure` for a key the shape itself requires);
+  in `crewhaus run`, or through a CLI verb that reads it (`via` says which:
+  `bundle`, `interpreter` or `toolchain`; `structure` for a key the shape
+  itself requires; `construction` for a safety setting a Cloudflare Worker
+  meets by how it runs, so the build is the same with or without it);
 - `degraded`: it takes effect, with a note the compiler prints;
 - `unwired`: the shape accepts it and does not use it, and the compiler says so;
 - `rejected`: the shape does not accept it;
