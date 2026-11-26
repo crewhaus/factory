@@ -33,6 +33,7 @@
 import { randomBytes } from "node:crypto";
 import type { ProviderAdapter, ProviderId } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
+import type { SpendMeter } from "@crewhaus/cost-tracker/spend";
 import { judgePairwise, judgeSelect } from "@crewhaus/eval-judge";
 import type { IrModelPoolStrategy } from "@crewhaus/ir";
 import { type RunContext, createRunContext, lineageOf, mintRunId } from "@crewhaus/run-context";
@@ -126,6 +127,14 @@ export type NestedSingleTurnArgs = {
    */
   readonly parentSpanId?: string;
   readonly signal?: AbortSignal;
+  /**
+   * The spend meter the side call reserves on, fixed when it was scheduled
+   * (a guide, shadow or committee call passes its context's `spend`). Absent:
+   * the parent's meter as of now (`spendMeterOf(parent)`), which names the
+   * parent's call in progress, right for a call made from inside a tool
+   * (consult).
+   */
+  readonly spend?: SpendMeter;
   readonly maxTokens?: number;
   readonly sessionTarget: string;
   readonly deps: SideCallDeps;
@@ -184,6 +193,11 @@ export async function runNestedSingleTurn(
     ...(args.stage !== undefined ? { stage: args.stage } : {}),
   };
   const usage = { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 };
+  // A budgeted parent's spend meter: the side call reserves its own worst case on it,
+  // naming the parent's call in progress (if any) so it never waits on it, and
+  // prices its cost with the run's table.
+  const spendMeter = args.spend ?? spendMeterOf(parent);
+  const pricing = spendMeter?.pricing ?? DEFAULT_PRICING;
   // A child call's request and response share one span id on the child bus;
   // they share one on the parent bus too, so the pair still matches there.
   const parentSpans = new Map<string, string>();
@@ -200,7 +214,7 @@ export async function runNestedSingleTurn(
       usage.cacheCreate += r.usage.cacheCreate ?? 0;
       durationMs += r.durationMs;
       const row =
-        r.provider !== undefined ? resolvePricing(DEFAULT_PRICING, r.provider, r.model) : undefined;
+        r.provider !== undefined ? resolvePricing(pricing, r.provider, r.model) : undefined;
       if (row !== undefined) {
         costUsdMicros =
           (costUsdMicros ?? 0) +
@@ -227,8 +241,6 @@ export async function runNestedSingleTurn(
     }
   });
   const injected = deps._consultAdapters?.get(args.target.modelString);
-  // A budgeted parent's spend meter: the side call reserves its own worst case on it.
-  const spendMeter = spendMeterOf(parent);
   const t0 = performance.now();
   try {
     const text = await runChatLoop({
@@ -265,6 +277,15 @@ export async function runNestedSingleTurn(
   } finally {
     unsubscribe();
   }
+}
+
+/**
+ * A side call's judge options from its context: the spend view fixed when the
+ * side call was scheduled, and the side call's abort signal, which ends a
+ * judge's wait for room.
+ */
+function judgeSpendOf(ctx: SideCallTurnContext): { spend?: SpendMeter; signal: AbortSignal } {
+  return { ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}), signal: ctx.signal };
 }
 
 // ---------------------------------------------------------------------------
@@ -394,6 +415,7 @@ export function buildGuideSideCall(
         parent: ctx.runContext,
         ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
+        ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
         maxTokens,
         sessionTarget: "guide",
         deps,
@@ -442,6 +464,7 @@ export function buildShadowSideCall(
         parent: ctx.runContext,
         ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
+        ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
         sessionTarget: "shadow",
         deps,
       });
@@ -457,6 +480,8 @@ export function buildShadowSideCall(
         bus: ctx.bus,
         role: "judge",
         stage: "shadow",
+        // The judge reserves on the spend view fixed when the shadow was scheduled.
+        ...judgeSpendOf(ctx),
       });
       const verdict =
         comparison.verdict === "new" ? "shadow" : comparison.verdict === "prev" ? "primary" : "tie";
@@ -582,6 +607,7 @@ export function buildCommitteeSideCall(
             parent: ctx.runContext,
             ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
             signal: ctx.signal,
+            ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
             sessionTarget: "committee",
             deps,
           });
@@ -652,6 +678,7 @@ export function buildCommitteeSideCall(
           bus: ctx.bus,
           role: "judge",
           stage: "committee",
+          ...judgeSpendOf(ctx),
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -697,6 +724,7 @@ export function buildCommitteeSideCall(
               parent: ctx.runContext,
               ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
               signal: ctx.signal,
+              ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
               sessionTarget: "committee",
               deps,
             });

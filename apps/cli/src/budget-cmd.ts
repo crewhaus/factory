@@ -15,7 +15,7 @@
  * command was started by an agent's tool. Side-effect-free on import.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { BUDGET_EXTEND_REASONS, EXIT_FOR_ERROR, type ErrorCode } from "@crewhaus/control-contract";
 import {
   type BudgetFold,
@@ -35,6 +35,7 @@ import { parseSpec } from "@crewhaus/spec";
 import { AGENT_TOOL_ENV } from "./approvals-cmd";
 import { directControl } from "./daemon-cmd";
 import { parseFamilyArgs as parseArgs } from "./family-args";
+import { runSpecDirOf } from "./surface-disclosure";
 import type { CliFamily } from "./verbs";
 
 export const CLI_FAMILY = {
@@ -120,9 +121,14 @@ export type SpecPeriod =
 
 /** The harness's spec, read and parsed, and the period it declares. */
 export function readSpecPeriod(harnessDir: string): SpecPeriod {
+  return readSpecPeriodFile(join(harnessDir, "crewhaus.yaml"));
+}
+
+/** The spec file `specFile`, read and parsed, and the period it declares. */
+export function readSpecPeriodFile(specFile: string): SpecPeriod {
   let text: string;
   try {
-    text = readFileSync(join(harnessDir, "crewhaus.yaml"), "utf8");
+    text = readFileSync(specFile, "utf8");
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ENOENT"
       ? { kind: "no-spec" }
@@ -379,16 +385,19 @@ export async function runBudgetCommand(
 
 /**
  * The harness's period ledger for the optimizer's own model calls, opened with trigger
- * `optimize` when the spec at `specPath` declares `budget.period`; `{}` otherwise.
+ * `optimize` when the spec file at `specPath` (whatever it is named) declares
+ * `budget.period`, rooted at that spec's real directory; `{}` otherwise, and for a spec
+ * that cannot be read or parsed.
  *
  * First consumers: `crewhaus optimize` and `crewhaus flywheel run`.
  */
 export function optimizeSpendLedger(specPath: string): {
   readonly spendLedger?: ReturnType<typeof openBudgetLedger>;
 } {
-  const dir = dirname(resolve(specPath));
-  const def = specPeriodOf(dir);
-  return def === undefined
-    ? {}
-    : { spendLedger: openBudgetLedger(dir, def, { trigger: "optimize" }) };
+  const absSpec = resolve(specPath);
+  const read = readSpecPeriodFile(absSpec);
+  if (read.kind !== "period") return {};
+  return {
+    spendLedger: openBudgetLedger(runSpecDirOf(absSpec), read.def, { trigger: "optimize" }),
+  };
 }

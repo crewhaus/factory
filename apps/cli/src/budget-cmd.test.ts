@@ -3,7 +3,7 @@
  * spec and its ledger, and raised by a person, through the control service, as a
  * receipted command that works with Home stopped.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ import {
   readBudgetState,
 } from "@crewhaus/control-records/budget";
 import { AREA_RUNTIMES, type ControlService, wireControl } from "@crewhaus/control-service";
-import { runBudgetCommand, specPeriodOf } from "./budget-cmd";
+import { optimizeSpendLedger, readSpecPeriod, runBudgetCommand, specPeriodOf } from "./budget-cmd";
 
 const roots: string[] = [];
 afterAll(() => {
@@ -185,5 +185,37 @@ describe("crewhaus budget", () => {
     });
     expect(agent.exitCode).toBe(EXIT_FOR_ERROR.forbidden);
     expect(foldBudget(dir, def, NOW).extensionsUsdMicros).toBe(0);
+  });
+});
+
+describe("the optimizer's period ledger", () => {
+  const FIXED = Date.UTC(2026, 5, 15, 12);
+  const SPEC = (period: string) =>
+    `name: spend\ntarget: cli\nagent: {model: claude-opus-4-7, instructions: Help.}\nbudget:\n  usd: 5\n  period: ${period}\n`;
+  afterEach(() => {
+    (Date.now as unknown as { mockRestore?: () => void }).mockRestore?.();
+  });
+
+  test("comes from the spec it is given, whatever its name, never a sibling crewhaus.yaml", () => {
+    spyOn(Date, "now").mockReturnValue(FIXED);
+    const dir = temp("opt");
+    writeFileSync(join(dir, "agent.yaml"), SPEC("{every: month, usd: 1}"));
+    writeFileSync(join(dir, "crewhaus.yaml"), SPEC("{every: week, usd: 1}"));
+    const { spendLedger } = optimizeSpendLedger(join(dir, "agent.yaml"));
+    expect(spendLedger?.periodId).toBe(
+      periodOf({ every: "month", usdMicros: 1_000_000 }, FIXED).periodId,
+    );
+    // `budget show|history|extend` still read the directory's crewhaus.yaml.
+    const read = readSpecPeriod(dir);
+    expect(read.kind === "period" && read.def.every).toBe("week");
+  });
+
+  test("a missing or unparseable spec opens nothing", () => {
+    const dir = temp("opt-bad");
+    expect(optimizeSpendLedger(join(dir, "agent.yaml"))).toEqual({});
+    writeFileSync(join(dir, "broken.yaml"), "name: [unclosed\n");
+    expect(optimizeSpendLedger(join(dir, "broken.yaml"))).toEqual({});
+    writeFileSync(join(dir, "crewhaus.yaml"), SPEC("{every: month, usd: 1}"));
+    expect(optimizeSpendLedger(join(dir, "agent.yaml"))).toEqual({});
   });
 });

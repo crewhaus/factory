@@ -1058,8 +1058,17 @@ export function createDreamStep(): DreamJanitorStep | null {
             maxToolIterations: input.maxToolIterations,
             budget: {
               usdMicros: Math.round(input.budgetUsd * 1_000_000),
-              onExceed: { kind: "stop" },
-            },
+              onExceed: { kind: "stop" },${
+                ir.budget?.period !== undefined
+                  ? `\n              period: ${JSON.stringify(ir.budget.period)},`
+                  : ""
+              }
+            },${
+              // A model priced by the spec reserves on the period at its declared price.
+              ir.budget?.period !== undefined && ir.agent.declaredPricing !== undefined
+                ? `\n            declaredPricing: ${JSON.stringify(ir.agent.declaredPricing)},`
+                : ""
+            }
             spinner: false,
           });
           return {
