@@ -43,7 +43,7 @@ import {
   resolvePricing,
   sumRoleCost,
 } from "@crewhaus/cost-tracker";
-import type { SpendMeter } from "@crewhaus/cost-tracker/spend";
+import type { SpendMeter, SpendScope } from "@crewhaus/cost-tracker/spend";
 import {
   type EgressMatcher,
   type EgressVerdict,
@@ -332,6 +332,7 @@ import {
   type StreamReport,
   attachSpendMeter,
   estimateRequestMicros,
+  failedCallSpend,
   notingUsage,
   reserveModelCall,
   settleModelCall,
@@ -1462,6 +1463,11 @@ export type EvaluationTurn = {
    * worst case on it and settles on its usage, as the run's own calls do.
    */
   readonly spend?: SpendMeter;
+  /**
+   * The turn's abort signal: a judge call waiting for room on `spend` stops
+   * waiting when it aborts (the run's stop, its deadline, the turn's timeout).
+   */
+  readonly signal?: AbortSignal;
   /** 0.6.0 §7.3 — the WIRE model id that produced `finalText` (this attempt's
    *  last main-turn response), when known. */
   readonly servedModel?: string;
@@ -1471,6 +1477,33 @@ export type EvaluationTurn = {
    *  absent outside a cascade. */
   readonly stage?: string;
 };
+
+/**
+ * Which budget refused a judge call, as an error carries it
+ * (`@crewhaus/eval-judge`'s `JudgeBudgetError.budgetRefused`, matched by
+ * shape so this package does not depend on the judge's).
+ */
+export type JudgeBudgetRefusal = {
+  readonly scope: SpendScope;
+  /** The period's cap is reached only with reservations whose holders never finished. */
+  readonly held?: true;
+  /** The cap is reached counting the call still in progress this one runs inside. */
+  readonly inFlight?: true;
+};
+
+/** The budget refusal `err` carries, when it is a judge call the spend meter refused. */
+export function judgeBudgetRefusal(err: unknown): JudgeBudgetRefusal | undefined {
+  if (err === null || typeof err !== "object") return undefined;
+  const refused = (err as { budgetRefused?: unknown }).budgetRefused;
+  if (refused === null || typeof refused !== "object") return undefined;
+  const r = refused as { scope?: unknown; held?: unknown; inFlight?: unknown };
+  if (r.scope !== "run" && r.scope !== "share" && r.scope !== "period") return undefined;
+  return {
+    scope: r.scope,
+    ...(r.held === true ? { held: true as const } : {}),
+    ...(r.inFlight === true ? { inFlight: true as const } : {}),
+  };
+}
 
 /** The injected grader's verdict for one graded attempt. */
 export type EvaluationResult = {
@@ -1837,6 +1870,13 @@ export type SideCallTurnContext = {
    * before they start.
    */
   readonly budgetGate?: () => Promise<"continue" | "stop">;
+  /**
+   * The run's spend meter, when it is budgeted, as a view fixed when this
+   * context was built: it names the loop's call in progress at that moment
+   * (if any) as an ancestor, and never a call that starts later. A side
+   * call's model calls and its judge reserve on it.
+   */
+  readonly spend?: SpendMeter;
 };
 
 /** What a guide call produced: text to inject, or `null` with a `cause`. */
@@ -8900,7 +8940,12 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
       if (meter.inFlight === true) {
         return `the run's ${capText} budget is used up${counting} before ${where}`;
       }
-      return `${usd(spendMeter.snapshot().spentMicros)} spent ≥ ${capText} cap before ${where}`;
+      const snap = spendMeter.snapshot();
+      // A worst case counted for a call that failed after it was sent is not money known spent.
+      if (snap.assumedMicros > 0) {
+        return `the run's ${capText} budget is used up before ${where}, counting calls that failed after they were sent at their worst case`;
+      }
+      return `${usd(snap.spentMicros)} spent ≥ ${capText} cap before ${where}`;
     };
     return {
       class: BUILTIN_FAILURE_CLASSES.crewhaus_budget.class,
@@ -8941,6 +8986,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
     ...(opts.budget !== undefined
       ? { budgetGate: () => enforceBudget(runContext.turnNumber) }
       : {}),
+    // Fixed now: a shadow that runs after a later call has started never adopts it.
+    ...(spendMeter !== undefined ? { spend: spendMeter.within(inFlightReservation) } : {}),
   });
 
   // §7.4 — the guide block. Runs ONCE per strategy turn (keyed on the turn
@@ -10172,7 +10219,9 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                   provider: respProviderS,
                   wireModelId: respModelIdS,
                   role: opts.modelRole,
-                  usage,
+                  // A stream that ended without its final counts (an abort ends some
+                  // silently) is counted at its reserved worst case.
+                  usage: spendReport.usage === undefined ? undefined : usage,
                   meta: { run: runContext.runId, model: respModelIdS },
                 });
               }
@@ -10335,7 +10384,8 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                 provider: respProvider,
                 wireModelId: respWireModelId,
                 role: opts.modelRole,
-                usage: final.usage,
+                // A stream that ended without its final counts is counted at its worst case.
+                usage: spendReport.usage === undefined ? undefined : final.usage,
                 meta: { run: runContext.runId, model: respWireModelId },
               });
             }
@@ -10455,14 +10505,21 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           } catch (err) {
             // G10 — the watchdog must not outlive the call it watched.
             clearModelCallTimer();
-            // A call that was never sent spends nothing. A call that was sent is
-            // counted: at the usage its stream reported, else at its reserved worst
-            // case (each recovery attempt holds and settles its own).
+            // A call that reached no provider spends nothing; one the provider refused
+            // outright counts $0. Any other call that was sent is counted: at the usage
+            // its stream reported, else at its reserved worst case (each recovery attempt
+            // holds and settles its own).
             if (spendMeter !== undefined && spendHeld !== undefined) {
               const id = spendHeld;
               spendHeld = undefined;
               inFlightReservation = undefined;
-              if (!spendSent || spendHeldAs === undefined) {
+              const counted =
+                !spendSent || spendHeldAs === undefined
+                  ? "release"
+                  : spendReport.usage !== undefined
+                    ? "reported"
+                    : failedCallSpend(err, spendReport.started === true);
+              if (counted === "release" || spendHeldAs === undefined) {
                 await spendMeter.release(id);
               } else {
                 const served =
@@ -10470,23 +10527,23 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
                     ? poolTurn.candidate.lastServed?.()
                     : failoverChain?.lastServed();
                 const model = served?.modelId ?? spendHeldAs.model;
-                const meta = { run: runContext.runId, model };
-                if (spendReport.usage === undefined) {
-                  await spendMeter.settleUnreported(id, meta);
-                } else {
-                  await settleModelCall({
-                    meter: spendMeter,
-                    id,
-                    runContext,
-                    bus,
-                    budgeted: opts.budget !== undefined,
-                    provider: served?.providerId ?? spendHeldAs.provider,
-                    wireModelId: model,
-                    role: opts.modelRole,
-                    usage: spendReport.usage,
-                    meta,
-                  });
-                }
+                await settleModelCall({
+                  meter: spendMeter,
+                  id,
+                  runContext,
+                  bus,
+                  budgeted: opts.budget !== undefined,
+                  provider: served?.providerId ?? spendHeldAs.provider,
+                  wireModelId: model,
+                  role: opts.modelRole,
+                  usage:
+                    counted === "reported"
+                      ? spendReport.usage
+                      : counted === "zero"
+                        ? { input: 0, output: 0 }
+                        : undefined,
+                  meta: { run: runContext.runId, model },
+                });
               }
             }
             // A call that failed is the one recovery retries next.
@@ -11280,13 +11337,33 @@ export async function runChatLoop(opts: RunChatLoopOptions): Promise<string> {
           // 0.6.0 §6.2 — the judge publishes its model calls on THIS bus, so
           // the budget meter above (and any attached cost-tracker) sees them.
           bus,
-          // The judge's call reserves on this run's spend meter, as a model call does.
+          // The judge's call reserves on this run's spend meter, as a model call does;
+          // its wait for room ends on the turn's stop, deadline or timeout.
           ...(spendMeter !== undefined ? { spend: spendMeter } : {}),
+          signal: turnAbort.signal,
           ...(attempt.servedModel !== undefined ? { servedModel: attempt.servedModel } : {}),
           ...(attempt.profile !== undefined ? { profile: attempt.profile } : {}),
           ...(current !== undefined ? { stage: current.stage } : {}),
         });
       } catch (err) {
+        // A judge call the budget refused is not a grader outage: a gate that
+        // blocks (`retry`, `halt`, `escalate`) never serves an answer it could
+        // not grade. The run ends as any refused call ends it (exit 33).
+        const refused = judgeBudgetRefusal(err);
+        if (refused !== undefined && evaluation.onFail !== "note") {
+          await judgeSpan.close({ err });
+          discardUngraded(attempt);
+          if (cascade !== undefined) {
+            flushCascade(gradedStages(), { success: false }, performance.now() - turnStartMs);
+          }
+          const report = budgetStopReport(
+            `the evaluation of turn ${runContext.turnNumber}`,
+            refused.held === true ? "period_held" : refused.scope,
+            { inFlight: refused.inFlight === true },
+          );
+          await publishRunFailed(report);
+          throw new RunFailedError(report);
+        }
         // Grading INFRASTRUCTURE failure (judge model down, evaluator bug)
         // is not a verdict. Fail open: record it and let the turn stand —
         // a flaky judge must not kill an otherwise healthy run. §7.13 — a

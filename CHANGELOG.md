@@ -151,7 +151,9 @@ these on: they reach every harness that uses what each one names.
   `sh -c` and wrappers such as `env`, `exec` and `timeout`; not a word built
   when the hook runs, a here-document, a package script or a module, or what
   that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
-  a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
+  a spec in another directory, that directory's `.crewhaus/run` (its spec
+  record, and the period ledger and intake state a declared `budget.period`
+  keeps there); the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
   a managed run's whole tenants root; on a `channel` or `managed` run, and in
   the loops it starts, whose spec at the working directory has that target or
@@ -202,7 +204,7 @@ these on: they reach every harness that uses what each one names.
   matrices included), `crewhaus optimize` (`--from-advice` included),
   `crewhaus flywheel`, `crewhaus model-scan`, `crewhaus model right-size`,
   `crewhaus deploy canary`, `crewhaus changes check` (for the spec the change
-  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run/spec` is
+  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run` is
   on the runtime-state floor, as it is for `crewhaus run`.
 
 - **An approval covers the work it was asked in, and is used once.** A grant
@@ -912,13 +914,20 @@ these on: they reach every harness that uses what each one names.
   a call is sent, its worst case (its request at about four characters a
   token, plus its `max_tokens`) is reserved against the run's cap: it is
   admitted while the spend so far plus the other calls in flight stays under
-  the cap, and it settles to its real cost when it answers. A call that fails
-  after it was sent counts the usage it reported, or its worst case when it
-  reported none, and a call made inside a tool never waits on the call running
-  that tool. Sub-agents spend from their parent's budget as they go, so calls
-  made at the same time pass the cap by at most one call. A call that is not
-  admitted ends the run with exit 33, as reaching the cap does, and nothing of
-  it is logged.
+  the cap, and it settles to its real cost when it answers. A call that
+  reached no provider spends nothing, and one the provider refused outright,
+  before any reply, counts $0; any other call that fails after it was sent, or
+  whose reply ends before its final counts, counts the usage it reported, or
+  its worst case when it reported none. A call made inside a tool never waits
+  on the call running that tool. Sub-agents spend from their parent's budget
+  as they go, so calls made at the same time pass the cap by at most one call.
+  A call of the run's own that is not admitted ends the run with exit 33, as
+  reaching the cap does, and nothing of it is logged. The in-run `evaluation:`
+  judge, the route classifier, and shadow and committee calls and their judges
+  reserve against the run's cap too: a refused evaluation judge call ends the
+  run with exit 33 under `on_fail: retry`, `halt` or `escalate` (under `note`
+  the turn stands ungraded), and a refused classifier, shadow or committee
+  call falls back as it does on any other error.
 
 - **Managed tenant budgets reserve an estimate of each request instead of
   zero.** A `runs.create` or `runs.continue` request, and a queued run,

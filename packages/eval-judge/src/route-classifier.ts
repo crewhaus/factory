@@ -156,6 +156,7 @@ export async function classifyRouteLabel(
       role: opts.role ?? "classifier",
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
       ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
     },

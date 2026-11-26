@@ -134,6 +134,7 @@ async function evalIn(
   budget: string,
   graders: string = EXACT,
   judge?: ProviderAdapter,
+  samples: Sample[] = SAMPLES,
 ) {
   const adapter = textAdapter();
   const chatLoop: EvalChatLoopFn = (opts) =>
@@ -142,7 +143,7 @@ async function evalIn(
   if (ir.target !== "cli") throw new Error("expected target cli");
   const summary = await runEval({
     ir: ir as IrV0,
-    dataset: { name: "period", samples: yieldSamples(SAMPLES) },
+    dataset: { name: "period", samples: yieldSamples(samples) },
     compiledGraders: parseGradersConfig(graders).compiled,
     opts: {
       chatLoop,
@@ -256,6 +257,32 @@ describe("an eval under a budget period", () => {
     expect(lines.filter((l) => l["op"] === "reserve")).toHaveLength(2 * SAMPLES.length);
     expect(totals(lines)).toEqual({ spent: 4 * CALL_MICROS, open: 0 });
   }, 20_000); // two real chat-loop runs, each wiring the spec's tools
+
+  test("a judge call the period refuses keeps the sample's answer and its other grades, with no second attempt", async () => {
+    const harness = tempDir("judge-refused");
+    pinClock();
+    // Earlier spend leaves room for one call: the sample's answer takes the period to its cap.
+    const dir = periodDirAt(harness, FIXED);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "000001.jsonl"),
+      `${JSON.stringify({ v: 1, at: new Date(FIXED).toISOString(), op: "settle", id: "earlier", usdMicros: CAP_MICROS - 400 })}\n`,
+    );
+    const judge = judgeAdapter();
+    const both = `${EXACT}${JUDGED.replace("graders:\n", "")}`;
+    const { summary, adapter } = await evalIn(harness, WITH_PERIOD, both, judge, [
+      { id: "a", input: "2+2?", expected_output: "4" },
+    ]);
+    expect(adapter.requests).toHaveLength(1);
+    expect(judge.requests).toHaveLength(0);
+    const sample = summary.samples[0];
+    expect(sample?.retried).toBeUndefined();
+    expect(sample?.agentOutput).toBe("4");
+    expect(sample?.error).toBeUndefined();
+    const exact = sample?.grades.perGrader.find((g) => g.name === "m");
+    expect(exact?.passed).toBe(true);
+    expect(sample?.graderError).toContain("budget for this period is used up");
+  }, 20_000); // a real chat-loop run, wiring the spec's tools
 
   test("a spec without a period writes nothing under budget/", async () => {
     const harness = tempDir("none");

@@ -1648,6 +1648,23 @@ describe("emitChannelBot — the dream session and the harness's budget period",
     const budget = { usdMicros: 5_000_000, onExceed: { kind: "stop" as const }, period };
     const agent = fileMap({ ...DREAM_BUDGET_IR, budget }).get("agent.ts") ?? "";
     expect(dreamBlock(agent)).toContain(`period: ${JSON.stringify(period)},`);
+    // No declared prices: no declaredPricing line.
+    expect(dreamBlock(agent)).not.toContain("declaredPricing");
+  });
+
+  test("with a period, the spec's declared prices price the dream session's calls", () => {
+    const period = { every: "month" as const, usdMicros: 100_000_000 };
+    const declaredPricing = { $stub: { inputPer1M: 1, outputPer1M: 2 } };
+    const priced = { ...DREAM_BUDGET_IR, agent: { ...DREAM_BUDGET_IR.agent, declaredPricing } };
+    const withPeriod = fileMap({
+      ...priced,
+      budget: { usdMicros: 5_000_000, onExceed: { kind: "stop" as const }, period },
+    }).get("agent.ts");
+    expect(dreamBlock(withPeriod ?? "")).toContain(
+      `declaredPricing: ${JSON.stringify(declaredPricing)},`,
+    );
+    // Without a period the dream runner carries no prices of its own.
+    expect(dreamBlock(fileMap(priced).get("agent.ts") ?? "")).not.toContain("declaredPricing: {");
   });
 
   test("without a period the dream runner is emitted exactly as before", () => {

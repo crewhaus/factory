@@ -1,16 +1,21 @@
 /**
- * The spend meter: reservations before dispatch, settles on response,
- * releases on failure, child meters that spend from their parent live, and an
- * injected period ledger. No timers: concurrency is promise order.
+ * The spend meter: reservations before dispatch, settles on response, a
+ * release only for a call that reached no provider, child meters that spend
+ * from their parent live, and an injected period ledger. No timers:
+ * concurrency is promise order.
  */
 import { describe, expect, test } from "bun:test";
 import type { PricingTable } from "./pricing";
 import {
   type SpendAdmission,
   type SpendLedgerPort,
+  type StreamReport,
+  type UsageStreamEvent,
   actualCallMicros,
   createSpendMeter,
   estimateCallMicros,
+  failedCallSpend,
+  notingUsage,
 } from "./spend";
 
 /** $1 per million tokens on both axes: one token is one micro. */
@@ -342,8 +347,23 @@ describe("a call that was sent and reported no usage", () => {
     const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
     await meter.reserve("a", 70);
     expect(await meter.settleUnreported("a")).toEqual({ usdMicros: 70 });
-    expect(meter.snapshot()).toMatchObject({ spentMicros: 70, activeReservations: 0 });
+    expect(meter.snapshot()).toMatchObject({
+      spentMicros: 70,
+      assumedMicros: 70,
+      activeReservations: 0,
+    });
     expect(ledger.lines).toEqual(["reserve a 70", "settle a 70"]);
+  });
+
+  test("an assumed worst case is told apart from priced spend, in every scope", async () => {
+    const meter = createSpendMeter({ capMicros: 1_000, pricing: FLAT });
+    const child = meter.child({ capMicros: 500 });
+    await child.reserve("a", 40);
+    await child.settleUnreported("a");
+    await meter.reserve("b", 10);
+    await meter.settle("b", costing(7));
+    expect(child.snapshot()).toMatchObject({ spentMicros: 40, assumedMicros: 40 });
+    expect(meter.snapshot()).toMatchObject({ spentMicros: 47, assumedMicros: 40 });
   });
 
   test("an unpriced call counts one unknown call and settles the period with null", async () => {
@@ -370,5 +390,92 @@ describe("a call that was sent and reported no usage", () => {
       "reserve w 30",
       "settle w 5",
     ]);
+  });
+});
+
+describe("a call's stream, as the meter reads it", () => {
+  async function drain(events: UsageStreamEvent[], throwAfter?: number): Promise<StreamReport> {
+    const report: StreamReport = {};
+    async function* source(): AsyncGenerator<UsageStreamEvent> {
+      let n = 0;
+      for (const ev of events) {
+        if (throwAfter !== undefined && n === throwAfter) throw new Error("reset");
+        n += 1;
+        yield ev;
+      }
+    }
+    try {
+      for await (const _ of notingUsage(source(), report)) {
+        // consumed
+      }
+    } catch {
+      // the report is what the caller reads
+    }
+    return report;
+  }
+
+  test("final counts are noted once the closing delta arrives", async () => {
+    const report = await drain([
+      { kind: "message_start", usage: { input: 12, output: 1 } },
+      { kind: "message_delta", stopReason: "end_turn", usage: { input: 0, output: 30 } },
+      { kind: "message_stop" },
+    ]);
+    expect(report).toEqual({ started: true, usage: { input: 12, output: 30 } });
+  });
+
+  test("a stream that ends before its counts, or reports none, leaves usage unknown", async () => {
+    // An abort that ends a stream silently: content, then nothing.
+    expect(
+      await drain([{ kind: "message_start", usage: { input: 12, output: 1 } }, { kind: "x" }]),
+    ).toEqual({ started: true });
+    // A server that reports no usage at all.
+    expect(
+      await drain([{ kind: "message_delta", stopReason: "end_turn" }, { kind: "message_stop" }]),
+    ).toEqual({ started: true });
+    expect(await drain([{ kind: "message_start" }], 0)).toEqual({});
+  });
+});
+
+describe("what a failed call counts as", () => {
+  const status = (n: number) => Object.assign(new Error(`HTTP ${n}`), { status: n });
+  const code = (c: string) => Object.assign(new Error(c), { code: c });
+  const named = (n: string) => Object.assign(new Error(n), { name: n });
+  const wrapped = (cause: unknown) =>
+    Object.assign(new Error("Connection error."), { name: "APIConnectionError", cause });
+
+  test("a request that reached no provider is released", () => {
+    for (const err of [
+      code("ECONNREFUSED"),
+      wrapped(code("ConnectionRefused")),
+      wrapped(code("ENOTFOUND")),
+      wrapped(code("DEPTH_ZERO_SELF_SIGNED_CERT")),
+      named("ProviderAuthError"),
+      named("CircuitBreakerOpenError"),
+      named("FailoverExhaustedError"),
+    ]) {
+      expect(failedCallSpend(err, false)).toBe("release");
+    }
+  });
+
+  test("a provider's outright refusal counts $0", () => {
+    for (const n of [400, 401, 403, 404, 413, 429, 529]) {
+      expect(failedCallSpend(status(n), false)).toBe("zero");
+      expect(failedCallSpend(wrapped(status(n)), false)).toBe("zero");
+    }
+  });
+
+  test("anything else, and any failure after an event arrived, counts its worst case", () => {
+    for (const err of [
+      status(500),
+      code("ECONNRESET"),
+      named("AbortError"),
+      named("APIConnectionTimeoutError"),
+      new Error("stream broke"),
+      "a string",
+    ]) {
+      expect(failedCallSpend(err, false)).toBe("worst");
+    }
+    expect(failedCallSpend(code("ECONNREFUSED"), true)).toBe("worst");
+    expect(failedCallSpend(status(429), true)).toBe("worst");
   });
 });

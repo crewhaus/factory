@@ -42,6 +42,7 @@ import {
   type CapabilityRequirement,
   DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
+  type DeclaredPricing,
   type PricingTable,
   classifyPricingStaleness,
   computeCacheSavingsMicros,
@@ -22950,6 +22951,8 @@ function buildWatchmeJudgePhase(
   spend?: {
     readonly period: NonNullable<NonNullable<WatchmeIrView["budget"]>["period"]>;
     readonly ledgerRoot: string;
+    /** The spec's declared prices, so a judge model priced only there reserves. */
+    readonly declaredPricing?: DeclaredPricing;
   },
 ): WatchmeJudgePhase {
   // Judge sessions live in an ISOLATED root the report NEVER enumerates
@@ -23041,6 +23044,9 @@ function buildWatchmeJudgePhase(
             ...(spend !== undefined ? { period: spend.period } : {}),
           },
           ...(spend !== undefined ? { spendLedgerRoot: spend.ledgerRoot } : {}),
+          ...(spend?.declaredPricing !== undefined
+            ? { declaredPricing: spend.declaredPricing }
+            : {}),
           spinner: false,
         });
         if (verdict === undefined) {
@@ -23113,6 +23119,20 @@ function watchmeSessionRows(
   return rows;
 }
 
+/** The watch-me judge's period: its ledger in the spec's directory, and the spec's declared prices. */
+function watchmeSpendOf(
+  ir: WatchmeIrView,
+  period: NonNullable<NonNullable<WatchmeIrView["budget"]>["period"]>,
+  specPath: string,
+): NonNullable<Parameters<typeof buildWatchmeJudgePhase>[4]> {
+  const declared = declaredPricingOfIr(ir as unknown as IrNode);
+  return {
+    period,
+    ledgerRoot: runSpecDirOf(specPath),
+    ...(declared !== undefined ? { declaredPricing: declared } : {}),
+  };
+}
+
 /** One-harness phase-1(+2) report with the real seams wired (watch-me §11). */
 async function runWatchmeHarnessReport(opts: {
   readonly ir: WatchmeIrView;
@@ -23155,7 +23175,7 @@ async function runWatchmeHarnessReport(opts: {
             opts.crewhausDir,
             opts.ir.watchme?.judgeParams,
             opts.ir.budget?.period !== undefined
-              ? { period: opts.ir.budget.period, ledgerRoot: runSpecDirOf(opts.specPath) }
+              ? watchmeSpendOf(opts.ir, opts.ir.budget.period, opts.specPath)
               : undefined,
           ),
         }

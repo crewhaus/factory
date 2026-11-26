@@ -151,6 +151,7 @@ import type { Sample } from "@crewhaus/eval-dataset";
 import type { CompiledGrader, Grader, PerModelJudgeOverride } from "@crewhaus/eval-grader";
 import { perModelArmKey, perModelOverrideFor } from "@crewhaus/eval-grader";
 import {
+  JudgeBudgetError,
   type JudgeUsageSink,
   createJudgeGrader,
   loadCategoricalRubric,
@@ -1455,6 +1456,10 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
                 gateHalted = isRunFailedError(err) && err.report.class === "provability";
                 budgetStopped = isRunFailedError(err) && err.report.class === "crewhaus_budget";
               },
+              // A judge call the budget refused: the answer stands, ungraded by that judge.
+              onGraderError: (err) => {
+                if (err instanceof JudgeBudgetError) budgetStopped = true;
+              },
             });
             // NEW-HUNT-3 — accrue this attempt's agent-model spend toward
             // the budget cap (noise-retry attempts included — those tokens
@@ -1486,8 +1491,9 @@ export async function runEval(args: RunEvalArgs): Promise<EvalRunSummary> {
           // the verdict for whatever a re-roll produces (an answer with no
           // claims passes vacuously), erasing the halt.
           if (gateHalted) return classifyFailure(first);
-          // Nor is a budget stop: the period is used up, and another attempt would
-          // only be refused again.
+          // Nor is a budget stop, the sample's or a judge's: the budget is used up,
+          // another attempt would only be refused again, and the sample's output
+          // and its other grades stand.
           if (budgetStopped) return classifyFailure(first);
           if (first.error !== undefined && taxonomy.length > 0) {
             const named = matchNamedFailure({ message: first.error }, taxonomy);

@@ -179,6 +179,7 @@ export async function judgePair(opts: JudgePairOptions): Promise<PairwiseCallVer
       specModel: model,
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
       ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
     },
@@ -246,6 +247,7 @@ export async function judgePairwise(opts: JudgePairwiseOptions): Promise<Pairwis
     ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
     ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
     ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     ...(opts.role !== undefined ? { role: opts.role } : {}),
     ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
   };

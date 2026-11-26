@@ -1063,7 +1063,12 @@ export function createDreamStep(): DreamJanitorStep | null {
                   ? `\n              period: ${JSON.stringify(ir.budget.period)},`
                   : ""
               }
-            },
+            },${
+              // A model priced by the spec reserves on the period at its declared price.
+              ir.budget?.period !== undefined && ir.agent.declaredPricing !== undefined
+                ? `\n            declaredPricing: ${JSON.stringify(ir.agent.declaredPricing)},`
+                : ""
+            }
             spinner: false,
           });
           return {

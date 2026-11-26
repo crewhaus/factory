@@ -676,7 +676,7 @@ export function buildRouteClassifier(
   classifier: NonNullable<IrModelPool["classifier"]>,
   deps: WireModelsDeps,
 ): RouteClassifierFn {
-  return async ({ userText, bus, spend }) => {
+  return async ({ userText, bus, signal, spend }) => {
     const verdict = await classifyRouteLabel({
       labels: classifier.labels,
       userText,
@@ -685,8 +685,10 @@ export function buildRouteClassifier(
       ...(deps._classifierAdapter !== undefined ? { adapter: deps._classifierAdapter } : {}),
       bus,
       role: "classifier",
-      // The label call reserves on the run's spend meter before it is sent.
+      // The label call reserves on the run's spend meter before it is sent; its wait
+      // for room ends on the turn's stop.
       ...(spend !== undefined ? { spend } : {}),
+      signal,
     });
     return {
       label: verdict.label,

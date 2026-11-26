@@ -1090,6 +1090,12 @@ export type BudgetSweepStop = "not-a-directory" | "outside" | "chain-changed" | 
 type BudgetSweepSeams = {
   /** After the directory's identity is recorded, before anything in it is removed. */
   readonly beforeRemove?: (dir: string) => void;
+  /**
+   * At each step of the removal: `"entry"` before an entry is judged (after the
+   * entries before it were removed), `"unlink"` between an entry's `lstat` and its
+   * `unlink`, `"rmdir"` before the emptied directory is removed.
+   */
+  readonly beforeStep?: (step: "entry" | "unlink" | "rmdir", dir: string, file?: string) => void;
   /** Why a removal stopped. */
   readonly onStop?: (reason: BudgetSweepStop) => void;
 };
@@ -1104,10 +1110,11 @@ export function _setBudgetSweepSeamsForTest(next: BudgetSweepSeams | undefined):
 /**
  * Remove one closed period's directory: only when it is a real directory that
  * resolves inside the harness, and only its regular files, each judged without
- * following it. Every directory from the harness down to the period's keeps
- * the identity it had when the checks passed, before and after each removal;
- * on any change the sweep stops, removes nothing more, and leaves the period
- * for the next sweep. Anything else is left, and so is the directory.
+ * following it. Every directory from the harness down to the period's must
+ * keep the identity it had when the checks passed, checked right before each
+ * `unlink` (after that entry's `lstat`) and right before the final `rmdir`; on
+ * any change the sweep stops, removes nothing more, and leaves the period for
+ * the next sweep. Anything else is left, and so is the directory.
  */
 function removePeriodDir(
   harnessDir: string,
@@ -1127,15 +1134,16 @@ function removePeriodDir(
     const chain = recordChain(realpathSync(harnessDir), lexical);
     if (chain === undefined) return stop("not-a-directory");
     sweepSeams.beforeRemove?.(lexical);
-    if (!chainUnchanged(chain)) return stop("chain-changed");
     for (const file of readdirSync(lexical)) {
       const entry = join(lexical, file);
-      if (!chainUnchanged(chain)) return stop("chain-changed");
+      sweepSeams.beforeStep?.("entry", lexical, file);
       if (!lstatSync(entry).isFile()) continue;
+      sweepSeams.beforeStep?.("unlink", lexical, file);
+      // Every component of `entry` but the last is followed: each must still be the one checked.
       if (!chainUnchanged(chain)) return stop("chain-changed");
       unlinkSync(entry);
-      if (!chainUnchanged(chain)) return stop("chain-changed");
     }
+    sweepSeams.beforeStep?.("rmdir", lexical);
     if (!chainUnchanged(chain)) return stop("chain-changed");
     rmdirSync(lexical);
     return true;

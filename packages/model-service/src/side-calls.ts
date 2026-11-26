@@ -127,6 +127,14 @@ export type NestedSingleTurnArgs = {
    */
   readonly parentSpanId?: string;
   readonly signal?: AbortSignal;
+  /**
+   * The spend meter the side call reserves on, fixed when it was scheduled
+   * (a guide, shadow or committee call passes its context's `spend`). Absent:
+   * the parent's meter as of now (`spendMeterOf(parent)`), which names the
+   * parent's call in progress, right for a call made from inside a tool
+   * (consult).
+   */
+  readonly spend?: SpendMeter;
   readonly maxTokens?: number;
   readonly sessionTarget: string;
   readonly deps: SideCallDeps;
@@ -188,7 +196,7 @@ export async function runNestedSingleTurn(
   // A budgeted parent's spend meter: the side call reserves its own worst case on it,
   // naming the parent's call in progress (if any) so it never waits on it, and
   // prices its cost with the run's table.
-  const spendMeter = spendMeterOf(parent);
+  const spendMeter = args.spend ?? spendMeterOf(parent);
   const pricing = spendMeter?.pricing ?? DEFAULT_PRICING;
   // A child call's request and response share one span id on the child bus;
   // they share one on the parent bus too, so the pair still matches there.
@@ -271,10 +279,13 @@ export async function runNestedSingleTurn(
   }
 }
 
-/** The run's spend meter as a judge option: present only when the run is budgeted. */
-function spendOf(runContext: RunContext): { spend?: SpendMeter } {
-  const spend = spendMeterOf(runContext);
-  return spend !== undefined ? { spend } : {};
+/**
+ * A side call's judge options from its context: the spend view fixed when the
+ * side call was scheduled, and the side call's abort signal, which ends a
+ * judge's wait for room.
+ */
+function judgeSpendOf(ctx: SideCallTurnContext): { spend?: SpendMeter; signal: AbortSignal } {
+  return { ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}), signal: ctx.signal };
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +415,7 @@ export function buildGuideSideCall(
         parent: ctx.runContext,
         ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
+        ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
         maxTokens,
         sessionTarget: "guide",
         deps,
@@ -452,6 +464,7 @@ export function buildShadowSideCall(
         parent: ctx.runContext,
         ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
         signal: ctx.signal,
+        ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
         sessionTarget: "shadow",
         deps,
       });
@@ -467,8 +480,8 @@ export function buildShadowSideCall(
         bus: ctx.bus,
         role: "judge",
         stage: "shadow",
-        // The judge reserves on the run's spend meter, as the shadow call did.
-        ...spendOf(ctx.runContext),
+        // The judge reserves on the spend view fixed when the shadow was scheduled.
+        ...judgeSpendOf(ctx),
       });
       const verdict =
         comparison.verdict === "new" ? "shadow" : comparison.verdict === "prev" ? "primary" : "tie";
@@ -594,6 +607,7 @@ export function buildCommitteeSideCall(
             parent: ctx.runContext,
             ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
             signal: ctx.signal,
+            ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
             sessionTarget: "committee",
             deps,
           });
@@ -664,7 +678,7 @@ export function buildCommitteeSideCall(
           bus: ctx.bus,
           role: "judge",
           stage: "committee",
-          ...spendOf(ctx.runContext),
+          ...judgeSpendOf(ctx),
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -710,6 +724,7 @@ export function buildCommitteeSideCall(
               parent: ctx.runContext,
               ...(ctx.parentSpanId !== undefined ? { parentSpanId: ctx.parentSpanId } : {}),
               signal: ctx.signal,
+              ...(ctx.spend !== undefined ? { spend: ctx.spend } : {}),
               sessionTarget: "committee",
               deps,
             });

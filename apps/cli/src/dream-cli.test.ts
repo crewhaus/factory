@@ -15,8 +15,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { lower } from "@crewhaus/compiler";
+import { openBudgetLedger } from "@crewhaus/control-records/budget";
 import { parseArgs } from "@crewhaus/infra-utils";
 import type { DreamRunReport } from "@crewhaus/memory-service";
+import { runChatLoop } from "@crewhaus/runtime-core";
 import { parseSpec } from "@crewhaus/spec";
 import {
   DREAM_CLI_SCHEMA,
@@ -231,6 +233,67 @@ describe("the dream session and the harness's budget period", () => {
     });
     expect(opts?.spendLedgerRoot).toBe(realpathSync(tmp));
   });
+
+  test("a model priced only by the spec reserves on the period: a used-up period sends nothing", async () => {
+    // A closed loopback port: a call that got past the period would fail to connect.
+    const closed = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const port = closed.port as number;
+    closed.stop(true);
+    const spec = [
+      "name: support-bot",
+      "target: cli",
+      "models:",
+      "  stub:",
+      `    model: local/stub@http://127.0.0.1:${port}/v1`,
+      "    price: {input_per_1m: 1, output_per_1m: 2}",
+      "agent:",
+      "  model: $stub",
+      "  instructions: hi",
+      "memory:",
+      "  dream:",
+      "    every: 1d",
+      "    mode: full",
+      "    budget_usd: 0.5",
+      "budget:",
+      "  usd: 5",
+      "  period: {every: month, usd: 100}",
+      "",
+    ].join("\n");
+    const specPath = join(tmp, "agent.yaml");
+    writeFileSync(specPath, spec);
+    const ir = lower(parseSpec(spec)) as unknown as Parameters<typeof dreamSpendOf>[0] & {
+      agent: { model: string };
+    };
+    const spend = dreamSpendOf(ir, specPath);
+    expect(spend.declaredPricing).toEqual({
+      [ir.agent.model]: { inputPer1M: 1, outputPer1M: 2 },
+    });
+    // Earlier spend took the whole period.
+    await openBudgetLedger(realpathSync(tmp), {
+      every: "month",
+      usdMicros: 100_000_000,
+    }).settle({ id: "earlier", usdMicros: 100_000_000 });
+    const phase = buildDreamModelPhase({
+      model: ir.agent.model,
+      specName: "support-bot",
+      fragment: { specName: "support-bot", memory: {} },
+      cwd: tmp,
+      chatLoop: (opts) =>
+        runChatLoop({
+          ...opts,
+          installSigintHandler: false,
+          stdout: () => {},
+          persistSession: false,
+        }),
+      ...spend,
+    });
+    await expect(
+      phase.run({ playbook: "p", prompt: "f", budgetUsd: 0.5, maxToolIterations: 3 }),
+    ).rejects.toMatchObject({
+      name: "RunFailedError",
+      report: { class: "crewhaus_budget", exitCode: 33 },
+    });
+  }, 20_000); // a real chat loop, wiring the model router
 
   test("without a period the session's options are as they were: no period, no ledger root", async () => {
     const plain = PERIOD_SPEC.replace("  period: {every: month, usd: 100}\n", "");

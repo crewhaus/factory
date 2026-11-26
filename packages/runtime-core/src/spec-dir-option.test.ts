@@ -1,6 +1,7 @@
 /**
- * `RunChatLoopOptions.specDir`: the record of a spec kept in another directory
- * (`<specDir>/.crewhaus/run/spec`) is on the runtime-state floor for the run
+ * `RunChatLoopOptions.specDir`: the run directory of a spec kept in another
+ * directory (`<specDir>/.crewhaus/run`: its record and a declared period's
+ * ledger) is on the runtime-state floor for the run
  * and for every loop it starts, and a spec in the working directory adds no
  * root (the list the loop hands its tools is the same element for element).
  */
@@ -202,7 +203,7 @@ describe("a run's specDir option", () => {
   test("a loop started inside the run puts the same record on its floor", async () => {
     const cwd = tempDir("crewhaus-spec-dir-cwd-");
     const specDir = tempDir("crewhaus-spec-dir-spec-");
-    const record = join(specDir, ".crewhaus", "run", "spec");
+    const record = join(specDir, ".crewhaus", "run");
     const decoy = join(cwd, "notes.txt");
 
     const guarded = await runOnce(cwd, decoy, specDir);

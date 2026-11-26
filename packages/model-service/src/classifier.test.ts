@@ -127,6 +127,27 @@ describe("wireModels — routeClassifier (§7.2.3)", () => {
     expect(none.adapter.requests).toHaveLength(0);
   });
 
+  test("a label call waiting for room stops when the turn's signal aborts, and sends nothing", async () => {
+    const adapter = labelAdapter("strong");
+    const spend = createSpendMeter({ capMicros: 1_000_000, pricing: DEFAULT_PRICING });
+    // Another call holds the whole cap and never settles.
+    await spend.reserve("other", 1_000_000);
+    const stop = new AbortController();
+    stop.abort();
+    const wired = wireModels({ modelPool: CLASSIFIED_POOL }, { _classifierAdapter: adapter });
+    await expect(
+      wired.routeClassifier?.({
+        userText: "hi",
+        labels: ["cheap", "strong"],
+        bus: new TraceEventBus({ runId: "run_z", sessionId: "sess_z" }),
+        signal: stop.signal,
+        spend,
+      }) as Promise<unknown>,
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(adapter.requests).toHaveLength(0);
+    expect(spend.snapshot().activeReservations).toBe(1);
+  });
+
   test("an undeclared label propagates as a throw (the loop falls back to heuristic)", async () => {
     const wired = wireModels(
       { modelPool: CLASSIFIED_POOL },

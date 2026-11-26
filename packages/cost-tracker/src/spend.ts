@@ -3,10 +3,13 @@
  * calls that spend at the same time.
  *
  * Every model call in a budgeted run reserves its worst case before it is
- * dispatched and settles on its response. A call that was never sent spends
- * nothing (`release`); a call that was sent and failed counts the usage it
+ * dispatched and settles on its response. A call that reached no provider
+ * spends nothing (`release`); a call the provider refused outright, before
+ * any event, counts $0; any other call that failed counts the usage it
  * reported, or its reserved worst case when it reported none
- * (`settleUnreported`). A call is admitted while, in every scope it spends
+ * (`settleUnreported`, {@link failedCallSpend}). A stream that ends without
+ * its final counts (an abort ends some streams silently) is counted at its
+ * worst case too. A call is admitted while, in every scope it spends
  * from (the run, each enclosing sub-agent share, the harness's budget
  * period), the spend so far plus the OTHER active reservations stays under
  * that scope's cap; equality refuses. A call's own estimate is not added, so
@@ -121,6 +124,13 @@ export type SpendSnapshot = {
   readonly activeReservations: number;
   /** Settles nothing could price, in this scope and below. */
   readonly unknownCalls: number;
+  /**
+   * The part of `spentMicros` counted at a reserved worst case
+   * (`settleUnreported`): calls that failed after they were sent and reported
+   * no usage. Their real cost is not known, so a report never prints it as
+   * money spent.
+   */
+  readonly assumedMicros: number;
 };
 
 /** What a settle found the call cost. */
@@ -185,6 +195,8 @@ type Scope = {
   readonly capMicros: number | undefined;
   spent: number;
   unknownCalls: number;
+  /** The part of `spent` counted at a reserved worst case. */
+  assumed: number;
   readonly active: Map<string, Reservation>;
 };
 
@@ -224,6 +236,7 @@ export function createSpendMeter(opts: CreateSpendMeterOptions): SpendMeter {
     capMicros: opts.capMicros,
     spent: Math.max(0, opts.seedMicros ?? 0),
     unknownCalls: 0,
+    assumed: 0,
     active: new Map(),
   };
   return meterFor(root, opts.ledger, opts.pricing, NO_ANCESTORS, new Set());
@@ -347,8 +360,12 @@ function meterFor(
       drop(id);
       const micros = held?.micros;
       for (const s of chain) {
-        if (micros === undefined) s.unknownCalls += 1;
-        else s.spent += micros;
+        if (micros === undefined) {
+          s.unknownCalls += 1;
+        } else {
+          s.spent += micros;
+          s.assumed += micros;
+        }
       }
       if (ledger !== undefined) {
         onLedger.delete(id);
@@ -367,6 +384,7 @@ function meterFor(
           capMicros: childOpts.capMicros,
           spent: 0,
           unknownCalls: 0,
+          assumed: 0,
           active: new Map(),
         },
         ledger,
@@ -390,6 +408,7 @@ function meterFor(
         reservedMicros: reserved,
         activeReservations: scope.active.size,
         unknownCalls: scope.unknownCalls,
+        assumedMicros: scope.assumed,
       };
     },
   };
@@ -436,4 +455,121 @@ export function actualCallMicros(
   const row = resolvePricing(pricing, provider, modelId);
   if (!row) return undefined;
   return computeCostMicros(row, usage.input, usage.output, usage.cacheRead ?? 0);
+}
+
+/** A call's stream as {@link notingUsage} saw it. */
+export type StreamReport = {
+  /** Set once any event arrived: the provider answered the request. */
+  started?: true;
+  /** Set once the stream reported its final counts. */
+  usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+    readonly cacheCreate?: number;
+  };
+};
+
+/** The slice of a provider stream event {@link notingUsage} reads. */
+export type UsageStreamEvent = {
+  readonly kind: string;
+  readonly usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+    readonly cacheCreate?: number;
+  };
+  readonly stopReason?: string;
+};
+
+/**
+ * `stream`, unchanged, noting on `report` that an event arrived and the usage
+ * it reported once the counts are final: a closing `message_delta` (one with
+ * a stop reason), or the `message_stop` after a delta that carried counts.
+ * The counts merge as the stream's consumers merge them. A stream that ends
+ * before that, or that counted nothing, leaves `report.usage` undefined: its
+ * cost is not known. A stream an abort ends silently is such a stream.
+ */
+export async function* notingUsage<E extends UsageStreamEvent>(
+  stream: AsyncIterable<E>,
+  report: StreamReport,
+): AsyncGenerator<E> {
+  let seen: NonNullable<StreamReport["usage"]> = { input: 0, output: 0 };
+  let counted = false;
+  for await (const ev of stream) {
+    report.started = true;
+    if (ev.kind === "message_start" && ev.usage !== undefined) seen = ev.usage;
+    if (ev.kind === "message_delta" && ev.usage !== undefined) {
+      const { input, output, cacheRead, cacheCreate } = ev.usage;
+      seen = {
+        ...seen,
+        ...(input > 0 ? { input } : {}),
+        ...(output > 0 ? { output } : {}),
+        ...(cacheRead !== undefined ? { cacheRead } : {}),
+        ...(cacheCreate !== undefined ? { cacheCreate } : {}),
+      };
+      counted = output > 0 || input > 0;
+    }
+    const closing =
+      ev.kind === "message_stop" || (ev.kind === "message_delta" && ev.stopReason !== undefined);
+    if (closing && counted) report.usage = seen;
+    yield ev;
+  }
+}
+
+/**
+ * What a call that threw before it reported its usage is counted as:
+ *
+ * - `"release"`: the request reached no provider (nothing arrived, and the
+ *   error is a refused connection, a failed name lookup or TLS handshake, a
+ *   missing credential, an open circuit breaker, or a failover chain with no
+ *   candidate left). It spends nothing.
+ * - `"zero"`: nothing arrived and the provider refused the request outright
+ *   with an HTTP status that does no billed work (400, 401, 403, 404, 413,
+ *   429, 529). The attempt is counted at $0, so it still has its line.
+ * - `"worst"`: anything else (an event arrived, a timeout, a reset
+ *   connection, a server error): its cost is not known, so it is counted at
+ *   its reserved worst case.
+ */
+export function failedCallSpend(err: unknown, started: boolean): "release" | "zero" | "worst" {
+  if (started) return "worst";
+  // The error and its causes, outermost first (an SDK or adapter error wraps the transport's).
+  const chain: { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }[] = [];
+  for (let e: unknown = err; e !== null && typeof e === "object" && chain.length < 8; ) {
+    const o = e as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown };
+    if (chain.includes(o)) break;
+    chain.push(o);
+    e = o.cause;
+  }
+  // An HTTP status anywhere in the chain: the provider answered the request.
+  const status = chain.find((o) => typeof o.status === "number")?.status as number | undefined;
+  if (status !== undefined) return REJECTED_STATUS.has(status) ? "zero" : "worst";
+  for (const o of chain) {
+    if (typeof o.name === "string" && UNSENT_NAMES.has(o.name)) return "release";
+    if (typeof o.code === "string" && isUnsentCode(o.code)) return "release";
+  }
+  return "worst";
+}
+
+const REJECTED_STATUS: ReadonlySet<number> = new Set([400, 401, 403, 404, 413, 429, 529]);
+/** Error names that mean the request was never handed to a provider. */
+const UNSENT_NAMES: ReadonlySet<string> = new Set([
+  "ProviderAuthError",
+  "CircuitBreakerOpenError",
+  "FailoverExhaustedError",
+]);
+/** Connection, name-lookup and TLS-handshake failures (Node and Bun spellings). */
+const UNSENT_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ConnectionRefused",
+  "FailedToOpenSocket",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_NONAME",
+  "EAI_FAIL",
+  "DNSException",
+]);
+
+function isUnsentCode(code: string): boolean {
+  return UNSENT_CODES.has(code) || /CERT|SSL|TLS/.test(code);
 }

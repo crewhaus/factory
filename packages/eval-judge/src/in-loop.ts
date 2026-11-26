@@ -101,6 +101,8 @@ export async function gradeWithJudgePanel(
     readonly stage?: string;
     /** The run's spend meter: every judge call reserves on it before it is sent. */
     readonly spend?: SpendMeter;
+    /** Ends a judge call's wait for room on `spend` (the turn's stop). */
+    readonly signal?: AbortSignal;
   },
 ): Promise<InLoopJudgeVerdict> {
   const calls: JudgeCallUsage[] = [];
@@ -114,6 +116,7 @@ export async function gradeWithJudgePanel(
     ...(opts.params !== undefined ? { params: opts.params } : {}),
     ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
     ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     ...(opts.role !== undefined ? { role: opts.role } : {}),
     ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
     onCall: (usage) => {

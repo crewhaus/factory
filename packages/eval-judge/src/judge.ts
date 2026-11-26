@@ -8,7 +8,13 @@ import {
   extractToolUse,
 } from "@crewhaus/adapter-anthropic";
 import { DEFAULT_PRICING, computeCostMicros, resolvePricing } from "@crewhaus/cost-tracker";
-import { type SpendMeter, estimateCallMicros } from "@crewhaus/cost-tracker/spend";
+import {
+  type SpendMeter,
+  type StreamReport,
+  estimateCallMicros,
+  failedCallSpend,
+  notingUsage,
+} from "@crewhaus/cost-tracker/spend";
 import type { Sample } from "@crewhaus/eval-dataset";
 import type { GradeResult, Grader, RunResult } from "@crewhaus/eval-grader";
 import { createLogger } from "@crewhaus/logging";
@@ -18,7 +24,7 @@ import { resolveModel } from "@crewhaus/model-router";
 import type { ModelRole, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { JudgeError } from "./errors";
+import { JudgeBudgetError, JudgeError } from "./errors";
 import {
   buildCategoricalJudgePrompt,
   buildJudgePrompt,
@@ -116,14 +122,22 @@ export function isTemperatureRejectionError(err: unknown): boolean {
 export async function collectWithTemperatureRetry(
   adapter: ProviderAdapter,
   request: ProviderRequest,
+  /** Noted with what the call's stream reported (the retry's, when one ran). */
+  report?: StreamReport,
 ): Promise<ProviderMessage> {
+  const open = (req: ProviderRequest) =>
+    report === undefined ? adapter.stream(req) : notingUsage(adapter.stream(req), report);
   try {
-    return await collectFinalMessage(adapter.stream(request));
+    return await collectFinalMessage(open(request));
   } catch (err) {
     if (request.temperature === undefined || !isTemperatureRejectionError(err)) throw err;
     logger.warn("judge.temperature_pin_rejected", { model: request.model });
     const { temperature: _dropped, ...withoutTemperature } = request;
-    return await collectFinalMessage(adapter.stream(withoutTemperature));
+    if (report !== undefined) {
+      Reflect.deleteProperty(report, "started");
+      Reflect.deleteProperty(report, "usage");
+    }
+    return await collectFinalMessage(open(withoutTemperature));
   }
 }
 
@@ -168,9 +182,14 @@ export type JudgeBusOptions = {
   /**
    * The spend meter the call reserves on (a run's, or an eval's period
    * meter): its worst case is reserved before it is sent, and it settles on
-   * its usage. A refusal sends nothing and throws a {@link JudgeError}.
+   * its usage. A refusal sends nothing and throws a {@link JudgeBudgetError}.
    */
   readonly spend?: SpendMeter;
+  /**
+   * Ends a wait for room on `spend` (the run's stop, its deadline, the turn's
+   * timeout): the call throws an `AbortError` and nothing is sent.
+   */
+  readonly signal?: AbortSignal;
 };
 
 /**
@@ -205,9 +224,12 @@ export type JudgeCallUsage = {
  * call in the system meters identically.
  *
  * With `spend`, the call reserves its worst case before it is sent (waiting
- * while only other calls' reservations stand in the way), settles on its
- * usage, and, when it fails after it was sent, settles at the reserved worst
- * case. A refusal sends nothing.
+ * while only other calls' reservations stand in the way, until `signal`
+ * aborts) and settles on the usage its stream reported. A call that reached
+ * no provider is released; one the provider refused outright counts $0; any
+ * other failure, and a stream that ended without its final counts, settles
+ * at the reserved worst case. A refusal sends nothing and throws a
+ * {@link JudgeBudgetError}.
  */
 export async function meteredJudgeCall(
   adapter: ProviderAdapter,
@@ -223,7 +245,9 @@ export async function meteredJudgeCall(
   const spend = meta.spend;
   const spendId = `rsv_judge_${startEnvelope?.spanId ?? randomBytes(8).toString("hex")}`;
   const spendMeta = { role, model: request.model };
-  if (spend !== undefined) await reserveJudgeCall(spend, spendId, adapter, request, spendMeta);
+  if (spend !== undefined) {
+    await reserveJudgeCall(spend, spendId, adapter, request, spendMeta, meta.signal);
+  }
   if (bus !== undefined && startEnvelope !== undefined) {
     bus.publish({
       ...startEnvelope,
@@ -239,15 +263,33 @@ export async function meteredJudgeCall(
   }
   const t0 = performance.now();
   let final: ProviderMessage;
+  const report: StreamReport = {};
+  const zero = { provider: adapter.providerId, modelId: request.model, input: 0, output: 0 };
   try {
-    final = await collectWithTemperatureRetry(adapter, request);
+    final = await collectWithTemperatureRetry(
+      adapter,
+      request,
+      spend !== undefined ? report : undefined,
+    );
   } catch (err) {
-    // Sent: it is counted, at its reserved worst case.
-    if (spend !== undefined) await spend.settleUnreported(spendId, spendMeta);
+    // A call that reached no provider spends nothing; one the provider refused
+    // outright counts $0; any other is counted at the usage it reported, else at
+    // its reserved worst case.
+    if (spend !== undefined && report.usage !== undefined) {
+      await spend.settle(spendId, { ...zero, ...report.usage }, spendMeta);
+    } else if (spend !== undefined) {
+      const counted = failedCallSpend(err, report.started === true);
+      if (counted === "release") await spend.release(spendId);
+      else if (counted === "zero") await spend.settle(spendId, zero, spendMeta);
+      else await spend.settleUnreported(spendId, spendMeta);
+    }
     throw err;
   }
   const durationMs = performance.now() - t0;
-  if (spend !== undefined) {
+  // A stream that ended without its final counts is counted at its worst case.
+  if (spend !== undefined && report.usage === undefined) {
+    await spend.settleUnreported(spendId, spendMeta);
+  } else if (spend !== undefined) {
     await spend.settle(
       spendId,
       {
@@ -306,7 +348,9 @@ export async function meteredJudgeCall(
 /**
  * Reserve a judge call's worst case on `spend`: its system, messages and
  * tools at the input rate, `maxTokens` at the output rate. Waits while only
- * other calls' reservations stand in the way; a refusal throws.
+ * other calls' reservations stand in the way, until `signal` aborts (then it
+ * throws an `AbortError` and holds nothing); a refusal throws a
+ * {@link JudgeBudgetError}.
  */
 async function reserveJudgeCall(
   spend: SpendMeter,
@@ -314,6 +358,7 @@ async function reserveJudgeCall(
   adapter: ProviderAdapter,
   request: ProviderRequest,
   meta: { readonly role: ModelRole; readonly model: string },
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   const chars = JSON.stringify({
     system: request.system,
@@ -329,19 +374,61 @@ async function reserveJudgeCall(
     spend.pricing,
   );
   for (;;) {
+    if (signal !== undefined && stopped(signal)) throw abortError(signal);
     const answer = await spend.reserve(id, estimate, meta);
-    if (answer.admit) return;
-    if (answer.on === "spent") {
-      throw new JudgeError(
-        answer.scope === "period"
-          ? "the harness's budget for this period is used up; the judge call was not sent"
-          : answer.scope === "share"
-            ? "this sub-agent's share of the budget is used up; the judge call was not sent"
-            : "the run's budget is used up; the judge call was not sent",
-      );
+    if (answer.admit) {
+      // A stop that landed while the ledger answered: nothing is sent.
+      if (signal !== undefined && stopped(signal)) {
+        await spend.release(id);
+        throw abortError(signal);
+      }
+      return;
     }
-    await answer.settled;
+    if (answer.on === "spent") {
+      throw new JudgeBudgetError({
+        scope: answer.scope ?? "run",
+        ...(answer.held === true ? { held: true as const } : {}),
+        ...(answer.inFlight === true ? { inFlight: true as const } : {}),
+      });
+    }
+    await untilSettledOrAborted(answer.settled, signal);
   }
+}
+
+/** Read through a call, so a check after an `await` is not narrowed away. */
+function stopped(signal: AbortSignal): boolean {
+  return signal.aborted;
+}
+
+function abortError(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error("the judge call was stopped before it was sent");
+  err.name = "AbortError";
+  return err;
+}
+
+/** `settled`, or an `AbortError` as soon as `signal` aborts. */
+function untilSettledOrAborted(
+  settled: Promise<void>,
+  signal: AbortSignal | undefined,
+): Promise<void> {
+  if (signal === undefined) return settled;
+  if (signal.aborted) return Promise.reject(abortError(signal));
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError(signal));
+    signal.addEventListener("abort", onAbort, { once: true });
+    settled.then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
 }
 
 export type JudgeOptions = {
@@ -479,6 +566,7 @@ export async function judge(opts: JudgeOptions): Promise<JudgeResult> {
       specModel: model,
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
       ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -632,6 +720,7 @@ export async function judgeCategorical(
       specModel: model,
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
       ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -759,6 +848,7 @@ export async function verifyDraft(opts: VerifyDraftOptions): Promise<VerifyDraft
       // stage "verify" by default so the run's cost fold names the stage.
       ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
       ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+      ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
       ...(opts.role !== undefined ? { role: opts.role } : {}),
       stage: opts.stage ?? "verify",
       ...(opts.onUsage !== undefined ? { onUsage: opts.onUsage } : {}),
@@ -991,6 +1081,8 @@ export function createJudgeGrader(
     stage?: string;
     /** The spend meter every judge call this grader makes reserves on before it is sent. */
     spend?: SpendMeter;
+    /** Ends a judge call's wait for room on `spend`. */
+    signal?: AbortSignal;
     /**
      * 0.6.0 §4.2 — the judge profile's pinned request params, threaded into
      * EVERY call this grader makes (single verdicts, each repeat, each
@@ -1014,6 +1106,7 @@ export function createJudgeGrader(
   const busOpts: JudgeBusOptions = {
     ...(opts.bus !== undefined ? { bus: opts.bus } : {}),
     ...(opts.spend !== undefined ? { spend: opts.spend } : {}),
+    ...(opts.signal !== undefined ? { signal: opts.signal } : {}),
     ...(opts.role !== undefined ? { role: opts.role } : {}),
     ...(opts.stage !== undefined ? { stage: opts.stage } : {}),
   };

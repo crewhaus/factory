@@ -225,7 +225,7 @@ describe("a change check protects the checked spec's record", () => {
     writeFileSync(join(real, "crewhaus.yaml"), SPEC);
     symlinkSync(join(real, "crewhaus.yaml"), join(harness, "crewhaus.yaml"));
     const roots = await checkedRoots(harness, undefined);
-    expect(roots).toContain(join(real, ".crewhaus", "run", "spec"));
+    expect(roots).toContain(join(real, ".crewhaus", "run"));
     // A full eval through the live loop, slow by construction on a loaded runner.
   }, 30_000);
 
@@ -234,7 +234,7 @@ describe("a change check protects the checked spec's record", () => {
     mkdirSync(join(harness, "sub"));
     writeFileSync(join(harness, "sub", "x.yaml"), SPEC);
     const roots = await checkedRoots(harness, join("sub", "x.yaml"));
-    expect(roots).toContain(join(harness, "sub", ".crewhaus", "run", "spec"));
+    expect(roots).toContain(join(harness, "sub", ".crewhaus", "run"));
     // A full eval through the live loop, slow by construction on a loaded runner.
   }, 30_000);
 });

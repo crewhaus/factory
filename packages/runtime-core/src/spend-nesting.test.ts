@@ -11,11 +11,13 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type {
-  ProviderAdapter,
-  ProviderId,
-  ProviderRequest,
-  StreamEvent,
+import {
+  Anthropic,
+  AnthropicAdapter,
+  type ProviderAdapter,
+  type ProviderId,
+  type ProviderRequest,
+  type StreamEvent,
 } from "@crewhaus/adapter-anthropic";
 import type { RuntimeBridge } from "@crewhaus/agent-context-isolation";
 import { openBudgetLedger } from "@crewhaus/control-records/budget";
@@ -50,7 +52,15 @@ afterAll(() => {
 const SONNET = "claude-sonnet-4-6";
 const USAGE = { input: 100, output: 10 };
 
-type Step = "spawn" | "text" | "throw" | "rate-limited" | "late-throw";
+type Step =
+  | "spawn"
+  | "text"
+  | "throw"
+  | "rate-limited"
+  | "late-throw"
+  | "refused-429"
+  | "unreachable"
+  | "silent";
 
 /** A rate limit the built-in recovery retries at once (Retry-After 0). */
 const rateLimited = (): Error =>
@@ -74,8 +84,27 @@ function scripted(
       const id = `tu_${call}`;
       call += 1;
       return (async function* () {
+        // The provider refuses before any event: nothing was billed.
+        if (step === "refused-429") throw rateLimited();
+        // No connection: the request reached no provider.
+        if (step === "unreachable") {
+          throw Object.assign(new Error("Connection error."), {
+            name: "APIConnectionError",
+            cause: Object.assign(new Error("Unable to connect"), { code: "ConnectionRefused" }),
+          });
+        }
         yield { kind: "message_start", usage: { input: USAGE.input, output: 0 } };
         if (step === "throw") throw new Error("the stream broke");
+        // An abort that ends the stream silently, before its final counts.
+        if (step === "silent") {
+          yield { kind: "content_block_start", index: 0, block: { type: "text", text: "" } };
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "pa" },
+          };
+          return;
+        }
         if (step === "rate-limited") throw rateLimited();
         if (step === "spawn") {
           yield {
@@ -122,6 +151,7 @@ function recording(meter: SpendMeter, answers: SpendAdmission[]): SpendMeter {
 /** A streaming parent near its cap whose one tool runs `inside` while the parent's call is still open. */
 async function streamingParent(
   inside: (bridge: RuntimeBridge, parent: RunContext) => Promise<string>,
+  extra: Partial<Parameters<typeof runChatLoop>[0]> = {},
 ): Promise<{ parent: RunContext; caught: unknown }> {
   const parent = createRunContext();
   const spawn = buildTool({
@@ -148,6 +178,7 @@ async function streamingParent(
       spinner: false,
       stdout: () => {},
       runContext: parent,
+      ...extra,
     });
   } catch (err) {
     caught = err;
@@ -208,6 +239,65 @@ describe("a loop nested inside a streaming call's tool", () => {
     });
     expect(caught).toBeUndefined();
     expect(answer).toEqual({ admit: false, on: "spent", scope: "run", inFlight: true });
+  });
+
+  test("under a budget period, the nested loop's answer is final on the period too", async () => {
+    const harness = tempDir("nested-period");
+    const answers: SpendAdmission[] = [];
+    let nested: unknown;
+    const { parent, caught } = await streamingParent(
+      async (_bridge, parentCtx) => {
+        const view = spendMeterOf(parentCtx);
+        if (view === undefined) throw new Error("the parent has no spend meter");
+        try {
+          await runChatLoop({
+            model: SONNET,
+            instructions: "child",
+            _adapter: scripted(["text"]),
+            tools: [],
+            maxTokens: 64_000,
+            spendMeter: recording(view, answers),
+            singleTurn: true,
+            seedMessages: [{ role: "user", content: "help" }],
+            installSigintHandler: false,
+            spinner: false,
+            stdout: () => {},
+            runContext: createRunContext(),
+            persistSession: false,
+          });
+        } catch (err) {
+          nested = err;
+        }
+        return "stopped";
+      },
+      {
+        // The run's own cap has room; the period's $0.50 is filled by the parent's
+        // $0.96 worst case, still in progress.
+        budget: {
+          usdMicros: 50_000_000,
+          onExceed: { kind: "stop" },
+          period: { every: "month", usdMicros: 500_000 },
+        },
+        spendLedgerRoot: harness,
+        persistSession: false,
+      },
+    );
+    expect(caught).toBeUndefined();
+    expect((nested as RunFailedError).report).toMatchObject({
+      class: "crewhaus_budget",
+      exitCode: 33,
+    });
+    expect((nested as RunFailedError).report.detail).toContain(
+      "the harness's budget for this period is used up, counting the call still in progress",
+    );
+    expect(answers).toEqual([{ admit: false, on: "spent", scope: "period", inFlight: true }]);
+    expect(spendMeterOf(parent)?.snapshot().activeReservations).toBe(0);
+    // The nested refusal wrote nothing to the ledger, and closed nothing.
+    const lines = ledgerLines(harness);
+    expect(lines.filter((l) => l["op"] === "reserve")).toHaveLength(2);
+    expect(existsSync(join(harness, ".crewhaus", "run", "control", "budget-state.json"))).toBe(
+      false,
+    );
   });
 });
 
@@ -330,6 +420,48 @@ describe("a call that was sent is counted", () => {
     expect(lines.filter((l) => l["op"] === "release")).toEqual([]);
   });
 
+  test("a stream that ends before its final counts, as an abort ends one, settles at its worst case", async () => {
+    for (const streaming of [false, true]) {
+      const harness = tempDir(`silent-${streaming}`);
+      await periodRun(harness, scripted(["silent"]), { streaming });
+      const lines = ledgerLines(harness);
+      const reserves = lines.filter((l) => l["op"] === "reserve");
+      const settles = lines.filter((l) => l["op"] === "settle");
+      expect(reserves).toHaveLength(1);
+      expect(settles).toHaveLength(1);
+      expect(settles[0]?.["usdMicros"]).toBe(reserves[0]?.["usdMicros"]);
+    }
+  });
+
+  test("a request that reached no provider is released", async () => {
+    const harness = tempDir("unreachable");
+    const { caught } = await periodRun(harness, scripted(["unreachable"]));
+    expect(caught).toBeDefined();
+    const ops = ledgerLines(harness).map((l) => l["op"]);
+    expect(ops).toEqual(["reserve", "release"]);
+  });
+
+  test("a provider's outright 429 counts $0, and the retry recovers under a cap below one worst case", async () => {
+    // The run's cap ($0.50) is below one call's worst case ($0.96).
+    for (const period of [false, true]) {
+      const harness = tempDir(`refused-429-${period}`);
+      const adapter = scripted(["refused-429", "text"]);
+      const { caught } = await periodRun(harness, adapter, {
+        maxTokens: 64_000,
+        budget: {
+          usdMicros: period ? 50_000_000 : 500_000,
+          onExceed: { kind: "stop" },
+          period: { every: "month", usdMicros: period ? 500_000 : 100_000_000 },
+        },
+      });
+      expect(caught).toBeUndefined();
+      expect(adapter.requests).toHaveLength(2);
+      const settles = ledgerLines(harness).filter((l) => l["op"] === "settle");
+      // 100 in at $3/M and 10 out at $15/M on the retry.
+      expect(settles.map((l) => l["usdMicros"])).toEqual([0, 450]);
+    }
+  });
+
   test("a reservation refused before the call is sent leaves no line", async () => {
     const harness = tempDir("refused");
     const tight = { every: "month" as const, usdMicros: 1_000 };
@@ -359,6 +491,106 @@ describe("a call that was sent is counted", () => {
     expect(adapter.requests).toHaveLength(0);
     expect(ledgerLines(harness).map((l) => l["id"])).toEqual(["earlier"]);
   });
+});
+
+/** The shipped Anthropic adapter, pointed at a loopback `server` (or a closed port). */
+function anthropicAt(port: number): ProviderAdapter {
+  const client = new Anthropic({
+    apiKey: ["test", "key"].join("-"),
+    baseURL: `http://127.0.0.1:${port}`,
+    maxRetries: 0,
+  });
+  return new AnthropicAdapter({ client, isOAuth: false });
+}
+
+/** A loopback server that starts a long answer and never finishes it. */
+function stallingServer(): { port: number; stop: () => void } {
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    idleTimeout: 60,
+    fetch() {
+      const enc = new TextEncoder();
+      const body = new ReadableStream({
+        start(c) {
+          const ev = (o: Record<string, unknown>) =>
+            c.enqueue(enc.encode(`event: ${o["type"]}\ndata: ${JSON.stringify(o)}\n\n`));
+          ev({
+            type: "message_start",
+            message: {
+              id: "m",
+              type: "message",
+              role: "assistant",
+              model: SONNET,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 100, output_tokens: 1 },
+            },
+          });
+          ev({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+          ev({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "a" } });
+          // Never closes: the rest of the answer could still be streaming.
+        },
+      });
+      return new Response(body, { headers: { "content-type": "text/event-stream" } });
+    },
+  });
+  return { port: server.port as number, stop: () => server.stop(true) };
+}
+
+describe("the shipped Anthropic adapter", () => {
+  test("a call cut off by the turn or model-call timeout settles at its worst case", async () => {
+    for (const limit of [{ turnTimeoutMs: 300 }, { modelCallTimeoutMs: 300 }]) {
+      const harness = tempDir("cut-off");
+      const server = stallingServer();
+      try {
+        // The timer only ends the stalled stream; nothing here measures time.
+        await periodRun(harness, anthropicAt(server.port), { maxTokens: 64_000, ...limit });
+      } finally {
+        server.stop();
+      }
+      const lines = ledgerLines(harness);
+      const reserves = lines.filter((l) => l["op"] === "reserve");
+      const settles = lines.filter((l) => l["op"] === "settle");
+      expect(reserves).toHaveLength(1);
+      expect(settles).toHaveLength(1);
+      expect(settles[0]?.["usdMicros"]).toBe(reserves[0]?.["usdMicros"]);
+    }
+  }, 20_000); // two loopback runs, each cut off by its timer
+
+  test("a refused connection is released; a 401 counts $0", async () => {
+    const closed = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const closedPort = closed.port as number;
+    closed.stop(true);
+    const refusedHarness = tempDir("conn-refused");
+    const refused = await periodRun(refusedHarness, anthropicAt(closedPort));
+    expect(refused.caught).toBeDefined();
+    expect(ledgerLines(refusedHarness).map((l) => l["op"])).toEqual(["reserve", "release"]);
+
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch: () =>
+        new Response(
+          JSON.stringify({
+            type: "error",
+            error: { type: "authentication_error", message: "invalid" },
+          }),
+          { status: 401, headers: { "content-type": "application/json" } },
+        ),
+    });
+    const authHarness = tempDir("auth-401");
+    try {
+      const auth = await periodRun(authHarness, anthropicAt(server.port as number));
+      expect(auth.caught).toBeDefined();
+    } finally {
+      server.stop(true);
+    }
+    const lines = ledgerLines(authHarness);
+    expect(lines.map((l) => l["op"])).toEqual(["reserve", "settle"]);
+    expect(lines[1]?.["usdMicros"]).toBe(0);
+  }, 20_000); // loopback HTTP round trips
 });
 
 describe("the period ledger's root", () => {

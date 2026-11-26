@@ -746,12 +746,13 @@ describe("side calls on a budgeted run's spend meter", () => {
     expect(result.costUsd).toBe(0.015);
   });
 
-  test("the shadow's judge calls reserve and settle on the run's meter", async () => {
+  test("the shadow's call and its judge calls reserve on the view it was scheduled with", async () => {
     const meter = createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING });
     const reserves: string[] = [];
     const counting = countingReserves(meter, reserves);
     const { parent } = watch();
-    await meterOn(parent, counting);
+    // The parent's loop holds a different meter: only the context's view is read.
+    await meterOn(parent, createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING }));
     const shadow = buildShadowSideCall(
       { ...POOL, strategy: { shadow: { candidate: MID, sampleRate: 1, gradeWith: STRONG } } },
       {
@@ -759,18 +760,24 @@ describe("side calls on a budgeted run's spend meter", () => {
         _judgeAdapter: judgeStub(selectContaining("shadow says")),
       },
     );
-    await shadow?.run({ ...ctxOf(parent), primaryText: "poll", primaryModel: CHEAP });
+    await shadow?.run({
+      ...ctxOf(parent),
+      spend: counting.within(undefined),
+      primaryText: "poll",
+      primaryModel: CHEAP,
+    });
     // The shadow's own call, then both orders of the pairwise judge.
+    expect(reserves.filter((r) => r.endsWith(" call"))).toHaveLength(1);
     expect(reserves.filter((r) => r === "judge judge")).toHaveLength(2);
     expect(meter.snapshot()).toMatchObject({ activeReservations: 0 });
     expect(meter.snapshot().spentMicros).toBeGreaterThan(0);
   });
 
-  test("the committee's members and its judge reserve and settle on the run's meter", async () => {
+  test("the committee's members and its judge reserve on the view it was started with", async () => {
     const meter = createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING });
     const reserves: string[] = [];
     const { parent } = watch();
-    await meterOn(parent, countingReserves(meter, reserves));
+    await meterOn(parent, createSpendMeter({ capMicros: 10_000_000, pricing: DEFAULT_PRICING }));
     const committee = buildCommitteeSideCall(
       { ...POOL, strategy: { committee: { members: ["cheap", "strong"], judge: STRONG } } },
       {
@@ -782,7 +789,10 @@ describe("side calls on a budgeted run's spend meter", () => {
       },
     );
     const before = meter.snapshot().spentMicros;
-    await committee?.run(ctxOf(parent));
+    await committee?.run({
+      ...ctxOf(parent),
+      spend: countingReserves(meter, reserves).within(undefined),
+    });
     // One call per member, then both orders of the judge's selection.
     expect(reserves.filter((r) => r.endsWith(" call"))).toHaveLength(2);
     expect(reserves.filter((r) => r === "judge judge")).toHaveLength(2);

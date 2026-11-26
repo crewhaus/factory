@@ -3941,7 +3941,7 @@ describe("the release notes name what the decision service changes for every har
       expect(roots).toContain(join(cwd, "scripts", "post.sh"));
       // A subcommand names no file: `test/` stays the agent's to write.
       expect(roots.some((root) => root === join(cwd, "test"))).toBe(false);
-      expect(roots).toContain(join(specDir, ".crewhaus", "run", "spec"));
+      expect(roots).toContain(join(specDir, ".crewhaus", "run"));
     } finally {
       rmSync(cwd, { recursive: true, force: true });
       rmSync(specDir, { recursive: true, force: true });
@@ -3954,7 +3954,7 @@ describe("the release notes name what the decision service changes for every har
       "not a word built when the hook runs, a here-document, a package script or a module, or what that script runs in turn",
     );
     expect(floor.replace(/\s+/g, " ")).toContain(
-      "for `crewhaus run` or `crewhaus runs resume` of a spec in another directory, that directory's `.crewhaus/run/spec`",
+      "for `crewhaus run` or `crewhaus runs resume` of a spec in another directory, that directory's `.crewhaus/run` (its spec record, and the period ledger and intake state a declared `budget.period` keeps there)",
     );
   });
 
@@ -4050,7 +4050,7 @@ describe("the release notes name what the decision service changes for every har
     }
     expect(seen.map((opts) => opts["specDir"])).toEqual([join(root, "spec")]);
     const bullet = bulletFor("keep a spec's records out of an").replace(/\s+/g, " ");
-    expect(bullet).toContain("`.crewhaus/run/spec`");
+    expect(bullet).toContain("that directory's `.crewhaus/run` is on the runtime-state floor");
     expect(bullet).toContain("`crewhaus optimize`");
   });
 });
@@ -7073,17 +7073,21 @@ describe("0.9.0 — spend is never a guessed $0", () => {
     expect(stream).toBeGreaterThan(reserve);
     expect(later().some((b) => b.includes("reserves its worst case first"))).toBe(true);
     // A call is counted from the moment it is sent: the loop marks it sent just before the
-    // stream call, and its catch settles a sent call rather than releasing it.
+    // stream call, and its catch decides by what arrived and why it failed.
     const sent = loop.indexOf("spendSent = true;");
     expect(sent).toBeGreaterThan(reserve);
     expect(stream).toBeGreaterThan(sent);
-    expect(loop.includes("await spendMeter.settleUnreported(id, meta);")).toBe(true);
-    expect(
-      later().some(
-        (b) =>
-          b.includes("reserves its worst case first") && b.includes("counts the usage it reported"),
-      ),
-    ).toBe(true);
+    expect(loop.includes("failedCallSpend(err, spendReport.started === true)")).toBe(true);
+    // A blocking evaluation gate stops on a refused judge call; the turn is not served.
+    expect(loop.includes("const refused = judgeBudgetRefusal(err);")).toBe(true);
+    const bullet = later().find((b) => b.includes("reserves its worst case first")) ?? "";
+    const flat = bullet.replace(/\s+/g, " ");
+    expect(flat).toContain("counts the usage it reported");
+    expect(flat).toContain("A call that reached no provider spends nothing");
+    expect(flat).toContain(
+      "a refused evaluation judge call ends the run with exit 33 under `on_fail: retry`, `halt` or `escalate`",
+    );
+    expect(flat).toContain("the route classifier, and shadow and committee calls and their judges");
   });
 
   test("managed tenant budgets reserve an estimate, and a bullet names `estimateUsage`", () => {

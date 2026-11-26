@@ -30,7 +30,7 @@
  *   settle counts an unknown call, and a budgeted run publishes one
  *   `budget_unpriced` per wire model ({@link settleModelCall}, the one site).
  */
-import type { ProviderRequest, StreamEvent, TokenUsage } from "@crewhaus/adapter-anthropic";
+import type { ProviderRequest } from "@crewhaus/adapter-anthropic";
 import { intakeRoot } from "@crewhaus/control-records";
 import { type BudgetPeriodDef, openBudgetLedger } from "@crewhaus/control-records/budget";
 import {
@@ -46,6 +46,9 @@ import {
   createSpendMeter,
   estimateCallMicros,
 } from "@crewhaus/cost-tracker/spend";
+
+/** The stream reporter the loop wraps each call's stream in (`@crewhaus/cost-tracker/spend`). */
+export { type StreamReport, failedCallSpend, notingUsage } from "@crewhaus/cost-tracker/spend";
 import type { RunContext } from "@crewhaus/run-context";
 import type { ModelRole, ProviderId, TraceEventBus } from "@crewhaus/trace-event-bus";
 
@@ -250,44 +253,10 @@ export async function reserveModelCall(
   }
 }
 
-/** A call's usage as its stream reports it: `usage` is set once the final counts arrive. */
-export type StreamReport = { usage?: TokenUsage };
-
 /**
- * `stream`, unchanged, noting on `report` the usage it reported once the counts
- * are final: a closing `message_delta` (one with a stop reason), or the
- * `message_stop` after a delta that carried counts. The counts merge as the
- * stream's consumers merge them. A stream that ends before that, or that counted
- * nothing, leaves `report.usage` undefined: its output is not known.
- */
-export async function* notingUsage(
-  stream: AsyncIterable<StreamEvent>,
-  report: StreamReport,
-): AsyncGenerator<StreamEvent> {
-  let seen: TokenUsage = { input: 0, output: 0 };
-  let counted = false;
-  for await (const ev of stream) {
-    if (ev.kind === "message_start" && ev.usage !== undefined) seen = ev.usage;
-    if (ev.kind === "message_delta" && ev.usage !== undefined) {
-      const { input, output, cacheRead, cacheCreate } = ev.usage;
-      seen = {
-        ...seen,
-        ...(input > 0 ? { input } : {}),
-        ...(output > 0 ? { output } : {}),
-        ...(cacheRead !== undefined ? { cacheRead } : {}),
-        ...(cacheCreate !== undefined ? { cacheCreate } : {}),
-      };
-      counted = output > 0 || input > 0;
-    }
-    const closing =
-      ev.kind === "message_stop" || (ev.kind === "message_delta" && ev.stopReason !== undefined);
-    if (closing && counted) report.usage = seen;
-    yield ev;
-  }
-}
-
-/**
- * Settle call `id` with its response's usage. The first unpriced settle of a
+ * Settle call `id` with its response's usage, or, when `usage` is undefined
+ * (the call was sent and its stream never reported its final counts), at its
+ * reserved worst case (`settleUnreported`). The first unpriced settle of a
  * wire model in a budgeted run publishes `budget_unpriced` once: never a
  * stop, never a degrade.
  */
@@ -300,26 +269,32 @@ export async function settleModelCall(args: {
   readonly provider: ProviderId;
   readonly wireModelId: string;
   readonly role: ModelRole | undefined;
-  readonly usage: {
-    readonly input: number;
-    readonly output: number;
-    readonly cacheRead?: number;
-    readonly cacheCreate?: number;
-  };
+  readonly usage:
+    | {
+        readonly input: number;
+        readonly output: number;
+        readonly cacheRead?: number;
+        readonly cacheCreate?: number;
+      }
+    | undefined;
   readonly meta: SpendReserveMeta;
 }): Promise<void> {
-  const settled = await args.meter.settle(
-    args.id,
-    {
-      provider: args.provider,
-      modelId: args.wireModelId,
-      input: args.usage.input,
-      output: args.usage.output,
-      ...(args.usage.cacheRead !== undefined ? { cacheRead: args.usage.cacheRead } : {}),
-      ...(args.usage.cacheCreate !== undefined ? { cacheCreate: args.usage.cacheCreate } : {}),
-    },
-    args.meta,
-  );
+  const usage = args.usage;
+  const settled =
+    usage === undefined
+      ? await args.meter.settleUnreported(args.id, args.meta)
+      : await args.meter.settle(
+          args.id,
+          {
+            provider: args.provider,
+            modelId: args.wireModelId,
+            input: usage.input,
+            output: usage.output,
+            ...(usage.cacheRead !== undefined ? { cacheRead: usage.cacheRead } : {}),
+            ...(usage.cacheCreate !== undefined ? { cacheCreate: usage.cacheCreate } : {}),
+          },
+          args.meta,
+        );
   if (settled.usdMicros !== undefined || !args.budgeted) return;
   let seen = unpricedSeen.get(args.runContext);
   if (seen === undefined) {
