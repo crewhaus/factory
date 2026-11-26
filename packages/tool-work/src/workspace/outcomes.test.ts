@@ -222,6 +222,32 @@ describe("the pull request tracker", () => {
   );
 
   test(
+    "a revert moves nothing: an item a person reopened after the merge stays open",
+    async () => {
+      const t = await delivered();
+      t.later();
+      const { mergeSha } = t.b.fake.mergePull(REPO, t.pr);
+      await t.sync();
+      expect(t.item()).toMatchObject({ state: "closed", outcome: "done" });
+      t.later();
+      const reopened = await t.store.transition(t.wi, "open", {}, PERSON);
+      expect(reopened.ok).toBe(true);
+      const history = t.item().history.length;
+      const lines = t.lines().length;
+      t.later();
+      t.b.fake.commitOnBranch(REPO, "main", `Revert it\n\nThis reverts commit ${mergeSha}.`);
+      expect(await t.sync()).toMatchObject({ wrote: 1, moved: 0 });
+      expect(readOutcomes(t.b.dir).get(t.wi)).toMatchObject({ state: "reverted" });
+      // Only the pull request's own line is written; the item is where the person put it.
+      expect(t.lines().length).toBe(lines + 1);
+      expect(t.item().state).toBe("open");
+      expect(t.item().history.length).toBe(history);
+      expect(t.item().history.at(-1)).toMatchObject({ event: "reopened", by: PERSON.by });
+    },
+    SLOW,
+  );
+
+  test(
     "a merged pull request is not watched for ever",
     async () => {
       const t = await delivered();

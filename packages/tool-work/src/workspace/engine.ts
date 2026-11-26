@@ -26,6 +26,7 @@ import type {
   WorkPublishCode,
   WorkPublishState,
   WorkPublishVerdict,
+  WorkPublishWhy,
 } from "@crewhaus/control-contract";
 import { type LeaseProbe, ensureDigestKey, keyedDigest } from "@crewhaus/control-records";
 import { maskCredentialTokens } from "@crewhaus/ir/redact";
@@ -56,6 +57,7 @@ import {
   type PublishLine,
   type WorkActor,
   type WorkRevision,
+  type WorkTextField,
   type WorkspaceLine,
   openWorkStore,
   readAttempts,
@@ -134,6 +136,8 @@ export type WorkspaceRefusal = {
   readonly line?: number;
   /** For `over_limits`: what a decision on this change is about. */
   readonly limits?: OverLimits;
+  /** The cause behind `code`, where the code alone does not say what to do. */
+  readonly why?: WorkPublishWhy;
 };
 
 export type OpenAnswer =
@@ -373,6 +377,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     return refuse(
       "unsupported_host",
       `Workspaces need git 2.38 or newer on this computer; it has ${found}.`,
+      { why: "git-too-old" },
     );
   }
 
@@ -413,10 +418,13 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         return refuse(
           "unsupported_host",
           `This item's workspace is in ${ws.binding}, which the harness no longer declares (it declares ${names}).`,
+          { why: "repository-gone" },
         );
       }
       if (asked !== undefined && asked !== ws.binding) {
-        return refuse("unsupported_host", `This item's workspace is already in ${ws.binding}.`);
+        return refuse("unsupported_host", `This item's workspace is already in ${ws.binding}.`, {
+          why: "repository-elsewhere",
+        });
       }
       return held;
     }
@@ -426,6 +434,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         refuse(
           "unsupported_host",
           `No repository is called ${asked}: the harness declares ${names}.`,
+          { why: "repository-unknown" },
         )
       );
     }
@@ -434,6 +443,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       return refuse(
         "unsupported_host",
         `This harness declares several repositories: name one of ${names}.`,
+        { why: "repository-ambiguous" },
       );
     }
     return only;
@@ -497,10 +507,14 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       apiOrigin = await assertCodehostOrigin(binding.server.api, opts);
     } catch (err) {
       if (!(err instanceof CodehostOriginError)) throw err;
-      return refuse("unsupported_host", err.message);
+      return refuse("unsupported_host", err.message, { why: "host-not-allowed" });
     }
     const repo = parseRepoName(binding.repo);
-    if (repo === undefined) return refuse("unsupported_host", "The repository is owner/name.");
+    if (repo === undefined) {
+      return refuse("unsupported_host", "The repository is owner/name.", {
+        why: "host-not-allowed",
+      });
+    }
     const provider = deps.provider ?? tokenEnvProvider({ tokenEnv: bindingsNow().tokenEnv, env });
     const credential = await provider({ origin: apiOrigin.origin, repo: binding.repo });
     if (!credential.ok) return refuse(credential.code, credential.message);
@@ -517,18 +531,22 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
   }
 
   function networkRefusal(done: GitRun, what: string): WorkspaceRefusal {
-    switch (networkFailure(done)) {
+    const failure = networkFailure(done);
+    switch (failure) {
       case "credential":
         return refuse(
           "credential_unavailable",
           `${what}: the code host refused the credential, or it cannot see this repository.`,
         );
       case "timeout":
-        return refuse("unsupported_host", `${what}: the code host did not answer in time.`);
+        return refuse("unsupported_host", `${what}: the code host did not answer in time.`, {
+          why: "host-timeout",
+        });
       default:
         return refuse(
           "unsupported_host",
           `${what}: ${redact(done.stderr.trim().split("\n").at(-1) ?? "git failed").slice(0, 200)}`,
+          { why: failure === "host" ? "host-unreachable" : "host-refused" },
         );
     }
   }
@@ -551,6 +569,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     return refuse(
       "unsupported_host",
       `The managed clone of ${binding.repo} has git settings this harness did not make (${strange.slice(0, 5).join(", ")}), so it talks to no code host. A person removes them from ${join(bindingDirOf(binding.name), "repo", "config")}.`,
+      { why: "clone-settings" },
     );
   }
 
@@ -595,7 +614,12 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       return networkRefusal(done, `Reading ${binding.base} of ${binding.repo}`);
     }
     const at = await sha({ repoDir: paths.repoDir }, `refs/remotes/origin/${binding.base}`);
-    return at ?? refuse("unsupported_host", `${binding.repo} has no branch ${binding.base}.`);
+    return (
+      at ??
+      refuse("unsupported_host", `${binding.repo} has no branch ${binding.base}.`, {
+        why: "base-missing",
+      })
+    );
   }
 
   async function line(
@@ -826,7 +850,6 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     readonly stat: DiffStat;
     readonly added: readonly AddedLine[];
     readonly files: readonly string[];
-    readonly messages: string;
     readonly digest: string;
     readonly truncated: boolean;
   };
@@ -856,22 +879,44 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       },
       "Listing the change",
     );
-    const messages = await must(
-      {
-        repoDir,
-        args: ["log", "--no-color", "--format=%an%n%B", `${base}..${head}`],
-        maxOutputChars: DIFF_MAX_CHARS,
-      },
-      "Reading the commits",
-    );
     return {
       stat: parseNumstat(numstat),
       added: parseAddedLines(diff.stdout),
       files: names.split("\0").filter((n) => n !== ""),
-      messages,
       digest: changeDigest(diff.stdout),
       truncated: diff.truncated,
     };
+  }
+
+  /**
+   * The one commit a publish pushes: `head`'s tree on `base`, with the publish's own message.
+   * Its tree is exactly the change every gate read, and it carries none of the branch's own
+   * commits. Its dates are `head`'s, so the same change and text make the same commit again.
+   */
+  async function publishedCommit(
+    paths: Paths,
+    base: string,
+    head: string,
+    message: string,
+  ): Promise<string> {
+    const { repoDir } = paths;
+    const when = (
+      await must({ repoDir, args: ["log", "-1", "--format=%ct", head] }, "Reading the change")
+    ).trim();
+    if (!/^\d{1,12}$/.test(when)) throw new WorkspaceError("The change's date could not be read.");
+    const made = (
+      await must(
+        {
+          repoDir,
+          args: ["commit-tree", `${head}^{tree}`, "-p", base, "-F", "-"],
+          stdin: message,
+          date: `@${when} +0000`,
+        },
+        "Making the published commit",
+      )
+    ).trim();
+    if (!SHA_RE.test(made)) throw new WorkspaceError("The published commit could not be read.");
+    return made;
   }
 
   /** The text a publish goes out with: the agent's, or what the last attempt said. */
@@ -916,14 +961,26 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     return undefined;
   }
 
-  const ownWords = (revision: WorkRevision): string[] => [
-    revision.title,
-    revision.goal ?? "",
-    ...(revision.acceptance ?? []),
-    ...(revision.notes ?? []).map((n) => n.text),
-    JSON.stringify(revision.assessment ?? ""),
-    revision.sourceExcerpt ?? "",
-  ];
+  /**
+   * The item's own words, which its change may repeat: only what a person wrote, or accepted.
+   * A title, goal or criterion counts when it came through the API, or when a person opened
+   * or accepted the item (the harness edits nothing after that). A note or the assessment
+   * counts only when it came through the API. Nothing the harness, a tool or an adopted
+   * source wrote ever counts, so text a run copies into its own item stays its lineage.
+   */
+  const ownWords = (item: FoldedWorkItem, revision: WorkRevision): string[] => {
+    const byPerson = item.history.some((l) => l.state === "open" && !l.by.startsWith("sys:"));
+    const fromApi = (field: WorkTextField): boolean => revision.fieldOrigins[field] === "api";
+    return [
+      ...(byPerson || fromApi("title") ? [revision.title] : []),
+      ...(revision.goal !== undefined && (byPerson || fromApi("goal")) ? [revision.goal] : []),
+      ...(byPerson || fromApi("acceptance") ? (revision.acceptance ?? []) : []),
+      ...(revision.notes ?? []).filter((n) => n.origin === "api").map((n) => n.text),
+      ...(revision.assessment !== undefined && fromApi("assessment")
+        ? [JSON.stringify(revision.assessment)]
+        : []),
+    ];
+  };
 
   async function publish(input: PublishInput): Promise<PublishAnswer> {
     assertHarnessCwd(harnessDir);
@@ -1026,7 +1083,12 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       refusal: WorkspaceRefusal,
       fields: Partial<PublishLine> = {},
     ): Promise<PublishAnswer> => {
-      await record({ ...fields, state: "failed", code: refusal.code });
+      await record({
+        ...fields,
+        state: "failed",
+        code: refusal.code,
+        ...(refusal.why !== undefined ? { why: refusal.why } : {}),
+      });
       return {
         ...refusal,
         attempt: n,
@@ -1128,6 +1190,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
             refuse(
               "gate_failed",
               "The base moved since this change was judged. Run the item again so the harness can rebase and check it.",
+              { why: "base-moved" },
             ),
           );
         }
@@ -1219,6 +1282,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
             refuse(
               "gate_failed",
               `No run of this harness has judged this exact change and passed it. Run the item again: crewhaus work start ${wi}`,
+              { why: "not-judged" },
             ),
           );
         }
@@ -1269,25 +1333,33 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
                 results: answer.results.map((r) => ({ k: r.k, exit: r.exit })),
               });
             } else if (binding.pullRequests.require.includes("checks")) {
-              return await fail(refuse("gate_failed", answer.reason), {
-                verdict: {
-                  checks: "not-run",
-                  acceptance: binding.pullRequests.require.includes("acceptance")
-                    ? "not-run"
-                    : "not-required",
-                  sha: head,
+              return await fail(
+                refuse("gate_failed", answer.reason, {
+                  why: answer.reason === NO_SANDBOX_REMEDY ? "no-sandbox" : "sandbox-failed",
+                }),
+                {
+                  verdict: {
+                    checks: "not-run",
+                    acceptance: binding.pullRequests.require.includes("acceptance")
+                      ? "not-run"
+                      : "not-required",
+                    sha: head,
+                  },
                 },
-              });
+              );
             }
           }
         }
         verdict = { checks: "skipped", acceptance: "not-run", sha: head };
       }
 
-      // What leaves: the change, its names and messages, and the pull request's own text.
+      // What leaves: one commit holding the change read above on the base it was read
+      // against, its file names and message, and the pull request's own text. The branch's
+      // own commits stay in this clone, so nothing a later commit took out goes with it.
+      const message = `${pullTitle(text.title)}\n\nWork item: ${wi}\n`;
       const values = [...credentialValues(env), host.token];
       const sinkId = `codehost:${binding.repo}`;
-      const own = ownWords(revision);
+      const own = ownWords(accepted.item, revision);
       if (change.truncated) {
         return await fail(
           refuse(
@@ -1297,7 +1369,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         );
       }
       const hit =
-        scanSecrets({ ...change, values }) ??
+        scanSecrets({ ...change, messages: message, values }) ??
         (input.rc !== undefined
           ? await scanLineage({ added: change.added, rc: input.rc, sinkId, own })
           : undefined);
@@ -1377,6 +1449,8 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         );
       }
       if (signal?.aborted === true) throw new WorkspaceError("The publish was stopped.");
+      const out = await publishedCommit(paths, base, head, message);
+      await record({ pushedSha: out });
 
       // The whole text that goes out, read once more: nothing it was rendered from adds a secret.
       const link = deps.homeLink?.(wi);
@@ -1411,9 +1485,10 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       const remoteSha = remote.stdout.trim().split(/\s+/)[0] ?? "";
       if (remoteSha !== "") {
         const mine = new Set(
-          (readAttempts(harnessDir).get(wi) ?? []).flatMap((a) =>
-            a.headSha !== undefined ? [a.headSha] : [],
-          ),
+          (readAttempts(harnessDir).get(wi) ?? []).flatMap((a) => [
+            ...(a.headSha !== undefined ? [a.headSha] : []),
+            ...(a.pushedSha !== undefined ? [a.pushedSha] : []),
+          ]),
         );
         if (!SHA_RE.test(remoteSha) || !mine.has(remoteSha)) {
           return await fail(
@@ -1425,7 +1500,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
         }
       }
       written = true;
-      if (remoteSha !== head) {
+      if (remoteSha !== out) {
         const pushed = await step({
           repoDir: paths.repoDir,
           network: host,
@@ -1435,7 +1510,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
             "--no-verify",
             `--force-with-lease=refs/heads/${ws.branch}:${remoteSha}`,
             host.url,
-            `${head}:refs/heads/${ws.branch}`,
+            `${out}:refs/heads/${ws.branch}`,
           ],
           ...more,
         });
@@ -1520,7 +1595,7 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
     }
     return {
       kind: "refused",
-      refusal: refuse("unsupported_host", `${failure.message}.`),
+      refusal: refuse("unsupported_host", `${failure.message}.`, { why: "host-refused" }),
     };
   }
 
@@ -1635,7 +1710,8 @@ export function createWorkspaceEngine(deps: EngineDeps): WorkspaceEngine {
       (readAttempts(harnessDir).get(wi) ?? []).some((a) => a.attempt < n && a.pr === pull.number);
     const landed =
       pull !== undefined &&
-      (!earlier || (pull.state === "open" && pull.headSha === attempt.headSha));
+      (!earlier ||
+        (pull.state === "open" && pull.headSha === (attempt.pushedSha ?? attempt.headSha)));
     if (pull !== undefined && landed) {
       const done = await settle({ state: "done", pr: pull.number });
       await deliverOnce(wi, binding.repo, pull.number, opts.actor);

@@ -49,8 +49,11 @@ tool_config:
 nothing observed: it waits for a person. Evidence counts as observed only when this harness's
 own records hold what it names: another run of this harness (`run_…`), a session of this
 harness (`session:<id>`), or a work item a person or the system adopted from a Thredz task or
-a GitHub issue (`wi_…`). A label alone never counts, and neither does a reference to the
-proposing run, the run it continues, or their sessions. Without
+a GitHub issue (`wi_…`). A label alone never counts. Neither does a reference to the
+proposer's own runs: a sub-agent proposes as its top run, and that run, the runs it continues
+or shares a root with, the runs that belong to it, its session and every run of that session
+are all its own. A run or session reference counts only when the proposing run has a row in
+the runs ledger. Without
 `ranking.weights`, items rank by priority, then age. Every leaf under `tool_config` is out of
 the optimizer's reach.
 
@@ -92,17 +95,22 @@ tool_config:
   person's decision, with the counts), the base (rebased onto, and checked again), the checks
   for that exact commit, what leaves (a credential of the harness, a credential-shaped token,
   or text from a source whose words do not leave in a commit refuses it, naming the file and
-  the line), and the acceptance check: deterministic criteria first (`check: <name>`), then a
-  judge over the item's criteria and, when the spec declares one, its `intent:`. The judge's
-  reasons stay in a private file beside the check logs; the pull request and the agent get the
-  verdict as a word.
+  the line; the words a person wrote or accepted for the item may be repeated, and text a run
+  or a tool wrote into the item never counts as those), and the acceptance check:
+  deterministic criteria first (`check: <name>`), then a judge over the item's criteria and,
+  when the spec declares one, its `intent:`. The judge's reasons stay in a private file beside
+  the check logs; the pull request and the agent get the verdict as a word.
+- **What leaves is what was checked.** The branch's own commits stay in the managed clone: the
+  push carries one commit, the checked tree on its base with the pull request's title as its
+  message, recorded as the attempt's `pushedSha`. A value a later commit took out never
+  reaches the code host.
 - **One pull request per item.** The branch is pushed under a lease, and the pull request is
   found by its branch before one is made, so a retry updates it. An attempt whose answer was
   lost is `unknown` until it is looked up; it is never made a second time.
 - **The tracker** (`syncOutcomes`, run by Home every ten minutes) reads each delivered pull
   request: merged closes an open item as done, closed without merging declines it, reopened
-  reopens an item the tracker declined, and a revert of the merge is recorded. An item a person
-  moved stays where they put it.
+  reopens an item the tracker declined, and a revert of the merge is recorded and moves
+  nothing. An item a person moved stays where they put it.
 
 `work.publish` (Home's API, `crewhaus work publish <wi>`) publishes only a change a run of the
 harness judged and passed for the same commit, with the harness's own environment files.

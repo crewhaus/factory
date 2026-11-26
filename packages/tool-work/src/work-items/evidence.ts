@@ -8,9 +8,17 @@
  * - a work item of this harness (`wi_…`) that a person or the system adopted from a
  *   Thredz task or a GitHub issue.
  *
- * A ref to the proposing run, to the run it continues or belongs to, or to one of those
- * runs' own sessions never counts: a run citing itself is the label again. Reads only:
- * the runs ledger is scanned raw and the session directory is checked contained.
+ * The proposer is its top run (a sub-agent proposes as the run it belongs to), and a run or
+ * session ref counts only when that top run has a row in the runs ledger: without one,
+ * nothing says which runs are its own, so only an adopted item counts. A ref to the
+ * proposer's own run family never counts, a run citing itself being the label again:
+ *
+ * - the top run, the run it continues, and the runs those continue or belong to;
+ * - every run that belongs to the top run, or to the same root as the top run;
+ * - the proposer's own session, and every run whose rows name one of the family's sessions,
+ *   with that run's sessions in turn.
+ *
+ * Reads only: the runs ledger is scanned raw and the session directory is checked contained.
  */
 import { lstatSync } from "node:fs";
 import { join } from "node:path";
@@ -76,26 +84,42 @@ function readRuns(harnessDir: string): ReadonlyMap<string, RunFacts> {
   return out;
 }
 
-/** The runs and sessions a proposal by `run` may not cite: its own and those it belongs to. */
+/**
+ * The runs and sessions a proposal may not cite: the proposer's whole run family, grown to a
+ * fixed point over the ledger's `continues`, `parent` and `session` facts, both ways.
+ */
 function selfOf(
-  run: string | undefined,
+  proposer: Proposer,
   runs: ReadonlyMap<string, RunFacts>,
 ): {
   readonly runs: ReadonlySet<string>;
   readonly sessions: ReadonlySet<string>;
 } {
-  const selfRuns = new Set<string>();
+  const selfRuns = new Set<string>([proposer.run]);
   const sessions = new Set<string>();
-  if (run === undefined) return { runs: selfRuns, sessions };
-  const queue = [run];
-  while (queue.length > 0) {
-    const next = queue.pop() as string;
-    if (selfRuns.has(next)) continue;
-    selfRuns.add(next);
-    const facts = runs.get(next);
-    if (facts === undefined) continue;
-    for (const s of facts.sessions) sessions.add(s);
-    for (const r of facts.related) queue.push(r);
+  if (proposer.continues !== undefined) selfRuns.add(proposer.continues);
+  if (proposer.session !== undefined) sessions.add(proposer.session);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [id, facts] of runs) {
+      const mine =
+        selfRuns.has(id) ||
+        [...facts.related].some((r) => selfRuns.has(r)) ||
+        [...facts.sessions].some((s) => sessions.has(s));
+      if (!mine) continue;
+      for (const r of [id, ...facts.related]) {
+        if (!selfRuns.has(r)) {
+          selfRuns.add(r);
+          grew = true;
+        }
+      }
+      for (const s of facts.sessions) {
+        if (!sessions.has(s)) {
+          sessions.add(s);
+          grew = true;
+        }
+      }
+    }
   }
   return { runs: selfRuns, sessions };
 }
@@ -113,10 +137,20 @@ function sessionLogExists(harnessDir: string, id: string): boolean {
   }
 }
 
+/** Who proposes: a run, as its context names it. */
+export type Proposer = {
+  /** The top run: a sub-agent's parent, else the run itself. */
+  readonly run: string;
+  /** The session the proposing call ran in. */
+  readonly session?: string;
+  /** The parked run the top run continues. */
+  readonly continues?: string;
+};
+
 export type EvidenceContext = {
   readonly harnessDir: string;
-  /** The run proposing, when a run proposes. */
-  readonly run?: string;
+  /** The run proposing. Absent, no run or session ref counts. */
+  readonly proposer?: Proposer;
   /** The work log, folded whole, for a `wi_…` ref. */
   readonly fold?: WorkFold;
 };
@@ -134,22 +168,36 @@ export function verifiedObservedEvidence(
     (e) => e.label === "observed" && !isHypothesis(e) && typeof e.ref === "string",
   );
   if (observed.length === 0) return false;
-  let runs: ReadonlyMap<string, RunFacts> | undefined;
-  const runsOf = (): ReadonlyMap<string, RunFacts> => {
-    runs ??= readRuns(ctx.harnessDir);
-    return runs;
+  // Who the proposer is decides which runs and sessions are its own: unknown, none count.
+  let known: { all: ReadonlyMap<string, RunFacts>; self: ReturnType<typeof selfOf> } | null = null;
+  let read = false;
+  const family = () => {
+    if (!read) {
+      read = true;
+      const { proposer } = ctx;
+      const all =
+        proposer !== undefined && CANONICAL_RUN_ID_RE.test(proposer.run)
+          ? readRuns(ctx.harnessDir)
+          : undefined;
+      known =
+        all !== undefined && proposer !== undefined && all.has(proposer.run)
+          ? { all, self: selfOf(proposer, all) }
+          : null;
+    }
+    return known;
   };
   for (const e of observed) {
     const ref = (e.ref as string).trim();
     const runRef = ref.startsWith("run:") ? ref.slice(4) : ref;
     if (CANONICAL_RUN_ID_RE.test(runRef)) {
-      const all = runsOf();
-      if (all.has(runRef) && !selfOf(ctx.run, all).runs.has(runRef)) return true;
+      const f = family();
+      if (f?.all.has(runRef) && !f.self.runs.has(runRef)) return true;
       continue;
     }
     if (ref.startsWith("session:")) {
       const id = ref.slice("session:".length);
-      if (selfOf(ctx.run, runsOf()).sessions.has(id)) continue;
+      const f = family();
+      if (f === null || f.self.sessions.has(id)) continue;
       if (sessionLogExists(ctx.harnessDir, id)) return true;
       continue;
     }

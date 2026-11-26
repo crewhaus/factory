@@ -65,7 +65,7 @@ import {
   mayMove,
 } from "./actors";
 import { checkProposal, parseAssessment } from "./assessment";
-import { verifiedObservedEvidence } from "./evidence";
+import { type Proposer, verifiedObservedEvidence } from "./evidence";
 import { type FoldedWorkItem, type WorkFold, foldWork } from "./fold";
 import {
   REVISION_MAX_BYTES,
@@ -187,7 +187,15 @@ export type WorkStore = {
   propose(
     input: WorkInput,
     actor: WorkActor,
-    options?: { readonly policy?: WorkAcceptPolicy },
+    options?: {
+      readonly policy?: WorkAcceptPolicy;
+      /**
+       * The run proposing, as its context names it, for the accept policy's evidence check;
+       * `actor.run` alone when absent, and nobody when `null`. Without a proposer, only an
+       * adopted item counts.
+       */
+      readonly proposer?: Proposer | null;
+    },
   ): Promise<WorkWrite>;
   update(wi: string, patch: WorkPatch, actor: WorkActor): Promise<WorkWrite>;
   /**
@@ -1032,9 +1040,15 @@ export function openWorkStore(harnessDir: string, options: WorkStoreOptions = {}
       const needsObserved = input.kind === "feature" || input.basis === "speculative";
       const verified = (): boolean => {
         const folded = foldWork(harnessDir);
+        const proposer =
+          opts.proposer === undefined
+            ? actor.run !== undefined
+              ? { run: actor.run }
+              : undefined
+            : (opts.proposer ?? undefined);
         return verifiedObservedEvidence(assessment, {
           harnessDir,
-          ...(actor.run !== undefined ? { run: actor.run } : {}),
+          ...(proposer !== undefined ? { proposer } : {}),
           ...(folded.ok ? { fold: folded } : {}),
         });
       };

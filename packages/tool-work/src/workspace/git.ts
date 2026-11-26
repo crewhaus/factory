@@ -82,6 +82,8 @@ export type GitCall = {
   /** A call that talks to the code host. */
   readonly network?: NetworkGit;
   readonly identity?: string;
+  /** A commit's author and committer date, so the same tree on the same base is the same commit. */
+  readonly date?: string;
   readonly stdin?: string;
   readonly signal?: AbortSignal;
   readonly timeoutMs?: number;
@@ -140,6 +142,9 @@ export function git(ctx: GitContext, call: GitCall): Promise<GitRun> {
       GIT_AUTHOR_EMAIL: `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}@crewhaus.invalid`,
       GIT_COMMITTER_NAME: name,
       GIT_COMMITTER_EMAIL: `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}@crewhaus.invalid`,
+      ...(call.date !== undefined
+        ? { GIT_AUTHOR_DATE: call.date, GIT_COMMITTER_DATE: call.date }
+        : {}),
       ...(call.network !== undefined ? networkGitEnv(call.network.origin, call.network.token) : {}),
     },
     ...(call.stdin !== undefined ? { stdin: call.stdin } : {}),

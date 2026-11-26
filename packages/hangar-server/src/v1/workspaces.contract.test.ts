@@ -128,12 +128,42 @@ describe("reading workspaces", () => {
       expect(one.status).toBe(200);
       expect(problemsOf("workspaceAnswer", one.body)).toEqual([]);
       const ws = one.body["workspace"] as Record<string, unknown>;
+      expect(ws["declared"]).toEqual(["test -f README.md"]);
       expect(ws["checks"]).toEqual([{ name: "test -f README.md", exit: 0, passed: true }]);
       expect(ws["attempts"]).toMatchObject([
         { attempt: 1, state: "unknown", verdict: { checks: "pass", acceptance: "pass" } },
       ]);
+      const attempts = ws["attempts"] as Array<Record<string, unknown>>;
+      expect(attempts[0]?.["pushedSha"]).toMatch(/^[0-9a-f]{40}$/);
       expect(ws["reasons"]).toContain(REASON);
       expect(ws["logs"]).toMatchObject([{ name: "test -f README.md" }]);
+    },
+    SLOW,
+  );
+
+  test(
+    "a check that has not run is declared without a result, and a refusal names its cause",
+    async () => {
+      const engine = b.engine({ checkRunner: null });
+      const wi = await b.item({ title: "No sandbox here" });
+      const opened = await engine.open(wi, { actor: HARNESS });
+      if (!opened.ok) throw new Error(opened.message);
+      b.write(opened.worktree, "src/dates.ts", `export const parse = "${wi}";\n`);
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: false, code: "gate_failed" });
+      const one = await home.call("GET", `/api/v1/work/${h.id}/work/${wi}/workspace`);
+      expect(one.status).toBe(200);
+      expect(problemsOf("workspaceAnswer", one.body)).toEqual([]);
+      const ws = one.body["workspace"] as Record<string, unknown>;
+      expect(ws["declared"]).toEqual(["test -f README.md"]);
+      expect(ws["checks"]).toBeUndefined();
+      expect(ws["attempts"]).toMatchObject([
+        {
+          state: "failed",
+          code: "gate_failed",
+          why: "no-sandbox",
+          verdict: { checks: "not-run" },
+        },
+      ]);
     },
     SLOW,
   );

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { mintId, mintRunId } from "@crewhaus/control-contract";
 import { append, runsLedger } from "@crewhaus/control-records";
 import { ACCEPT_RULE, OUTCOME_RULE } from "./actors";
+import type { Proposer } from "./evidence";
 import { readWorkLines } from "./fold";
 import { REVISION_MAX_BYTES, type WorkActor, itemDirOf } from "./records";
 import {
@@ -262,16 +263,26 @@ function observed(ref: string) {
 
 const POLICY = { policy: { accept: ["feature" as const] } };
 
-async function stateOf(dir: string, ref: string, actor: WorkActor): Promise<string> {
+async function stateOf(
+  dir: string,
+  ref: string,
+  actor: WorkActor,
+  proposer?: Proposer | null,
+): Promise<string> {
   const store = openWorkStore(dir);
   const written = ok(
     await store.propose(
       { title: `Export ${ref}`, kind: "feature", basis: "user-pain", assessment: observed(ref) },
       actor,
-      POLICY,
+      { ...POLICY, ...(proposer !== undefined ? { proposer } : {}) },
     ),
   );
   return written.item.state;
+}
+
+function sessionLog(dir: string, id: string): void {
+  mkdirSync(join(dir, ".crewhaus", "sessions"), { recursive: true });
+  writeFileSync(join(dir, ".crewhaus", "sessions", `${id}.jsonl`), "{}\n");
 }
 
 describe("auto-accept counts only evidence this harness's records hold", () => {
@@ -306,6 +317,61 @@ describe("auto-accept counts only evidence this harness's records hold", () => {
     expect(await stateOf(dir, "session:sess_mine", actor)).toBe("proposed");
     expect(await stateOf(dir, "session:../../etc/passwd", actor)).toBe("proposed");
     expect(await stateOf(dir, "session:sess_other", actor)).toBe("open");
+  });
+
+  test("a sub-agent proposes as its top run: the top run and its session do not count", async () => {
+    const dir = harness();
+    const top = recordRun(dir, { session: "sess_top" });
+    sessionLog(dir, "sess_top");
+    // A sub-agent's context has its own run id, with no row, and names the top run as parent.
+    const sub = harnessActor();
+    const proposer = { run: top, session: "sess_top" };
+    expect(await stateOf(dir, `run:${top}`, sub, proposer)).toBe("proposed");
+    expect(await stateOf(dir, "session:sess_top", sub, proposer)).toBe("proposed");
+    expect(await stateOf(dir, `run:${recordRun(dir)}`, sub, proposer)).toBe("open");
+  });
+
+  test("a proposer the runs ledger does not hold, or no proposer, counts no run or session", async () => {
+    const dir = harness();
+    sessionLog(dir, "sess_mine");
+    sessionLog(dir, "sess_other");
+    const other = recordRun(dir, { session: "sess_other" });
+    // The ledger is off, or its row was never written: its own session is all it could cite.
+    const unrecorded = harnessActor();
+    const proposer = { run: unrecorded.run as string, session: "sess_mine" };
+    expect(await stateOf(dir, "session:sess_mine", unrecorded, proposer)).toBe("proposed");
+    expect(await stateOf(dir, "session:sess_other", unrecorded, proposer)).toBe("proposed");
+    expect(await stateOf(dir, `run:${other}`, unrecorded, proposer)).toBe("proposed");
+    const nobody: WorkActor = { by: "sys:runtime", via: "tool", role: "harness" };
+    expect(await stateOf(dir, "session:sess_other", nobody)).toBe("proposed");
+    expect(await stateOf(dir, `run:${other}`, nobody)).toBe("proposed");
+    expect(await stateOf(dir, `run:${other}`, harnessActor(other), null)).toBe("proposed");
+  });
+
+  test("runs that share a root or a session with the proposer do not count", async () => {
+    const dir = harness();
+    sessionLog(dir, "sess_turn1");
+    sessionLog(dir, "sess_sibling");
+    const root = recordRun(dir);
+    // Two top-level loops of one job: each names the job's root as its parent.
+    const mine = recordRun(dir, { parent: root, session: "sess_mine" });
+    const sibling = recordRun(dir, { parent: root, session: "sess_sibling" });
+    // Two turns of one conversation: two runs, one session.
+    const turn1 = recordRun(dir, { session: "sess_chat" });
+    const turn2 = recordRun(dir, { session: "sess_chat" });
+    const child = recordRun(dir, { parent: mine });
+    const actor = harnessActor(mine);
+    const proposer = { run: mine, session: "sess_mine" };
+    expect(await stateOf(dir, `run:${sibling}`, actor, proposer)).toBe("proposed");
+    expect(await stateOf(dir, "session:sess_sibling", actor, proposer)).toBe("proposed");
+    expect(await stateOf(dir, `run:${root}`, actor, proposer)).toBe("proposed");
+    expect(await stateOf(dir, `run:${child}`, actor, proposer)).toBe("proposed");
+    const chat = harnessActor(turn2);
+    const inChat = { run: turn2, session: "sess_chat" };
+    expect(await stateOf(dir, `run:${turn1}`, chat, inChat)).toBe("proposed");
+    // An unrelated run and session of this harness still count.
+    expect(await stateOf(dir, `run:${turn1}`, actor, proposer)).toBe("open");
+    expect(await stateOf(dir, "session:sess_turn1", actor, proposer)).toBe("open");
   });
 
   test("an item counts when a person adopted it from a Thredz task or an issue; the harness's own does not", async () => {

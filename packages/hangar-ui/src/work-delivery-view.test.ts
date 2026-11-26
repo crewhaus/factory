@@ -10,7 +10,9 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   DELIVERY_COPY,
+  NEEDS_YOU_ROUTE,
   PUBLISH_REASONS,
+  PUBLISH_WHYS,
   deliveredModel,
   publishModel,
   publishTwin,
@@ -164,6 +166,7 @@ describe("where the last publish stands", () => {
     expect(again.detail).toBe("A check failed.");
     const big = publishModel(failed("over_limits", { files: 21, lines: 40 }), open, can, HRN);
     expect(big.detail).toContain("21 files and 40 lines");
+    expect(big.retry).toMatchObject({ label: "Publish after approval" });
     const lost = publishModel(
       workspace({ attempts: [attempt({ state: "not-done", pr: undefined })] }),
       open,
@@ -184,6 +187,121 @@ describe("where the last publish stands", () => {
     ].map((m) => m[1]);
     expect(codes.length).toBe(10);
     expect(Object.keys(PUBLISH_REASONS).sort()).toEqual([...codes].sort());
+  });
+
+  test("a cause the code alone does not say: its own words, and a retry only for a slow or unreachable host", () => {
+    const failed = (code: string, more: Record<string, unknown> = {}) =>
+      workspace({ attempts: [attempt({ state: "failed", code, pr: undefined, ...more })] });
+    const old = publishModel(failed("unsupported_host", { why: "git-too-old" }), open, can, HRN);
+    expect(old).toMatchObject({
+      detail: "This computer's git is too old for workspaces.",
+      retry: null,
+      next: "Update git to 2.38 or newer, then publish again.",
+    });
+    const several = publishModel(
+      failed("unsupported_host", { why: "repository-ambiguous" }),
+      open,
+      can,
+      HRN,
+    );
+    expect(several).toMatchObject({
+      detail: "This harness delivers to several repositories, and none was named.",
+      retry: null,
+      next: "Start the item again and name the repository its change goes to.",
+    });
+    expect(several.detail).not.toContain("could not be reached");
+    for (const why of ["host-timeout", "host-unreachable"]) {
+      expect(
+        publishModel(failed("unsupported_host", { why }), open, can, HRN)?.retry,
+      ).toMatchObject({ label: "Retry publishing" });
+    }
+    // A local cause, and one with no cause recorded, never offer a retry.
+    for (const why of ["host-refused", "clone-settings", "base-missing", "repository-gone"]) {
+      expect(publishModel(failed("unsupported_host", { why }), open, can, HRN)?.retry).toBeNull();
+    }
+    expect(publishModel(failed("unsupported_host"), open, can, HRN)?.retry).toBeNull();
+    // Every cause the contract names has its words.
+    const whys = [
+      ...(/WORK_PUBLISH_WHYS = deepFreeze\(\[([^\]]+)\]/.exec(WORK_CODES)?.[1] ?? "").matchAll(
+        /"([a-z-]+)"/g,
+      ),
+    ].map((m) => m[1]);
+    expect(whys.length).toBe(15);
+    expect(Object.keys(PUBLISH_WHYS).sort()).toEqual([...whys].sort());
+  });
+
+  test("checks with no sandbox: says so, names the remedy in technical details, and does not say to run again", () => {
+    const unran = { checks: "not-run", acceptance: "not-run", sha: HEAD };
+    for (const more of [{ why: "no-sandbox" }, {}]) {
+      const model = publishModel(
+        workspace({
+          attempts: [
+            attempt({
+              state: "failed",
+              code: "gate_failed",
+              pr: undefined,
+              verdict: unran,
+              ...more,
+            }),
+          ],
+        }),
+        open,
+        can,
+        HRN,
+      );
+      expect(model).toMatchObject({
+        detail: "The checks could not run: this computer has no sandbox for them.",
+        retry: null,
+        next: null,
+      });
+      expect(model.detail).not.toContain("did not pass");
+      expect(model.technical).toContain("CREWHAUS_SANDBOX");
+    }
+    // A real failure still says it did not pass, and to run again.
+    const real = publishModel(
+      workspace({
+        attempts: [
+          attempt({
+            state: "failed",
+            code: "gate_failed",
+            pr: undefined,
+            verdict: { checks: "pass", acceptance: "fail", sha: HEAD },
+          }),
+        ],
+      }),
+      open,
+      can,
+      HRN,
+    );
+    expect(real).toMatchObject({
+      detail: "The change did not pass its checks or its acceptance check.",
+      next: DELIVERY_COPY.runAgain,
+      technical: null,
+    });
+  });
+
+  test("a change past the size limits says where a person decides, and its button publishes after that", () => {
+    const big = (more: Record<string, unknown>) =>
+      publishModel(
+        workspace({
+          attempts: [attempt({ state: "failed", code: "over_limits", pr: undefined, ...more })],
+        }),
+        open,
+        can,
+        HRN,
+      );
+    const both = big({ files: 40, lines: 900 });
+    expect(both.detail).toContain("review the request in Needs you, then publish");
+    expect(both.detail).toContain("It changes 40 files and 900 lines.");
+    expect(both).toMatchObject({
+      retry: { label: "Publish after approval", op: "work.publish" },
+      link: { href: NEEDS_YOU_ROUTE, text: "Open Needs you" },
+    });
+    // A count that is not there is left out, never shown as zero.
+    const filesOnly = big({ files: 40 });
+    expect(filesOnly.detail).toContain("It changes 40 files.");
+    expect(filesOnly.detail).not.toContain("0 lines");
+    expect(filesOnly.detail).not.toContain("lines");
   });
 
   test("the twins are commands the CLI takes", () => {
@@ -219,6 +337,43 @@ describe("the workspace", () => {
       reasons: null,
     });
     expect(workspaceModel(null, HRN)).toBeNull();
+  });
+
+  test("a declared check with no result is not run yet; 'declares no checks' only when it declares none", () => {
+    const fresh = workspaceModel(
+      workspace({ declared: ["bun test"], checks: undefined, attempts: [] }),
+      HRN,
+    );
+    expect(fresh).toMatchObject({
+      checks: [{ name: "bun test", word: "Not run yet", tone: "off" }],
+      empty: null,
+      unran: null,
+    });
+    const none = workspaceModel(workspace({ declared: [], checks: undefined }), HRN);
+    expect(none).toMatchObject({ checks: [], empty: DELIVERY_COPY.noChecks });
+    // Nothing says what the repository declares: no claim that it declares none.
+    const unknown = workspaceModel(workspace({ checks: undefined, attempts: [] }), HRN);
+    expect(unknown).toMatchObject({ checks: [], empty: DELIVERY_COPY.noResults });
+    expect(unknown.empty).not.toBe(DELIVERY_COPY.noChecks);
+    const noSandbox = workspaceModel(
+      workspace({
+        declared: ["bun test"],
+        checks: undefined,
+        attempts: [
+          attempt({
+            state: "failed",
+            code: "gate_failed",
+            why: "no-sandbox",
+            verdict: { checks: "not-run", acceptance: "not-run", sha: HEAD },
+          }),
+        ],
+      }),
+      HRN,
+    );
+    expect(noSandbox).toMatchObject({
+      checks: [{ name: "bun test", word: "Not run yet" }],
+      unran: DELIVERY_COPY.noSandbox,
+    });
   });
 });
 

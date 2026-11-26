@@ -7,12 +7,14 @@
  *   (In review, Changes requested, Merged, Merged with changes by a maintainer, Closed
  *   without merging, Reverted), and the checks and the acceptance check as words.
  * - A publish the code host did not confirm says "Checking with GitHub…": Home looks it up.
- * - A publish that did not finish says why, and offers "Retry publishing" only where trying
- *   again can help; otherwise it says to start the item again, so a run makes and checks
- *   the change.
- * - The workspace: its branch, the commit it started from, and each check's result in words.
- *   A check's log and the acceptance check's reasons are shown to a reader with content
- *   access, folded.
+ * - A publish that did not finish says why, from its code and, where the code alone does
+ *   not say what to do, its recorded cause: "Retry publishing" only where trying again can
+ *   help (GitHub was slow or out of reach), the fix where something here must change, and
+ *   otherwise to start the item again, so a run makes and checks the change. A change past
+ *   the size limits says where a person decides, and its button says it publishes after that.
+ * - The workspace: its branch, the commit it started from, and each declared check's result in
+ *   words, "Not run yet" for one with none. A check's log and the acceptance check's reasons
+ *   are shown to a reader with content access, folded, wrapping at any width.
  *
  * The models are pure, so the tests read them without a DOM. DOM by `createElement` and
  * `textContent` only.
@@ -38,6 +40,13 @@ export const DELIVERY_COPY = Object.freeze({
   unconfirmed: "GitHub did not confirm it yet. Home checks again.",
   why: "Why it passed or not",
   noChecks: "This repository declares no checks.",
+  noResults: "No check has run on this commit yet.",
+  notRunYet: "Not run yet",
+  noSandbox: "The checks could not run: this computer has no sandbox for them.",
+  sandboxFailed: "The checks could not start in the sandbox.",
+  technical: "Technical details",
+  afterApproval: "Publish after approval",
+  needsYou: "Open Needs you",
   hiddenLogs: "Check output is hidden: you can't read this harness's content.",
 });
 
@@ -59,14 +68,94 @@ export const PUBLISH_REASONS = Object.freeze({
   },
   not_accepted: { text: "The item is not open.", retry: false },
   already_publishing: { text: "Another publish was running.", retry: true },
-  unsupported_host: { text: "GitHub could not be reached.", retry: true },
+  unsupported_host: { text: "Home could not publish to this repository.", retry: false },
   gate_failed: {
     text: "The change did not pass its checks or its acceptance check.",
     retry: false,
   },
   over_limits: {
-    text: "The change is larger than this repository allows without a person's decision.",
+    text: "The change is larger than this repository allows. A person decides whether a change this size goes out: review the request in Needs you, then publish.",
     retry: true,
+  },
+});
+
+/** Where a change past the size limits is decided. */
+export const NEEDS_YOU_ROUTE = "#/home/needs-you?type=approvals";
+
+/** The sandbox remedy, as the engine words it; shown in technical details. */
+const NO_SANDBOX_FIX =
+  "The checks run your project's code, so they need a sandbox and none is available. Start Docker or Podman and set CREWHAUS_SANDBOX=docker (or podman), or have the owner confirm the agreement line \"Runs your project's checks on this computer\".";
+
+/**
+ * A refusal's recorded cause in words: what happened, whether trying again can help, and
+ * what to do instead. Only a slow or unreachable code host is worth another try.
+ */
+export const PUBLISH_WHYS = Object.freeze({
+  "git-too-old": {
+    text: "This computer's git is too old for workspaces.",
+    retry: false,
+    fix: "Update git to 2.38 or newer, then publish again.",
+  },
+  "repository-gone": {
+    text: "This item's repository is no longer in the harness's spec.",
+    retry: false,
+    fix: "Add the repository back to the spec and rebuild the harness, then publish again.",
+  },
+  "repository-elsewhere": {
+    text: "This item's workspace is in another of the harness's repositories.",
+    retry: false,
+    fix: "Publish it to the repository its workspace is in.",
+  },
+  "repository-unknown": {
+    text: "The repository named is not one this harness delivers to.",
+    retry: false,
+    fix: "Name one of the repositories in the harness's spec.",
+  },
+  "repository-ambiguous": {
+    text: "This harness delivers to several repositories, and none was named.",
+    retry: false,
+    fix: "Start the item again and name the repository its change goes to.",
+  },
+  "host-not-allowed": {
+    text: "The code host address in the harness's spec is not one Home may reach.",
+    retry: false,
+    fix: "Correct the repository's server address in the spec and rebuild the harness.",
+  },
+  "host-timeout": { text: "GitHub did not answer in time.", retry: true, fix: null },
+  "host-unreachable": { text: "GitHub could not be reached.", retry: true, fix: null },
+  "host-refused": {
+    text: "GitHub refused the request.",
+    retry: false,
+    fix: "Check the repository and the credential's access on GitHub, then publish again.",
+  },
+  "clone-settings": {
+    text: "This harness's copy of the repository has git settings Home did not make, so nothing was sent.",
+    retry: false,
+    fix: "A person removes those settings from the copy's config file; the workspace's CLI line shows where it is.",
+  },
+  "base-missing": {
+    text: "The repository has no branch by the name the spec gives as its base.",
+    retry: false,
+    fix: "Correct the base branch in the spec and rebuild the harness.",
+  },
+  "base-moved": {
+    text: "Newer work landed in the repository since this change was checked.",
+    retry: false,
+    fix: null,
+  },
+  "not-judged": { text: "No run has checked this exact change yet.", retry: false, fix: null },
+  "no-sandbox": {
+    text: "The checks could not run: this computer has no sandbox for them.",
+    retry: false,
+    fix: null,
+    technical: NO_SANDBOX_FIX,
+    noRunAgain: true,
+  },
+  "sandbox-failed": {
+    text: "The checks could not start in the sandbox.",
+    retry: false,
+    fix: "Check that Docker or Podman is running, then start the item again.",
+    noRunAgain: true,
   },
 });
 
@@ -176,16 +265,25 @@ export function publishModel(workspace, item, can, hrn) {
     };
   }
   if (newest.state !== "failed" && newest.state !== "not-done") return null;
+  // Checks that gave no answer for want of a sandbox: an attempt recorded before causes were.
+  const why =
+    newest.why ??
+    (newest.code === "gate_failed" && newest.verdict?.checks === "not-run" ? "no-sandbox" : null);
   const reason =
     newest.state === "not-done"
       ? { text: "It did not reach GitHub.", retry: true }
-      : (PUBLISH_REASONS[newest.code] ?? { text: "Something went wrong.", retry: false });
+      : (PUBLISH_WHYS[why] ??
+        PUBLISH_REASONS[newest.code] ?? { text: "Something went wrong.", retry: false });
+  const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   const size =
-    newest.code === "over_limits" && Number.isSafeInteger(newest.files)
-      ? ` It changes ${newest.files} ${newest.files === 1 ? "file" : "files"} and ${newest.lines ?? 0} ${newest.lines === 1 ? "line" : "lines"}.`
-      : "";
+    newest.code !== "over_limits" || !Number.isSafeInteger(newest.files)
+      ? ""
+      : Number.isSafeInteger(newest.lines)
+        ? ` It changes ${count(newest.files, "file", "files")} and ${count(newest.lines, "line", "lines")}.`
+        : ` It changes ${count(newest.files, "file", "files")}.`;
   const open = item?.state === "open";
   const may = can?.["h.run.submit"] === true;
+  const sizeDecision = newest.state === "failed" && newest.code === "over_limits";
   return {
     kind: "unfinished",
     word: DELIVERY_COPY.unfinished,
@@ -193,18 +291,60 @@ export function publishModel(workspace, item, can, hrn) {
     detail: `${reason.text}${size}`,
     retry:
       reason.retry && open && may
-        ? { label: DELIVERY_COPY.retry, op: "work.publish", twin: publishTwin(wi, hrn) }
+        ? {
+            label: sizeDecision ? DELIVERY_COPY.afterApproval : DELIVERY_COPY.retry,
+            op: "work.publish",
+            twin: publishTwin(wi, hrn),
+          }
         : null,
-    next: !reason.retry && open ? DELIVERY_COPY.runAgain : null,
+    link: sizeDecision ? { href: NEEDS_YOU_ROUTE, text: DELIVERY_COPY.needsYou } : null,
+    next:
+      typeof reason.fix === "string"
+        ? reason.fix
+        : !reason.retry && open && reason.noRunAgain !== true
+          ? DELIVERY_COPY.runAgain
+          : null,
+    technical: typeof reason.technical === "string" ? reason.technical : null,
     verdict: verdictWords(newest.verdict),
     twin: workspaceTwin(wi, hrn),
   };
 }
 
-/** The workspace block: branch, where it started, and each check in words. */
+/**
+ * The workspace block: branch, where it started, and each check in words. A declared check
+ * with no result on this commit is "Not run yet"; "declares no checks" only when it declares
+ * none.
+ */
 export function workspaceModel(workspace, hrn) {
   if (workspace === null || typeof workspace !== "object") return null;
-  const checks = Array.isArray(workspace.checks) ? workspace.checks : [];
+  const results = Array.isArray(workspace.checks) ? workspace.checks : [];
+  const declared = Array.isArray(workspace.declared) ? workspace.declared.map(String) : null;
+  const word = (c) => ({
+    name: String(c?.name ?? ""),
+    word: c?.passed === true ? "Passed" : `Failed (exit ${Number(c?.exit ?? 1)})`,
+    tone: c?.passed === true ? "ok" : "bad",
+  });
+  const checks =
+    declared === null
+      ? results.map(word)
+      : [
+          ...declared.map((name) => {
+            const result = results.find((r) => r?.name === name);
+            return result !== undefined
+              ? word(result)
+              : { name, word: DELIVERY_COPY.notRunYet, tone: "off" };
+          }),
+          ...results.filter((r) => !declared.includes(String(r?.name ?? ""))).map(word),
+        ];
+  const attempts = Array.isArray(workspace.attempts) ? workspace.attempts : [];
+  const newest = attempts.at(-1);
+  const unran =
+    newest?.why === "sandbox-failed"
+      ? DELIVERY_COPY.sandboxFailed
+      : newest?.why === "no-sandbox" ||
+          (newest?.verdict?.checks === "not-run" && (declared?.length ?? 1) > 0)
+        ? DELIVERY_COPY.noSandbox
+        : null;
   return {
     branch: String(workspace.branch ?? ""),
     state:
@@ -215,11 +355,14 @@ export function workspaceModel(workspace, hrn) {
         : "Open",
     base: shortSha(workspace.baseSha),
     head: shortSha(workspace.headSha),
-    checks: checks.map((c) => ({
-      name: String(c?.name ?? ""),
-      word: c?.passed === true ? "Passed" : `Failed (exit ${Number(c?.exit ?? 1)})`,
-      tone: c?.passed === true ? "ok" : "bad",
-    })),
+    checks,
+    empty:
+      checks.length > 0
+        ? null
+        : declared !== null
+          ? DELIVERY_COPY.noChecks
+          : DELIVERY_COPY.noResults,
+    unran,
     hidden: Array.isArray(workspace.hidden) && workspace.hidden.includes("content"),
     reasons: typeof workspace.reasons === "string" ? workspace.reasons : null,
     logs: Array.isArray(workspace.logs)
@@ -250,10 +393,23 @@ function twinLine(command) {
   ]);
 }
 
-function folded(summary, text) {
+/** A check's log, folded: it wraps at any width, and a long one scrolls in its own region. */
+function foldedLog(summary, text) {
   return el("details", { class: "work-fold" }, [
     el("summary", { text: summary }),
-    el("pre", { class: "prewrap mono", text }),
+    el("pre", { class: "mono", tabindex: "0", role: "region", "aria-label": summary, text }),
+  ]);
+}
+
+/** Prose, folded: the judge's reasons, a paragraph per blank-line-separated part. */
+function foldedProse(summary, text) {
+  const parts = String(text)
+    .split(/\n\s*\n/)
+    .map((p) => p.trim())
+    .filter((p) => p !== "");
+  return el("details", { class: "work-fold" }, [
+    el("summary", { text: summary }),
+    ...parts.map((p) => el("p", { text: p })),
   ]);
 }
 
@@ -298,6 +454,12 @@ export function deliverySections({ delivered, publish, workspace, ref, after }) 
           : null,
         publish.next !== undefined && publish.next !== null
           ? el("p", { text: publish.next })
+          : null,
+        publish.link !== undefined && publish.link !== null
+          ? el("p", {}, [el("a", { href: publish.link.href, text: publish.link.text })])
+          : null,
+        publish.technical !== undefined && publish.technical !== null
+          ? foldedProse(DELIVERY_COPY.technical, publish.technical)
           : null,
       ]);
       if (publish.retry !== null) {
@@ -351,7 +513,7 @@ export function deliverySections({ delivered, publish, workspace, ref, after }) 
         ]),
         el("h4", { text: "Checks" }),
         workspace.checks.length === 0
-          ? el("p", { class: "muted", text: DELIVERY_COPY.noChecks })
+          ? el("p", { class: "muted", text: workspace.empty })
           : el(
               "ul",
               {},
@@ -359,9 +521,10 @@ export function deliverySections({ delivered, publish, workspace, ref, after }) 
                 el("li", {}, [statusBadge(c.tone, c.word), " ", el("code", { text: c.name })]),
               ),
             ),
+        workspace.unran !== null ? el("p", { class: "muted", text: workspace.unran }) : null,
         workspace.hidden ? el("p", { class: "muted", text: DELIVERY_COPY.hiddenLogs }) : null,
-        workspace.reasons !== null ? folded(DELIVERY_COPY.why, workspace.reasons) : null,
-        ...workspace.logs.map((l) => folded(`Output of ${l.name}`, l.text)),
+        workspace.reasons !== null ? foldedProse(DELIVERY_COPY.why, workspace.reasons) : null,
+        ...workspace.logs.map((l) => foldedLog(`Output of ${l.name}`, l.text)),
         twinLine(workspace.twin),
       ]),
     );

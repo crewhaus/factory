@@ -177,7 +177,9 @@ async function moveItem(harnessDir: string, wi: string, now: () => number): Prom
     (l) => (l.event === "closed" || l.event === "reopened") && l.at >= outcome.at,
   );
   if (movedSince) return false;
-  if (item.state === "open" && (outcome.state === "merged" || outcome.state === "reverted")) {
+  // A revert is recorded and moves nothing: it never means the work is done, and an item a
+  // person reopened after the merge stays where they put it.
+  if (item.state === "open" && outcome.state === "merged") {
     return (await store.transition(wi, "closed", { outcome: "done" }, TRACKER, OUTCOME_RULE)).ok;
   }
   if (item.state === "open" && outcome.state === "closed") {
@@ -211,9 +213,8 @@ async function applyFacts(
   now: () => number,
   delivery?: string,
 ): Promise<ApplyAnswer> {
-  const pushed = [...attempts]
-    .reverse()
-    .find((a) => a.pr === facts.pr && a.state === "done")?.headSha;
+  const done = [...attempts].reverse().find((a) => a.pr === facts.pr && a.state === "done");
+  const pushed = done?.pushedSha ?? done?.headSha;
   const newestOf = (): OutcomeLine | undefined => readOutcomes(harnessDir).get(wi);
   const line = outcomeLine(wi, facts, newestOf(), pushed, new Date(now()).toISOString(), delivery);
   const wrote = await appendOutcome(

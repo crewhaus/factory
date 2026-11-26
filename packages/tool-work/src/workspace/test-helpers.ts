@@ -103,6 +103,31 @@ function authHeader(token: string): string {
   return `http.extraheader=AUTHORIZATION: basic ${Buffer.from(`x:${token}`).toString("base64")}`;
 }
 
+/**
+ * What a branch on the fake host holds past `main`: the whole patch of every commit, and the
+ * number of files each commit touches. Read from a clone of its own.
+ */
+export async function hostHistory(
+  fake: FakeGitHub,
+  token: string,
+  branch: string,
+): Promise<{ readonly patch: string; readonly files: readonly number[] }> {
+  const at = mkdtempSync(join(tmpdir(), "tool-work-host-"));
+  try {
+    await remoteGit(at, ["-c", authHeader(token), "clone", "-q", fake.gitUrl(REPO), "."]);
+    const range = `origin/main..origin/${branch}`;
+    const patch = plainGit(at, ["log", "-p", "--text", "--format=%H %B", range]);
+    const shas = plainGit(at, ["log", "--format=%H", range]).split("\n").filter(Boolean);
+    const files = shas.map(
+      (sha) =>
+        plainGit(at, ["show", "--name-only", "--format=", sha]).split("\n").filter(Boolean).length,
+    );
+    return { patch, files };
+  } finally {
+    rmSync(at, { recursive: true, force: true });
+  }
+}
+
 /** Commit files to a branch of the fake's repository, from a clone of its own. */
 export async function commitFiles(
   fake: FakeGitHub,

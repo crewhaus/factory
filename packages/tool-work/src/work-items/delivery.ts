@@ -23,6 +23,7 @@ import {
   type WorkPublishCode,
   type WorkPublishState,
   type WorkPublishVerdict,
+  type WorkPublishWhy,
   type WorkspaceEvent,
   type WorkspaceState,
   canTransition,
@@ -89,9 +90,14 @@ export type PublishLine = {
   readonly run?: string;
   readonly branch?: string;
   readonly baseSha?: string;
+  /** The branch commit whose tree every gate read. */
   readonly headSha?: string;
+  /** The one commit pushed: that tree on the base, with the publish's own message. */
+  readonly pushedSha?: string;
   readonly pr?: number;
   readonly code?: WorkPublishCode;
+  /** The cause behind `code`, where the code alone does not say what to do. */
+  readonly why?: WorkPublishWhy;
   /** A keyed digest of the file a refusal names; the name is in the check log. */
   readonly file?: string;
   readonly line?: number;

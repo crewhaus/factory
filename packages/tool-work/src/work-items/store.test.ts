@@ -427,14 +427,14 @@ describe("who may do what", () => {
 });
 
 /** Record a run of this harness in its runs ledger, so evidence can name it. */
-function recordRun(dir: string): string {
+function recordRun(dir: string, session = "sess_0000000000000001"): string {
   const run = mintRunId();
   const written = append(runsLedger(dir), {
     id: run,
     state: "running",
     at: new Date().toISOString(),
     trigger: { kind: "cli" },
-    session: "sess_0000000000000001",
+    session,
   });
   if (!written.ok) throw new Error("the run row could not be written");
   return run;
@@ -501,7 +501,8 @@ describe("the owner's accept policy", () => {
             evidence: [...HYPOTHESIS.evidence, ...observedIn(dir).evidence],
           },
         },
-        HARNESS,
+        // The proposing run has its own row and session, so its runs are told from others.
+        { ...HARNESS, run: recordRun(dir, "sess_0000000000000002") },
         { policy },
       ),
     );
@@ -531,7 +532,7 @@ describe("the owner's accept policy, by basis", () => {
           basis: "speculative",
           assessment: observedIn(dir),
         },
-        HARNESS,
+        { ...HARNESS, run: recordRun(dir, "sess_0000000000000002") },
         { policy },
       ),
     );

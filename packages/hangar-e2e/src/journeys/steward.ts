@@ -28,8 +28,11 @@ export type Steward = {
   readonly fake: FakeGitHub;
   readonly engine: WorkspaceEngine;
   readonly wi: string;
-  /** A run of the harness makes the change and publishes it, judged as meeting the item. */
-  publish(): ReturnType<WorkspaceEngine["publish"]>;
+  /**
+   * A run of the harness makes the change and publishes it, judged as meeting the item, with
+   * the judge's `rationale` when one is given.
+   */
+  publish(rationale?: string): ReturnType<WorkspaceEngine["publish"]>;
   /** Home's tracker reads the pull request and moves the item with it. */
   track(): ReturnType<typeof syncOutcomes>;
   /** How many pull requests were asked for. */
@@ -90,7 +93,7 @@ export async function steward(dir: string): Promise<Steward> {
     fake,
     engine,
     wi,
-    publish: async () => {
+    publish: async (rationale = "It does.") => {
       const opened = await engine.open(wi, { actor: HARNESS });
       if (!opened.ok) throw new Error(`the workspace did not open: ${opened.message}`);
       const at = join(dir, opened.worktree, "src", "rounding.ts");
@@ -101,7 +104,7 @@ export async function steward(dir: string): Promise<Steward> {
         actor: HARNESS,
         mode: "harness",
         text: { title: STEWARD_TITLE, summary: "Exports round currency half to even." },
-        judge: async () => ({ label: "meets", abstain: false, rationale: "It does." }),
+        judge: async () => ({ label: "meets", abstain: false, rationale }),
       });
     },
     track: () => syncOutcomes(dir, { env }),

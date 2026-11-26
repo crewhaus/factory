@@ -65,6 +65,36 @@ export const WORK_PUBLISH_CODES = deepFreeze([
 export type WorkPublishCode = (typeof WORK_PUBLISH_CODES)[number];
 
 /**
+ * Which cause a refusal had, where its code alone does not say what to do: a client words
+ * its fix from this, and offers to try again only for `host-timeout` and `host-unreachable`.
+ * Closed, like the codes.
+ */
+export const WORK_PUBLISH_WHYS = deepFreeze([
+  "git-too-old",
+  "repository-gone",
+  "repository-elsewhere",
+  "repository-unknown",
+  "repository-ambiguous",
+  "host-not-allowed",
+  "host-timeout",
+  "host-unreachable",
+  "host-refused",
+  "clone-settings",
+  "base-missing",
+  "base-moved",
+  "not-judged",
+  "no-sandbox",
+  "sandbox-failed",
+] as const);
+export type WorkPublishWhy = (typeof WORK_PUBLISH_WHYS)[number];
+
+/** The causes a second try can get past: the code host was slow or out of reach. */
+export const WORK_PUBLISH_TRANSIENT_WHYS: readonly WorkPublishWhy[] = deepFreeze([
+  "host-timeout",
+  "host-unreachable",
+] as const);
+
+/**
  * A verdict's parts: the declared checks, and the acceptance check. `not-run` says a
  * required part gave no answer (the checks had no sandbox to run in, or an earlier part
  * refused the change first): only `pass` passes.
@@ -115,8 +145,10 @@ export const WORK_PUBLISH_LOG_KEYS = deepFreeze([
   "branch",
   "baseSha",
   "headSha",
+  "pushedSha",
   "pr",
   "code",
+  "why",
   "file",
   "line",
   "files",
@@ -166,9 +198,14 @@ export type WorkPublishView = {
   readonly at: string;
   readonly branch?: string;
   readonly baseSha?: string;
+  /** The branch commit whose tree was judged. */
   readonly headSha?: string;
+  /** The one commit that went to the code host: that tree on the base, with the publish's message. */
+  readonly pushedSha?: string;
   readonly pr?: number;
   readonly code?: WorkPublishCode;
+  /** The cause behind `code`, where the code alone does not say what to do. */
+  readonly why?: WorkPublishWhy;
   readonly files?: number;
   readonly lines?: number;
   readonly verdict?: WorkPublishVerdict;
@@ -213,6 +250,11 @@ export type WorkspaceSummaryView = {
 export type WorkspaceView = WorkspaceSummaryView & {
   readonly headSha?: string;
   readonly wip?: boolean;
+  /**
+   * The checks the repository declares, by name, when its binding is known: a check with no
+   * result in `checks` has not run on this commit.
+   */
+  readonly declared?: readonly string[];
   readonly checks?: readonly WorkspaceCheckView[];
   readonly attempts: readonly WorkPublishView[];
   /** The acceptance check's reasons for the newest attempt, for a reader with content access. */

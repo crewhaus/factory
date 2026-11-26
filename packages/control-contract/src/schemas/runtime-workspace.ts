@@ -13,6 +13,7 @@ import {
   WORK_PR_STATES,
   WORK_PUBLISH_CODES,
   WORK_PUBLISH_STATES,
+  WORK_PUBLISH_WHYS,
 } from "../index.js";
 import { commandReceipt, listEnvelope } from "./core.js";
 
@@ -42,8 +43,10 @@ export const workPublishView = z
     branch: z.string().optional(),
     baseSha: z.string().optional(),
     headSha: z.string().optional(),
+    pushedSha: z.string().optional(),
     pr: z.number().int().positive().optional(),
     code: oneOf(WORK_PUBLISH_CODES).optional(),
+    why: oneOf(WORK_PUBLISH_WHYS).optional(),
     files: count.optional(),
     lines: count.optional(),
     verdict: workPublishVerdict.optional(),
@@ -85,6 +88,7 @@ export const workspaceView = workspaceSummary
   .extend({
     headSha: z.string().optional(),
     wip: z.boolean().optional(),
+    declared: z.array(z.string()).optional(),
     checks: z.array(workspaceCheckView).optional(),
     attempts: z.array(workPublishView),
     reasons: z.string().optional(),

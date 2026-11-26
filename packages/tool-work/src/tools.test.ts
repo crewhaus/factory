@@ -1,9 +1,10 @@
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { BoundaryResult, TrustOrigin } from "@crewhaus/boundary-classifier";
 import { mintId, mintRunId } from "@crewhaus/control-contract";
+import { append, runsLedger } from "@crewhaus/control-records";
 import { createRunContext } from "@crewhaus/run-context";
 import { buildTenant, withTenant } from "@crewhaus/tenancy";
 import * as main from "./index";
@@ -398,6 +399,47 @@ describe("writes through the tools", () => {
       ),
     );
     expect(fix.state).toBe("open");
+  });
+});
+
+describe("WorkPropose's accept policy and the proposer's own records", () => {
+  test("a sub-agent proposes as its top run: citing that run or its session is not evidence", async () => {
+    const dir = harness();
+    registerWorkConfig({ accept: ["feature"] });
+    const tools = createWorkTools({ harnessDir: dir, classify: countingClassifier().classify });
+    const top = mintRunId();
+    const session = "sess_00000000000000aa";
+    append(runsLedger(dir), {
+      id: top,
+      state: "running",
+      at: new Date().toISOString(),
+      trigger: { kind: "cli" },
+      session,
+    });
+    mkdirSync(join(dir, ".crewhaus", "sessions"), { recursive: true });
+    writeFileSync(join(dir, ".crewhaus", "sessions", `${session}.jsonl`), "{}\n");
+    // A sub-agent's context: its own run id, the top run as parent, the same session.
+    const child = createRunContext({ runId: mintRunId(), sessionId: session, parent: top });
+    const propose = async (ref: string) =>
+      JSON.parse(
+        String(
+          await tools.workPropose.execute(
+            {
+              title: `Export ${ref}`,
+              kind: "feature",
+              basis: "user-pain",
+              assessment: {
+                ...OBSERVED,
+                evidence: [{ label: "observed", kind: "observed-usage", ref, note: "Seen." }],
+                doNothing: "People copy rows by hand.",
+              },
+            },
+            { runContext: child },
+          ),
+        ),
+      ).state;
+    expect(await propose(`run:${top}`)).toBe("proposed");
+    expect(await propose(`session:${session}`)).toBe("proposed");
   });
 });
 

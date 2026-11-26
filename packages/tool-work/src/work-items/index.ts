@@ -44,7 +44,7 @@ export {
   readWorkspaces,
   workspacesLedger,
 } from "./delivery";
-export { type EvidenceContext, verifiedObservedEvidence } from "./evidence";
+export { type EvidenceContext, type Proposer, verifiedObservedEvidence } from "./evidence";
 export {
   FEED_SECTION_MAX,
   type ThredzTasksAnswer,

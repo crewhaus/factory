@@ -2,9 +2,11 @@
  * A steward delivers an accepted work item as a pull request, and the console follows it:
  * the item reads "In review" with its card "PR #1 opened: <title>", the Work list names the
  * pull request, and once a maintainer merges it the item reads "Merged". Axe runs on the
- * item page in both states.
+ * item page in both states, and with the judge's long one-line reasons unfolded the page
+ * still reflows at 320 px.
  */
 import { runAxe } from "../a11y/axe";
+import { reflowFinding } from "../a11y/reflow";
 import { routeFor } from "../console-routes";
 import { waitFor } from "./a11y-states";
 import type { Journey } from "./journey";
@@ -25,7 +27,9 @@ export const stewardDeliversPr: Journey = {
     scope.defer(() => s.stop());
     const out: string[] = [];
 
-    const published = await s.publish();
+    // A judge's reasons are usually one long line, with a path that has no place to break.
+    const rationale = `${"The export now rounds every currency amount half to even, as the item asks. ".repeat(12)}See src/${"rounding-".repeat(30)}helpers.ts.`;
+    const published = await s.publish(rationale);
     if (!published.ok || published.state !== "done" || published.pr !== 1) {
       throw new Error(`the publish answered ${JSON.stringify(published)}`);
     }
@@ -42,6 +46,18 @@ export const stewardDeliversPr: Journey = {
     const href = await page.locator(".work-card a").first().getAttribute("href");
     if (href !== `${s.fake.url}/${STEWARD_REPO}/pull/1`) out.push(`the card links to ${href}`);
     if ((await page.getByText("crewhaus/").count()) === 0) out.push("no workspace branch shown");
+    const viewport = page.viewportSize();
+    await page.evaluate(() => {
+      for (const fold of document.querySelectorAll("details.work-fold")) {
+        fold.setAttribute("open", "");
+      }
+    });
+    if ((await page.getByText("rounds every currency amount").count()) === 0) {
+      out.push("the judge's reasons are not on the item page");
+    }
+    const reflow = await reflowFinding(page);
+    if (reflow !== undefined) out.push(`reflow with the reasons open: ${reflow.detail}`);
+    if (viewport !== null) await page.setViewportSize(viewport);
     const inReview = await runAxe(page);
     const found = Object.entries(inReview.violations).filter(([, n]) => n > 0);
     if (inReview.passes === 0) out.push("axe did not run on the item page");

@@ -34,8 +34,10 @@ export function attemptView(a: FoldedAttempt): WorkPublishView {
     ...(a.branch !== undefined ? { branch: a.branch } : {}),
     ...(a.baseSha !== undefined ? { baseSha: a.baseSha } : {}),
     ...(a.headSha !== undefined ? { headSha: a.headSha } : {}),
+    ...(a.pushedSha !== undefined ? { pushedSha: a.pushedSha } : {}),
     ...(a.pr !== undefined ? { pr: a.pr } : {}),
     ...(a.code !== undefined ? { code: a.code } : {}),
+    ...(a.why !== undefined ? { why: a.why } : {}),
     ...(a.files !== undefined ? { files: a.files } : {}),
     ...(a.lines !== undefined ? { lines: a.lines } : {}),
     ...(a.verdict !== undefined ? { verdict: a.verdict } : {}),
@@ -130,7 +132,8 @@ export function workspaceView(
   const newest = attempts.at(-1);
   const headSha = newest?.headSha ?? ws.headSha;
   const recorded = headSha === undefined ? undefined : ws.results.get(headSha);
-  const declared = opts.bindings?.repositories.find((r) => r.name === ws.binding)?.checks ?? [];
+  const binding = opts.bindings?.repositories.find((r) => r.name === ws.binding);
+  const declared = binding?.checks ?? [];
   const checks: WorkspaceCheckView[] | undefined = recorded?.map((r) => {
     const argv = declared[r.k];
     return {
@@ -158,6 +161,8 @@ export function workspaceView(
     ...summaryOf(ws, attempts, outcome, opts.bindings),
     ...(headSha !== undefined ? { headSha } : {}),
     ...(ws.wip !== undefined ? { wip: ws.wip } : {}),
+    // The checks the repository declares, by name, whether or not they ran on this commit.
+    ...(binding !== undefined ? { declared: binding.checks.map(checkName) } : {}),
     ...(checks !== undefined ? { checks } : {}),
     attempts: attempts.map(attemptView),
     ...(reasons !== undefined ? { reasons: tail(reasons) } : {}),

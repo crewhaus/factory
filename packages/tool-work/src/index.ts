@@ -59,6 +59,7 @@ import { z } from "zod";
 import { inManagedTenant } from "./tenant";
 import {
   type FoldedWorkItem,
+  type Proposer,
   type WorkActor,
   type WorkConfig,
   type WorkRefusal,
@@ -133,6 +134,21 @@ function actorOf(rc: RunContext | undefined): WorkActor {
     via: "tool",
     role: "harness",
     ...(run !== undefined && CANONICAL_RUN_ID_RE.test(run) ? { run } : {}),
+  };
+}
+
+/**
+ * Who proposes, for the accept policy's evidence check: the top run (a sub-agent proposes
+ * as the run it belongs to), its session and the run it continues. A run with no canonical
+ * id proposes as nobody, so none of its own records can count as evidence.
+ */
+function proposerOf(rc: RunContext | undefined): Proposer | undefined {
+  const top = rc?.parent ?? rc?.runId;
+  if (rc === undefined || top === undefined || !CANONICAL_RUN_ID_RE.test(top)) return undefined;
+  return {
+    run: top,
+    ...(rc.sessionId !== undefined && rc.sessionId !== "" ? { session: rc.sessionId } : {}),
+    ...(rc.continues !== undefined ? { continues: rc.continues } : {}),
   };
 }
 
@@ -558,7 +574,10 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
           ...(input.priority !== undefined ? { priority: input.priority } : {}),
         },
         actorOf(rc),
-        accept !== undefined ? { policy: { accept } } : {},
+        {
+          ...(accept !== undefined ? { policy: { accept } } : {}),
+          proposer: proposerOf(rc) ?? null,
+        },
       );
       if (!written.ok) fail(written);
       return JSON.stringify({ work: written.item.id, state: written.item.state });

@@ -1,14 +1,16 @@
 /**
  * What leaves with a pull request, checked before it leaves: the lines a change adds, its
- * file names and commit messages, and the pull request's own text.
+ * file names, the message of the one commit that carries it, and the pull request's own
+ * text. The engine pushes exactly that commit, so what is checked is what leaves.
  *
  * - **Secrets.** A value of a credential-named variable in the harness's own environment
  *   (compared in memory, never written), a credential-shaped token, a password in a URL or
  *   handed to a client, and a file that holds credentials by name. A line that only names a
  *   credential (`apiKey: process.env.API_KEY`) is source code, not a secret.
  * - **Lineage.** Text the run read from a chat, a peer, an MCP server, a chain or the
- *   harness's memory does not ride out in a commit. The item's own words are its subject,
- *   so a change may repeat them.
+ *   harness's memory does not ride out in a commit. The words a person wrote or accepted
+ *   for the item are its subject, so a change may repeat them; text a run or a tool wrote
+ *   into the item never counts as the item's own.
  *
  * A hit names the file and the line, and never the text.
  */
@@ -78,7 +80,7 @@ export function secretIn(text: string, values: readonly string[]): string | unde
   return undefined;
 }
 
-/** The first secret in a change, its file names or its commit messages, or `undefined`. */
+/** The first secret in a change, its file names or its commit message, or `undefined`. */
 export function scanSecrets(input: {
   readonly added: readonly AddedLine[];
   readonly files: readonly string[];
@@ -113,7 +115,7 @@ export const CODEHOST_EGRESS_POLICY: EgressPolicyOverride = Object.freeze({
   memory: "block",
 });
 
-/** The run's lineage without the item's own words, which its change may repeat. */
+/** The run's lineage without the words a person wrote or accepted for the item. */
 function lineageBeyond(rc: RunContext, own: readonly string[]): RunContext {
   const lineage = rc.dataLineage;
   if (lineage === undefined || lineage.size === 0) return rc;

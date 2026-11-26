@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mintId } from "@crewhaus/control-contract";
 import { publishClaim } from "@crewhaus/control-records";
@@ -24,6 +24,7 @@ import {
   bench,
   commitFiles,
   filesUnder,
+  hostHistory,
   hostRunner,
   judgeThat,
   plainGit,
@@ -248,7 +249,7 @@ describe("no program the repository supplies", () => {
       const answer = await b.publish(engine, wi);
       expect(answer).toMatchObject({ ok: true, state: "done" });
       expect(b.fake.branchSha(REPO, readWorkspaces(b.dir).get(wi)?.branch ?? "")).toBe(
-        readAttempts(b.dir).get(wi)?.at(-1)?.headSha as string,
+        readAttempts(b.dir).get(wi)?.at(-1)?.pushedSha as string,
       );
     },
     SLOW,
@@ -891,6 +892,113 @@ describe("what leaves", () => {
       tagContent(own, "Parse ISO dates in every import", "mcp");
       b.write(second.worktree, "CHANGELOG.md", "- Parse ISO dates in every import\n");
       expect(await b.publish(engine, second.wi, { rc: own })).toMatchObject({ ok: true });
+    },
+    SLOW,
+  );
+
+  test(
+    "one commit leaves, holding what was read: a value an earlier commit added and a later one took out stays here",
+    async () => {
+      const b = await fresh();
+      const secret = ["planted", "value", "two", String(Math.random()).slice(2)].join("_");
+      b.env["STRIPE_API_KEY"] = secret;
+      const { wi, engine, worktree, branch } = await opened(b);
+      const at = join(b.dir, worktree);
+      // The agent makes its own commits: one adds the value, the next takes it out.
+      b.write(worktree, "src/config.ts", `export const k = "${secret}";\n`);
+      plainGit(at, ["add", "-A"]);
+      plainGit(at, ["commit", "-q", "-m", "Add config"]);
+      b.write(worktree, "src/config.ts", "export const k = process.env.STRIPE_API_KEY;\n");
+      plainGit(at, ["add", "-A"]);
+      plainGit(at, ["commit", "-q", "-m", "Read it from the environment"]);
+      const answer = await b.publish(engine, wi);
+      expect(answer).toMatchObject({ ok: true, state: "done" });
+      const history = await hostHistory(b.fake, b.token, branch);
+      expect(history.files).toEqual([1]);
+      expect(history.patch).toContain("process.env.STRIPE_API_KEY");
+      expect(history.patch.includes(secret)).toBe(false);
+      // The pushed commit is recorded, apart from the branch commit it was made from.
+      const last = readAttempts(b.dir).get(wi)?.at(-1);
+      expect(last?.pushedSha).toBe(b.fake.branchSha(REPO, branch) as string);
+      expect(last?.pushedSha).not.toBe(last?.headSha);
+      // The same change and text publish the same commit: nothing is pushed again.
+      const pushes = b.hostWrites().filter((w) => w.path.endsWith("/git-receive-pack")).length;
+      expect(pushes).toBe(1);
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: true, state: "done" });
+      expect(readAttempts(b.dir).get(wi)?.at(-1)?.pushedSha).toBe(last?.pushedSha);
+      expect(b.hostWrites().filter((w) => w.path.endsWith("/git-receive-pack")).length).toBe(
+        pushes,
+      );
+    },
+    SLOW,
+  );
+
+  test(
+    "a refused change, taken out and published again, never reaches the host's history",
+    async () => {
+      const b = await fresh();
+      const secret = ["planted", "value", "three", String(Math.random()).slice(2)].join("_");
+      b.env["STRIPE_API_KEY"] = secret;
+      const { wi, engine, worktree, branch } = await opened(b);
+      b.write(worktree, "src/config.ts", `export const k = "${secret}";\n`);
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: false, code: "egress_blocked" });
+      b.write(worktree, "src/config.ts", "export const k = process.env.STRIPE_API_KEY;\n");
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: true, state: "done" });
+      const history = await hostHistory(b.fake, b.token, branch);
+      expect(history.files).toEqual([1]);
+      expect(history.patch.includes(secret)).toBe(false);
+    },
+    SLOW,
+  );
+
+  test(
+    "a parked change, trimmed and published, goes out as the trimmed change alone",
+    async () => {
+      const b = await fresh();
+      const { wi, engine, worktree, branch } = await opened(b);
+      for (let i = 0; i < 21; i += 1) b.write(worktree, `src/f${i}.ts`, "x\n");
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: false, code: "over_limits" });
+      for (let i = 1; i < 21; i += 1) rmSync(join(b.dir, worktree, `src/f${i}.ts`));
+      expect(await b.publish(engine, wi)).toMatchObject({ ok: true, state: "done" });
+      const history = await hostHistory(b.fake, b.token, branch);
+      expect(history.files).toEqual([1]);
+      expect(history.files.every((n) => n < 21)).toBe(true);
+    },
+    SLOW,
+  );
+
+  test(
+    "text a run copies into its own item's note is still its lineage, and does not leave",
+    async () => {
+      const b = await fresh();
+      const engine = b.engine();
+      const line = "The customer's unannounced plan is to leave in March";
+      const rc = createRunContext();
+      tagContent(rc, line, "memory");
+      const { wi, worktree } = await opened(b, engine);
+      b.write(worktree, "src/notes.md", `# Notes\n${line}\n`);
+      expect(await b.publish(engine, wi, { rc })).toMatchObject({
+        ok: false,
+        code: "egress_blocked",
+      });
+      const noted = await openWorkStore(b.dir).apply(wi, { note: line }, { ...HARNESS });
+      expect(noted.ok).toBe(true);
+      expect(await b.publish(engine, wi, { rc })).toMatchObject({
+        ok: false,
+        code: "egress_blocked",
+        file: "src/notes.md",
+      });
+      // Nor in the pull request's own text.
+      b.write(worktree, "src/notes.md", "# Notes\n");
+      expect(
+        await b.publish(engine, wi, { rc, text: { title: "Notes", summary: line } }),
+      ).toMatchObject({ ok: false, code: "egress_blocked" });
+      expect(posts(b)).toEqual([]);
+      // A person's note is the item's own words: the change may repeat it.
+      const person = await openWorkStore(b.dir).apply(wi, { note: line }, PERSON);
+      expect(person.ok).toBe(true);
+      b.write(worktree, "src/notes.md", `# Notes\n${line}\n`);
+      expect(await b.publish(engine, wi, { rc })).toMatchObject({ ok: true, state: "done" });
     },
     SLOW,
   );
