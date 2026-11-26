@@ -21,11 +21,16 @@ describe("the main entry", () => {
     expect(graph.problems).toEqual([]);
   });
 
-  test("reaches every source file outside ./schemas, ./http and ./delegation, and none inside them", () => {
+  test("reaches every source file outside ./schemas, ./http, ./delegation and ./search, and none inside them", () => {
     const expected = sourceFiles(SRC)
       .filter((file) => {
         const rel = relative(SRC, file);
-        return !rel.startsWith("schemas") && !rel.startsWith("http") && rel !== "delegation.ts";
+        return (
+          !rel.startsWith("schemas") &&
+          !rel.startsWith("http") &&
+          rel !== "delegation.ts" &&
+          rel !== "search.ts"
+        );
       })
       .sort();
     expect(graph.files).toEqual(expected);
@@ -55,6 +60,8 @@ describe("the main entry", () => {
       "./schemas": "./src/schemas/index.ts",
       "./http": "./src/http/index.ts",
       "./delegation": "./src/delegation.ts",
+      "./knowledge": "./src/knowledge.ts",
+      "./search": "./src/search.ts",
     });
   });
 });
@@ -88,6 +95,36 @@ describe("./delegation", () => {
     const own = join(SRC, "delegation.ts");
     expect(graph.files).toContain(own);
     expect(graph.files.filter((file) => file !== own && !main.has(file))).toEqual([]);
+    expect(graph.files.length).toBeGreaterThan(1);
+  });
+});
+
+describe("./knowledge", () => {
+  const graph = scanImportGraph(join(SRC, "knowledge.ts"));
+  const main = new Set(scanImportGraph(join(SRC, "index.ts")).files);
+
+  test("imports nothing but relative .js files, and reaches only what the main entry reaches", () => {
+    expect(graph.problems).toEqual([]);
+    expect(graph.files).toContain(join(SRC, "knowledge.ts"));
+    expect(graph.files.filter((file) => !main.has(file))).toEqual([]);
+    // The core's `knowledge` ref kind is in the codec's grammar, so the main entry holds it.
+    expect(main.has(join(SRC, "knowledge.ts"))).toBe(true);
+  });
+});
+
+describe("./search", () => {
+  const graph = scanImportGraph(join(SRC, "search.ts"));
+  const main = new Set(scanImportGraph(join(SRC, "index.ts")).files);
+
+  test("imports nothing but relative .js files: no package, no builtin, no ./schemas", () => {
+    expect(graph.problems).toEqual([]);
+  });
+
+  test("reaches only its own file and files the main entry reaches, which does not reach it", () => {
+    const own = join(SRC, "search.ts");
+    expect(graph.files).toContain(own);
+    expect(graph.files.filter((file) => file !== own && !main.has(file))).toEqual([]);
+    expect(main.has(own)).toBe(false);
     expect(graph.files.length).toBeGreaterThan(1);
   });
 });

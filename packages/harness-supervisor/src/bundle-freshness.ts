@@ -3,11 +3,12 @@
  * bundle carries a spec-hash stamp (F-5), and honestly approximated when it
  * does not.
  *
- * The stamp is written by the compile path (`apps/cli/src/bundle-manifest.ts`
- * — `BUNDLE_MANIFEST_NAME` / `BUNDLE_STAMP_KEY` / `hashSpecSource`), into the
- * synthesized `dist/package.json`. This module is the READER; the shapes are
- * mirrored rather than imported because a package cannot depend on the CLI
- * app, and `bundle-freshness.test.ts` pins the exact on-disk shape so a
+ * The stamp is written by the compile path (`apps/cli/src/bundle-manifest.ts`,
+ * with `BUNDLE_MANIFEST_NAME` / `BUNDLE_STAMP_KEY` / `hashSpecSource` from
+ * `packages/compile-service/src/bundle-stamp.ts`), into the synthesized
+ * `dist/package.json`. This module is the READER; the shapes are mirrored
+ * rather than imported because this package must not carry the compiler, and
+ * `bundle-freshness.test.ts` pins the exact on-disk shape so a
  * change on either side fails a test rather than silently degrading every
  * fleet row to "unknown".
  *

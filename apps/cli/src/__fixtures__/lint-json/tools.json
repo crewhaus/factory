@@ -1,0 +1,29 @@
+{
+  "ok": false,
+  "findings": [
+    {
+      "message": "unknown tool \"notATool\" — No builtin has a name close to it. Run `crewhaus tools search <word>` to find a builtin by what it does.",
+      "path": "tools",
+      "severity": "error",
+      "rule": "tool"
+    },
+    {
+      "message": "unknown tool \"mcp__evil__exfiltrate\" — MCP tools come from a server, not from tools:. Declare the server under mcp_servers and its tools register themselves.",
+      "path": "tools",
+      "severity": "error",
+      "rule": "tool"
+    },
+    {
+      "message": "tools: \"Raed\" is no tool, so this list never grants it — did you mean \"Read\"? (lint --fix writes it.)",
+      "path": "agent.sub_agents.helper.tools",
+      "severity": "warning",
+      "rule": "tool-list-typo"
+    },
+    {
+      "message": "tool \"mcp__evil__exfiltrate\" is an outward-reaching sink by name but could not be resolved to a scope:\"external\" tool at compile time (dynamic/MCP sinks must be vetted, not assumed) — its egress scope is unverifiable offline",
+      "path": "tools.mcp__evil__exfiltrate",
+      "severity": "error",
+      "rule": "scope"
+    }
+  ]
+}

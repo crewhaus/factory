@@ -8,7 +8,8 @@
  * when, Why (a proposal's evidence, each labelled in words), its runs and its history, and
  * the actions its state allows: Accept or Decline a proposal, Start now or Cancel an open
  * item, Reopen a closed one, Edit, and "Move above…" to correct the ranking (a form, never
- * a drag). Every action shows its CLI twin where one exists.
+ * a drag). Every action shows its CLI twin where one exists. What the item delivered (its
+ * pull request, where its last publish stands) and its workspace are `./work-delivery.js`.
  *
  * Status is a word beside a mark, never colour alone. A refresh never moves focus or
  * scrolls, and keeps a half-typed note. Every call goes through `v1.js` by operation id;
@@ -21,6 +22,13 @@ import { hrefHarness } from "../router.js";
 import { emptyFor } from "../ui/empty.js";
 import { announce } from "../ui/live.js";
 import { call, createAction } from "../v1.js";
+import {
+  deliveredModel,
+  deliverySections,
+  publishModel,
+  rowDelivery,
+  workspaceModel,
+} from "./work-delivery.js";
 
 /** The words the screen says, in one place. */
 export const WORK_COPY = Object.freeze({
@@ -149,7 +157,7 @@ export function causeOf(reason, group = "fromThredz") {
 }
 
 /** One row of a group: its words, its status, its link and its one primary action. */
-function rowOf(entry, hrn) {
+function rowOf(entry, hrn, workspaces) {
   const label = typeof entry?.label === "string" ? entry.label : "";
   const status = typeof entry?.status === "string" ? entry.status : null;
   const word = typeof entry?.statusWord === "string" ? entry.statusWord : null;
@@ -166,15 +174,17 @@ function rowOf(entry, hrn) {
   };
   if (entry?.kind === "item" && WI_RE.test(String(entry.id))) {
     const item = entry.item ?? {};
+    const delivery = rowDelivery(workspaces?.get(entry.id) ?? null);
     return {
       ...base,
       href: hrefHarness(hrn, "work", "items", entry.id),
       detail:
-        item.corrected !== undefined
+        delivery ??
+        (item.corrected !== undefined
           ? "Placed by a person"
           : item.ranking === "weights"
             ? "Ranked by your weights"
-            : null,
+            : null),
       primary: {
         label: item.state === "proposed" ? "Review" : "Open",
         href: hrefHarness(hrn, "work", "items", entry.id),
@@ -229,9 +239,13 @@ function rowOf(entry, hrn) {
 
 /**
  * The feed as the screen draws it: each group with its rows, the Proposed group split by
- * basis, and an empty state only where it says something useful.
+ * basis, and an empty state only where it says something useful. `workspaces` is the
+ * `workspaces.list` answer's items, when the harness has any: a row says its pull request.
  */
-export function feedModel(feed, hrn) {
+export function feedModel(feed, hrn, workspaces = []) {
+  const byWork = new Map(
+    (Array.isArray(workspaces) ? workspaces : []).map((w) => [String(w?.work ?? ""), w]),
+  );
   const sections =
     feed && typeof feed.sections === "object" && feed.sections !== null ? feed.sections : {};
   const nothing = GROUPS.every(
@@ -242,7 +256,7 @@ export function feedModel(feed, hrn) {
     const section = sections[group.id] ?? {};
     const items = Array.isArray(section.items) ? section.items : [];
     if (items.length > 0) {
-      const rows = items.map((entry) => rowOf(entry, hrn));
+      const rows = items.map((entry) => rowOf(entry, hrn, byWork));
       const parts =
         group.id === "proposed" && Array.isArray(section.groups) && section.groups.length > 0
           ? section.groups.map((g) => ({
@@ -679,7 +693,10 @@ export async function renderWork(root, ctx) {
   root.appendChild(groups);
   const can = await canOf();
   const refresh = async (retried = false) => {
-    const feed = await call("work.feed", { params: { h: ctx.id } });
+    const [feed, workspaces] = await Promise.all([
+      call("work.feed", { params: { h: ctx.id } }),
+      call("workspaces.list", { params: { h: ctx.id }, query: { limit: "500" } }),
+    ]);
     // Never redraw under the reader's focus: the next refresh catches up. "Try again" is
     // the reader asking for the redraw, so it redraws and puts focus back on the heading.
     if (!retried && groups.contains(document.activeElement) && groups.childElementCount > 0) return;
@@ -695,7 +712,8 @@ export async function renderWork(root, ctx) {
       );
       return;
     }
-    drawGroups(groups, feedModel(feed.body, ctx.id), () => refresh(true));
+    const delivered = workspaces.ok ? workspaces.body?.items : [];
+    drawGroups(groups, feedModel(feed.body, ctx.id, delivered), () => refresh(true));
   };
   await refresh();
   if (can["h.run.submit"] === true) root.appendChild(addForm(ctx, () => refresh()));
@@ -714,11 +732,19 @@ export async function renderWorkItem(root, ctx, wi) {
     root.appendChild(el("p", { text: "There is no such work item." }));
     return undefined;
   }
-  const [detail, can, list] = await Promise.all([
-    call("work.get", { params: { ref: `${ctx.id}/work/${wi}` } }),
+  const ref = `${ctx.id}/work/${wi}`;
+  const [detail, can, list, workspaces] = await Promise.all([
+    call("work.get", { params: { ref } }),
     canOf(),
     call("work.list", { params: { h: ctx.id } }),
+    call("workspaces.list", { params: { h: ctx.id }, query: { limit: "500" } }),
   ]);
+  // Only an item the list names has a workspace to read; one past the list is asked for.
+  const listed = workspaces.ok && Array.isArray(workspaces.body?.items) ? workspaces.body : null;
+  const known =
+    listed === null || listed.truncated !== undefined || listed.items.some((w) => w?.work === wi);
+  const workspace = known ? await call("workspaces.get", { params: { ref } }) : null;
+  const ws = workspace?.ok === true ? (workspace.body?.workspace ?? null) : null;
   if (!detail.ok) {
     root.appendChild(back);
     root.appendChild(el("h2", { text: WORK_COPY.title }));
@@ -797,17 +823,7 @@ export async function renderWorkItem(root, ctx, wi) {
       ]),
     );
   }
-  if (model.delivered.length > 0) {
-    root.appendChild(
-      block("Delivered", [
-        el(
-          "ul",
-          {},
-          model.delivered.map((d) => el("li", { text: d })),
-        ),
-      ]),
-    );
-  }
+  const deliveryAt = root.childElementCount;
   if (model.runs.length > 0) {
     root.appendChild(
       block("Runs", [
@@ -840,6 +856,16 @@ export async function renderWorkItem(root, ctx, wi) {
     }
     status.textContent = errorText(answer);
   };
+  // What it delivered and its workspace, in the place the Delivered section always had.
+  const delivery = deliverySections({
+    delivered: deliveredModel(detail.body?.content?.delivered, model.title, ws),
+    publish: publishModel(ws, detail.body.item, can, ctx.id),
+    workspace: workspaceModel(ws, ctx.id),
+    ref,
+    after,
+  });
+  const anchor = root.children[deliveryAt] ?? null;
+  for (const section of delivery) root.insertBefore(section, anchor);
   const actions = el("section", { "aria-label": "Actions" }, [el("h3", { text: "Actions" })]);
   for (const a of actionsFor(detail.body.item, can, ctx.id)) {
     const row = el("div", { class: "work-action" });

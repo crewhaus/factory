@@ -634,9 +634,14 @@ describe("every edge tool with operative fields carries a value on every call", 
   /** Values each operative field is probed with, beside the sample's own. */
   const PROBES = [" ", "*", "/", "x".repeat(5000), "https://evil.example.net/x?y=1#z"];
 
+  /** The refusal's reason, read after its `ok: false` is asserted. */
+  const refusalOf = (subject: ReturnType<typeof preparePermissionSubject>): string =>
+    subject.ok ? "" : subject.reason;
+
   test("each operative field is required and non-empty, and a T(**) deny or ask decides every call", async () => {
     const live = await loadBuiltinTools(CLI_RUNTIME_TOOL_KEYS);
     let checked = 0;
+    let reasons = 0;
     for (const key of [...EDGE_SAFE_TOOLS].sort()) {
       const manifest = TOOL_FLAGS[key];
       expect(manifest, key).toBeDefined();
@@ -652,13 +657,21 @@ describe("every edge tool with operative fields carries a value on every call", 
       if (sample === undefined) throw new Error(`no valid sample input for the edge tool ${key}`);
       expect(preparePermissionSubject(tool, sample).ok, key).toBe(true);
       const accepted: unknown[] = [sample];
+      // The tool's own input check refuses, naming the tool and the rule broken:
+      // a refusal for any other reason (a timeout, a crash) is not this guarantee.
+      const clause = `invalid input for tool "${tool.name}"`;
       for (const field of declared) {
         const { [field]: _dropped, ...without } = sample;
-        expect(preparePermissionSubject(tool, without).ok, `${key} without ${field}`).toBe(false);
-        expect(
-          preparePermissionSubject(tool, { ...sample, [field]: "" }).ok,
-          `${key} ${field}: ""`,
-        ).toBe(false);
+        const missing = preparePermissionSubject(tool, without);
+        expect(missing.ok, `${key} without ${field}`).toBe(false);
+        expect(refusalOf(missing), `${key} without ${field}`).toContain(clause);
+        expect(refusalOf(missing), `${key} without ${field}`).toContain("Required");
+        reasons += 1;
+        const empty = preparePermissionSubject(tool, { ...sample, [field]: "" });
+        expect(empty.ok, `${key} ${field}: ""`).toBe(false);
+        expect(refusalOf(empty), `${key} ${field}: ""`).toContain(clause);
+        expect(refusalOf(empty), `${key} ${field}: ""`).toContain("at least 1 character");
+        reasons += 1;
         for (const value of PROBES) {
           const input = { ...sample, [field]: value };
           if (preparePermissionSubject(tool, input).ok) accepted.push(input);
@@ -695,5 +708,7 @@ describe("every edge tool with operative fields carries a value on every call", 
       checked += 1;
     }
     expect(checked).toBeGreaterThanOrEqual(3);
+    // fetch, webFetch and webSearch: one operative field each, two refusals each.
+    expect(reasons).toBe(6);
   }, 20_000); // the CLI's loader imports every builtin tool package the cli shape carries
 });

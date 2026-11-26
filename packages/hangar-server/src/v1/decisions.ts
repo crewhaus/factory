@@ -118,7 +118,8 @@ function locate(ctx: V1Context): Located {
   });
 }
 
-function actorOf(ctx: V1Context): DecisionActor {
+/** The caller as the decision service judges them. */
+export function actorOf(ctx: V1Context): DecisionActor {
   const caller = ctx.access.caller;
   return {
     kind: "principal",

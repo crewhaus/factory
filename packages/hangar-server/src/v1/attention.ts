@@ -1,6 +1,8 @@
 /**
  * The attention area in Home (#517, #513): one list of everything that needs a person
- * across the harnesses the caller may read, served read-only from `@crewhaus/attention`.
+ * across the harnesses the caller may read, served from `@crewhaus/attention`, what a
+ * person does about an item (`./attention-acts`), and the `attention.*` events those acts
+ * are on a harness's stream.
  *
  * - `attention.list`, `attention.get` and `attention.metrics` read each visible harness's
  *   attention read model (the projection Home's projector keeps, or a fold on the spot
@@ -21,6 +23,7 @@ import {
   advisorSnapshotRecord,
   advisorSnapshotRel,
   assembleInbox,
+  attentionEventOf,
   attentionListBody,
   attentionProjection,
   harnessAttention,
@@ -28,15 +31,17 @@ import {
   readAdvisorSnapshot,
   windowMs,
 } from "@crewhaus/attention";
+import { classReached } from "@crewhaus/attention/act";
 import {
   ATTENTION_BANDS,
   ATTENTION_ID_RE,
   ATTENTION_KINDS,
   type AttentionItem,
+  type AttentionYou,
   attentionRef,
   parseRef,
 } from "@crewhaus/control-contract";
-import { writeIndexRecord } from "@crewhaus/control-records";
+import { attentionActionsLedger, writeIndexRecord } from "@crewhaus/control-records";
 import { type Projection, readModel } from "@crewhaus/control-service";
 import type { HangarHarnessEntry } from "@crewhaus/harness-registry";
 import { harnessEnvFacts } from "@crewhaus/harness-supervisor";
@@ -44,8 +49,11 @@ import { PEOPLE_SENSITIVITY } from "../access";
 import type { Sweep } from "../scheduler-host";
 import type { HomePorts } from "../sweeps";
 import type { HomeAreaRuntime } from "./areas";
+import { attentionActHandlers, peopleOf } from "./attention-acts";
 import type { RefResolver, V1Context, V1Handler } from "./context";
+import { actorOf } from "./decisions";
 import { V1Error } from "./errors";
+import type { EnvelopeFields, StreamSourceDecl } from "./event-map";
 import { fleetSnapshot } from "./lists";
 import { entryOf, liveDirOf, visibleHarnesses } from "./resolve";
 
@@ -64,6 +72,7 @@ export function harnessAttentionOf(
   dir: string,
   now: number,
   content: boolean,
+  viewer?: string,
 ): HarnessAttention {
   const read = readModel(hangarRoot, entry.id, dir, ATTENTION_PROJECTION, now);
   const advisor = readAdvisorSnapshot(hangarRoot, entry.id);
@@ -75,6 +84,7 @@ export function harnessAttentionOf(
       now,
       content,
       freshness: { asOf: iso(now), mode: read.freshness, ...(read.stale ? { stale: true } : {}) },
+      ...(viewer !== undefined ? { viewer } : {}),
     },
     { facts: HOME_FACTS, ...(advisor !== undefined ? { advisor } : {}) },
   );
@@ -119,10 +129,64 @@ function scopeOf(ctx: V1Context): Scope {
   return { harnesses, visible: visible.length };
 }
 
-function perHarnessOf(ctx: V1Context, scope: Scope, now: number): HarnessAttention[] {
-  return scope.harnesses.map(({ entry, dir }) =>
-    harnessAttentionOf(ctx.deps.hangarRoot, entry, dir, now, ctx.access.canReadContent(entry.id)),
+async function perHarnessOf(
+  ctx: V1Context,
+  scope: Scope,
+  now: number,
+): Promise<HarnessAttention[]> {
+  const actor = actorOf(ctx);
+  return Promise.all(
+    scope.harnesses.map(async ({ entry, dir }) => {
+      // What a person hid from their own list is hidden from theirs alone: the harness's
+      // records name them its own way, and a read that cannot tell hides nothing.
+      const viewer = await ctx.deps.control.decisions
+        .readActorOf(dir, actor)
+        .catch(() => undefined);
+      return harnessAttentionOf(
+        ctx.deps.hangarRoot,
+        entry,
+        dir,
+        now,
+        ctx.access.canReadContent(entry.id),
+        viewer,
+      );
+    }),
   );
+}
+
+/** What the caller may do in each harness the items listed are about. */
+function youOf(ctx: V1Context, scope: Scope, items: readonly AttentionItem[]): AttentionYou[] {
+  const about = new Set(
+    items.flatMap((item) => [
+      ...(item.harnesses ?? []),
+      ...(item.harness !== undefined ? [item.harness] : []),
+    ]),
+  );
+  const named = [
+    ...new Set(
+      items.flatMap((item) =>
+        item.choices.flatMap((choice) =>
+          choice.permission !== undefined ? [choice.permission] : [],
+        ),
+      ),
+    ),
+  ];
+  const deps = { decisions: ctx.deps.control.decisions, now: ctx.deps.now };
+  const actor = actorOf(ctx);
+  return scope.harnesses
+    .filter(({ entry }) => about.has(entry.id))
+    .map(({ entry, dir }) => {
+      const may = (permission: string) =>
+        ctx.access.authorize(permission, { harness: entry.id }).allow;
+      const act = may("h.decision.resolve");
+      return {
+        harness: entry.id,
+        act,
+        class: act ? classReached({ dir, actor }, deps) : null,
+        content: ctx.access.canReadContent(entry.id),
+        can: named.filter(may),
+      };
+    });
 }
 
 function snapshotAtOf(ctx: V1Context): string {
@@ -144,7 +208,7 @@ const list: V1Handler = async (ctx) => {
   const state = oneOf(ctx.query, "state", ["open", "all"] as const) ?? "open";
   const now = ctx.deps.now();
   const scope = scopeOf(ctx);
-  const inbox = assembleInbox(perHarnessOf(ctx, scope, now), now, {
+  const inbox = assembleInbox(await perHarnessOf(ctx, scope, now), now, {
     state,
     ...(kind !== undefined ? { kind } : {}),
     ...(band !== undefined ? { band } : {}),
@@ -152,15 +216,24 @@ const list: V1Handler = async (ctx) => {
   const names = new Map(
     scope.harnesses.map(({ entry }) => [entry.id, entry.slug ?? entry.specName]),
   );
+  const body = attentionListBody(inbox, {
+    limit,
+    filtered: kind !== undefined || band !== undefined || ctx.query["harness"] !== undefined,
+    visible: scope.visible,
+    nameOf: (id) => names.get(id),
+    snapshotAt: snapshotAtOf(ctx),
+  });
+  const people = peopleOf(
+    ctx,
+    body.items.map((item) => item.assignee),
+  );
   return {
     status: 200,
-    body: attentionListBody(inbox, {
-      limit,
-      filtered: kind !== undefined || band !== undefined || ctx.query["harness"] !== undefined,
-      visible: scope.visible,
-      nameOf: (id) => names.get(id),
-      snapshotAt: snapshotAtOf(ctx),
-    }),
+    body: {
+      ...body,
+      ...(people.length > 0 ? { people } : {}),
+      you: youOf(ctx, scope, body.items),
+    },
   };
 };
 
@@ -187,12 +260,15 @@ function idOfRef(raw: string): string | undefined {
  * ref, one about a harness the caller may not read, and an item about people the caller
  * may not see (the list withholds it) answer the same 404.
  */
-function findItem(ctx: V1Context, raw: string): { item: AttentionItem; dir?: string } {
+async function findItem(
+  ctx: V1Context,
+  raw: string,
+): Promise<{ item: AttentionItem; dir?: string }> {
   const id = idOfRef(raw);
   if (id === undefined) throw MISSING();
   const now = ctx.deps.now();
   const scope = scopeOf(ctx);
-  const inbox = assembleInbox(perHarnessOf(ctx, scope, now), now, { state: "all" });
+  const inbox = assembleInbox(await perHarnessOf(ctx, scope, now), now, { state: "all" });
   const ref = attentionRef(id);
   const item = inbox.all.find((candidate) => candidate.ref === ref);
   if (item === undefined) throw MISSING();
@@ -210,7 +286,7 @@ function findItem(ctx: V1Context, raw: string): { item: AttentionItem; dir?: str
 }
 
 const get: V1Handler = async (ctx) => {
-  const { item, dir } = findItem(ctx, ctx.params["ref"] ?? "");
+  const { item, dir } = await findItem(ctx, ctx.params["ref"] ?? "");
   return { status: 200, body: item, ...(dir !== undefined ? { scrubDir: dir } : {}) };
 };
 
@@ -220,7 +296,7 @@ const metrics: V1Handler = async (ctx) => {
   if (span === undefined) throw invalid("since", "since is a window like 30d, 12h or 90m.");
   const now = ctx.deps.now();
   const scope = scopeOf(ctx);
-  const perHarness = perHarnessOf(ctx, scope, now);
+  const perHarness = await perHarnessOf(ctx, scope, now);
   const inbox = assembleInbox(perHarness, now, { state: "all" });
   return {
     status: 200,
@@ -234,7 +310,7 @@ const metrics: V1Handler = async (ctx) => {
 
 /** `refs.resolve` for `home/attention/att_…`: where the item opens, and its revision. */
 const resolveAttention: RefResolver = async (ctx, ref) => {
-  const { item, dir } = findItem(ctx, `${ref.scope}/${ref.kind}/${ref.id}`);
+  const { item, dir } = await findItem(ctx, `${ref.scope}/${ref.kind}/${ref.id}`);
   const href = `/#/home/needs-you?item=${ref.id}`;
   const base = ctx.deps.baseUrl;
   return {
@@ -317,6 +393,37 @@ export const ATTENTION_HANDLERS: Readonly<Record<string, V1Handler>> = {
   "attention.list": list,
   "attention.get": get,
   "attention.metrics": metrics,
+  ...attentionActHandlers(findItem),
+};
+
+// ---------------------------------------------------------------------------
+// The event stream
+// ---------------------------------------------------------------------------
+
+/** An actions line as its event: the item's ref, who acted and closed codes. */
+export function attentionLineEvent(
+  record: Readonly<Record<string, unknown>>,
+  harness: string,
+): EnvelopeFields | undefined {
+  const event = attentionEventOf(record);
+  if (event === undefined) return undefined;
+  return {
+    type: event.type,
+    at: event.at,
+    ingestedAt: event.at,
+    harness,
+    sensitivity: event.sensitivity,
+    attention: event.attention,
+    actor: event.actor,
+    payload: event.payload,
+  };
+}
+
+/** What people did about a harness's items, as that harness's stream sends it. */
+export const ATTENTION_STREAM_SOURCE: StreamSourceDecl = {
+  name: "attention",
+  source: attentionActionsLedger,
+  eventOf: attentionLineEvent,
 };
 
 /** The attention area's entry. */
@@ -326,4 +433,5 @@ export const HOME_ATTENTION: HomeAreaRuntime = {
   handlers: ATTENTION_HANDLERS,
   refResolvers: { attention: resolveAttention },
   projections: [ATTENTION_PROJECTION as unknown as Projection<unknown>],
+  streamSources: [ATTENTION_STREAM_SOURCE],
 };

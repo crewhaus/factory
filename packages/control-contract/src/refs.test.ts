@@ -20,6 +20,7 @@ import {
   parseRef,
   parseResumeScope,
 } from "./index.js";
+import { KNOWLEDGE_ID_MAX_LENGTH } from "./knowledge.js";
 import {
   SCHEMAS,
   approverProjection,
@@ -59,8 +60,8 @@ describe("refs", () => {
     [HRN, "work", mintId("wi")],
     ["home", "connection", mintId("con")],
     [HRN, "connection", mintId("con")],
-    ["home", "knowledge", "notes.2026-q4"],
-    [HRN, "knowledge", "notes.2026-q4"],
+    ["home", "knowledge", "wiki~notes~-~2026-q4"],
+    [HRN, "knowledge", "wiki~notes~-~2026-q4"],
   ];
 
   test("every kind round-trips in every scope it allows", () => {
@@ -102,9 +103,16 @@ describe("refs", () => {
   }
 
   test("exactly 200 characters still parses", () => {
-    const ref = `home/knowledge/${"a".repeat(128)}`;
-    expect(ref.length).toBeLessThanOrEqual(200);
+    const head = "wiki~";
+    const tail = `~-~${"b".repeat(60)}`;
+    const spec = "a".repeat(KNOWLEDGE_ID_MAX_LENGTH - head.length - tail.length);
+    const ref = `${HRN}/knowledge/${head}${spec}${tail}`;
+    expect(ref.length).toBe(200);
     expect("error" in parseRef(ref)).toBe(false);
+    // One character more is past the cap: of the ref here, and of the id in a shorter scope.
+    const longer = `${head}${spec}a${tail}`;
+    expect(parseRef(`${HRN}/knowledge/${longer}`)).toEqual({ error: "too-long" });
+    expect(parseRef(`home/knowledge/${longer}`)).toEqual({ error: "id" });
   });
 
   test("formatRef throws on what would not parse", () => {
@@ -155,9 +163,11 @@ describe("actors", () => {
       "sys:executor",
       "sys:slo",
       "sys:ingress",
+      "sys:outcomes",
     ]);
     expect(parseActor("sys:ingress")).toEqual({ form: "system", id: "sys:ingress" });
     expect(isStoredActor("sys:ingress")).toBe(true);
+    expect(isStoredActor("sys:outcomes")).toBe(true);
   });
 
   for (const bad of [

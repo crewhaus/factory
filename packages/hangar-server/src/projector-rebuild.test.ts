@@ -150,10 +150,10 @@ describe("the read models", () => {
       expect(items.every((item) => item["freshness"] === "direct-fold")).toBe(true);
       const segments = opened.filter((given) => given.endsWith(".jsonl"));
       expect(segments.length).toBeGreaterThan(0);
-      // At most each of the overview's four sources' files, the inbox's own four (its two
+      // At most each of the overview's four sources' files, the inbox's own five (its three
       // ledgers, the approvals file and the review queue) and the work model's one, once
       // per harness, and the approvals file once more for its count.
-      expect(segments.length).toBeLessThanOrEqual(items.length * 10);
+      expect(segments.length).toBeLessThanOrEqual(items.length * 11);
     } finally {
       _setIoTapForTest(undefined);
     }

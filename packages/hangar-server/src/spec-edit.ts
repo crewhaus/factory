@@ -49,7 +49,9 @@
  * child process
  * (`spec-validator-child.ts`): a harness's code never runs inside Home. Any
  * other harness, or a check that cannot answer, is checked with this
- * manager's own schema, with a note that says so. A spec carrying keys the
+ * manager's own schema, with a note that says so: through
+ * `@crewhaus/compile-service`'s `checkSpec`, loaded on first use, so Home and
+ * `crewhaus lint` list the same issues. A spec carrying keys the
  * schema in use does not know is READ-ONLY here: every read says so, and
  * every write answers 409 `read-only` naming the keys. Resolution never
  * installs anything: opening a tab must not dirty a git-clean dir.
@@ -68,7 +70,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { readSpecHeader } from "@crewhaus/harness-inventory";
-import { type Spec, parseSpec, parseSpecIssues, specJsonSchema } from "@crewhaus/spec";
+import { type Spec, parseSpec, specJsonSchema } from "@crewhaus/spec";
 import { autoRegisterSpecVersion } from "@crewhaus/spec-changelog/spec-changelog";
 import {
   OPTIMIZABLE_PATHS,
@@ -98,6 +100,7 @@ import {
   specRev,
 } from "@crewhaus/spec-patch/commit";
 import { createFileBackedRegistry } from "@crewhaus/spec-registry";
+import { specSchemaIdentity } from "@crewhaus/spec/identity";
 import { MAX_TEXT_BYTES, SAFE_SEGMENT_RE } from "./constants";
 import { HttpError } from "./http";
 import { readTextCapped } from "./jsonl";
@@ -297,19 +300,49 @@ function rowsOf(
   }));
 }
 
-/** This manager's own schema. */
-function managerCheck(yamlText: string, op: "issues" | "schema", note: string | null): SchemaCheck {
+/** The compile service's module, loaded on first use: it carries the compiler. */
+type CompileService = typeof import("@crewhaus/compile-service");
+let compileService: Promise<CompileService> | undefined;
+
+/**
+ * Load `@crewhaus/compile-service` once. A literal specifier, so a compiled
+ * binary embeds it; a failed load is forgotten, so the next check tries again.
+ */
+function loadCompileService(): Promise<CompileService> {
+  compileService ??= import("@crewhaus/compile-service").catch((err: unknown) => {
+    compileService = undefined;
+    throw err;
+  });
+  return compileService;
+}
+
+/**
+ * This manager's own schema, through the compile service's `checkSpec`: every
+ * schema issue (or every cross-field issue once the schema passes), the same
+ * list `crewhaus lint` prints, and the version of the schema that answered.
+ * An empty text has nothing to check; a service that cannot load answers one
+ * `parser_failed` row.
+ */
+async function managerCheck(
+  yamlText: string,
+  op: "issues" | "schema",
+  note: string | null,
+): Promise<SchemaCheck> {
   let issues: SpecIssueRow[];
+  let version: string | null = null;
   if (yamlText === "") {
     issues = [];
+    version = specSchemaIdentity().version;
   } else {
     try {
-      issues = rowsOf(parseSpecIssues(yamlText));
+      const result = (await loadCompileService()).checkSpec(yamlText);
+      issues = rowsOf(result.issues);
+      version = result.schema.version;
     } catch (err) {
       issues = [{ path: [], message: maskText(errText(err)), code: "parser_failed" }];
     }
   }
-  if (op === "issues") return { source: "manager", version: null, note, issues };
+  if (op === "issues") return { source: "manager", version, note, issues };
   let parsed: unknown;
   let parseError: string | undefined;
   try {
@@ -319,7 +352,7 @@ function managerCheck(yamlText: string, op: "issues" | "schema", note: string | 
   }
   return {
     source: "manager",
-    version: null,
+    version,
     note,
     issues,
     schema: specJsonSchema() as Record<string, unknown>,

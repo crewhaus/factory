@@ -247,11 +247,17 @@ export function parseModelString(modelString: string): ParsedModelString {
   }
 
   // Named OpenAI-compatible cloud hosts: `groq/<model>`, `xai/<model>`, …
+  // A prefix names a host only as the table's own key, never an inherited
+  // name (`constructor/`, `__proto__/`), so the router and the pricing twin
+  // read one set of hosts.
   const slash = modelString.indexOf("/");
   if (slash > 0) {
-    const host = OPENAI_COMPAT_HOSTS[modelString.slice(0, slash)];
+    const prefix = modelString.slice(0, slash);
+    const host = Object.hasOwn(OPENAI_COMPAT_HOSTS, prefix)
+      ? OPENAI_COMPAT_HOSTS[prefix]
+      : undefined;
     if (host !== undefined) {
-      const hostId = modelString.slice(0, slash);
+      const hostId = prefix;
       const modelId = modelString.slice(slash + 1);
       if (modelId.length === 0) {
         throw new ConfigError(

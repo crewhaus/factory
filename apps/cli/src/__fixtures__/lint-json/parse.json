@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "findings": [
+    {
+      "message": "spec validation failed:\n  agent: Required",
+      "path": "<spec>",
+      "severity": "error",
+      "rule": "parse"
+    }
+  ]
+}

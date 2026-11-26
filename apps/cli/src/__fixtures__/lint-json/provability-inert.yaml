@@ -1,0 +1,6 @@
+name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+provability: { level: off, threshold: 0.9 }

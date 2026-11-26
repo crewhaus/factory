@@ -16,8 +16,8 @@
  * | open with a queued run | queued |
  * | open | up-next |
  *
- * The pull-request and publish facts are optional: nothing fills them until work is
- * delivered as pull requests.
+ * The pull-request and publish facts come from the delivery records (`./delivery`); an item
+ * nobody delivered as a pull request has none.
  */
 import type { WorkCloseOutcome, WorkState, WorkStatus } from "@crewhaus/control-contract";
 

@@ -37,6 +37,7 @@ import { CrewhausError } from "@crewhaus/errors";
 // the two enforcement paths cannot drift (ops-review F2). See
 // retention-config.ts for the schema + safety stance.
 export {
+  DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS,
   DEFAULT_SESSION_MAX_AGE_DAYS,
   RETENTION_CONFIG_RELPATH,
   type RetentionAuditWindowConfig,

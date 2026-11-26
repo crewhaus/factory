@@ -388,7 +388,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["controlReason", "string|null"],
     ["draining", "boolean"],
   ],
-  // views/approvals.js — the fleet inbox
+  // views/home.js and the header: the approvals waiting on a person
   approvals: [
     ["approvals[].id", "string"],
     ["approvals[].harnessId", "string"],
@@ -406,7 +406,7 @@ const VIEW_READS: Record<string, ReadonlyArray<readonly [string, string]>> = {
     ["truncatedHarnesses", "array"],
     ["unreachableHarnesses", "array"],
   ],
-  // views/review.js — the fleet review queue
+  // views/home.js and the header: the review items waiting on a person
   review: [
     ["items[].id", "string"],
     ["items[].kind", "string"],

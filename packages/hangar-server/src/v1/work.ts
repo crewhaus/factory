@@ -70,142 +70,19 @@ import { emptyOf, nextCursor, pagingOf, snapshotCursor } from "./lists";
 import { entryOf, harnessOf, liveDirOf, liveDirOr409, visibleHarnesses } from "./resolve";
 import { homeFor } from "./runs";
 import { acceptedAnswer, replayedCommand, submitCommand } from "./submit";
+import {
+  type SpecRead,
+  callerOf,
+  headOf,
+  humanOnly,
+  locate,
+  missingItem,
+  refusalError,
+  workSpecOf,
+} from "./work-shared";
+import { WORKSPACES_HOME } from "./workspaces";
 
-/** The most bytes of a spec this module reads. */
-const SPEC_MAX_BYTES = 1024 * 1024;
-
-type SpecRead = WorkSpecFacts & {
-  /** Whether the spec could be read at all. */
-  readonly read: boolean;
-  readonly schedules: boolean;
-};
-
-/** What the harness's spec says about work items, read contained. Never throws. */
-export function workSpecOf(dir: string): SpecRead {
-  for (const name of ["crewhaus.yaml", "crewhaus.yml"]) {
-    const read = openForReadSync(dir, name, { maxBytes: SPEC_MAX_BYTES, followLeafSymlink: false });
-    if (!read.ok) continue;
-    if (read.truncated) return { tools: false, read: false, schedules: false };
-    const cadences = declaredCadences(read.text);
-    const schedules =
-      cadences.heartbeat !== undefined ||
-      cadences.schedule !== undefined ||
-      (cadences.scheduleLanes?.length ?? 0) > 0;
-    return { ...workSpecFacts(readYamlLoose(read.text)), read: true, schedules };
-  }
-  return { tools: false, read: false, schedules: false };
-}
-
-function headOf(ctx: V1Context, entry: HangarHarnessEntry, dir: string): WorkHead {
-  const spec = workSpecOf(dir);
-  return {
-    harnessDir: dir,
-    harness: entry.id,
-    target: entry.target,
-    specName: entry.specName,
-    ...(spec.read ? { tools: spec.tools } : {}),
-    now: ctx.deps.now,
-  };
-}
-
-/** A person or a service, as the work rules take a caller. */
-function callerOf(ctx: V1Context): WorkCaller {
-  const service =
-    ctx.access.caller.via === "service" ||
-    (ctx.actor !== undefined && isServiceActor(ctx.deps.hangarRoot, ctx.actor));
-  return { role: service ? "service" : "person" };
-}
-
-/** Accepting, declining and correcting the ranking are a person's acts. */
-function humanOnly(ctx: V1Context, act: string): void {
-  if (callerOf(ctx).role === "service") {
-    throw new V1Error({
-      status: 403,
-      code: "forbidden",
-      reason: "human_only",
-      message: `${act} is a person's act; a service credential cannot do it.`,
-    });
-  }
-}
-
-function refusalError(refusal: WorkCommandRefusal): V1Error {
-  const status =
-    refusal.reason === "not_served"
-      ? 501
-      : ((ERROR_CODES as Readonly<Record<string, { statuses: readonly number[] }>>)[refusal.code]
-          ?.statuses[0] ?? 500);
-  return new V1Error({
-    status,
-    code: refusal.code as ErrorCode,
-    reason: refusal.reason,
-    message: refusal.message,
-    ...(refusal.verb !== undefined && refusal.verb !== null ? { verb: refusal.verb } : {}),
-    ...(refusal.current !== undefined ? { current: refusal.current } : {}),
-    ...(refusal.field !== undefined ? { details: { field: refusal.field } } : {}),
-  });
-}
-
-export type Located = {
-  readonly entry: HangarHarnessEntry;
-  readonly dir: string;
-  readonly wi: string;
-};
-
-const missingItem = (): V1Error =>
-  new V1Error({
-    status: 404,
-    code: "not_found",
-    reason: "work_unknown",
-    message: "No work item has that ref here.",
-  });
-
-function holds(dir: string, wi: string): boolean {
-  const read = openWorkStore(dir).get(wi);
-  return !("ok" in read);
-}
-
-/**
- * The work item `{ref}` names, in a harness the caller may read: `<harness>/work/<wi>`, or
- * a bare `wi_…` with `?harness=`. Without either it is 422 `harness_needed` with the
- * harnesses the caller may read that hold it, never a guess.
- */
-export function locate(ctx: V1Context): Located {
-  const raw = ctx.params["ref"] ?? "";
-  const lookIn = (entry: HangarHarnessEntry | undefined, wi: string): Located | undefined => {
-    const dir = entry === undefined ? undefined : liveDirOf(entry);
-    if (entry === undefined || dir === undefined || !ctx.access.canRead(entry.id)) return undefined;
-    return holds(dir, wi) ? { entry, dir, wi } : undefined;
-  };
-  if (!isId("wi", raw)) {
-    const parsed = parseRef(raw);
-    if ("error" in parsed || parsed.kind !== "work") throw missingItem();
-    const found = lookIn(entryOf(ctx.deps, parsed.scope), parsed.id);
-    if (found === undefined) throw missingItem();
-    return found;
-  }
-  const hint = ctx.query["harness"];
-  if (hint !== undefined) {
-    const found = lookIn(entryOf(ctx.deps, hint), raw);
-    if (found === undefined) throw missingItem();
-    return found;
-  }
-  const candidates = visibleHarnesses(ctx.deps)
-    .map((entry) => lookIn(entry, raw))
-    .filter((f): f is Located => f !== undefined);
-  throw new V1Error({
-    status: 422,
-    code: "invalid",
-    reason: "harness_needed",
-    message: "Say which harness with ?harness=, or name the item as <harness>/work/<wi>.",
-    details: {
-      candidates: candidates.map((f) => ({
-        kind: "work",
-        ref: workRefOf(f.entry.id, raw),
-        href: `/#/h/${f.entry.id}/work/items/${raw}`,
-      })),
-    },
-  });
-}
+export { workSpecOf };
 
 /** One item as a list shows it, ranked among the rest. */
 function viewOfItem(dir: string, wi: string, weights: SpecRead["config"]) {
@@ -759,9 +636,15 @@ export const WORK_HOME = {
 /** The runtime area's slot in Home, one half per file. */
 export const HOME_RUNTIME: HomeAreaRuntime = {
   area: "runtime",
-  sweeps: [...BUDGET_HOME.sweeps],
+  sweeps: [
+    ...WORKSPACES_HOME.sweeps,
+
+    ...BUDGET_HOME.sweeps,
+  ],
   handlers: {
     ...WORK_HOME.handlers,
+
+    ...WORKSPACES_HOME.handlers,
 
     ...BUDGET_HOME.handlers,
   },
@@ -773,6 +656,8 @@ export const HOME_RUNTIME: HomeAreaRuntime = {
   capabilityProviders: [
     ...WORK_HOME.capabilityProviders,
 
+    ...WORKSPACES_HOME.capabilityProviders,
+
     ...BUDGET_HOME.capabilityProviders,
   ],
   projections: [
@@ -782,6 +667,8 @@ export const HOME_RUNTIME: HomeAreaRuntime = {
   ],
   streamSources: [
     ...WORK_HOME.streamSources,
+
+    ...WORKSPACES_HOME.streamSources,
 
     // ...BUDGET_HOME.streamSources,
   ],

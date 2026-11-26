@@ -934,6 +934,15 @@ button.tab {
 .work-action select {
   max-width: 100%;
 }
+/* A check's log and the judge's reasons wrap at any width; a long log scrolls inside its
+   own region, never the page. */
+.work-fold pre {
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .work-scope label {
   display: inline-flex;
   align-items: center;
@@ -1796,49 +1805,10 @@ dialog.modal::backdrop {
 
 /* ── inboxes ───────────────────────────────────────────────────────────── */
 
-.inbox-hint {
-  font-size: 0.75rem;
-  margin: 6px 0;
-}
-.keyhelp,
-.rowmenu {
-  margin: 6px 0;
-}
-.keyhelp kbd {
-  display: inline-block;
-  min-width: 42px;
-  color: var(--accent);
-}
-.rowmenu-body {
-  display: flex;
-  gap: 8px;
-  flex-wrap: wrap;
-}
 .inbox {
   list-style: none;
   margin: 0;
   padding: 0;
-}
-.inbox-card {
-  border-left: 3px solid transparent;
-}
-/* The look of the selected row. The row also carries the word "Selected"
-   (statusBadge), so the colour is never the only cue. */
-.inbox-card.selected {
-  border-left-color: var(--accent);
-  background: var(--panel-2);
-}
-.inbox-state {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-}
-.inbox-state:empty {
-  display: none;
-}
-.inbox-armed {
-  font-weight: 550;
 }
 .inbox-head {
   display: flex;
@@ -1851,6 +1821,7 @@ dialog.modal::backdrop {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
   margin-top: 8px;
 }
 .inbox-twins {
@@ -1867,9 +1838,74 @@ dialog.modal::backdrop {
   margin: 4px 0 0;
   padding: 0;
 }
+.attention-choices li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 6px;
+}
 .attention-choices code,
-.attention-card .inbox-twins code {
+.attention-card .inbox-twins code,
+.attention-form .cli-twin code,
+.attention-discuss .cli-twin code {
   overflow-wrap: anywhere;
+}
+.attention-side {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+}
+.attention-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.attention-filters .page-nav-list {
+  flex-wrap: wrap;
+}
+.attention-form,
+.attention-discuss {
+  display: grid;
+  gap: 8px;
+}
+.attention-set {
+  border: 1px solid var(--boundary);
+  border-radius: 8px;
+  padding: 6px 10px;
+  min-width: 0;
+}
+.attention-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+}
+.attention-form-status:empty {
+  display: none;
+}
+/* Each disclosure is a whole target of its own. */
+.attention-body > summary,
+.attention-thread > summary {
+  padding: 5px 0;
+  min-height: 28px;
+}
+.attention-thread {
+  margin-top: 6px;
+}
+.attention-messages {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+}
+/* A message wraps and keeps its line breaks: the page reflows at 320 px. */
+.attention-message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0 0 8px;
 }
 .activity-row {
   display: flex;

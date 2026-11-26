@@ -5,6 +5,7 @@ import { axeGate } from "./axe-gate.journey";
 import { axeStates } from "./axe-states.journey";
 import { benchDryRun } from "./bench-dry-run.journey";
 import { cliBoot } from "./cli-boot.journey";
+import { crashAfterPrCreated } from "./crash-after-pr-created.journey";
 import { crawl } from "./crawl.journey";
 import { deepLinks } from "./deep-links.journey";
 import { exportJourney } from "./export.journey";
@@ -21,6 +22,7 @@ import { signIn } from "./sign-in.journey";
 import { specConflict } from "./spec-conflict.journey";
 import { specForm } from "./spec-form.journey";
 import { specReadOnly } from "./spec-read-only.journey";
+import { stewardDeliversPr } from "./steward-delivers-pr.journey";
 import { thredzProxy } from "./thredz-proxy.journey";
 import { untrustedMarkup } from "./untrusted-markup.journey";
 
@@ -48,4 +50,6 @@ export const JOURNEYS: readonly Journey[] = [
   deepLinks,
   liveFeed,
   exportJourney,
+  stewardDeliversPr,
+  crashAfterPrCreated,
 ];

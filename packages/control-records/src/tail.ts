@@ -45,6 +45,8 @@ export type TailRead =
       readonly gaps: readonly TailGap[];
       /** The file's final bytes have no `\n` yet: they are not returned. */
       readonly torn: boolean;
+      /** How many bytes were read from the file. {@link readTail} always says. */
+      readonly bytesRead?: number;
     }
   | { readonly state: "absent" }
   | { readonly state: "refused"; readonly code: SafeFsCode; readonly reason: string };
@@ -96,6 +98,7 @@ export function readTail(root: string, given: string, options: TailOptions): Tai
       truncated,
       gaps: gaps.reverse(),
       torn: scan.torn,
+      bytesRead: scan.bytesRead,
     };
   } catch (err) {
     const code = (err as { code?: unknown }).code;

@@ -558,10 +558,10 @@ export async function spawnSubAgent(
       //     Skill tool itself already inherits via the catalog).
       //   - failureTaxonomy: the child's recovery consults the same named
       //     classes as the parent.
-      //   - continuity: READ-ONLY — `loadPlan` renders the plan tail;
-      //     `ledger: false` plus the absent onPlanDirty/onHandoff closures
-      //     mean a child never writes the parent's plan-store state
-      //     through the seam.
+      //   - continuity: READ-ONLY — `loadPlan` renders the plan tail and
+      //     `tailRefs` names what it rendered; `ledger: false` plus the
+      //     absent onPlanDirty/onHandoff closures mean a child never writes
+      //     the parent's plan-store state through the seam.
       //   - provability (0.8.0 §8): READ-ONLY — the guidance rides
       //     `instructions` above; the child gets no `provability` gate of
       //     its own (only the parent's final text is gated), and its return
@@ -573,6 +573,11 @@ export async function spawnSubAgent(
         ? {
             continuity: {
               loadPlan: parent.continuity.loadPlan,
+              // What that tail rendered, by reference: the child's run
+              // records which items it was shown.
+              ...(parent.continuity.tailRefs !== undefined
+                ? { tailRefs: parent.continuity.tailRefs }
+                : {}),
               ledger: false,
               // The store's files stay out of the child's tools too.
               ...(parent.continuity.storeFiles !== undefined

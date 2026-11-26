@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "rule \"webFetch\" names webFetch, the key a spec lists the tool under, but a rule is matched against the tool's name, WebFetch, so this rule never fires. Write \"WebFetch\".",
+      "path": "permissions.rules[alwaysAllow webFetch]",
+      "severity": "warning",
+      "rule": "permission-rule:tool-key-not-name"
+    },
+    {
+      "message": "rule \"alwaysDeny Write(/etc/**)\" never fires outside plan mode: \"alwaysAllow Write\", above it in the same list, matches every call it matches, and the first rule that matches a call decides it. Move it above \"alwaysAllow Write\".",
+      "path": "permissions.rules[alwaysDeny Write(/etc/**)]",
+      "severity": "warning",
+      "rule": "permission-rule:shadowed-by-allow"
+    }
+  ]
+}

@@ -233,10 +233,10 @@ describe("every boot seam in a tool package has a delivery path", () => {
     // registerChaincallConfig does the same for tool-chaincall, and 0.7.1 C052
     // added tool-proc's registerProcConfig (by code and by name), and the
     // agents unit tool-objectstore's and tool-secure's registrars, and 0.9.0's
-    // tool-work registerWorkConfig (by code and by name).
-    expect(seams.length).toBe(40);
-    expect(by("code").length).toBe(27);
-    expect(by("name").length).toBe(39);
+    // tool-work registerWorkConfig and bindWorkspaceRepositories (by code and by name).
+    expect(seams.length).toBe(41);
+    expect(by("code").length).toBe(28);
+    expect(by("name").length).toBe(40);
     expect(by("code")).toContain("setChainRpcResolver");
     expect(by("name")).toContain("registerChannelAdapter");
     expect(by("name")).toContain("bindEvmChains");
@@ -249,7 +249,7 @@ describe("every boot seam in a tool package has a delivery path", () => {
   test("every tool_config registrar is named by a builtin row, so emitters call it", () => {
     for (const [symbol, reg] of Object.entries(TOOL_BOOT_REGISTRARS)) {
       const rows = Object.values(BUILTIN_TOOLS).filter(
-        (e) => e.initSymbol === symbol || e.chainSymbol === symbol,
+        (e) => e.initSymbol === symbol || e.chainSymbol === symbol || e.repositorySymbol === symbol,
       );
       expect({ symbol, rows: rows.length > 0 }).toEqual({ symbol, rows: true });
       expect(reg.source === "tool_config" ? (reg.keys ?? []).length > 0 : true).toBe(true);

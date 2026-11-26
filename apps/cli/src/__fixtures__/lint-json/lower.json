@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "findings": [
+    {
+      "message": "mcp_servers.docs.env.DOCS_TOKEN value \"$not-a-name\" looks like an environment reference but is not a valid one. Environment references must be $UPPER_SNAKE_CASE (e.g. $SLACK_BOT_TOKEN) — no lowercase, no leading digit, no ${...} braces. Fix the variable name, or remove the leading \"$\" if this is genuinely a literal value.",
+      "path": "<lower>",
+      "severity": "error",
+      "rule": "lower"
+    }
+  ]
+}

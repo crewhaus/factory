@@ -37,6 +37,9 @@
  * sources rather than from snapshots a read would have to persist).
  */
 import { appendFileSync, mkdirSync, statSync } from "node:fs";
+import { advisorItems, readAdvisorSnapshot } from "@crewhaus/attention";
+import { type ActionLine, type AdvisorLedgerLine, appendAction } from "@crewhaus/attention/act";
+import { type AttentionItem, isStoredActor } from "@crewhaus/control-contract";
 import {
   baselineKeyFor,
   breakBoundaries,
@@ -55,8 +58,9 @@ import {
   assembleFeed,
   deriveAdvisorItems as deriveWith,
 } from "@crewhaus/harness-advice/advisor";
-import { runPreflight } from "@crewhaus/preflight";
+import { PORTS_NOT_CHECKED, runPreflight } from "@crewhaus/preflight";
 import { foldApprovals, statusOf } from "./approvals";
+import { currentCommand } from "./command-context";
 import { foldHarnessCosts } from "./costs";
 import { mergedSpawnEnv } from "./env-file";
 import {
@@ -187,6 +191,52 @@ export function deriveAdvisorItems(inputs: AdvisorInputs): AdvisorItem[] {
 
 const ADVISOR_SEGMENTS = [".crewhaus", "advisor"] as const;
 
+/**
+ * The finding's item in the inbox, as Home last gathered it: its ref and its evidence. None
+ * before Home's first check, or once the finding cleared.
+ */
+function inboxItemOf(ctx: M3Context, itemId: string): AttentionItem | undefined {
+  if (ctx.entry === null || ctx.harnessDir === null || ctx.hangarRoot === undefined) {
+    return undefined;
+  }
+  const snapshot = readAdvisorSnapshot(ctx.hangarRoot, ctx.entry.id);
+  if (snapshot === undefined) return undefined;
+  const now = ctx.now();
+  return advisorItems(snapshot, {
+    harness: ctx.entry.id,
+    dir: ctx.harnessDir,
+    now,
+    content: false,
+    freshness: { asOf: new Date(now).toISOString(), mode: "projection" },
+  }).find(({ item }) => item.source.id === itemId)?.item;
+}
+
+/**
+ * Record what a person did about a finding on the harness's actions ledger too, so the
+ * inbox and the harness's stream say it. The Advisor's own ledger stands either way.
+ */
+async function recordAction(
+  ctx: M3Context,
+  itemId: string,
+  act: Pick<ActionLine, "event" | "state" | "how" | "choice">,
+): Promise<string | undefined> {
+  const item = inboxItemOf(ctx, itemId);
+  if (item === undefined || ctx.harnessDir === null) return undefined;
+  const by = await ctx.storedActor?.();
+  if (!isStoredActor(by)) return item.evidenceRev;
+  const cmd = currentCommand()?.commandId;
+  const failed = await appendAction(ctx.harnessDir, item, {
+    ...act,
+    at: new Date(ctx.now()).toISOString(),
+    by: by as string,
+    via: "home",
+    evidenceRev: item.evidenceRev,
+    ...(cmd !== undefined ? { cmd } : {}),
+  });
+  if (failed !== undefined) ctx.warn(`hangar-server: advisor ${itemId}: ${failed.message}`);
+  return item.evidenceRev;
+}
+
 function readDecisions(ctx: M3Context): DecisionRecord[] {
   const path = safeContain(ctx, [...ADVISOR_SEGMENTS, "decisions.jsonl"]);
   if (path === undefined) return [];
@@ -210,6 +260,25 @@ function readDecisions(ctx: M3Context): DecisionRecord[] {
     });
   }
   return out;
+}
+
+/** A version 2 line of the Advisor's ledger, which a reader of version 1 reads too. */
+function ledgerLine(
+  ctx: M3Context,
+  line: Pick<
+    AdvisorLedgerLine,
+    "itemId" | "action" | "evidenceRev" | "comment" | "reason" | "jobId"
+  >,
+): AdvisorLedgerLine & { readonly v: 2 } {
+  const cmd = currentCommand()?.commandId;
+  return {
+    v: 2,
+    ...line,
+    at: new Date(ctx.now()).toISOString(),
+    by: ctx.principal,
+    via: "home",
+    ...(cmd !== undefined ? { cmd } : {}),
+  };
 }
 
 function appendAdvisorLine(ctx: M3Context, file: string, record: unknown): void {
@@ -275,7 +344,11 @@ async function gatherInputs(ctx: M3Context, dir: string): Promise<AdvisorInputs>
   let preflight: { items: readonly HealthPreflightItem[] } | null = null;
   try {
     const merged = mergedSpawnEnv(ctx.env, dir);
-    const report = await runPreflight({ harnessDir: dir, env: merged.env });
+    const report = await runPreflight({
+      harnessDir: dir,
+      env: merged.env,
+      ...(ctx.checkPort !== undefined ? { checkPort: ctx.checkPort } : {}),
+    });
     preflight = { items: report.items };
   } catch (err) {
     ctx.warn(
@@ -468,15 +541,19 @@ export const advisorAct: M3Handler = async (ctx) => {
     job = record;
     jobId = (record as { jobId?: string }).jobId;
   }
-  const decision: DecisionRecord = {
-    v: 1,
+  const evidenceRev = await recordAction(ctx, itemId, {
+    event: "resolved",
+    state: "open",
+    how: "acted",
+    choice: "act",
+  });
+  const decision = ledgerLine(ctx, {
     itemId,
     action: "acted",
-    at: new Date(ctx.now()).toISOString(),
-    by: ctx.principal,
+    ...(evidenceRev !== undefined ? { evidenceRev } : {}),
     ...(comment !== null && comment !== "" ? { comment } : {}),
     ...(jobId !== undefined ? { jobId } : {}),
-  };
+  });
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
   return {
     ...found(
@@ -496,18 +573,21 @@ export const advisorAct: M3Handler = async (ctx) => {
 /** `POST /api/h/:id/advisor/:itemId/dismiss` — dismiss WITH the reasoning.
  *  The reason is required: "why was this alert ignored" must have an answer
  *  in the ledger, not in somebody's memory. */
-export const advisorDismiss: M3Handler = (ctx) => {
+export const advisorDismiss: M3Handler = async (ctx) => {
   requireDir(ctx);
   const itemId = ctx.params["itemId"] as string;
   const reason = requireString(ctx.body, "reason");
-  const decision: DecisionRecord = {
-    v: 1,
+  const evidenceRev = await recordAction(ctx, itemId, {
+    event: "dismissed",
+    state: "resolved",
+    how: "dismissed",
+  });
+  const decision = ledgerLine(ctx, {
     itemId,
     action: "dismissed",
-    at: new Date(ctx.now()).toISOString(),
-    by: ctx.principal,
+    ...(evidenceRev !== undefined ? { evidenceRev } : {}),
     reason,
-  };
+  });
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
   return {
     ...found("dismissed — the item moves to the dismissed fold with this reason attached", null),
@@ -519,16 +599,15 @@ export const advisorDismiss: M3Handler = (ctx) => {
 
 /** `POST /api/h/:id/advisor/:itemId/reopen` — lift a dismissal. An appended
  *  superseding record, never an edit: the ledger keeps both decisions. */
-export const advisorReopen: M3Handler = (ctx) => {
+export const advisorReopen: M3Handler = async (ctx) => {
   requireDir(ctx);
   const itemId = ctx.params["itemId"] as string;
-  const decision: DecisionRecord = {
-    v: 1,
+  const evidenceRev = await recordAction(ctx, itemId, { event: "reopened", state: "open" });
+  const decision = ledgerLine(ctx, {
     itemId,
     action: "reopened",
-    at: new Date(ctx.now()).toISOString(),
-    by: ctx.principal,
-  };
+    ...(evidenceRev !== undefined ? { evidenceRev } : {}),
+  });
   appendAdvisorLine(ctx, "decisions.jsonl", decision);
   return { ...found("reopened — the item returns to the open feed", null), itemId, reopened: true };
 };
@@ -1125,7 +1204,9 @@ export type AdvisorSweepHome = Pick<
  * One harness's open Advisor findings off the request path, for Home's attention sweep:
  * gathered in a context built as the fleet board builds one per harness (every read
  * contained in that harness, no process handle), with no caller, every permission
- * refused and every job refused. It runs a preflight, so only the sweep calls it.
+ * refused and every job refused. It runs a preflight, so only the sweep calls it. The
+ * preflight binds no port here: no one is waiting for the answer, and a daemon may be
+ * about to bind the same one. A check a person opens looks at the ports.
  */
 export async function advisorSweepItems(
   home: AdvisorSweepHome,
@@ -1155,6 +1236,7 @@ export async function advisorSweepItems(
     submitJob: refuse,
     checkJob: refuse,
     warn: home.warn,
+    checkPort: PORTS_NOT_CHECKED,
     ...(home.hangarRoot !== undefined ? { hangarRoot: home.hangarRoot } : {}),
   };
   return advisorOpenItems(ctx, harness.dir);

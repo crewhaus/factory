@@ -6,9 +6,11 @@
  * cross-harness groups, the read model Home's projector keeps, a direct fold for when
  * there is none, search documents and metrics.
  *
- * Nothing here writes, creates or compacts a file, makes a model call or opens a socket.
+ * Nothing here writes, creates or compacts a file, makes a model call or opens a socket:
+ * what a person does about an item is `@crewhaus/attention/act`.
  */
 export {
+  advisorItems,
   advisorKindOf,
   advisorTitleOf,
 } from "./adapters/advisor";
@@ -29,7 +31,13 @@ export {
   approvalKeyOf,
   approvalKindOf,
 } from "./adapters/approvals";
-export { decisionKindOf } from "./adapters/decisions";
+export {
+  GRAPHS_REL,
+  GRAPH_META_MAX_BYTES,
+  checkpointKeyOf,
+  pauseOf,
+} from "./adapters/checkpoints";
+export { MINTED_DECISION_KINDS, decisionKindOf } from "./adapters/decisions";
 export { REVIEW_QUEUE_REL } from "./adapters/review";
 export { FAILURES_MAX, PROVIDER_LIMIT_WINDOW_MS, newestEpisode } from "./adapters/runs";
 export {
@@ -39,6 +47,7 @@ export {
   causeOf,
   credentialFactsOf,
 } from "./causes";
+export { type AttentionEvent, attentionEventOf } from "./events";
 export {
   type FoldHarnessOptions,
   type HarnessReadOptions,
@@ -86,8 +95,11 @@ export {
   percentile,
   windowMs,
 } from "./metrics";
+export { DEFER_MAX_MS, decidesItself, hiddenNow, idOfItem } from "./overlays";
 export {
   type AttentionProducer,
+  type ProducedChoice,
+  type ProducedItem,
   _resetProducersForTest,
   producers,
   registerProducer,
@@ -100,17 +112,27 @@ export {
 export {
   type AttentionReader,
   DEFAULT_READER,
+  LIST_MAX,
+  type Listing,
   READ_CAPS,
   type ReadCaps,
   SESSION_CAPS,
 } from "./read";
 export { type AttentionSearchDocument, searchDocumentsOf } from "./search";
-export { ATTENTION_SENTENCES, UNKNOWN_SENTENCE, classWordOf, sentenceOf } from "./sentences";
+export {
+  ATTENTION_SENTENCES,
+  CHOICE_EFFECTS,
+  UNKNOWN_SENTENCE,
+  choiceEffectOf,
+  classWordOf,
+  sentenceOf,
+} from "./sentences";
 export type {
   AdvisorFinding,
   AdvisorSnapshot,
   ApprovalFact,
   AttentionModel,
+  CheckpointFact,
   DecisionFact,
   Drafted,
   FailureSignature,
@@ -119,6 +141,7 @@ export type {
   HarnessAttention,
   HarnessFacts,
   ItemContext,
+  ItemOverlay,
   MetricDecision,
   ReviewFact,
   RunFact,

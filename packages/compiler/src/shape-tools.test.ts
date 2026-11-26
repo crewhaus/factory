@@ -341,9 +341,17 @@ describe("the edge flavour of a shape refuses what that shape refuses, in the sa
         expect(edgeError(yaml)).toBe(local);
       }
     }
-    // sendMessage on all three, and the evm family on cli.
+    // sendMessage on all three, the evm family on cli, and the workspace tools on graph.
     expect(refused).toBe(
-      3 + Object.values(BUILTIN_TOOLS).filter((e) => e.shapes?.includes("graph") === true).length,
+      Object.keys(flavours).reduce(
+        (n, shape) =>
+          n +
+          Object.values(BUILTIN_TOOLS).filter(
+            (e) => e.shapes !== undefined && !(e.shapes as readonly string[]).includes(shape),
+          ).length,
+        0,
+      ),
     );
+    expect(refused).toBeGreaterThan(3 + 3);
   }, 60_000);
 });

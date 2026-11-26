@@ -270,15 +270,22 @@ export type SubAgentMemorySeam = {
 
 /**
  * v0.3.0 §7.1 — the parent's continuity seam as projected for children:
- * READ-ONLY by construction. Only `loadPlan` crosses the boundary (so the
- * `<current_plan>` tail renders in child loops); `onPlanDirty` / `onHandoff`
- * / the ledger writes are deliberately unrepresentable — a child must not
- * mutate the parent's plan-store state through the seam. (Plan TOOLS still
- * reach children via catalog inheritance under the parent's permissions —
- * that is a tool-permission decision, not a seam leak.)
+ * READ-ONLY by construction. `loadPlan` crosses the boundary (so the
+ * `<current_plan>` tail renders in child loops), with `tailRefs` (what that
+ * tail rendered, by reference, so the child's run records which items it was
+ * shown) and `storeFiles`; `onPlanDirty` / `onHandoff` / the ledger writes are
+ * deliberately unrepresentable — a child must not mutate the parent's
+ * plan-store state through the seam. (Plan TOOLS still reach children via
+ * catalog inheritance under the parent's permissions — that is a
+ * tool-permission decision, not a seam leak.)
  */
 export type SubAgentContinuitySeam = {
   readonly loadPlan: () => Promise<string | null>;
+  /**
+   * What the last `loadPlan` rendered, by reference. A read closure: ids and
+   * line numbers, never text, and nothing it answers can be written through.
+   */
+  readonly tailRefs?: () => Promise<readonly RecalledItemRef[]>;
   /**
    * The continuity store's own files, which the child's floor keeps from
    * every tool but the store's own, as the parent's does. Data only, so the

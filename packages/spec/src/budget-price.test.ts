@@ -6,7 +6,7 @@
 import { describe, expect, test } from "bun:test";
 import { budgetPeriodIssues } from "./blocks/budget-period";
 import { DELTA_090_ISSUES } from "./blocks/delta-090";
-import { modelPriceIssues } from "./blocks/model-price";
+import { modelPriceIssues, modelPriceKeyIssues, priceFamilyOf } from "./blocks/model-price";
 import { parseSpec, parseSpecIssues } from "./index";
 
 const CLI = "name: a\ntarget: cli\nagent: {model: claude-opus-4-7, instructions: Help.}\n";
@@ -153,6 +153,161 @@ describe("models.<name>.price", () => {
   });
 });
 
+describe("a declared price names one model", () => {
+  const FREE = { input_per_1m: 0, output_per_1m: 0 };
+  const LOCAL = "http://127.0.0.1:11434/v1";
+  const agentOn = (model: string, models: unknown): string =>
+    `name: a\ntarget: cli\nagent: {model: ${JSON.stringify(model)}, instructions: Help.}\nmodels: ${JSON.stringify(models)}\n`;
+
+  test("a free local model priced as a model the pricing table prices is refused, naming both", () => {
+    const issues = refusals(
+      agentOn("openai/gpt-4o", { free: { model: `local/gpt-4o@${LOCAL}`, price: FREE } }),
+    );
+    expect(issues).toEqual([
+      "models.free.price: models.free.price: local/gpt-4o@… is priced as openai gpt-4o, which the pricing table already prices; a declared price would also price those calls. Remove the price, or name a model the table does not price.",
+    ]);
+    // The endpoint is not repeated in the reason.
+    expect(issues[0]).not.toContain("11434");
+  });
+
+  test("a price on a local model another profile names under another family is refused, naming both profiles", () => {
+    const issues = refusals(
+      withModels({
+        mine: { model: `local/my-model@${LOCAL}`, price: { input_per_1m: 1, output_per_1m: 1 } },
+        hosted: { model: "groq/my-model" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.mine.price: models.mine.price: local/my-model@… is priced as openai my-model, and so is models.hosted (groq/my-model); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a free local model with a key of its own parses beside a real OpenAI model", () => {
+    expect(
+      refusals(agentOn("openai/gpt-4o", { free: { model: `local/qwen3@${LOCAL}`, price: FREE } })),
+    ).toEqual([]);
+  });
+
+  test("two endpoints of one local model share its price", () => {
+    expect(
+      refusals(
+        withModels({
+          a: { model: "local/qwen3@http://host-a:11434/v1", price: FREE },
+          b: { model: "local/qwen3@http://host-b:11434/v1" },
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("an Azure price for a model the table prices is refused; an openai or Bedrock price over the table parses", () => {
+    expect(
+      refusals(
+        withModels({ az: { model: "azure/gpt-4o", price: { input_per_1m: 1, output_per_1m: 1 } } }),
+      ),
+    ).toEqual([
+      "models.az.price: models.az.price: azure/gpt-4o is priced as openai gpt-4o, which the pricing table already prices; a declared price would also price those calls. Remove the price, or name a model the table does not price.",
+    ]);
+    const price = { input_per_1m: 1, output_per_1m: 1 };
+    expect(refusals(withModels({ o: { model: "openai/gpt-4o", price } }))).toEqual([]);
+    expect(
+      refusals(withModels({ b: { model: "bedrock/us.anthropic.claude-sonnet-4-5-v1:0", price } })),
+    ).toEqual([]);
+  });
+
+  test("an openai price is refused beside the same wire id under another family", () => {
+    const issues = refusals(
+      withModels({
+        real: { model: "openai/my-model", price: { input_per_1m: 1, output_per_1m: 1 } },
+        mine: { model: `local/my-model@${LOCAL}` },
+      }),
+    );
+    expect(issues.length).toBe(1);
+    expect(issues[0]).toContain(
+      "openai/my-model is priced as openai my-model, and so is models.mine",
+    );
+  });
+
+  test("the families: every prefix that shares a pricing key with another, and Bedrock as one", () => {
+    expect(priceFamilyOf(`local/q@${LOCAL}`)).toBe("local");
+    expect(priceFamilyOf("azure/gpt-4o")).toBe("azure");
+    expect(priceFamilyOf("openrouter/meta/llama-4")).toBe("openrouter");
+    expect(priceFamilyOf("openai/gpt-4o")).toBe("openai");
+    expect(priceFamilyOf("claude-opus-4-7")).toBe("anthropic");
+    expect(priceFamilyOf("vertex/claude-sonnet-4-5")).toBe("vertex");
+    expect(priceFamilyOf("gemini/gemini-2.5-pro")).toBe("gemini");
+    expect(priceFamilyOf("vertex/gemini-2.5-pro")).toBe("vertex");
+    expect(priceFamilyOf("bedrock/us.anthropic.claude-sonnet-4-5-v1:0")).toBe("bedrock");
+    expect(priceFamilyOf("bedrock/anthropic.claude-sonnet-4-5-v1:0")).toBe("bedrock");
+    for (const other of ["gpt-5", "vertex/llama", "$p", "cheapest", "constructor/gpt-4o"]) {
+      expect(priceFamilyOf(other), other).toBeUndefined();
+    }
+  });
+
+  test("a Vertex Claude price beside a direct Claude profile with its key is refused, naming both", () => {
+    const issues = refusals(
+      withModels({
+        v: { model: "vertex/claude-sonnet-4-5", price: FREE },
+        direct: { model: "claude-sonnet-4-5" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.v.price: models.v.price: vertex/claude-sonnet-4-5 is priced as anthropic claude-sonnet-4-5, and so is models.direct (claude-sonnet-4-5); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a direct Claude price beside a Vertex profile with its key is refused the same way", () => {
+    const issues = refusals(
+      withModels({
+        direct: { model: "claude-sonnet-4-5", price: FREE },
+        v: { model: "vertex/claude-sonnet-4-5" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.direct.price: models.direct.price: claude-sonnet-4-5 is priced as anthropic claude-sonnet-4-5, and so is models.v (vertex/claude-sonnet-4-5); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a Vertex Gemini price beside a gemini/ profile with its key is refused, naming both", () => {
+    const issues = refusals(
+      withModels({
+        v: { model: "vertex/gemini-2.5-pro", price: FREE },
+        g: { model: "gemini/gemini-2.5-pro" },
+      }),
+    );
+    expect(issues).toEqual([
+      "models.v.price: models.v.price: vertex/gemini-2.5-pro is priced as gemini gemini-2.5-pro, and so is models.g (gemini/gemini-2.5-pro); a declared price would also price its calls. Remove the price, or keep only one of the two models.",
+    ]);
+  });
+
+  test("a Vertex price alone over the table parses, and two Bedrock regions of one model share a price", () => {
+    const price = { input_per_1m: 1, output_per_1m: 1 };
+    expect(refusals(withModels({ v: { model: "vertex/claude-sonnet-4-5", price } }))).toEqual([]);
+    expect(refusals(withModels({ v: { model: "vertex/gemini-2.5-pro", price } }))).toEqual([]);
+    expect(
+      refusals(
+        withModels({
+          us: { model: "bedrock/us.anthropic.claude-sonnet-4-5-v1:0", price },
+          eu: { model: "bedrock/eu.anthropic.claude-sonnet-4-5-v1:0" },
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("the refusal comes after every older issue: an earlier error is still the one parseSpec throws", () => {
+    const yaml = `${agentOn("openai/gpt-4o", { free: { model: `local/gpt-4o@${LOCAL}`, price: FREE } })}expose: {mcp: {transport: stdio, tools: per-subagent}}\n`;
+    let thrown = "";
+    try {
+      parseSpec(yaml);
+    } catch (err) {
+      thrown = (err as Error).message;
+    }
+    expect(thrown).toContain("per-subagent");
+    expect(thrown).not.toContain("models.free.price");
+    const paths = parseSpecIssues(yaml).map((i) => i.path.join("."));
+    expect(paths).toEqual(["expose.mcp.tools", "models.free.price"]);
+  });
+});
+
 describe("budget.period", () => {
   test("a period parses inside the budget, every field kept", () => {
     const spec = parseSpec(
@@ -207,7 +362,13 @@ describe("budget.period", () => {
 });
 
 describe("the check order", () => {
-  test("the price and period checks are appended after every older 0.9.0 check", () => {
-    expect(DELTA_090_ISSUES.slice(-2)).toEqual([modelPriceIssues, budgetPeriodIssues]);
+  test("the price and period checks are appended after every older 0.9.0 check, the price-key check right after them", () => {
+    const price = DELTA_090_ISSUES.indexOf(modelPriceIssues);
+    expect(price).toBeGreaterThan(0);
+    expect(DELTA_090_ISSUES.slice(price, price + 3)).toEqual([
+      modelPriceIssues,
+      budgetPeriodIssues,
+      modelPriceKeyIssues,
+    ]);
   });
 });

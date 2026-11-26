@@ -1,10 +1,9 @@
 /**
  * Needs you (`#/home/needs-you`): everything waiting on a person, in one
  * place. All is Home's inbox, one list in three bands across the harnesses
- * you can see (`views/attention.js`); `?type=` opens the approvals inbox, the
- * review queue or the fleet advice, where items are acted on. Each section
- * loads and fails on its own, and each list keeps its own keys while it has
- * focus.
+ * you can see, where items are decided (`views/attention.js`; `?kind=` shows
+ * one kind); `?type=advice` opens the fleet advice. Each section loads and
+ * fails on its own, and a list keeps its own keys while it has focus.
  */
 
 import { NEEDS_YOU_FILTERS } from "../destinations.js";
@@ -12,15 +11,11 @@ import { clear, el } from "../dom.js";
 import { hrefFleet } from "../router.js";
 import { emptyFor } from "../ui/empty.js";
 import { renderAdvisorBoard } from "./advisor.js";
-import { renderApprovals } from "./approvals.js";
 import { renderAttention } from "./attention.js";
-import { renderReview } from "./review.js";
 
 /** Filter id → the screen that draws it; `all` is the inbox. */
 const DRAW = {
   all: renderAttention,
-  approvals: renderApprovals,
-  review: renderReview,
   advice: renderAdvisorBoard,
 };
 

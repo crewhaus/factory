@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "findings": [
+    {
+      "message": "tools is accepted on the voice shape but its emitter does not wire it yet — the realtime voice loop does not register a tool catalog",
+      "path": "tools",
+      "severity": "warning",
+      "rule": "accepted-but-unwired"
+    }
+  ]
+}

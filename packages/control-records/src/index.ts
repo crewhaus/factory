@@ -9,6 +9,7 @@ export {
   type Ledger,
   type RecordSource,
   type RecordsAt,
+  attentionActionsLedger,
   controlPaths,
   harnessLedger,
   runsLedger,
@@ -43,7 +44,13 @@ export {
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export { type IoTap, _setIoTapForTest } from "./io";
 export { appendRecord, openRecordFd, readAt, readRecordFile } from "./io";
-export { _setRollBytesForTest } from "./segments";
+export { CHUNK_BYTES } from "./lines";
+export {
+  type RetainedSegments,
+  _setRollBytesForTest,
+  retainedSegments,
+  segmentRel,
+} from "./segments";
 export {
   CACHE_INDEX_DIR,
   type FleetAppend,
@@ -142,6 +149,12 @@ export {
   defaultLeaseProbe,
   holderProvablyDead,
 } from "./lease";
+export {
+  parseProcBtime,
+  parseProcStartTime,
+  parsePsLstart,
+  systemLeaseProbe,
+} from "./process-start";
 export { type RunnableMode, type RunnableVerdict, assertRunnable } from "./runnable";
 export {
   type DeploymentsRead,
@@ -183,6 +196,8 @@ export {
   readActionDecisions,
   type ChangeAdoptionRow,
   type ChangeAdoptionSubjectRow,
+  DEPLOY_QUORUM_TTL_MS,
+  type DeployQuorumRow,
   type LedgerRead,
   PROPOSAL_TTL_MS,
   type ProposalRow,
@@ -192,9 +207,12 @@ export {
   changeAdoptionState,
   createStandingRuleReader,
   decisionsLedger,
+  deployQuorumOf,
+  deployQuorumState,
   proposalOf,
   proposalState,
   readChangeAdoptions,
+  readDeployQuorums,
   readProposals,
   readStandingRules,
   ruleIsLive,

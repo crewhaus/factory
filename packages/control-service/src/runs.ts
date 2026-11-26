@@ -465,6 +465,17 @@ function operatorRefusal<T>(
   };
 }
 
+/**
+ * Why a harness takes no new work now (its operator paused or disabled it, or its budget
+ * is used), as a run's refusal; `undefined` when it takes work. Reads only.
+ *
+ * First consumers: `crewhaus runs resume <grun_…>` and Home's act on a paused graph run.
+ */
+export function intakeRefusal(harnessDir: string): RunRefusal | undefined {
+  const { plan } = operatorRefusal<never>(harnessDir, false);
+  return plan !== undefined && !plan.ok ? plan.refusal : undefined;
+}
+
 /** The shape's own words for how it takes work, from the run-control table. */
 function intakeOf(target: string): { readonly message: string; readonly verb?: string } {
   const cell = (
@@ -477,7 +488,7 @@ function intakeOf(target: string): { readonly message: string; readonly verb?: s
 }
 
 /** Withdraw a queued run nothing started: win its claim, and close it `cancelled`. */
-function withdrawQueued(harnessDir: string, runId: string, receipt: CommandReceipt): void {
+export function withdrawQueued(harnessDir: string, runId: string, receipt: CommandReceipt): void {
   const ledger = runsLedger(harnessDir);
   const claimed = publishClaim(ledger, `run/${runId}`, { pid: process.pid, host: hostname() });
   if (claimed.ok && runRowOf(harnessDir, runId)?.["state"] === "queued") {
@@ -612,8 +623,13 @@ const jobRunAdapter: RunAdapter = {
           id: req.runId,
           state: "queued",
           at: new Date(now()).toISOString(),
-          trigger:
-            item.wi !== undefined ? { kind: "api" as const, workItem: item.wi } : API_TRIGGER,
+          // The door it came through: a work item's grant is spent by a run a person
+          // started, never by one a service queued.
+          trigger: {
+            kind: "api" as const,
+            ...(item.wi !== undefined ? { workItem: item.wi } : {}),
+            via: receipt.via,
+          },
           ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
@@ -1165,6 +1181,7 @@ const managedRunAdapter: RunAdapter = {
           by: receipt.actor,
           ...(receipt.credentialRef !== undefined ? { byCredential: receipt.credentialRef } : {}),
           cmd: receipt.id,
+          via: receipt.via,
           ...(req.subject !== undefined ? { subject: req.subject } : {}),
           ...(item.wi !== undefined ? { workItem: item.wi } : {}),
           ...(req.attemptOf !== undefined ? { attemptOf: req.attemptOf } : {}),

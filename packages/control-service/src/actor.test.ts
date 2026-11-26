@@ -4,11 +4,19 @@
  * keyed local digest otherwise.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  realpathSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { ensureAccessSetUp, localActorOf } from "@crewhaus/access-control";
-import { ensureDigestKey } from "@crewhaus/control-records";
-import { storedActorFor } from "./actor";
+import { controlPaths, ensureDigestKey } from "@crewhaus/control-records";
+import { readStoredActor, storedActorFor } from "./actor";
+import { type DecisionActor, createDecisions } from "./decisions";
 import {
   linkLocalMember,
   plantProjection,
@@ -85,5 +93,59 @@ describe("storedActorFor", () => {
     const first = await storedActorFor(b, h, STRANGER, key);
     const second = await storedActorFor(join(h, "no-such-home"), h, STRANGER, key);
     expect(first).toBe(second);
+  });
+});
+
+describe("the stored actor, as a reader finds it", () => {
+  test("is the one a writer stores: the linked member, else the digest under the harness's own key", async () => {
+    const { a, b, h, owner, key } = await homes();
+    plantProjection(h, owner, [], { accessRoot: realpathSync(a) });
+    for (const [root, who] of [
+      [a, OWNER_USER],
+      [a, STRANGER],
+      [b, STRANGER],
+      [join(h, "no-such-home"), OWNER_USER],
+    ] as const) {
+      expect(await readStoredActor(root, h, who)).toBe(await storedActorFor(root, h, who, key));
+    }
+    expect(await readStoredActor(a, h, OWNER_USER)).toBe(owner);
+    expect(await readStoredActor(a, h, STRANGER)).toMatch(DIGEST);
+  });
+
+  test("with no key yet a linked member is still named, anyone else is not, and no key is made", async () => {
+    const { a, h, owner } = await homes();
+    const keyFile = join(h, controlPaths(h).digestKeyFile);
+    unlinkSync(keyFile);
+    expect(await readStoredActor(a, h, OWNER_USER)).toBe(owner);
+    expect(await readStoredActor(a, h, STRANGER)).toBeUndefined();
+    expect(existsSync(keyFile)).toBe(false);
+  });
+
+  test("the decision service reads the actor it stores, and makes no key to do it", async () => {
+    const { a, h, owner } = await homes();
+    const decisions = createDecisions({ hangarRoot: a, identity: STRANGER, now: () => 0 });
+    const member: DecisionActor = { kind: "principal", principal: owner };
+    // What Home calls its one user before anyone signed in names no member.
+    const label: DecisionActor = { kind: "principal", principal: "operator" };
+    const local: DecisionActor = { kind: "local", identity: STRANGER };
+    for (const actor of [member, label, local]) {
+      const read = await decisions.readActorOf(h, actor);
+      expect(read).toBe(await decisions.storedActorOf(h, actor));
+    }
+    expect(await decisions.readActorOf(h, member)).toBe(owner);
+    expect(await decisions.readActorOf(h, label)).toMatch(DIGEST);
+    const keyFile = join(h, controlPaths(h).digestKeyFile);
+    unlinkSync(keyFile);
+    expect(await decisions.readActorOf(h, label)).toBeUndefined();
+    expect(existsSync(keyFile)).toBe(false);
+  });
+
+  test("under another Home's list of members, a member of this one is nobody there", async () => {
+    const { a, b, h, owner } = await homes();
+    plantProjection(h, owner, [], { accessRoot: realpathSync(b) });
+    const decisions = createDecisions({ hangarRoot: a, identity: STRANGER, now: () => 0 });
+    const member: DecisionActor = { kind: "principal", principal: owner };
+    expect(await decisions.readActorOf(h, member)).toMatch(DIGEST);
+    expect(await decisions.readActorOf(h, member)).toBe(await decisions.storedActorOf(h, member));
   });
 });

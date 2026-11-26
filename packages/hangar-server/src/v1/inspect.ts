@@ -72,7 +72,7 @@ import type { CapabilityProvider, V1Context, V1Handler } from "./context";
 import { V1Error } from "./errors";
 import { harnessOf, liveDirOr409 } from "./resolve";
 import { type RunFound, runOf } from "./runs";
-import { locate as locateWorkItem } from "./work";
+import { locate as locateWorkItem } from "./work-shared";
 
 /** The most entries an export holds. */
 export const EXPORT_MAX_ENTRIES = 20_000;

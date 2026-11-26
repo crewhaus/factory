@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../boundary-classifier" },
     { "path": "../checkpoint-store" },
     { "path": "../errors" },
     { "path": "../run-context" },

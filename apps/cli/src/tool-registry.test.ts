@@ -40,24 +40,38 @@ import {
 } from "./tools-cli";
 
 describe("category registry vs. the real builtin set", () => {
+  // A tool only some shapes carry is in no category (`shapes.test.ts` in
+  // tool-categories holds that), so `all-<category>` never grants it: the cli
+  // shape's shape-specific tools are the ones a spec lists by name.
+  const shapeSpecific = CLI_RUNTIME_TOOL_KEYS.filter((k) => BUILTIN_TOOLS[k]?.shapes !== undefined);
+  const categorizable = CLI_RUNTIME_TOOL_KEYS.filter((k) => !shapeSpecific.includes(k));
+
+  test("the shape-specific tools the cli shape carries are the workspace tools", () => {
+    expect([...shapeSpecific].sort()).toEqual([
+      "workspaceCheck",
+      "workspaceOpen",
+      "workspacePublish",
+    ]);
+  });
+
   test("every categorized key is a real builtin", () => {
     const unknown = allRegisteredTools().filter((k) => !CLI_RUNTIME_TOOL_KEYS.includes(k));
     expect(unknown).toEqual([]);
   });
 
   test("every builtin is categorized", () => {
-    const uncategorized = CLI_RUNTIME_TOOL_KEYS.filter((k) => categoriesForTool(k).length === 0);
+    const uncategorized = categorizable.filter((k) => categoriesForTool(k).length === 0);
     expect(uncategorized).toEqual([]);
   });
 
   test("the two sets are exactly equal", () => {
-    const { onlyInA, onlyInB } = diffToolMapKeys(allRegisteredTools(), CLI_RUNTIME_TOOL_KEYS);
+    const { onlyInA, onlyInB } = diffToolMapKeys(allRegisteredTools(), categorizable);
     expect({ onlyInA, onlyInB }).toEqual({ onlyInA: [], onlyInB: [] });
   });
 
   test("each builtin lives in exactly one LEAF category", () => {
     const multiHomed: Array<{ key: string; leaves: string[] }> = [];
-    for (const key of CLI_RUNTIME_TOOL_KEYS) {
+    for (const key of categorizable) {
       const leaves = leafCategories().filter((c) => (CATEGORIES[c]?.tools ?? []).includes(key));
       if (leaves.length !== 1) multiHomed.push({ key, leaves });
     }

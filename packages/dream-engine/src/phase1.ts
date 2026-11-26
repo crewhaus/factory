@@ -17,8 +17,9 @@
  *   3. fact dedupe/supersede — normalized-text near-duplicates collapse to
  *      the newest entry; the older ones get supersede tombstones
  *      (`forget(id)`), then `compact()` bounds file growth. Duplicate
- *      groups corroborated across ≥2 sessions surface as PROMOTION
- *      candidates in the findings (episodic → semantic, §6.2).
+ *      groups auto-capture corroborated across ≥2 sessions surface as
+ *      PROMOTION candidates in the findings (episodic → semantic, §6.2); a
+ *      fact the agent saved with Remember is not evidence there.
  *   4. fact staleness flags — live facts older than
  *      {@link STALE_FACT_AFTER_MS} are FLAGGED in the findings (fed to the
  *      model phase / operator), never deleted.
@@ -121,6 +122,12 @@ export function normalizeFactText(text: string): string {
     .trim();
 }
 
+/** A fact auto-capture wrote: it records no author, or the extractor. */
+function isCaptured(entry: MemoryEntry): boolean {
+  const author = entry.provenance?.author;
+  return author === undefined || author.kind === "extractor";
+}
+
 function clip(text: string, max: number): string {
   const flat = text.replace(/\s+/g, " ").trim();
   return flat.length > max ? `${flat.slice(0, max - 1).trimEnd()}…` : flat;
@@ -209,8 +216,14 @@ export async function runDreamPhase1(opts: DreamPhase1Options): Promise<DreamPha
         if (group.length < 2) continue;
         // Keep the newest (createdAt; later file position wins ties).
         const keep = group.reduce((a, b) => (b.createdAt >= a.createdAt ? b : a));
+        // Corroboration counts what auto-capture read out of a session. A
+        // fact the agent, a person or a sync wrote is its author's word
+        // however many sessions it was written in.
         const sessions = new Set(
-          group.map((e) => e.provenance?.sessionId).filter((s): s is string => s !== undefined),
+          group
+            .filter(isCaptured)
+            .map((e) => e.provenance?.sessionId)
+            .filter((s): s is string => s !== undefined),
         );
         for (const entry of group) {
           if (entry.id === keep.id) continue;

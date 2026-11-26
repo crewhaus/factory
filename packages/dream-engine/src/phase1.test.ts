@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createContinuityStore, moveToTrash } from "@crewhaus/continuity-store";
-import { createMemoryStore } from "@crewhaus/memory-store";
+import { type MemoryProvenance, captureFacts, createMemoryStore } from "@crewhaus/memory-store";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import {
   STALE_FACT_AFTER_MS,
@@ -170,6 +170,66 @@ describe("runDreamPhase1 — the duplicate pass keeps history", () => {
     expect(tombstone?.["reason"]).toBe(`dream: near-duplicate of ${keeper?.entry.id}`);
     // The fixture and a full phase-1 run are slow by construction on a loaded runner.
   }, 20_000);
+});
+
+describe("runDreamPhase1 — what corroborates a fact", () => {
+  const FIRST = "The deploy runs at 9am";
+  const SECOND = "the deploy runs at 9am!";
+  const store = () =>
+    createMemoryStore({ specName: "bot", rootDir: join(tmp, "memories"), now: fixedNow });
+  const run = (memoryStore: ReturnType<typeof store>) =>
+    runDreamPhase1({ specName: "bot", crewhausDir: tmp, memoryStore, now: fixedNow });
+  const promotions = (findings: readonly string[]) =>
+    findings.filter((f) => f.startsWith("promotion candidate:"));
+
+  async function remembered(
+    author: MemoryProvenance["author"] | undefined,
+  ): Promise<readonly string[]> {
+    const memoryStore = store();
+    for (const [text, sessionId] of [
+      [FIRST, SESS_A],
+      [SECOND, SESS_B],
+    ] as const) {
+      await memoryStore.remember(text, [], {
+        provenance: { sessionId, ...(author !== undefined ? { author } : {}) },
+      });
+    }
+    const report = await run(memoryStore);
+    // The duplicate is folded either way: only the finding depends on who wrote it.
+    expect(report.counts.factsSuperseded).toBe(1);
+    return promotions(report.findings);
+  }
+
+  test("two near-duplicates Remember wrote in different sessions are not a promotion finding", async () => {
+    expect(await remembered({ kind: "agent", via: "remember" })).toEqual([]);
+  });
+
+  test("nor are two a person wrote", async () => {
+    expect(await remembered({ kind: "operator", via: "cli" })).toEqual([]);
+  });
+
+  test("the same two auto-capture wrote are", async () => {
+    const memoryStore = store();
+    await captureFacts(memoryStore, [FIRST], ["auto-capture"], { sessionId: SESS_A });
+    await captureFacts(memoryStore, [SECOND], ["auto-capture"], { sessionId: SESS_B });
+    expect((await memoryStore.list()).length).toBe(2);
+    const report = await run(memoryStore);
+    expect(promotions(report.findings)).toHaveLength(1);
+    expect(report.findings[0]).toContain("corroborated across 2 sessions");
+  });
+
+  test("and so are two marked as the extractor's", async () => {
+    expect(await remembered({ kind: "extractor" })).toHaveLength(1);
+  });
+
+  test("one captured and one remembered is one session's evidence, not two", async () => {
+    const memoryStore = store();
+    await captureFacts(memoryStore, [FIRST], ["auto-capture"], { sessionId: SESS_A });
+    await memoryStore.remember(SECOND, [], {
+      provenance: { sessionId: SESS_B, author: { kind: "agent", via: "remember" } },
+    });
+    expect(promotions((await run(memoryStore)).findings)).toEqual([]);
+  });
 });
 
 describe("runDreamPhase1 — determinism", () => {

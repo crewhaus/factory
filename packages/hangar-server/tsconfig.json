@@ -8,6 +8,7 @@
     { "path": "../access-control" },
     { "path": "../attention" },
     { "path": "../boundary-classifier" },
+    { "path": "../compile-service" },
     { "path": "../spec-registry" },
     { "path": "../memory-store" },
     { "path": "../wiki-store" },

@@ -283,8 +283,10 @@ describe("GET routes change nothing", () => {
         "refs.resolve": `${live.id}/exec/${runId}`,
         "decisions.get": `${live.id}/decision/appr_00000000000000d1`,
         "attention.get": `home/attention/att_${"0".repeat(26)}`,
+        "attention.messages.list": `home/attention/att_${"0".repeat(26)}`,
         "work.get": `${live.id}/work/${mintId("wi")}`,
         "inspect.work": `${live.id}/work/${mintId("wi")}`,
+        "workspaces.get": `${live.id}/work/${mintId("wi")}`,
       };
       const v1Paths: Array<{ key: string; path: string }> = [];
       for (const op of v1Gets.filter((row) => !v1Excluded.has(row.id))) {

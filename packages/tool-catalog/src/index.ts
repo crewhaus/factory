@@ -58,8 +58,10 @@ export interface ToolExecuteContext {
    * item) after the call's output passed its post-tool check. Fire-and-forget:
    * a tool calls it once or more and never waits on it. Ids only, never text:
    * a ref whose id does not fit the run-record grammar is dropped by the
-   * runtime. Absent on bare unit calls and wherever nothing records, so a
-   * tool that reads it calls it only when present.
+   * runtime. Handed only to the built-in knowledge tools
+   * ({@link markReportsKnowledge}); absent for every other tool, on bare unit
+   * calls and wherever nothing records, so a tool that reads it calls it only
+   * when present.
    */
   readonly recordReads?: (refs: ReadonlyArray<ToolReadRef>) => void;
 }
@@ -932,6 +934,31 @@ export interface RegisteredTool {
     input: unknown,
     opts: { readonly signal: AbortSignal },
   ) => string | undefined | Promise<string | undefined>;
+}
+
+/**
+ * The mark of a tool whose `recordReads` reports the runtime records. A
+ * module-local `Symbol()`, never `Symbol.for`: only this module's own mark
+ * counts, and nothing a tool is named or described can stand in for it.
+ */
+const REPORTS_KNOWLEDGE: unique symbol = Symbol("reports-knowledge");
+
+/**
+ * Mark `tool` as one of the built-in knowledge tools (Recall, the wiki read
+ * tools, Retrieve): the runtime hands `recordReads` to a marked tool and to no
+ * other, so what a run's usage log holds is what those tools returned. Called
+ * by those tools' own factories, on the object `buildTool` returned; the same
+ * object is returned. The mark is an own enumerable property, so a copy made
+ * by spread keeps it.
+ */
+export function markReportsKnowledge(tool: RegisteredTool): RegisteredTool {
+  (tool as RegisteredTool & { [REPORTS_KNOWLEDGE]?: true })[REPORTS_KNOWLEDGE] = true;
+  return tool;
+}
+
+/** True when `tool` carries {@link markReportsKnowledge}'s mark. Never read from its name. */
+export function reportsKnowledge(tool: RegisteredTool): boolean {
+  return (tool as RegisteredTool & { [REPORTS_KNOWLEDGE]?: true })[REPORTS_KNOWLEDGE] === true;
 }
 
 export class ToolCatalogError extends CrewhausError {

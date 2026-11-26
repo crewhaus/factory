@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "references": [
+    { "path": "../compiler" },
+    { "path": "../errors" },
+    { "path": "../ir" },
+    { "path": "../ir-passes" },
+    { "path": "../migration-engine" },
+    { "path": "../preflight" },
+    { "path": "../smoke-harness" },
+    { "path": "../spec" },
+    { "path": "../target-cf-worker-cli" },
+    { "path": "../target-cf-worker-graph" },
+    { "path": "../target-cf-worker-workflow" }
+  ],
+  "include": ["src/**/*"]
+}

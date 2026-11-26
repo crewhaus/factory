@@ -54,6 +54,7 @@ import {
   resolveEvidence,
   verifyEvidence,
 } from "./evidence";
+import { NONE_LINE, REQUIREMENTS_MARKER, REQ_LINE_REGEX } from "./focus-format";
 import {
   CONTINUITY_PROOF_MODES,
   type ContinuityProofMode,
@@ -204,17 +205,13 @@ export const MAX_UNIT_CHARS = 64;
 
 export const FOCUS_MARKER = "<!-- crewhaus:focus -->";
 const ACTIVE_PLAN_MARKER = "<!-- crewhaus:active-plan -->";
-const REQUIREMENTS_MARKER = "<!-- crewhaus:requirements -->";
 const LEDGER_TRUNCATED_LINE = "[ledger truncated]";
-const NONE_LINE = "_none_";
 
 const SPEC_NAME_REGEX = /^[a-zA-Z0-9_\-.]+$/;
 const SESSION_ID_REGEX = /^sess_[0-9a-f]{16}$/;
 const PLAN_ID_REGEX = /^plan-\d{4}$/;
 const GOAL_ID_REGEX = /^goal-\d{4}$/;
 const REQ_ID_REGEX = /^REQ-\d{3,}$/;
-const REQ_LINE_REGEX =
-  /^- (REQ-\d{3,}) \[(open|confirmed|dropped)\] (".*") \(user, (sess_[0-9a-f]{16}), turn (\d+)\)$/;
 const STEP_LINE_REGEX = /^(\d+)\. \[(open|in_progress|claimed|proven)\] (.+)$/;
 const STEPS_HEADING = "## Steps";
 

@@ -14,12 +14,14 @@ import {
   loadRetentionConfig,
 } from "@crewhaus/data-retention-engine";
 import { createSessionStore } from "@crewhaus/session-store";
+import { type KnowledgeRetention, retainKnowledgeRecords } from "./knowledge-retention";
 
 // Config loading lives in @crewhaus/data-retention-engine (retention-config.ts)
 // so the daemon janitors read the IDENTICAL policy this CLI enforces
 // (ops-review F2). Re-exported here so callers/tests of this module keep one
 // import surface.
 export {
+  DEFAULT_KNOWLEDGE_USAGE_MAX_AGE_DAYS,
   DEFAULT_SESSION_MAX_AGE_DAYS,
   RETENTION_CONFIG_RELPATH,
   type RetentionAuditWindowConfig,
@@ -27,6 +29,8 @@ export {
   RetentionConfigError,
   loadRetentionConfig,
 } from "@crewhaus/data-retention-engine";
+
+export type { KnowledgeRetention } from "./knowledge-retention";
 
 /**
  * Item 35 — `crewhaus retention sweep|export|purge` plumbing, factored out of
@@ -63,7 +67,11 @@ export {
  *      become `addAuditWindow()` registrations (already-expired entries are
  *      ignored).
  *
- *   3. Evidence: every REAL (non-dry-run) sweep/export/purge appends one
+ *   3. The content-free knowledge usage records (`./knowledge-retention`): usage
+ *      segments and backend fallback markers past `knowledge.usageMaxAgeDays`
+ *      go, reported only for a harness that has them.
+ *
+ *   4. Evidence: every REAL (non-dry-run) sweep/export/purge appends one
  *      `retention_enforcement` record to `.crewhaus/audit` — the same
  *      hash-chained store the `run` justification gate writes — so retention
  *      enforcement is itself tamper-evidenced. Dry runs append nothing. A
@@ -382,6 +390,8 @@ export type RetentionEnforcementReport = {
   readonly keptOutsideCutoff: ReadonlyArray<string>;
   readonly activeAuditWindows: PurgeResult["auditWindowDeferred"];
   readonly skipped: ReadonlyArray<SkippedEntry>;
+  /** The knowledge usage records; absent when the harness has none. */
+  readonly knowledge?: KnowledgeRetention;
   /** The appended `retention_enforcement` record (real runs only). */
   readonly evidence?: EvidenceRef;
 };
@@ -440,6 +450,19 @@ async function runRetentionEnforcement(
           .map((s) => s.record.id);
   const keptPinned = store.refusals.filter((r) => r.id.startsWith("session:"));
 
+  // The content-free usage records age out under the same windows: an active
+  // audit window defers them too, and `--before` narrows them as it does sessions.
+  const knowledge = await retainKnowledgeRecords({
+    rootDir,
+    maxAgeDays: config.knowledgeUsageMaxAgeDays,
+    now: opts.now(),
+    ...(opts.before !== undefined ? { before: opts.before } : {}),
+    dryRun: opts.dryRun,
+    deferred: result.auditWindowDeferred.length > 0,
+  });
+  const agedOut =
+    knowledge !== undefined ? knowledge.usageSegments.length + knowledge.backendMarkers : 0;
+
   let evidence: EvidenceRef | undefined;
   // Evidence gating (ops-review F8b): dry runs never append. A REAL run
   // appends when it deleted something (enforcement happened — evidence it,
@@ -448,7 +471,7 @@ async function runRetentionEnforcement(
   // with no audit store appends nothing — `crewhaus retention sweep` in an
   // arbitrary directory must not fabricate `.crewhaus/audit`.
   const auditStoreExists = existsSync(join(rootDir, AUDIT_RELPATH));
-  if (!opts.dryRun && (store.deletions.length > 0 || auditStoreExists)) {
+  if (!opts.dryRun && (store.deletions.length > 0 || agedOut > 0 || auditStoreExists)) {
     evidence = await appendEvidence(rootDir, opts.now, {
       action: opts.action,
       dryRun: false,
@@ -467,6 +490,12 @@ async function runRetentionEnforcement(
         keptAuditWindow: keptAuditWindow.length,
         keptOutsideCutoff: keptOutsideCutoff.length,
         skipped: store.skipped.length,
+        ...(knowledge !== undefined
+          ? {
+              usageSegments: knowledge.usageSegments.length,
+              backendMarkers: knowledge.backendMarkers,
+            }
+          : {}),
       },
     });
   }
@@ -485,6 +514,7 @@ async function runRetentionEnforcement(
     keptOutsideCutoff,
     activeAuditWindows: result.auditWindowDeferred,
     skipped: store.skipped,
+    ...(knowledge !== undefined ? { knowledge } : {}),
     ...(evidence !== undefined ? { evidence } : {}),
   };
 }
@@ -772,6 +802,15 @@ export function formatEnforcementReport(report: RetentionEnforcementReport): Rea
     );
   }
   for (const s of report.skipped) lines.push(`~ skipped ${s.path} — ${s.reason}`);
+  const knowledge = report.knowledge;
+  if (knowledge !== undefined) {
+    lines.push(
+      knowledge.deferred === true
+        ? "• kept the knowledge usage records — audit window active"
+        : `${report.dryRun ? "→" : "✓"} knowledge usage (kept ${knowledge.maxAgeDays}d): ${verb} ${knowledge.usageSegments.length} usage segment(s) and ${knowledge.backendMarkers} fallback marker(s)`,
+    );
+    for (const reason of knowledge.skipped) lines.push(`~ skipped knowledge usage — ${reason}`);
+  }
   lines.push(
     `summary: ${report.deleted.length} ${verb}, ${
       report.keptPinned.length +

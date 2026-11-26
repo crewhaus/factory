@@ -214,8 +214,8 @@ describe("the checker", () => {
         pins++;
       }
     }
-    expect(Object.keys(REQUIRED).length).toBe(60);
-    expect(pins).toBe(92);
+    expect(Object.keys(REQUIRED).length).toBe(71);
+    expect(pins).toBe(111);
   });
 
   test("a requirement it is given is applied, and a key it is not given is not", () => {
@@ -345,6 +345,12 @@ describe("the server's twins, by import", () => {
     };
     const INBOX = {
       att: attIdFromDigest(new Uint8Array(32).fill(7)),
+      prn: mintId("prn"),
+      grun: "grun_0123456789abcdef",
+      ckpt: "ckpt_0123456789abcdef",
+      specName: "poly",
+      env: "prod",
+      version: "1.2.0",
     };
     const ACCESS = {
       grt: mintId("grt"),
@@ -379,6 +385,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "merge",
         ...INBOX,
+        attChoice: "grant",
+        dismissReason: "known",
+        graphDecision: "approve",
         ...WORK,
         declineReason: "not-now",
         correctionScope: "item",
@@ -407,6 +416,9 @@ describe("the server's twins, by import", () => {
         plugin: "notes-pane",
         delegationAction: "rollout",
         ...INBOX,
+        attChoice: "wait-for-renewal",
+        dismissReason: "not-a-problem",
+        graphDecision: "reject",
         ...WORK,
         declineReason: "needs-evidence",
         correctionScope: "all",
@@ -1200,5 +1212,19 @@ describe("the Work page's twins, by import", () => {
     expectRunnable("rank, as the page starts", rank ?? "");
     // proposed: accept, decline, edit; open: start, cancel, edit; closed: reopen.
     expect(checked).toBe(7 + 5 + 3);
+  });
+
+  test("the delivery part's twins, publishing and reading a workspace, are commands the CLI takes", async () => {
+    const url = new URL(
+      "../../../packages/hangar-ui/assets/js/views/work-delivery.js",
+      import.meta.url,
+    ).href;
+    const part = (await import(url)) as {
+      publishTwin(wi: string, hrn: string): string;
+      workspaceTwin(wi: string, hrn: string): string;
+    };
+    const wi = mintId("wi");
+    expectRunnable("Retry publishing", part.publishTwin(wi, "hrn_0123456789abcdef"));
+    expectRunnable("workspace", part.workspaceTwin(wi, "hrn_0123456789abcdef"));
   });
 });
