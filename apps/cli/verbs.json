@@ -6347,42 +6347,6 @@
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
@@ -6416,146 +6380,25 @@
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "status": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
+              "name": "json",
               "takesValue": false
             },
             {
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "list": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
-              "takesValue": false
-            },
-            {
-              "name": "help",
-              "short": "h",
-              "takesValue": false
-            },
-            {
               "name": "type",
               "takesValue": true
             },
@@ -6572,275 +6415,59 @@
               "takesValue": false
             },
             {
-              "name": "history",
+              "name": "help",
+              "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "show": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
+              "name": "history",
               "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
-              "takesValue": false
-            },
-            {
-              "name": "help",
-              "short": "h",
-              "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
             },
             {
               "name": "json",
               "takesValue": false
             },
             {
-              "name": "history",
+              "name": "help",
+              "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "why": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
+              "name": "json",
               "takesValue": false
             },
             {
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "usage": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
+              "name": "json",
               "takesValue": false
             },
             {
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "search": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
-              "takesValue": false
-            },
-            {
-              "name": "help",
-              "short": "h",
-              "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
+              "name": "harness",
               "takesValue": true
             },
             {
@@ -6848,154 +6475,34 @@
               "takesValue": false
             },
             {
-              "name": "history",
+              "name": "help",
+              "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "reindex": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
-            },
-            {
-              "name": "shared",
-              "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
+              "name": "json",
               "takesValue": false
             },
             {
               "name": "help",
               "short": "h",
               "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
-            },
-            {
-              "name": "yes",
-              "takesValue": false
-            },
-            {
-              "name": "confirm",
-              "takesValue": true
             }
           ]
         },
         "erase": {
           "flags": [
             {
-              "name": "root",
-              "takesValue": true
+              "name": "include-sources",
+              "takesValue": false
             },
             {
               "name": "shared",
               "takesValue": true
-            },
-            {
-              "name": "pull",
-              "takesValue": false
-            },
-            {
-              "name": "push",
-              "takesValue": false
-            },
-            {
-              "name": "dry-run",
-              "takesValue": false
-            },
-            {
-              "name": "no-redact",
-              "takesValue": false
-            },
-            {
-              "name": "help",
-              "short": "h",
-              "takesValue": false
-            },
-            {
-              "name": "type",
-              "takesValue": true
-            },
-            {
-              "name": "status",
-              "takesValue": true
-            },
-            {
-              "name": "scope",
-              "takesValue": true
-            },
-            {
-              "name": "json",
-              "takesValue": false
-            },
-            {
-              "name": "history",
-              "takesValue": false
-            },
-            {
-              "name": "harness",
-              "takesValue": true
-            },
-            {
-              "name": "include-sources",
-              "takesValue": false
             },
             {
               "name": "yes",
@@ -7004,6 +6511,15 @@
             {
               "name": "confirm",
               "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
             }
           ]
         }
@@ -7037,42 +6553,6 @@
           "name": "help",
           "short": "h",
           "takesValue": false
-        },
-        {
-          "name": "type",
-          "takesValue": true
-        },
-        {
-          "name": "status",
-          "takesValue": true
-        },
-        {
-          "name": "scope",
-          "takesValue": true
-        },
-        {
-          "name": "json",
-          "takesValue": false
-        },
-        {
-          "name": "history",
-          "takesValue": false
-        },
-        {
-          "name": "harness",
-          "takesValue": true
-        },
-        {
-          "name": "include-sources",
-          "takesValue": false
-        },
-        {
-          "name": "yes",
-          "takesValue": false
-        },
-        {
-          "name": "confirm",
-          "takesValue": true
         }
       ]
     },

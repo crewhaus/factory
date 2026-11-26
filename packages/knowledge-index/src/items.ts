@@ -15,7 +15,15 @@ import {
 import { type KnowledgeHistoryEntry, currentItems, itemHistory } from "./adapters";
 import { type CoverageNote, HarnessRead, type HarnessReadOptions } from "./context";
 import type { FoldedItem, RecordRef } from "./model";
-import { type ItemRow, REINDEX_VERB, SHARD_ITEM_CAP, Shard, itemRow, shardContent } from "./shard";
+import {
+  type ItemRow,
+  REINDEX_VERB,
+  SHARD_ITEM_CAP,
+  Shard,
+  adapterNameOf,
+  itemRow,
+  shardContent,
+} from "./shard";
 
 export type ItemFilter = {
   /** Stores to list; every store when absent. */
@@ -126,7 +134,10 @@ export async function readItems(opts: ReadItemsOptions): Promise<ItemsRead> {
   const filter = opts.filter ?? {};
   const limit = opts.limit ?? ITEMS_LIMIT_DEFAULT;
   const offset = opts.offset ?? 0;
-  const shard = opts.hangarRoot !== undefined ? Shard.open(opts.hangarRoot, opts.hrn) : undefined;
+  const shard =
+    opts.hangarRoot !== undefined
+      ? Shard.open(opts.hangarRoot, opts.hrn, opts.harnessDir)
+      : undefined;
   const stored = shard?.items();
   let rows: readonly ItemRow[];
   let usageRecorded: boolean;
@@ -271,7 +282,9 @@ export function idOfRecordRef(ref: RecordRef): string | undefined {
 
 /**
  * What became of the items a run used: their lifecycle and version now, from the harness's
- * index when one is fresh, else from the stores.
+ * index when one is fresh, else from the stores. An item the index does not hold is read from
+ * its store when that store changed since the index was built or the index does not list
+ * everything, so the answers are the same with an index and without one.
  */
 export async function lookup(
   opts: HarnessReadOptions & { readonly hangarRoot?: string },
@@ -281,21 +294,35 @@ export async function lookup(
   const now = read.now();
   const ids = refs.map(idOfRecordRef);
   const found = new Map<string, Pick<KnowledgeItem, "lifecycle" | "version">>();
-  const shard = opts.hangarRoot !== undefined ? Shard.open(opts.hangarRoot, opts.hrn) : undefined;
+  const shard =
+    opts.hangarRoot !== undefined
+      ? Shard.open(opts.hangarRoot, opts.hrn, opts.harnessDir)
+      : undefined;
   const rows = shard?.items();
   const changed = shard?.changed(read) ?? new Set<string>();
-  const wanted = new Set(ids.filter((id): id is string => id !== undefined));
+  const wanted = new Map<string, RecordRef>();
+  for (const [i, id] of ids.entries()) {
+    const ref = refs[i];
+    if (id !== undefined && ref !== undefined && !wanted.has(id)) wanted.set(id, ref);
+  }
   const ask: string[] = [];
-  if (rows !== undefined) {
+  if (shard !== undefined && rows !== undefined) {
     const byId = new Map(rows.map((row) => [row.item.id, row]));
-    for (const id of wanted) {
+    for (const [id, ref] of wanted) {
       const row = byId.get(id);
-      if (row === undefined) continue;
+      if (row === undefined) {
+        // Written since the index was built, or past what it lists: only its store can say.
+        const store = knowledgeStoreOf(ref.store);
+        const adapter =
+          store === undefined ? undefined : adapterNameOf({ store, backend: ref.backend });
+        if (shard.meta.truncated || (adapter !== undefined && changed.has(adapter))) ask.push(id);
+        continue;
+      }
       if (changed.has(row.adapter)) ask.push(id);
       else found.set(id, { ...row.item, lifecycle: lifecycleAt(row.item, now) });
     }
   } else {
-    for (const id of wanted) ask.push(id);
+    for (const id of wanted.keys()) ask.push(id);
   }
   for (const [id, { item }] of await currentItems(read, ask)) {
     found.set(id, { ...item, lifecycle: lifecycleAt(item, now) });

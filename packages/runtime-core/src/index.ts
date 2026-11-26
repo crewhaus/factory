@@ -2478,7 +2478,9 @@ export type RunChatLoopOptions = {
      * the focus, the active plan and each open goal, each with the lines of
      * the text it rendered when the store says which. Read after each plan
      * load; the run records them as knowledge usage (`via: "tail"`) and on
-     * the plan block of each context manifest. Ids only, never text.
+     * the plan block of each context manifest. A record holds the ids only; a
+     * ref's `units` (what it rendered, as plain text) are read by the screen
+     * alone.
      */
     readonly tailRefs?: () => Promise<readonly ContinuityTailRef[]>;
   };

@@ -74,6 +74,20 @@ describe("eraseShared", () => {
     expect(raw("retractions.jsonl")).not.toContain(MARKER);
   });
 
+  test("a line is matched by what it says, never by the hash it states", async () => {
+    const gone = shared(`${MARKER} likes calls after noon`);
+    // Says something else, and states the hash of what is going.
+    const other = { ...shared("invoices go out on Mondays"), contentHash: gone.contentHash };
+    write(other);
+    const before = raw("memories.jsonl");
+    expect(await eraseShared(dir, [gone.contentHash], grantFor([gone.contentHash]), now)).toEqual({
+      removed: 0,
+      retracted: 0,
+    });
+    expect(raw("memories.jsonl")).toBe(before);
+    expect(readRetractions(dir)).toEqual([]);
+  });
+
   test("a re-run removes and appends nothing", async () => {
     const gone = shared(MARKER);
     write(gone);

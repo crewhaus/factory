@@ -18,8 +18,8 @@
  * Only {@link buildShard} writes; {@link readShard} and its callers never do.
  */
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { lstatSync, mkdirSync, realpathSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { HARNESS_ID_RE } from "@crewhaus/control-contract";
 import type { KnowledgeItem } from "@crewhaus/control-contract/knowledge";
 import { CACHE_INDEX_DIR } from "@crewhaus/control-records";
@@ -79,6 +79,8 @@ export type ShardUsage = {
 export type ShardMeta = {
   readonly v: 1;
   readonly hrn: string;
+  /** The folder it was built from, as a digest of its real path. */
+  readonly source: string;
   readonly name: string;
   /** When it was built. The one thing that is not a function of the stores. */
   readonly asOf: string;
@@ -100,6 +102,17 @@ export type ShardMeta = {
 /** A text's digest as the index names a revision. */
 export function revisionOf(text: string): string {
   return createHash("sha256").update(text).digest("hex").slice(0, 16);
+}
+
+/** A harness folder as an index names where it was built from: a digest of its real path. */
+export function sourceOf(harnessDir: string): string {
+  let real: string;
+  try {
+    real = realpathSync(harnessDir);
+  } catch {
+    real = resolve(harnessDir);
+  }
+  return revisionOf(`harness\n${real}`);
 }
 
 export function shardRel(hrn: string, file = ""): string {
@@ -280,6 +293,7 @@ export async function buildShard(
   const meta: ShardMeta = {
     v: 1,
     hrn: opts.hrn,
+    source: sourceOf(opts.harnessDir),
     name: read.name,
     asOf: read.now().toISOString(),
     marks: content.marks,
@@ -324,18 +338,56 @@ export function searchedKinds(): string[] {
   return [...new Set([...stores, ...searchProviders().map((p) => p.kind)])].sort();
 }
 
+/**
+ * The term lists, one per audience, each over exactly the docs that audience may get, so a
+ * reader's hits are ranked only against what they could be shown: what one may not see
+ * moves no other's score.
+ */
 export type Postings = {
   readonly v: 1;
-  /** The words of names: what a reader who may not read content searches. */
+  /** The words of names, over the fleet's docs whose title is not their text: no content permission. */
   readonly names: InvertedIndex;
+  /** Every word, over the fleet's docs: content permission, searched across harnesses. */
+  readonly fleet: InvertedIndex;
+  /** Every word, over every doc: content permission, one harness asked about. */
   readonly full: InvertedIndex;
 };
 
+/** Which term list a reader is ranked against. */
+export type Audience = keyof Omit<Postings, "v">;
+
+/** The audience of a reader: the term list whose docs are the ones they may get. */
+export function audienceOf(scope: "fleet" | "harness", content: boolean): Audience {
+  if (!content) return "names";
+  return scope === "harness" ? "full" : "fleet";
+}
+
+/** Whether a doc is one this audience may get. */
+export function inAudience(
+  doc: Pick<SearchDoc, "fleet" | "contentOnly">,
+  audience: Audience,
+): boolean {
+  switch (audience) {
+    case "names":
+      return doc.fleet && !doc.contentOnly;
+    case "fleet":
+      return doc.fleet;
+    case "full":
+      return true;
+  }
+}
+
 /** The term lists of these docs, each doc named by its place. */
 export function postingsOf(docs: readonly IndexedDoc[]): Postings {
-  const index = (field: "names" | "full"): InvertedIndex =>
-    buildIndex(docs.map((doc, i) => ({ id: String(i), text: doc[field] })));
-  return { v: 1, names: index("names"), full: index("full") };
+  const index = (audience: Audience): InvertedIndex =>
+    buildIndex(
+      docs.flatMap((doc, i) =>
+        inAudience(doc.doc, audience)
+          ? [{ id: String(i), text: audience === "names" ? doc.names : doc.full }]
+          : [],
+      ),
+    );
+  return { v: 1, names: index("names"), fleet: index("fleet"), full: index("full") };
 }
 
 /** Remove one harness's index. Answers whether there was one. */
@@ -385,8 +437,12 @@ export class Shard {
     this.epoch = revisionOf(JSON.stringify(fixed));
   }
 
-  /** The index of `hrn`, or `undefined` when there is none to read. Opens one file. */
-  static open(hangarRoot: string, hrn: string): Shard | undefined {
+  /**
+   * The index of `hrn` built from `harnessDir`, or `undefined` when there is none to read: an
+   * index under that id that was built from another folder is not this harness's. Opens one
+   * file.
+   */
+  static open(hangarRoot: string, hrn: string, harnessDir: string): Shard | undefined {
     const text = readText(hangarRoot, hrn, "meta.json", META_MAX_BYTES);
     if (text === undefined) return undefined;
     try {
@@ -394,6 +450,7 @@ export class Shard {
       const shaped =
         meta.v === 1 &&
         meta.hrn === hrn &&
+        meta.source === sourceOf(harnessDir) &&
         typeof meta.asOf === "string" &&
         typeof meta.marks === "object" &&
         meta.marks !== null &&
@@ -439,7 +496,10 @@ export class Shard {
     if (text === undefined) return undefined;
     try {
       const value = JSON.parse(text) as Postings;
-      return value.v === 1 && isInvertedIndex(value.names) && isInvertedIndex(value.full)
+      return value.v === 1 &&
+        isInvertedIndex(value.names) &&
+        isInvertedIndex(value.fleet) &&
+        isInvertedIndex(value.full)
         ? value
         : undefined;
     } catch {

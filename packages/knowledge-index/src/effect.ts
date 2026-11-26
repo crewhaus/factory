@@ -18,7 +18,8 @@ export function knowledgeIndexEffect(at: {
   readonly hrn: string;
   readonly harnessDir: string;
 }): ReceiptEffect {
-  const shard = Shard.open(at.hangarRoot, at.hrn);
+  // An index under this id that was built from another folder says nothing about this one.
+  const shard = Shard.open(at.hangarRoot, at.hrn, at.harnessDir);
   const current =
     shard !== undefined &&
     shard.changed(new HarnessRead({ harnessDir: at.harnessDir, hrn: at.hrn })).size === 0;

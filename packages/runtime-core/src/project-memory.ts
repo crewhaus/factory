@@ -68,13 +68,34 @@ export type ScreenedLines = {
   readonly outcomes: readonly RememberedLineOutcome[];
 };
 
+/**
+ * One unit of content in a screened text, as its renderer wrote it: the text
+ * itself, without the markers it is rendered behind, and the 0-based lines
+ * `[from, to)` it is rendered on. The plan tail names its units (a plan's
+ * title and steps, a goal's title and unit, the focus body), so they are
+ * read as their text and never parsed back out of the rendering.
+ */
+export type ScreenUnit = {
+  readonly text: string;
+  readonly lines: readonly [number, number];
+  /**
+   * A unit rendered beside the main text (a goal's unit of measure): read with
+   * every other unit, and left out of a second reading of the main units alone.
+   */
+  readonly aside?: true;
+};
+
 /** The markers a line's content is written behind, as often as they repeat. */
 const LINE_MARKERS_RE =
   /^(?:- goal-\d+ \[[^\]]*\] |\s*\d+\. \[[^\]]*\] |\s*[-*] |focus: |plan-\d+ — )+/;
 /** A goal line as the plan tail renders it. */
 const GOAL_LINE_RE = /^- goal-\d+ \[[^\]]*\] /;
-/** A goal's trailing progress: ` (current/target unit)`. */
-const GOAL_PROGRESS_RE = /\s\(-?[\d.]+\/-?[\d.]+(?: ([^)]*))?\)$/;
+/**
+ * A goal's trailing progress, ` (current/target unit)`, for a text whose
+ * renderer named no units: the last such parenthesis, numbers in any form
+ * `String(number)` writes, and a unit that may hold anything.
+ */
+const GOAL_PROGRESS_RE = /^(.*) \(-?[\d.]+(?:e[+-]?\d+)?\/-?[\d.]+(?:e[+-]?\d+)?(?: (.*))?\)$/s;
 const HEADING_RE = /^#{1,6} /;
 
 /** A line as content: the unit of content it holds, and every word on it with the markup off. */
@@ -93,14 +114,10 @@ function lineContent(line: string): LineContent {
     return { unit: "", words: trimmed.slice(4, -3).trim() };
   }
   const content = line.replace(LINE_MARKERS_RE, "");
-  if (!GOAL_LINE_RE.test(line) || !content.endsWith(")")) return { unit: content, words: content };
-  // The progress is the text's last parenthesis, so nothing before the one
-  // that closes before it is looked at.
-  const from = content.lastIndexOf(")", content.length - 2) + 1;
-  const progress = GOAL_PROGRESS_RE.exec(content.slice(from));
+  const progress = GOAL_LINE_RE.test(line) ? GOAL_PROGRESS_RE.exec(content) : null;
   if (progress === null) return { unit: content, words: content };
-  const title = content.slice(0, from + progress.index);
-  return { unit: title, words: progress[1] !== undefined ? `${title} ${progress[1]}` : title };
+  const title = progress[1] ?? "";
+  return { unit: title, words: progress[2] !== undefined ? `${title} ${progress[2]}` : title };
 }
 
 /**
@@ -109,22 +126,29 @@ function lineContent(line: string): LineContent {
  *
  * 1. Each line, as rendered: a line the classifier redacts becomes its
  *    redaction notice.
- * 2. Each two adjacent lines still kept, read together: when the pair
- *    redacts, both lines become the pair's notice.
- * 3. The kept lines as a whole: when they still redact, the whole text is
+ * 2. Each two adjacent parts still kept, read together: when the pair
+ *    redacts, every line of both becomes the pair's notice.
+ * 3. The kept parts as a whole: when they still redact, the whole text is
  *    withheld and becomes that notice, every non-blank line counted.
  *
- * The pair and whole passes read the lines three ways: as rendered; as their
- * content, with the markers it is rendered behind off (a plan step's number
- * and status, a goal's id, status and progress, a list bullet, the focus and
- * plan-title labels) and the lines that only separate content left out (the
- * `goals:` header, a heading, a comment), so two plan steps, two goals or two
- * list items are adjacent; and as every word on them with the markers off.
+ * The pair and whole passes read the text in several ways: its lines as
+ * rendered; their content, with the markers it is rendered behind off (a plan
+ * step's number and status, a goal's id and status, a list bullet, the focus
+ * and plan-title labels) and the lines that only separate content left out
+ * (the `goals:` header, a heading, a comment), so two plan steps, two goals or
+ * two list items are adjacent; every word on them with the markers off; and,
+ * when the renderer names them, its `units` as plain text, each standing for
+ * the lines it is rendered on: once all of them, and once without the units
+ * rendered aside, so two goal titles are adjacent whatever measure the first
+ * carries.
  *
  * Every other line is kept as it is, with its line break. A classifier
  * rejection rejects.
  */
-export async function screenRememberedLines(text: string): Promise<ScreenedLines> {
+export async function screenRememberedLines(
+  text: string,
+  units: readonly ScreenUnit[] = [],
+): Promise<ScreenedLines> {
   const classify = (t: string) => classifyBoundary(t, { origin: "memory" });
   const lines = text.split("\n");
   const outcomes: RememberedLineOutcome[] = lines.map((line) =>
@@ -148,50 +172,70 @@ export async function screenRememberedLines(text: string): Promise<ScreenedLines
     rules: [...rules],
     outcomes,
   });
+  /** What was classified already, by the lines it stands for and its text. */
+  const read = new Set<string>();
+  const keyOf = (at: readonly number[], t: string): string => `${at.join(",")}\u0000${t}`;
   for (const [i, line] of lines.entries()) {
     if (outcomes[i] === "blank") continue;
+    read.add(keyOf([i], line));
     const boundary = await classify(line);
     if (boundary.action === "pass") continue;
     note(boundary.verdict.hits);
     if (boundary.action === "redact") withhold(i, boundary.redacted ?? "", "redacted");
     else outcomes[i] = "warned";
   }
-  if (lines.filter((_, i) => isKept(i)).length < 2) return result();
-  // Each reading holds the kept lines' text as it stood after the line pass,
-  // so a pair is judged by its own two lines.
-  type Part = { readonly at: number; readonly text: string };
-  const readings: Part[][] = [[], [], []];
+  // Each reading holds the kept parts' text as it stood after the line pass,
+  // so a pair is judged by its own two parts.
+  type Part = { readonly at: readonly number[]; readonly text: string };
+  const readings: Part[][] = [[], [], [], [], []];
   for (const [i, line] of lines.entries()) {
     if (!isKept(i)) continue;
     const { unit, words } = lineContent(line);
     for (const [r, part] of [line, unit, words].entries()) {
-      if (part.trim() !== "") readings[r]?.push({ at: i, text: part });
+      if (part.trim() !== "") readings[r]?.push({ at: [i], text: part });
     }
   }
-  // Read once per two lines and text, so a reading that says nothing new asks nothing.
-  const read = new Set<string>();
+  for (const unit of units) {
+    const [from, to] = Array.isArray(unit.lines) ? unit.lines : [Number.NaN, Number.NaN];
+    const fits =
+      typeof unit.text === "string" &&
+      Number.isInteger(from) &&
+      Number.isInteger(to) &&
+      from >= 0 &&
+      from < to &&
+      to <= lines.length;
+    if (!fits || unit.text.trim() === "") continue;
+    const at = [...lines.keys()].slice(from, to);
+    if (!at.every(isKept)) continue;
+    readings[3]?.push({ at, text: unit.text });
+    if (unit.aside !== true) readings[4]?.push({ at, text: unit.text });
+  }
+  const partKept = (part: Part): boolean => part.at.every(isKept);
   for (const reading of readings) {
     for (const [k, first] of reading.entries()) {
       const second = reading[k + 1];
       if (second === undefined) break;
       const pair = `${first.text}\n${second.text}`;
-      const seen = `${first.at}:${second.at}:${pair}`;
+      const seen = keyOf([...first.at, ...second.at], pair);
       if (read.has(seen)) continue;
       read.add(seen);
       const boundary = await classify(pair);
       if (boundary.action !== "redact") continue;
       note(boundary.verdict.hits);
-      for (const i of [first.at, second.at]) {
+      for (const i of [...first.at, ...second.at]) {
         if (!isWithheld(i)) withhold(i, boundary.redacted ?? "", "split-redacted");
       }
     }
   }
-  const wholes = new Set<string>();
   for (const reading of readings) {
-    const kept = reading.filter((part) => isKept(part.at)).map((part) => part.text);
-    const joined = kept.join("\n");
-    if (kept.length === 0 || wholes.has(joined)) continue;
-    wholes.add(joined);
+    const kept = reading.filter(partKept);
+    const joined = kept.map((part) => part.text).join("\n");
+    const seen = keyOf(
+      kept.flatMap((part) => part.at),
+      joined,
+    );
+    if (kept.length === 0 || read.has(seen)) continue;
+    read.add(seen);
     const whole = await classify(joined);
     if (whole.action !== "redact") continue;
     note(whole.verdict.hits);

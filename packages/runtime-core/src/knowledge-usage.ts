@@ -38,7 +38,11 @@ import type {
 } from "@crewhaus/event-log";
 import type { RunContext } from "@crewhaus/run-context";
 import type { ToolReadRef } from "@crewhaus/tool-catalog";
-import { type RememberedLineOutcome, screenRememberedLines } from "./project-memory";
+import {
+  type RememberedLineOutcome,
+  type ScreenUnit,
+  screenRememberedLines,
+} from "./project-memory";
 import {
   type RecallNote,
   type RecalledRef,
@@ -147,10 +151,15 @@ export function createReadCollector(): ReadCollector {
 // ---------------------------------------------------------------------------
 
 /**
- * One item the continuity tail rendered: its ref, and the 0-based lines of the
- * tail it rendered as `[from, to)` when the store says which.
+ * One item the continuity tail rendered: its ref, the 0-based lines of the
+ * tail it rendered as `[from, to)` when the store says which, and the units of
+ * content it rendered there, as plain text, for the screen alone (a record
+ * holds the ref, never the units).
  */
-export type ContinuityTailRef = RecalledRef & { readonly lines?: readonly [number, number] };
+export type ContinuityTailRef = RecalledRef & {
+  readonly lines?: readonly [number, number];
+  readonly units?: readonly ScreenUnit[];
+};
 
 /** One read of the continuity tail: its screened text, what it rendered, and the screen's outcome. */
 export type ContinuityTailRead = {
@@ -196,6 +205,8 @@ function spanStatus(
  * by adjacent pair and as a whole ({@link screenRememberedLines}: what the
  * classifier redacts becomes its notice, every other line is unchanged), and
  * read the refs of what it rendered, each with what became of its own lines.
+ * The refs are read first: the units of content they name are screened as
+ * their text, beside the rendered lines.
  * The text is
  * model-authored working state from earlier turns and sessions, so it is
  * screened as remembered memory before the model reads it again. It is not
@@ -209,13 +220,7 @@ export async function readContinuityTail(
 ): Promise<ContinuityTailRead> {
   const loaded = await load();
   if (loaded === null) return { text: null, refs: [], statuses: [], status: "included" };
-  const screened = await screenRememberedLines(loaded);
-  if (screened.redacted > 0) {
-    logger.warn("plan tail line withheld (prompt injection detected)", {
-      lines: screened.redacted,
-      rules: screened.rules,
-    });
-  }
+  // The refs of this render, before the screen: their units are what it reads as text.
   let refs: readonly ContinuityTailRef[] = [];
   if (tailRefs !== undefined) {
     try {
@@ -224,10 +229,18 @@ export async function readContinuityTail(
       logger.warn("continuity tail refs could not be read", { error: (err as Error).name });
     }
   }
+  const units = refs.flatMap((ref) => (Array.isArray(ref.units) ? ref.units : []));
+  const screened = await screenRememberedLines(loaded, units);
+  if (screened.redacted > 0) {
+    logger.warn("plan tail line withheld (prompt injection detected)", {
+      lines: screened.redacted,
+      rules: screened.rules,
+    });
+  }
   const status = screened.redacted > 0 ? "redacted" : screened.warned > 0 ? "warned" : "included";
   return {
     text: screened.text,
-    refs: refs.map(({ lines: _lines, ...ref }) => ref),
+    refs: refs.map(({ lines: _lines, units: _units, ...ref }) => ref),
     statuses: refs.map((ref) => spanStatus(ref, screened.outcomes) ?? status),
     status,
   };

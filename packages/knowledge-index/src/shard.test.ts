@@ -149,7 +149,7 @@ describe("an index is a function of the stores", () => {
     await seedHarness(dir);
     await built(dir, home);
     expect(statSync(home).mode & 0o777).toBe(0o700);
-    expect(Shard.open(home, HRN)?.items()?.length).toBeGreaterThan(0);
+    expect(Shard.open(home, HRN, dir)?.items()?.length).toBeGreaterThan(0);
   });
 
   test("a harness id that is not one never becomes a path, and a link at the index is not followed", async () => {
@@ -403,7 +403,7 @@ describe("an index that does not fit is not read", () => {
     await built(dir, home);
     const meta = join(shardDir(home), "meta.json");
     writeFileSync(meta, readFileSync(meta, "utf8").split(HRN).join("hrn_ffffffffffffffff"));
-    expect(Shard.open(home, HRN)).toBeUndefined();
+    expect(Shard.open(home, HRN, dir)).toBeUndefined();
   });
 });
 
@@ -665,6 +665,77 @@ describe("what became of the items a run used", () => {
     // A store that changed since is asked itself.
     await memories(dir).forget(ids.refunds);
     expect((await ask())[0]).toEqual(["found", "superseded", true]);
+  });
+
+  test("an item the index does not hold is read from its store: written since, or past the cap", async () => {
+    const dir = tempDir();
+    const home = tempDir();
+    await seedHarness(dir);
+    await built(dir, home);
+    const { id } = await memories(dir).remember("Refunds settle in two days");
+    const states = async (refs: readonly ReturnType<typeof fact>[]) =>
+      (await lookup({ ...opts(dir), hangarRoot: home }, refs)).map((l) => l.state);
+    expect(await states([fact(id)])).toEqual(["found"]);
+    expect(await states([fact("mem_ffffffffffffffff")])).toEqual(["unknown"]);
+
+    const capped = tempDir();
+    const cappedHome = tempDir();
+    const store = memories(capped);
+    const three: string[] = [];
+    for (const text of ["one thing", "another thing", "a third thing"]) {
+      three.push((await store.remember(text)).id);
+    }
+    const { meta } = await buildShard({
+      harnessDir: capped,
+      hrn: HRN,
+      harnessName: "bot",
+      now,
+      hangarRoot: cappedHome,
+      cap: 1,
+    }).then((answer) => {
+      if (!answer.ok) throw new Error(answer.reason);
+      return answer;
+    });
+    expect(meta.truncated).toBe(true);
+    const withIndex = await lookup(
+      { harnessDir: capped, hrn: HRN, now, hangarRoot: cappedHome },
+      three.map(fact),
+    );
+    const without = await lookup({ harnessDir: capped, hrn: HRN, now }, three.map(fact));
+    expect(withIndex.map((l) => l.state)).toEqual(["found", "found", "found"]);
+    expect(withIndex).toEqual(without);
+  });
+});
+
+describe("an index is its own folder's", () => {
+  test("an index built from another folder under this id is read by nothing here", async () => {
+    const dir = tempDir();
+    const copy = tempDir();
+    const home = tempDir();
+    await seedHarness(dir);
+    await memories(copy).remember(`${marker("copy")} only here`);
+    // Built from the copy, under the id of the harness in `dir`.
+    await built(copy, home);
+    expect(Shard.open(home, HRN, copy)).toBeDefined();
+    expect(Shard.open(home, HRN, dir)).toBeUndefined();
+    const list = await readItems({ ...opts(dir), hangarRoot: home, canReadContent: true });
+    expect(list.freshness.from).toBe("direct-fold");
+    expect(JSON.stringify(list)).not.toContain(marker("copy"));
+    const found = await search({
+      q: marker("copy").toLowerCase(),
+      harnesses: [{ hrn: HRN, dir, name: "bot" }],
+      hangarRoot: home,
+      canRead: () => true,
+      canReadContent: () => true,
+      now,
+    });
+    expect(found.total).toBe(0);
+    expect(found.coverage.namesOnly).toEqual([HRN]);
+    expect(knowledgeIndexEffect({ hangarRoot: home, hrn: HRN, harnessDir: dir })).toEqual({
+      kind: "index",
+      status: "unknown",
+      note: INDEX_PENDING,
+    });
   });
 });
 

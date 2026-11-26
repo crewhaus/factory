@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createContinuityStore } from "@crewhaus/continuity-store";
 import { append, controlPaths, ensureDigestKey, harnessLedger } from "@crewhaus/control-records";
+import { memoryContentHash } from "@crewhaus/harness-lifecycle/knowledge-sync";
 import { HARNESS_IDENTITY_REL, openHangarRegistry } from "@crewhaus/harness-registry";
 import { parseArgs } from "@crewhaus/infra-utils";
 import {
@@ -28,9 +29,9 @@ import {
 import { createMemoryStore } from "@crewhaus/memory-store";
 import { createWikiStore } from "@crewhaus/wiki-store";
 import { checkLine, realInventory } from "./__test__/twin-check";
-import * as SCHEMAS from "./arg-schemas";
 import {
   KNOWLEDGE_ACTIONS,
+  KNOWLEDGE_SCHEMAS,
   type KnowledgeAction,
   KnowledgeCmdError,
   type KnowledgeCmdIo,
@@ -52,6 +53,8 @@ let dir: string;
 let out: string[];
 let env: Record<string, string>;
 let owner: KnowledgeCmdIo["owner"];
+/** Where a verb runs, when that is not the harness `dir`. */
+let cwd: string | undefined;
 
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-knowledge-cmd-")));
@@ -63,11 +66,12 @@ beforeEach(() => {
     CREWHAUS_HANGAR_ROOT: join(root, "hangar"),
   };
   owner = () => ({ ok: true });
+  cwd = undefined;
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const io = (): KnowledgeCmdIo => ({
-  cwd: dir,
+  cwd: cwd ?? dir,
   env,
   stdout: (line) => out.push(line),
   now: () => NOW,
@@ -77,7 +81,7 @@ const text = (): string => out.join("\n");
 async function run(line: string | readonly string[], code = 0): Promise<string> {
   out = [];
   const [action, ...argv] = typeof line === "string" ? line.split(" ") : line;
-  const args = parseArgs(argv, SCHEMAS.KNOWLEDGE_SCHEMA);
+  const args = parseArgs(argv, KNOWLEDGE_SCHEMAS[action as KnowledgeAction]);
   expect(await runKnowledgeCmd(action as KnowledgeAction, args, io())).toBe(code);
   return text();
 }
@@ -88,7 +92,7 @@ const json = async (line: string | readonly string[], code = 0): Promise<Record<
 async function refused(line: string | readonly string[]): Promise<string> {
   out = [];
   const [action, ...argv] = typeof line === "string" ? line.split(" ") : line;
-  const args = parseArgs(argv, SCHEMAS.KNOWLEDGE_SCHEMA);
+  const args = parseArgs(argv, KNOWLEDGE_SCHEMAS[action as KnowledgeAction]);
   const err = await runKnowledgeCmd(action as KnowledgeAction, args, io()).catch((e) => e);
   expect(err).toBeInstanceOf(KnowledgeCmdError);
   return (err as Error).message;
@@ -158,8 +162,10 @@ async function seed(): Promise<{
   );
   return { refunds, person: successor.id, first };
 }
+/** A harness.json naming `hrn`, and the registry row that names this folder by it. */
 function identity(at = dir, hrn = HRN): void {
   write(HARNESS_IDENTITY_REL, `${JSON.stringify({ v: 1, id: hrn })}\n`, at);
+  expect(register(at)).toBe(hrn);
 }
 function register(at = dir): string {
   return openHangarRegistry({ env }).upsert({ dir: at, specName: "bot", target: "cli" }).id;
@@ -532,7 +538,7 @@ describe("reindex", () => {
     const added = [...snapshot().keys()].filter((path) => !before.has(path));
     expect(added.length).toBeGreaterThan(6);
     for (const path of added) expect(path).toStartWith(join(root, "hangar"));
-    expect(Shard.open(join(root, "hangar"), HRN)?.meta.asOf).toBe(NOW.toISOString());
+    expect(Shard.open(join(root, "hangar"), HRN, dir)?.meta.asOf).toBe(NOW.toISOString());
     expect(await json("reindex")).toMatchObject({
       hrn: HRN,
       truncated: false,
@@ -543,8 +549,55 @@ describe("reindex", () => {
 
   test("a folder with no harness id is refused, naming what gives it one", async () => {
     await seed();
-    expect(await refused("reindex")).toContain("crewhaus harness adopt . gives it one");
+    expect(await refused("reindex")).toContain("crewhaus harness adopt . registers it");
+    // A harness.json alone is not a registration.
+    write(HARNESS_IDENTITY_REL, `${JSON.stringify({ v: 1, id: HRN })}\n`);
+    expect(await refused("reindex")).toContain("crewhaus harness adopt . registers it");
     expect(existsSync(join(root, "hangar"))).toBe(false);
+  });
+
+  test("a command an agent's tool started is refused, and writes nothing", async () => {
+    await seed();
+    identity();
+    const before = snapshot();
+    env = { ...env, CREWHAUS_AGENT_TOOL: "Bash" };
+    expect(await refused("reindex")).toBe(
+      "knowledge reindex: this command was started by an agent's tool; a person does this",
+    );
+    expect(snapshot()).toEqual(before);
+  });
+
+  test("a copy carrying another harness's id keeps its index, and its content, out of that one", async () => {
+    await seed();
+    identity();
+    await run("reindex");
+    const home = join(root, "hangar");
+    const original = snapshot();
+    const shardOf = (): string[] =>
+      [...original.keys()].filter((path) => path.startsWith(join(home, "cache")));
+    expect(shardOf().length).toBeGreaterThan(0);
+    // The copy keeps the original's harness.json; the registry gives it an id of its own.
+    const copy = join(root, "copy");
+    mkdirSync(copy);
+    write("crewhaus.yaml", "name: bot\ntarget: cli\n", copy);
+    write(HARNESS_IDENTITY_REL, `${JSON.stringify({ v: 1, id: HRN })}\n`, copy);
+    expect(register(copy)).not.toBe(HRN);
+    const only = ["COPYONLY", "MARKER"].join("");
+    await facts(copy).remember(`${only} is in the copy`);
+    const inShard = (): Map<string, string> =>
+      new Map([...snapshot()].filter(([path]) => path.startsWith(join(home, "cache"))));
+    const shard = inShard();
+    cwd = copy;
+    expect(await refused("reindex")).toContain("crewhaus harness adopt . sets it right");
+    // Read in memory, from its own folder.
+    expect(await run("list")).toContain(only);
+    const marked = (await facts(copy).list())[0]?.entry.id ?? "";
+    await facts(copy).annotate(marked, { category: "person" });
+    await run(`erase ${marked} --yes --confirm bot`);
+    expect(inShard()).toEqual(shard);
+    cwd = undefined;
+    expect(await run("list")).not.toContain(only);
+    expect(await json("status")).toMatchObject({ index: { built: true, current: true } });
   });
 });
 
@@ -602,7 +655,7 @@ describe("erase", () => {
     const receipt = done["receipt"] as { by: string; effects: { kind: string; status: string }[] };
     expect(receipt.effects.at(-1)).toMatchObject({ kind: "index", status: "unknown" });
     expect(receipt.by).toMatch(/^local:#[0-9a-f]{64}$/);
-    expect(Shard.open(join(root, "hangar"), HRN)).toBeUndefined();
+    expect(Shard.open(join(root, "hangar"), HRN, dir)).toBeUndefined();
   });
 
   test("with its sources, what the conversation left behind goes too", async () => {
@@ -612,6 +665,75 @@ describe("erase", () => {
     expect(await facts().list()).toEqual([]);
     expect(await run("list --type wiki")).toContain("Nothing matches");
     expect(await run("list --type plan")).toContain("Migrate invoices");
+  });
+
+  test("a flag it does not read is refused, and nothing is deleted", async () => {
+    const { person } = await seed();
+    const before = snapshot();
+    expect(() =>
+      parseArgs([person, "--yes", "--confirm", "bot", "--dry-run"], KNOWLEDGE_SCHEMAS.erase),
+    ).toThrow("--dry-run");
+    expect(snapshot()).toEqual(before);
+    // No verb takes a flag only sync or another verb reads.
+    const foreign: Readonly<Record<string, readonly string[]>> = {
+      "--dry-run": [],
+      "--pull": [],
+      "--push": [],
+      "--no-redact": [],
+      "--root": ["x"],
+      "--shared": ["x"],
+      "--yes": [],
+      "--history": [],
+      "--harness": ["x"],
+    };
+    const reads: Readonly<Record<KnowledgeAction, readonly string[]>> = {
+      status: [],
+      list: [],
+      show: ["--history"],
+      why: [],
+      usage: [],
+      search: ["--harness"],
+      reindex: [],
+      erase: ["--shared", "--yes"],
+    };
+    for (const action of KNOWLEDGE_ACTIONS) {
+      for (const [name, value] of Object.entries(foreign)) {
+        if (reads[action].includes(name)) continue;
+        expect(
+          `${action} ${name}: ${(() => {
+            try {
+              parseArgs(["x", name, ...value], KNOWLEDGE_SCHEMAS[action]);
+              return "accepted";
+            } catch {
+              return "refused";
+            }
+          })()}`,
+        ).toBe(`${action} ${name}: refused`);
+      }
+    }
+  });
+
+  test("--shared names a shared store kept somewhere else, by its real path", async () => {
+    const { person } = await seed();
+    const elsewhere = join(root, "fleet-store");
+    mkdirSync(elsewhere);
+    const text = `${PERSON} likes evenings`;
+    write(
+      "memories.jsonl",
+      `${JSON.stringify({ contentHash: memoryContentHash(text, []), text, tags: [] })}\n`,
+      elsewhere,
+    );
+    const plan = await json(["erase", person, "--shared", elsewhere]);
+    expect(plan["targets"]).toContainEqual({
+      store: "shared-store",
+      copies: 1,
+      dir: realpathSync(elsewhere),
+    });
+    expect(await run(["erase", person, "--shared", elsewhere])).toContain(
+      `1 copy in the shared store (at ${realpathSync(elsewhere)})`,
+    );
+    await run(["erase", person, "--shared", elsewhere, "--yes", "--confirm", "bot"]);
+    expect(readFileSync(join(elsewhere, "memories.jsonl"), "utf8")).toBe("");
   });
 
   test("anything not marked personal is refused, and one refusal refuses the rest", async () => {
@@ -717,6 +839,11 @@ describe("the entry file", () => {
       ) as unknown as string,
     ]);
     expect(cli(["knowledge", "erase", refunds]).code).toBe(1);
+    const unread = cli(["knowledge", "erase", person, "--yes", "--confirm", "bot", "--dry-run"]);
+    expect([unread.code, unread.err]).toEqual([
+      1,
+      expect.stringContaining("--dry-run") as unknown as string,
+    ]);
     const tool = cli(["knowledge", "erase", person, "--yes", "--confirm", "bot"], {
       CREWHAUS_AGENT_TOOL: "Bash",
     });

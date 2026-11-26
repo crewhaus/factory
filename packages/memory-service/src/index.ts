@@ -607,10 +607,25 @@ export type RecalledRef = {
 };
 
 /**
- * One item the `<current_plan>` tail rendered: its ref, and the 0-based lines
- * of the tail it takes, as `[from, to)`.
+ * One unit of content the tail rendered, as plain text, and the lines `[from, to)` it is on.
+ * `aside` marks a unit rendered beside the main text (a goal's unit of measure).
  */
-export type TailRef = RecalledRef & { readonly lines?: readonly [number, number] };
+export type TailUnit = {
+  readonly text: string;
+  readonly lines: readonly [number, number];
+  readonly aside?: true;
+};
+
+/**
+ * One item the `<current_plan>` tail rendered: its ref, the 0-based lines of
+ * the tail it takes, as `[from, to)`, and the units of content it rendered
+ * there (a plan's title and steps, a goal's title and unit, the focus body),
+ * so the runtime screens them as their text. A record holds the ref alone.
+ */
+export type TailRef = RecalledRef & {
+  readonly lines?: readonly [number, number];
+  readonly units?: readonly TailUnit[];
+};
 
 /** One recalled item: the line `recall` returns, and the entry it came from when known. */
 export type RecalledItem = {
@@ -1073,20 +1088,24 @@ async function renderPlanTail(
     kind: "plan" | "goal" | "focus",
     localId: string,
     span: readonly [number, number],
+    units: readonly TailUnit[],
   ): void => {
-    refs.push({ store: kind, backend: "local", ...where, localId, lines: span });
+    refs.push({ store: kind, backend: "local", ...where, localId, lines: span, units });
   };
   if (focus !== null && focus.body !== "") {
-    shown("focus", "focus", push(`focus: ${focus.body}`));
+    const span = push(`focus: ${focus.body}`);
+    shown("focus", "focus", span, [{ text: focus.body, lines: span }]);
   }
   if (activePlan !== null) {
     if (lines.length > 0) push("");
-    const [from] = push(`${activePlan.id} — ${activePlan.title}`);
+    const title = push(`${activePlan.id} — ${activePlan.title}`);
+    const units: TailUnit[] = [{ text: activePlan.title, lines: title }];
     for (const step of activePlan.steps) {
       // Proven-by-assertion (`proof: off`) renders apart from a verified ✓.
-      push(`${step.index}. ${renderLadderStatus(step)} ${step.text}`);
+      const at = push(`${step.index}. ${renderLadderStatus(step)} ${step.text}`);
+      units.push({ text: step.text, lines: at });
     }
-    shown("plan", activePlan.id, [from, rows]);
+    shown("plan", activePlan.id, [title[0], rows], units);
   }
   if (openGoals.length > 0) {
     if (lines.length > 0) push("");
@@ -1097,7 +1116,11 @@ async function renderPlanTail(
           ? ` (${goal.current ?? 0}/${goal.target}${goal.unit !== undefined ? ` ${goal.unit}` : ""})`
           : "";
       const span = push(`- ${goal.id} ${renderLadderStatus(goal)} ${goal.title}${progress}`);
-      shown("goal", goal.id, span);
+      const units: TailUnit[] = [{ text: goal.title, lines: span }];
+      if (goal.target !== undefined && goal.unit !== undefined) {
+        units.push({ text: goal.unit, lines: span, aside: true });
+      }
+      shown("goal", goal.id, span, units);
     }
   }
   rendered?.(refs);

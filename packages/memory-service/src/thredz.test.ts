@@ -1036,9 +1036,31 @@ describe("the continuity seam names what its tail rendered", () => {
     expect(text).toContain("ship the report");
     const where = { backend: "local", spec: "tail-spec", partition: "-" };
     expect(await seam.tailRefs?.()).toEqual([
-      { store: "focus", ...where, localId: "focus", lines: [0, 1] },
-      { store: "plan", ...where, localId: plan.id, lines: [2, 5] },
-      { store: "goal", ...where, localId: goal.id, lines: [7, 8] },
+      {
+        store: "focus",
+        ...where,
+        localId: "focus",
+        lines: [0, 1],
+        units: [{ text: "ship the report", lines: [0, 1] }],
+      },
+      {
+        store: "plan",
+        ...where,
+        localId: plan.id,
+        lines: [2, 5],
+        units: [
+          { text: "Ship", lines: [2, 3] },
+          { text: "draft", lines: [3, 4] },
+          { text: "send", lines: [4, 5] },
+        ],
+      },
+      {
+        store: "goal",
+        ...where,
+        localId: goal.id,
+        lines: [7, 8],
+        units: [{ text: "Report sent", lines: [7, 8] }],
+      },
     ]);
     expect(plan.id).toMatch(/^plan-\d{4}$/);
     expect(goal.id).toMatch(/^goal-\d{4}$/);
@@ -1061,6 +1083,18 @@ describe("the continuity seam names what its tail rendered", () => {
       `${plan.id} — Ship\n1. [open] draft\n2. [open] send`,
       "- goal-0001 [open] Report sent",
       "- goal-0002 [open] Summary sent",
+    ]);
+    // Each unit is the text it renders, on the lines it is rendered on.
+    for (const ref of spans) {
+      for (const unit of ref.units ?? []) expect(textOf(unit.lines)).toContain(unit.text);
+    }
+    expect(spans.flatMap((ref) => (ref.units ?? []).map((unit) => unit.text))).toEqual([
+      "first line\n\nthird line",
+      "Ship",
+      "draft",
+      "send",
+      "Report sent",
+      "Summary sent",
     ]);
   });
 });

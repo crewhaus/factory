@@ -47,7 +47,10 @@ function endsTorn(root: string): boolean {
   return read.ok && read.bytes.length > 0 && read.bytes[read.bytes.length - 1] !== 0x0a;
 }
 
-/** One shared line: its hashes (stated, and of what it says), and who shared it. */
+/**
+ * One shared line: the hash of what it says, and who shared it. A hash the line states is
+ * never taken on its word: only what the line says can name it.
+ */
 function readLine(line: string): { readonly hashes: readonly string[]; readonly harness: string } {
   let rec: Record<string, unknown>;
   try {
@@ -61,10 +64,7 @@ function readLine(line: string): { readonly hashes: readonly string[]; readonly 
     : [];
   const provenance = rec["provenance"] as { harness?: unknown } | null | undefined;
   return {
-    hashes: [
-      ...(typeof rec["contentHash"] === "string" ? [rec["contentHash"]] : []),
-      ...(typeof rec["text"] === "string" ? [memoryContentHash(rec["text"], tags)] : []),
-    ],
+    hashes: typeof rec["text"] === "string" ? [memoryContentHash(rec["text"], tags)] : [],
     harness: typeof provenance?.harness === "string" ? provenance.harness : "unknown",
   };
 }

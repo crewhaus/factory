@@ -50,7 +50,8 @@ cannot, and the command that does it.
 ## What an answer leaves out
 
 - A harness the reader may not read adds nothing: it is left out before anything is ranked, counted,
-  faceted or cut.
+  faceted or cut. Within a harness, each reader is ranked only against what they may get, so what
+  they may not get moves no score they see.
 - Without content permission a fact, whose title is its text, is in no answer; other items show a name
   and no text.
 - A fact marked personal is in no search, and its row in the index holds no text, tag or
@@ -63,7 +64,8 @@ cannot, and the command that does it.
 `<hangarRoot>/cache/index/knowledge/<hrn>/` holds `meta.json`, `items.jsonl`, `docs.jsonl`,
 `postings.json`, `usage.json` and `epoch`, each 0600. Previews are at most 280 characters, and what
 looks like a credential is masked. Two builds of the same stores are the same bytes apart from when
-they were made, so the directory can be deleted at any time. Past 50,000 items an answer says that the
+they were made, so the directory can be deleted at any time. An index names the folder it was built
+from, and a harness reads no index built from another folder under its id. Past 50,000 items an answer says that the
 index cannot list everything.
 
 ## Usage
@@ -81,7 +83,10 @@ on facts marked personal.
 
 1. `planErasure` lists what would go and what would stay, and writes nothing. A fact's target is its
    whole correction chain, live and archived, its copies in the shared store and in the other
-   registered harnesses, and, with its sources, what its conversation left behind.
+   registered harnesses, and, with its sources, what its conversation left behind. A copy is matched
+   by what it says, never by a hash a record states. Shared stores are looked for where
+   `knowledge sync` keeps them (`CREWHAUS_SHARED_DIR`, or a `.crewhaus-shared` folder above the
+   harness) or where the caller names them, and a link at one of those names is not followed.
 2. `authorizeErasure` asks that the caller may manage every harness the plan reaches, and that they
    typed the harness's name. It answers a grant: what each store may erase, by name.
 3. `executeErasure` plans again and refuses when anything moved, runs each store's purge, removes the

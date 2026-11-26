@@ -11,6 +11,7 @@ import {
   seedHarness,
   seedTenant,
   tempDir,
+  wiki,
   write,
   writeJson,
 } from "./__test__/fixtures";
@@ -188,6 +189,66 @@ describe("a reader gets only what they may read", () => {
     expect(own.items.map((hit) => hit.kind).sort()).toEqual(["facts", "focus", "wiki"]);
     expect(own.items.every((hit) => hit.ref.includes("~t.acme~"))).toBe(true);
   });
+
+  test("what a reader may not get moves nothing they get: a customer's titles leave the fleet's order alone", async () => {
+    const order = async (customers: number, content: boolean): Promise<string[]> => {
+      const dir = tempDir();
+      const home = tempDir();
+      const articles = wiki(dir);
+      await articles.write({ slug: "a-page", title: "zebra notes", body: "One." });
+      await articles.write({ slug: "b-page", title: "yak notes", body: "Two." });
+      const theirs = wiki(dir, "bot", join(".crewhaus", "tenants", "acme"));
+      for (let i = 0; i < customers; i++) {
+        await theirs.write({ slug: `account-${i}`, title: `zebra account ${i}`, body: "Three." });
+      }
+      const built = await buildShard({ hangarRoot: home, hrn: HRN, harnessDir: dir, now });
+      if (!built.ok) throw new Error(built.reason);
+      const answer = await search({
+        q: "zebra yak",
+        harnesses: [{ hrn: HRN, dir, name: "bot" }],
+        hangarRoot: home,
+        canRead: all,
+        canReadContent: () => content,
+        now,
+      });
+      return answer.items.map((hit) => hit.title);
+    };
+    for (const content of [true, false]) {
+      const alone = await order(0, content);
+      expect(alone).toEqual(["zebra notes", "yak notes"]);
+      expect(await order(6, content)).toEqual(alone);
+    }
+  });
+
+  test("facts a reader without content permission may not get leave the order of names alone", async () => {
+    const order = async (facts: number): Promise<string[]> => {
+      const dir = tempDir();
+      const home = tempDir();
+      const articles = wiki(dir);
+      await articles.write({ slug: "a-page", title: "zebra", body: "One." });
+      await articles.write({
+        slug: "b-page",
+        title: "yak yak yak yak notes",
+        body: "Two.",
+      });
+      const store = memories(dir);
+      for (let i = 0; i < facts; i++) await store.remember(`fact number ${i}`);
+      const built = await buildShard({ hangarRoot: home, hrn: HRN, harnessDir: dir, now });
+      if (!built.ok) throw new Error(built.reason);
+      const answer = await search({
+        q: "zebra yak",
+        harnesses: [{ hrn: HRN, dir, name: "bot" }],
+        hangarRoot: home,
+        canRead: all,
+        canReadContent: none,
+        now,
+      });
+      return answer.items.map((hit) => hit.title);
+    };
+    const alone = await order(0);
+    expect(alone.length).toBe(2);
+    expect(await order(40)).toEqual(alone);
+  }, 20_000); // forty facts are written and indexed
 
   test("no harness readable is no access, and no other reason", async () => {
     const { find } = await fleet();

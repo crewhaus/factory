@@ -7,8 +7,10 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -291,7 +293,7 @@ describe("what may be erased", () => {
 
 describe("a dry run", () => {
   test("lists every copy by where it is, and what would stay", async () => {
-    const { request, build, home, dir } = await scene();
+    const { request, build, home, dir, sharedDir } = await scene();
     await ensureDigestKey(dir);
     append(harnessLedger(dir, { dir: controlPaths(dir).knowledgeUsageDir }), { v: 1 });
     await build();
@@ -302,7 +304,7 @@ describe("a dry run", () => {
       { store: "wiki-versions", copies: 2 },
       { store: "working-memory", copies: 2 },
       { store: "trash", copies: 1 },
-      { store: "shared-store", copies: 1 },
+      { store: "shared-store", copies: 1, dir: realpathSync(sharedDir) },
       // The live line, its mark and the fact captured beside it.
       { store: "facts", copies: 3 },
       // The corrected line, and the line that corrected it.
@@ -319,7 +321,7 @@ describe("a dry run", () => {
       { code: "shared-retraction" },
     ]);
     expect(plan.harnesses).toEqual([dir, request.harnesses?.[1]?.dir as string]);
-    expect(Shard.open(home, HRN)).toBeDefined();
+    expect(Shard.open(home, HRN, dir)).toBeDefined();
   });
 
   test("without the sources, only the fact and its copies", async () => {
@@ -405,6 +407,179 @@ describe("a dry run", () => {
       records: { a: { result: `near-duplicate: "${CAPTURED} pays late"` } },
     });
     expect(await codes(request)).toContain("dream-reports");
+  });
+});
+
+/** A personal fact in a harness nested two folders below the root knowledge sync ran from. */
+async function nested() {
+  const root = tempDir();
+  const dir = join(root, "team", "support");
+  mkdirSync(dir, { recursive: true });
+  write(dir, "crewhaus.yaml", "name: bot\ntarget: cli\n");
+  const facts = memories(dir);
+  const fact = await facts.remember(`${PERSON} likes tea`, ["crm"]);
+  await facts.annotate(fact.id, { category: "person" });
+  const line: SharedMemory = {
+    contentHash: memoryContentHash(`${PERSON} likes tea`, ["crm"]),
+    text: `${PERSON} likes tea`,
+    tags: ["crm"],
+    provenance: { harness: "support", pushedAt: "2026-10-01T00:00:00.000Z" },
+    origin: { harness: "support", fact: fact.id },
+  };
+  const request: ErasureRequest = {
+    harnessDir: dir,
+    hrn: HRN,
+    harnessName: "bot",
+    items: [`facts~bot~-~${fact.id}`],
+    includeSources: false,
+    basis: { kind: "marked" },
+    now,
+  };
+  const shareAt = (at: string): string => {
+    mkdirSync(at, { recursive: true });
+    writeFileSync(join(at, "memories.jsonl"), `${JSON.stringify(line)}\n`, { mode: 0o600 });
+    return realpathSync(at);
+  };
+  return { root, dir, request, shareAt, fact: fact.id };
+}
+
+describe("where the door looks for shared copies", () => {
+  test("the shared store at the root above a nested harness, named by its real path", async () => {
+    const n = await nested();
+    const at = n.shareAt(join(n.root, SHARED_DIR_DEFAULT));
+    const plan = await planErasure(n.request);
+    expect(plan.targets).toContainEqual({ store: "shared-store", copies: 1, dir: at });
+    expect(plan.residue.map((r) => r.code)).toContain("shared-retraction");
+    expect(plan.residue.map((r) => r.code)).not.toContain("shared-elsewhere");
+    await run(n.request);
+    expect(readFileSync(join(at, "memories.jsonl"), "utf8")).toBe("");
+  });
+
+  test("one kept somewhere else is found when it is named, and said to be there when it isn't", async () => {
+    const n = await nested();
+    const at = n.shareAt(join(tempDir(), "fleet-store"));
+    write(n.dir, join(".crewhaus", "knowledge.json"), '{"share":true}\n');
+    const unnamed = await planErasure(n.request);
+    expect(unnamed.targets.map((t) => t.store)).not.toContain("shared-store");
+    expect(unnamed.residue.map((r) => r.code)).toContain("shared-elsewhere");
+    const named = await planErasure({ ...n.request, sharedDirs: [at] });
+    expect(named.targets).toContainEqual({ store: "shared-store", copies: 1, dir: at });
+    expect(named.residue.map((r) => r.code)).not.toContain("shared-elsewhere");
+    await run({ ...n.request, sharedDirs: [at] });
+    expect(readFileSync(join(at, "memories.jsonl"), "utf8")).toBe("");
+    expect(readRetractions(at).map((r) => r.reason)).toEqual(["erased"]);
+  });
+
+  test("the harness's own folder is not where the fleet's shared store is kept", async () => {
+    const n = await nested();
+    const own = n.shareAt(join(n.dir, SHARED_DIR_DEFAULT));
+    const before = snapshot(own);
+    const plan = await planErasure(n.request);
+    expect(plan.targets.map((t) => t.store)).not.toContain("shared-store");
+    await run(n.request);
+    expect(snapshot(own)).toEqual(before);
+  });
+
+  test("a link at the harness's own shared folder is not followed: what it names stays byte for byte", async () => {
+    const n = await nested();
+    const elsewhere = n.shareAt(join(tempDir(), "unrelated"));
+    symlinkSync(elsewhere, join(n.dir, SHARED_DIR_DEFAULT));
+    const before = snapshot(elsewhere);
+    const plan = await planErasure(n.request);
+    expect(plan.targets.map((t) => t.store)).not.toContain("shared-store");
+    await run(n.request);
+    expect(snapshot(elsewhere)).toEqual(before);
+    expect(existsSync(join(elsewhere, "retractions.jsonl"))).toBe(false);
+  });
+
+  test("a link at the root's shared folder is not followed, and is named as a store not read", async () => {
+    const n = await nested();
+    const elsewhere = n.shareAt(join(tempDir(), "unrelated"));
+    symlinkSync(elsewhere, join(n.root, SHARED_DIR_DEFAULT));
+    const before = snapshot(elsewhere);
+    const plan = await planErasure(n.request);
+    expect(plan.targets.map((t) => t.store)).not.toContain("shared-store");
+    expect(plan.residue.map((r) => r.code)).toContain("unread-stores");
+    await run(n.request);
+    expect(snapshot(elsewhere)).toEqual(before);
+    expect(existsSync(join(elsewhere, "retractions.jsonl"))).toBe(false);
+  });
+});
+
+describe("a copy is matched by what it says", () => {
+  const invoices = memoryContentHash("Invoices go out on Mondays", []);
+
+  test("a shared line that only states another fact's hash and names this one removes nothing else", async () => {
+    const s = await scene();
+    const planted = `${JSON.stringify({ contentHash: invoices, origin: { harness: "support", fact: s.second } })}\n`;
+    appendFileSync(join(s.sharedDir, "memories.jsonl"), planted);
+    mkdirSync(join(s.dir, SHARED_DIR_DEFAULT));
+    writeFileSync(join(s.dir, SHARED_DIR_DEFAULT, "memories.jsonl"), planted);
+    const plan = await planErasure(s.request);
+    expect(plan.targets.filter((t) => t.store === "shared-store")).toEqual([
+      { store: "shared-store", copies: 1, dir: realpathSync(s.sharedDir) },
+    ]);
+    expect(plan.targets).toContainEqual({ store: "pulled-copies", copies: 2, harness: "sales" });
+    expect(plan.residue.map((r) => r.code)).toContain("shared-unconfirmed");
+    await run(s.request);
+    expect((await memories(s.other, "seller").list()).map((i) => i.entry.text)).toEqual([
+      "Invoices go out on Mondays",
+    ]);
+    const left = readFileSync(join(s.sharedDir, "memories.jsonl"), "utf8");
+    expect(left).toContain("Invoices go out on Mondays");
+    expect(readRetractions(s.sharedDir).map((r) => r.contentHash)).toEqual([s.hash]);
+  });
+
+  test("a fact another harness says it pulled from this one, saying something else, stays", async () => {
+    const s = await scene();
+    const file = join(s.other, ".crewhaus", "memories", "seller.jsonl");
+    const lines = readFileSync(file, "utf8")
+      .split("\n")
+      .map((text) => {
+        if (text === "" || !text.includes("Invoices go out")) return text;
+        const record = JSON.parse(text) as Record<string, unknown>;
+        const provenance = (record["provenance"] ?? {}) as Record<string, unknown>;
+        const origin = (provenance["origin"] ?? {}) as Record<string, unknown>;
+        return JSON.stringify({
+          ...record,
+          provenance: { ...provenance, origin: { ...origin, contentHash: s.hash } },
+        });
+      });
+    writeFileSync(file, lines.join("\n"));
+    await run(s.request);
+    expect((await memories(s.other, "seller").list()).map((i) => i.entry.text)).toEqual([
+      "Invoices go out on Mondays",
+    ]);
+  });
+
+  test("a hash a personal fact states it was pulled under names nothing else", async () => {
+    const s = await scene();
+    const file = join(s.dir, ".crewhaus", "memories", "bot.jsonl");
+    const lines = readFileSync(file, "utf8")
+      .split("\n")
+      .map((text) => {
+        if (text === "") return text;
+        const record = JSON.parse(text) as Record<string, unknown>;
+        if (record["id"] !== s.second) return text;
+        const provenance = (record["provenance"] ?? {}) as Record<string, unknown>;
+        return JSON.stringify({
+          ...record,
+          provenance: {
+            ...provenance,
+            origin: { kind: "sync", harness: "elsewhere", contentHash: invoices },
+          },
+        });
+      });
+    writeFileSync(file, lines.join("\n"));
+    const plan = await planErasure(s.request);
+    expect(plan.refusals).toEqual([]);
+    await run(s.request);
+    expect((await memories(s.other, "seller").list()).map((i) => i.entry.text)).toEqual([
+      "Invoices go out on Mondays",
+    ]);
+    expect(readFileSync(join(s.sharedDir, "memories.jsonl"), "utf8")).toContain(
+      "Invoices go out on Mondays",
+    );
   });
 });
 
@@ -761,7 +936,12 @@ describe("the receipt", () => {
     expect(takeNudgeMarkers(pending.home, [KNOWLEDGE_PROJECTION]).sort()).toEqual(
       [HRN, OTHER_HRN].sort(),
     );
-    for (const hrn of [HRN, OTHER_HRN]) expect(Shard.open(pending.home, hrn)).toBeUndefined();
+    for (const [hrn, at] of [
+      [HRN, pending.dir],
+      [OTHER_HRN, pending.other],
+    ] as const) {
+      expect(Shard.open(pending.home, hrn, at)).toBeUndefined();
+    }
   });
 
   test("a pass that fails leaves the effect pending and the erasure done", async () => {

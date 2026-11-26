@@ -24690,9 +24690,14 @@ switch (subcommand) {
       action === "reindex" ||
       action === "erase"
     ) {
-      const { KnowledgeCmdError, runKnowledgeCmd } = await import("./knowledge-cmd");
+      const { KNOWLEDGE_SCHEMAS, KnowledgeCmdError, runKnowledgeCmd } = await import(
+        "./knowledge-cmd"
+      );
       try {
-        const code = await runKnowledgeCmd(action, parseFor(rest.slice(1), KNOWLEDGE_SCHEMA));
+        const code = await runKnowledgeCmd(
+          action,
+          parseFor(rest.slice(1), KNOWLEDGE_SCHEMAS[action]),
+        );
         if (code !== 0) process.exitCode = code;
       } catch (err) {
         if (err instanceof KnowledgeCmdError || err instanceof CrewhausError) die(err.message);

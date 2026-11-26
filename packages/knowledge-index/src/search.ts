@@ -28,6 +28,8 @@ import {
   type Postings,
   Shard,
   adapterNameOf,
+  audienceOf,
+  inAudience,
   postingsOf,
   revisionOf,
   searchedKinds,
@@ -106,7 +108,9 @@ function readOptions(harness: SearchHarness, opts: SearchOptions): HarnessReadOp
 
 async function sourceOf(harness: SearchHarness, opts: SearchOptions): Promise<Source> {
   const shard =
-    opts.hangarRoot !== undefined ? Shard.open(opts.hangarRoot, harness.hrn) : undefined;
+    opts.hangarRoot !== undefined
+      ? Shard.open(opts.hangarRoot, harness.hrn, harness.dir)
+      : undefined;
   const docs = shard?.docs();
   const postings = docs === undefined ? undefined : shard?.postings();
   if (shard !== undefined && docs !== undefined && postings !== undefined) {
@@ -175,11 +179,12 @@ function statusWords(doc: SearchDoc, now: Date): readonly string[] {
   return doc.item !== undefined && !PAST.has(status) ? [status, "live"] : [status];
 }
 
-/** Whether this reader may get this doc at all. */
+/**
+ * Whether this reader may get this doc at all: exactly the docs of the term list they are
+ * ranked against ({@link audienceOf}), so what they may not get moves no score they see.
+ */
 function visible(doc: SearchDoc, scope: "fleet" | "harness", content: boolean): boolean {
-  if (doc.contentOnly && !content) return false;
-  if (doc.fleet) return true;
-  return scope === "harness" && content;
+  return inAudience(doc, audienceOf(scope, content));
 }
 
 function passes(doc: SearchDoc, query: ParsedQuery, now: Date): boolean {
@@ -238,7 +243,8 @@ export async function search(opts: SearchOptions): Promise<SearchAnswer> {
   const matches: Match[] = [];
   for (const source of sources) {
     const content = opts.canReadContent(source.harness.hrn);
-    const index = content ? source.postings.full : source.postings.names;
+    // Ranked only against the docs this reader may get.
+    const index = source.postings[audienceOf(scope, content)];
     const scored =
       query.words === ""
         ? source.docs.map((_, i) => ({ i, score: 0 }))

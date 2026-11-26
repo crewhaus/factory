@@ -16,12 +16,15 @@
  * A fact's target is its whole correction chain, live and archived; its copies in the shared
  * store and in the other registered harnesses; and, with its sources, what the conversation it
  * came from left behind: its summary, the wiki versions and working state written in it, and
- * the facts captured from it. What cannot be reached is named as residue before anyone
- * confirms.
+ * the facts captured from it. A copy is a line or a fact that says what the erased fact says,
+ * matched by the hash of its text: a hash any record states about itself is never taken on
+ * its word. Shared stores are looked for where `knowledge sync` keeps them, or where a person
+ * names them, and a link at one of those names is not followed. What cannot be reached is
+ * named as residue before anyone confirms.
  */
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, realpathSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { existsSync, lstatSync, realpathSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   type ContinuityErasure,
   purgeSessions,
@@ -46,6 +49,7 @@ import {
 } from "@crewhaus/control-records";
 import { eraseShared } from "@crewhaus/harness-lifecycle/erasure";
 import {
+  KNOWLEDGE_MARKER_RELPATH,
   SHARED_DIR_DEFAULT,
   maskKnowledgeSecrets,
   memoryContentHash,
@@ -88,7 +92,11 @@ export type ErasureRequest = {
   readonly basis: ErasureBasis;
   /** The other registered harnesses, for the copies they pulled. */
   readonly harnesses?: readonly ErasureHarness[];
-  /** Shared stores. Default: the named one, else the usual places beside the harness. */
+  /**
+   * The shared stores, as a person named them (`--shared`). Without them: `CREWHAUS_SHARED_DIR`
+   * and the `.crewhaus-shared` of each folder above the harness that `knowledge sync` could
+   * have run from; a link at one of those names is not followed.
+   */
   readonly sharedDirs?: readonly string[];
   readonly now?: () => Date;
 };
@@ -99,6 +107,8 @@ export type ErasureTargetLine = {
   readonly copies: number;
   /** The harness it is in, when that is not the one asked about. */
   readonly harness?: string;
+  /** Where a shared store is, as its real path. */
+  readonly dir?: string;
 };
 
 export type ErasureTargetStore =
@@ -122,7 +132,9 @@ export type ErasureResidue = {
     | "shared-retraction"
     | "origin-harness"
     | "dream-reports"
-    | "unread-stores";
+    | "unread-stores"
+    | "shared-elsewhere"
+    | "shared-unconfirmed";
   readonly until?: string;
 };
 
@@ -198,18 +210,25 @@ function factsIn(part: Part, at: SpecStore, read: HarnessRead): Set<string> {
   return entry.ids;
 }
 
-/** The content hashes a fact may be shared under: as it is, masked, and as it was pulled. */
-function hashesOf(entry: MemoryEntry): string[] {
+/**
+ * The content hashes a fact may be shared under: as it is, masked, and as it was pulled. Each
+ * is computed from what the fact says; a hash a record states about itself is never taken on
+ * its word, so no record can name what else the door removes.
+ */
+function hashesOf(entry: Pick<MemoryEntry, "text" | "tags">): string[] {
   const own = entry.tags.filter((tag) => !tag.startsWith("shared:"));
   return [
     memoryContentHash(entry.text, own),
     memoryContentHash(entry.text, entry.tags),
     memoryContentHash(maskKnowledgeSecrets(entry.text), own),
-    ...(entry.provenance?.origin !== undefined ? [entry.provenance.origin.contentHash] : []),
   ];
 }
 
-type SharedLine = { readonly hashes: readonly string[]; readonly origin: string };
+type SharedLine = {
+  /** The hash of what the line says, or `undefined` for a line that says nothing. */
+  readonly hash: string | undefined;
+  readonly origin: string;
+};
 
 /**
  * A shared store's lines, read without loading what they say into an answer; `unread` when
@@ -232,10 +251,7 @@ function sharedLines(dir: string): SharedLine[] | "unread" {
         : [];
       const origin = line["origin"] as { harness?: unknown; fact?: unknown } | null | undefined;
       out.push({
-        hashes: [
-          ...(typeof line["contentHash"] === "string" ? [line["contentHash"]] : []),
-          ...(typeof line["text"] === "string" ? [memoryContentHash(line["text"], tags)] : []),
-        ],
+        hash: typeof line["text"] === "string" ? memoryContentHash(line["text"], tags) : undefined,
         origin: `${String(origin?.harness)}\n${String(origin?.fact)}`,
       });
     } catch {
@@ -245,15 +261,50 @@ function sharedLines(dir: string): SharedLine[] | "unread" {
   return out;
 }
 
-function sharedDirsOf(request: ErasureRequest): string[] {
-  const dirs = request.sharedDirs ?? [
-    ...(process.env["CREWHAUS_SHARED_DIR"] !== undefined
-      ? [process.env["CREWHAUS_SHARED_DIR"]]
-      : []),
-    join(request.harnessDir, SHARED_DIR_DEFAULT),
-    join(request.harnessDir, "..", SHARED_DIR_DEFAULT),
-  ];
-  return [...new Set(dirs.map((dir) => realOr(dir)))];
+/** How many folders above a harness `knowledge sync` can run from: as deep as it finds harnesses. */
+export const SHARED_SEARCH_DEPTH = 6;
+
+/** The shared stores a plan looks in, and how many places one may be could not be looked at. */
+type SharedPlaces = {
+  readonly dirs: readonly string[];
+  readonly unread: number;
+  /** Whether a person named them. */
+  readonly named: boolean;
+};
+
+function sharedPlacesOf(request: ErasureRequest): SharedPlaces {
+  if (request.sharedDirs !== undefined) {
+    return {
+      dirs: [...new Set(request.sharedDirs.map((dir) => realOr(dir)))],
+      unread: 0,
+      named: true,
+    };
+  }
+  const env = process.env["CREWHAUS_SHARED_DIR"];
+  const candidates = env !== undefined && env !== "" ? [resolve(env)] : [];
+  // Each folder above the harness, never the harness's own: `knowledge sync` keeps the
+  // shared store at the root it discovers harnesses under.
+  let at = realOr(request.harnessDir);
+  for (let depth = 0; depth < SHARED_SEARCH_DEPTH; depth += 1) {
+    const up = dirname(at);
+    if (up === at) break;
+    at = up;
+    candidates.push(join(at, SHARED_DIR_DEFAULT));
+  }
+  const dirs: string[] = [];
+  let unread = 0;
+  for (const candidate of candidates) {
+    let stats: ReturnType<typeof lstatSync>;
+    try {
+      stats = lstatSync(candidate);
+    } catch {
+      continue;
+    }
+    // A link at the name is not followed: the store it points at is named, not written.
+    if (stats.isSymbolicLink()) unread += 1;
+    else if (stats.isDirectory()) dirs.push(realOr(candidate));
+  }
+  return { dirs: [...new Set(dirs)], unread, named: false };
 }
 
 async function inventory(request: ErasureRequest): Promise<Inventory> {
@@ -325,12 +376,22 @@ async function inventory(request: ErasureRequest): Promise<Inventory> {
   const steps: Step[] = [];
   const covered: unknown[] = [];
   /** One line per store and harness, however many places they keep it in. */
-  const line = (store: ErasureTargetStore, copies: number, harness?: string): void => {
+  const line = (
+    store: ErasureTargetStore,
+    copies: number,
+    harness?: string,
+    dir?: string,
+  ): void => {
     if (copies === 0) return;
-    const at = lines.findIndex((l) => l.store === store && l.harness === harness);
+    const at = lines.findIndex((l) => l.store === store && l.harness === harness && l.dir === dir);
     const before = lines[at];
     if (before === undefined) {
-      lines.push({ store, copies, ...(harness !== undefined ? { harness } : {}) });
+      lines.push({
+        store,
+        copies,
+        ...(harness !== undefined ? { harness } : {}),
+        ...(dir !== undefined ? { dir } : {}),
+      });
     } else {
       lines[at] = { ...before, copies: before.copies + copies };
     }
@@ -359,31 +420,36 @@ async function inventory(request: ErasureRequest): Promise<Inventory> {
     }
   }
 
-  // 3. Shared copies, and the copies other harnesses pulled.
-  const hashes = new Set([...entries.values()].flatMap(hashesOf));
+  // 3. Shared copies, and the copies other harnesses pulled: each matched by what it says.
+  const hashes: ReadonlySet<string> = new Set([...entries.values()].flatMap(hashesOf));
   const origins = new Set(
     [...home.facts.values()].flatMap(({ ids }) =>
       [...ids].map((id) => `${basename(resolve(request.harnessDir))}\n${id}`),
     ),
   );
   let shared = 0;
+  /** Lines that say they came from these facts but say something else: left, and named. */
+  let unconfirmed = 0;
+  const places = sharedPlacesOf(request);
   // Stores that may hold a copy and could not be read: named, never passed over.
-  let unread = 0;
-  for (const dir of sharedDirsOf(request)) {
+  let unread = places.unread;
+  for (const dir of places.dirs) {
     const lines = sharedLines(dir);
     if (lines === "unread") {
       unread += 1;
       continue;
     }
-    const found = lines.filter(
-      (l) => origins.has(l.origin) || l.hashes.some((hash) => hashes.has(hash)),
-    );
+    const found = lines.filter((l) => l.hash !== undefined && hashes.has(l.hash));
+    unconfirmed += lines.filter(
+      (l) => origins.has(l.origin) && (l.hash === undefined || !hashes.has(l.hash)),
+    ).length;
     if (found.length === 0) continue;
-    const targets = [...new Set(found.flatMap((l) => l.hashes))].sort();
-    for (const hash of targets) hashes.add(hash);
+    const targets = [
+      ...new Set(found.flatMap((l) => (l.hash !== undefined ? [l.hash] : []))),
+    ].sort();
     shared += found.length;
-    line("shared-store", found.length);
-    covered.push(["shared", targets]);
+    line("shared-store", found.length, undefined, dir);
+    covered.push(["shared", dir, targets]);
     scopes.push({ store: "shared", root: dir, targets });
     steps.push({
       store: "shared-store",
@@ -440,11 +506,16 @@ async function inventory(request: ErasureRequest): Promise<Inventory> {
   for (const part of parts) {
     if (request.hangarRoot === undefined || !hasIds(part)) continue;
     if (part.hrn === undefined || !HARNESS_ID_RE.test(part.hrn)) continue;
-    if (Shard.open(request.hangarRoot, part.hrn) !== undefined) {
+    if (Shard.open(request.hangarRoot, part.hrn, part.dir) !== undefined) {
       line("search-index", 1, part === home ? undefined : part.name);
     }
   }
 
+  // Taking part in sharing, with no shared store found where it would be: say so, and how to name it.
+  const elsewhere =
+    !places.named &&
+    places.dirs.length === 0 &&
+    read.text(KNOWLEDGE_MARKER_RELPATH, "shared") !== undefined;
   const residue = residueOf({
     read,
     entries: [...entries.values()],
@@ -452,6 +523,8 @@ async function inventory(request: ErasureRequest): Promise<Inventory> {
     sources,
     shared,
     unread,
+    elsewhere,
+    unconfirmed,
   });
   return {
     lines,
@@ -591,8 +664,9 @@ async function pulledInto(
       continue;
     }
     for (const entry of [...facts.live.map((item) => item.entry), ...facts.archived]) {
-      const origin = entry.provenance?.origin;
-      if (origin === undefined || !hashes.has(origin.contentHash)) continue;
+      // A pulled copy, matched by what it says: never by the hash it states it was pulled as.
+      if (entry.provenance?.origin === undefined) continue;
+      if (!hashesOf(entry).some((hash) => hashes.has(hash))) continue;
       for (const id of facts.chainOf.get(entry.id) ?? [entry.id]) factsIn(part, at, read).add(id);
     }
   }
@@ -637,6 +711,8 @@ function residueOf(at: {
   readonly sources: ReadonlySet<string>;
   readonly shared: number;
   readonly unread: number;
+  readonly elsewhere: boolean;
+  readonly unconfirmed: number;
 }): ErasureResidue[] {
   const { read } = at;
   if (at.entries.length === 0) return [];
@@ -675,6 +751,8 @@ function residueOf(at: {
   );
   if (quoted) out.push({ code: "dream-reports" });
   if (at.unread > 0) out.push({ code: "unread-stores" });
+  if (at.elsewhere) out.push({ code: "shared-elsewhere" });
+  if (at.unconfirmed > 0) out.push({ code: "shared-unconfirmed" });
   return out;
 }
 

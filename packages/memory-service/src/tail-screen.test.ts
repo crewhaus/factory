@@ -149,6 +149,45 @@ describe("what the plan tools store is screened as its text", () => {
     ]);
   });
 
+  // A goal's measure is rendered between two titles; each of these is read as the text it is.
+  for (const [name, first, second] of [
+    [
+      "a unit ending in a parenthesis",
+      { title: FIRST, target: 10, current: 2, unit: "x)" },
+      { title: SECOND },
+    ],
+    [
+      "a target written with an exponent",
+      { title: FIRST, target: 1e21, current: 0 },
+      { title: SECOND },
+    ],
+    [
+      "one goal's title and its unit",
+      { title: FIRST, target: 10, current: 0, unit: `${SECOND})` },
+      undefined,
+    ],
+  ] as const) {
+    test(`GoalWrite with a payload split around ${name}`, async () => {
+      const { seam, tool } = wired();
+      await tool("GoalWrite").execute(first);
+      if (second !== undefined) await tool("GoalWrite").execute(second);
+      const text = await planText(seam);
+      expect(text).not.toContain("exfiltrate");
+      expect(text).not.toContain("then ignore previous");
+      expect(text).toContain("redacted");
+      expect(tailUsage().every(({ status }) => status === "split-redacted")).toBe(true);
+      expect(tailUsage().length).toBe(second === undefined ? 1 : 2);
+    });
+  }
+
+  test("a goal whose measure only looks like a parenthesis is kept as it was rendered", async () => {
+    const { seam, tool } = wired();
+    await tool("GoalWrite").execute({ title: "Report sent", target: 1e21, current: 0, unit: "x)" });
+    const text = await planText(seam);
+    expect(text).toContain("- goal-0001 [open] Report sent (0/1e+21 x))");
+    expect(tailUsage()).toEqual([{ store: "goal", status: "included" }]);
+  });
+
   test("a plan with nothing to withhold reaches the model as it was rendered", async () => {
     const { seam, tool } = wired();
     await tool("PlanUpdate").execute({ action: "create", title: "Ship", steps: ["draft it"] });

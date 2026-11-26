@@ -10,7 +10,7 @@
  * | `usage <item>` | the runs that used it (or what one run used, for a `run_` id) |
  * | `search <words> [--harness h]` | find something, in this harness or every registered one |
  * | `reindex` | build this harness's search index again |
- * | `erase <item>… [--include-sources] [--yes --confirm <name>]` | delete data marked personal |
+ * | `erase <item>… [--include-sources] [--shared <dir>] [--yes --confirm <name>]` | delete data marked personal |
  *
  * Each works on the harness in the working directory and with Home stopped. Every verb but
  * `reindex` and a confirmed `erase` only reads: a search index is used when one was built, and
@@ -19,7 +19,7 @@
  * throw {@link KnowledgeCmdError}, which the entry file routes through `die()`. Side-effect-free
  * on import.
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { localActorOf } from "@crewhaus/access-control";
 import type {
@@ -40,7 +40,7 @@ import {
   readHarnessIdentityFile,
   resolveHangarRoot,
 } from "@crewhaus/harness-registry";
-import type { ParsedArgs } from "@crewhaus/infra-utils";
+import type { ParseArgsSchema, ParsedArgs } from "@crewhaus/infra-utils";
 import {
   type FoldedItem,
   HarnessRead,
@@ -68,6 +68,17 @@ import {
   planErasure,
 } from "@crewhaus/knowledge-index/erasure";
 import { isMemoryEntryId } from "@crewhaus/memory-store";
+import { AGENT_TOOL_ENV } from "./approvals-cmd";
+import {
+  KNOWLEDGE_ERASE_SCHEMA,
+  KNOWLEDGE_LIST_SCHEMA,
+  KNOWLEDGE_REINDEX_SCHEMA,
+  KNOWLEDGE_SEARCH_SCHEMA,
+  KNOWLEDGE_SHOW_SCHEMA,
+  KNOWLEDGE_STATUS_SCHEMA,
+  KNOWLEDGE_USAGE_SCHEMA,
+  KNOWLEDGE_WHY_SCHEMA,
+} from "./arg-schemas";
 import { type OwnerCheck, ownerCheck } from "./owner-check";
 
 /** The verbs this module answers; `sync` is the older one beside them. */
@@ -83,6 +94,18 @@ export const KNOWLEDGE_ACTIONS = [
 ] as const;
 
 export type KnowledgeAction = (typeof KNOWLEDGE_ACTIONS)[number];
+
+/** The flags each verb reads, and no other: a flag it does not read is refused as unknown. */
+export const KNOWLEDGE_SCHEMAS: Readonly<Record<KnowledgeAction, ParseArgsSchema>> = {
+  status: KNOWLEDGE_STATUS_SCHEMA,
+  list: KNOWLEDGE_LIST_SCHEMA,
+  show: KNOWLEDGE_SHOW_SCHEMA,
+  why: KNOWLEDGE_WHY_SCHEMA,
+  usage: KNOWLEDGE_USAGE_SCHEMA,
+  search: KNOWLEDGE_SEARCH_SCHEMA,
+  reindex: KNOWLEDGE_REINDEX_SCHEMA,
+  erase: KNOWLEDGE_ERASE_SCHEMA,
+};
 
 /** A bad argument or a refusal: the entry file prints it and exits 1. */
 export class KnowledgeCmdError extends Error {
@@ -142,8 +165,9 @@ const HELP: Readonly<Record<KnowledgeAction, readonly string[]>> = {
   ],
   erase: [
     "crewhaus knowledge erase — delete data marked personal, everywhere this harness kept it. Shows what it will remove first.",
-    "usage: crewhaus knowledge erase <item>… [--include-sources] [--yes --confirm <harness name>] [--json]",
+    "usage: crewhaus knowledge erase <item>… [--include-sources] [--shared <dir>] [--yes --confirm <harness name>] [--json]",
     "  --include-sources also removes what the conversation it came from left behind.",
+    "  --shared names the shared store knowledge sync uses, when it is kept somewhere else.",
     "  Mark a fact first: crewhaus memory mark <mem_id> --personal",
   ],
 };
@@ -153,7 +177,13 @@ const PAGE = 50;
 type Here = {
   readonly dir: string;
   readonly hrn: string;
+  /**
+   * Whether the registry names this folder by the id its own `harness.json` gives, so Home's
+   * cache may hold its index. Otherwise every read folds the harness in memory.
+   */
   readonly registered: boolean;
+  /** Why it is not, in words that name the verb that sets it right. */
+  readonly unbound?: string;
   readonly name: string;
   readonly hangarRoot: string;
   readonly read: HarnessReadOptions;
@@ -166,15 +196,45 @@ function str(args: ParsedArgs, name: string): string | undefined {
 
 const flag = (args: ParsedArgs, name: string): boolean => args.flags[name] === true;
 
-/** The harness in the working directory. */
+const NOT_REGISTERED =
+  "This folder isn't registered yet, so there is nowhere to keep its search index. crewhaus harness adopt . registers it.";
+const NOT_ITS_ID =
+  "This folder's harness id is not the one registered for it, so its search index is not kept. crewhaus harness adopt . sets it right.";
+
+/**
+ * The harness in the working directory. Its id is the registry's row for this folder, with
+ * its `harness.json` only as a cross-check: a folder the registry does not name, or names by
+ * another id, has no index in Home's cache and is read in memory.
+ */
 function harnessHere(io: KnowledgeCmdIo): Here {
   const dir = resolve(io.cwd);
-  const hrn = readHarnessIdentityFile(dir)?.id;
+  let real = dir;
+  try {
+    real = realpathSync(dir);
+  } catch {
+    // A folder that cannot be resolved is looked up as it was given.
+  }
+  let row: { readonly id: string } | undefined;
+  try {
+    const registry = openHangarRegistry({ env: { ...io.env, CREWHAUS_NO_REGISTRY: "1" } });
+    row = registry.get(dir) ?? (real !== dir ? registry.get(real) : undefined);
+  } catch {
+    row = undefined;
+  }
+  const own = readHarnessIdentityFile(dir)?.id;
+  const unbound =
+    row === undefined
+      ? NOT_REGISTERED
+      : own !== undefined && own !== row.id
+        ? NOT_ITS_ID
+        : undefined;
+  const hrn = unbound === undefined ? row?.id : undefined;
   const name = harnessSpecName(dir) ?? basename(dir);
   return {
     dir,
     hrn: hrn ?? UNREGISTERED_HRN,
     registered: hrn !== undefined,
+    ...(unbound !== undefined ? { unbound } : {}),
     name,
     hangarRoot: resolveHangarRoot(io.env),
     read: {
@@ -261,7 +321,7 @@ async function status(here: Here, args: ParsedArgs, io: KnowledgeCmdIo): Promise
     limit: 1,
   });
   const usage = await foldUsage(here.dir);
-  const shard = here.registered ? Shard.open(here.hangarRoot, here.hrn) : undefined;
+  const shard = here.registered ? Shard.open(here.hangarRoot, here.hrn, here.dir) : undefined;
   const changed = shard?.changed(new HarnessRead(here.read)).size ?? 0;
   const index = {
     built: shard !== undefined,
@@ -639,11 +699,13 @@ async function find(here: Here, args: ParsedArgs, io: KnowledgeCmdIo): Promise<n
 }
 
 async function reindex(here: Here, args: ParsedArgs, io: KnowledgeCmdIo): Promise<number> {
-  if (!here.registered) {
+  const agentTool = io.env[AGENT_TOOL_ENV];
+  if (agentTool !== undefined && agentTool !== "") {
     throw new KnowledgeCmdError(
-      "This folder has no harness id yet, so there is nowhere to keep its search index. crewhaus harness adopt . gives it one.",
+      "knowledge reindex: this command was started by an agent's tool; a person does this",
     );
   }
+  if (!here.registered) throw new KnowledgeCmdError(here.unbound ?? NOT_REGISTERED);
   const built = await buildShard({ ...here.read, hangarRoot: here.hangarRoot });
   if (!built.ok) throw new KnowledgeCmdError(`The search index was not written: ${built.reason}`);
   if (flag(args, "json")) {
@@ -692,13 +754,22 @@ const RESIDUE_WORDS: Readonly<Record<ErasureResidue["code"], string>> = {
     "Notes from earlier consolidations that quote it, until newer ones replace them.",
   "unread-stores":
     "A place a copy may be that could not be read: a harness's facts, or a shared store. Fix it, then run this again.",
+  "shared-elsewhere":
+    "A shared store kept somewhere else. Name it with --shared <dir> to delete the copies there too.",
+  "shared-unconfirmed":
+    "A line in the shared store that says it came from this but says something else, so it was left as it is.",
 };
 
 function planLines(plan: ErasurePlan): string[] {
   const out: string[] = [];
   if (plan.targets.length > 0) out.push("Will delete:");
   for (const target of plan.targets) {
-    const where = target.harness !== undefined ? ` (${target.harness})` : "";
+    const where =
+      target.harness !== undefined
+        ? ` (${target.harness})`
+        : target.dir !== undefined
+          ? ` (at ${target.dir})`
+          : "";
     out.push(`  ${counted(target.store, target.copies)}${where}`);
   }
   if (plan.targets.length > 0 && plan.residue.length > 0) out.push("Can't delete:");
@@ -717,13 +788,16 @@ async function erase(here: Here, args: ParsedArgs, io: KnowledgeCmdIo): Promise<
   }
   const items: string[] = [];
   for (const given of args.positional) items.push(await itemIdOf(here, given));
+  const shared = str(args, "shared");
   const plan = await planErasure({
     harnessDir: here.dir,
+    // Only a folder the registry names by its own id has an index here to remove.
     ...(here.registered ? { hrn: here.hrn } : {}),
     harnessName: here.name,
     hangarRoot: here.hangarRoot,
     items,
     includeSources: flag(args, "include-sources"),
+    ...(shared !== undefined ? { sharedDirs: [resolve(io.cwd, shared)] } : {}),
     basis: { kind: "marked" },
     harnesses: registered(io),
     now: io.now,
