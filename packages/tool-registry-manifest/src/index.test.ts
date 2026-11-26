@@ -49,13 +49,21 @@ describe("every row is well formed", () => {
     expect(mismatched.map(([key, entry]) => `${key} !== ${entry.key}`)).toEqual([]);
   });
 
+  const SHAPE_SPECIFIC = new Set(["workspaceOpen", "workspaceCheck", "workspacePublish"]);
+
   test("each row carries the fields a person needs to recognise the tool", () => {
     const thin: string[] = [];
     for (const [key, entry] of entries) {
       if (entry.name.length === 0) thin.push(`${key}: no name`);
       if (entry.description.length === 0) thin.push(`${key}: no description`);
       if (!entry.package.startsWith("@crewhaus/tool-")) thin.push(`${key}: ${entry.package}`);
-      if (entry.categories.length === 0) thin.push(`${key}: no category`);
+      if (entry.categories.length === 0 && !SHAPE_SPECIFIC.has(key)) {
+        thin.push(`${key}: no category`);
+      }
+    }
+    // A tool only some shapes carry is in no category, so `all-<category>` never grants it.
+    for (const key of SHAPE_SPECIFIC) {
+      expect({ key, categories: TOOL_REGISTRY[key]?.categories }).toEqual({ key, categories: [] });
     }
     expect(thin).toEqual([]);
   });

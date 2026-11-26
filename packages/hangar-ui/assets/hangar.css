@@ -934,6 +934,15 @@ button.tab {
 .work-action select {
   max-width: 100%;
 }
+/* A check's log and the judge's reasons wrap at any width; a long log scrolls inside its
+   own region, never the page. */
+.work-fold pre {
+  margin: 0;
+  max-height: 16rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .work-scope label {
   display: inline-flex;
   align-items: center;

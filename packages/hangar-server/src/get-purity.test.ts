@@ -282,6 +282,7 @@ describe("GET routes change nothing", () => {
         "attention.get": `home/attention/att_${"0".repeat(26)}`,
         "attention.messages.list": `home/attention/att_${"0".repeat(26)}`,
         "work.get": `${live.id}/work/${mintId("wi")}`,
+        "workspaces.get": `${live.id}/work/${mintId("wi")}`,
       };
       const v1Paths: Array<{ key: string; path: string }> = [];
       for (const op of v1Gets.filter((row) => !v1Excluded.has(row.id))) {

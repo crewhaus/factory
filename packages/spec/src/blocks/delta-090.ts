@@ -3,6 +3,7 @@ import { budgetPeriodIssues } from "./budget-period";
 import { intentIssues } from "./intent";
 import { modelPriceIssues } from "./model-price";
 import { pluginsIssues } from "./plugins";
+import { repositoriesIssues } from "./repositories";
 import { scheduleIssues, scheduleWakeIssues } from "./schedule";
 
 /** Reports one cross-field issue: where it is, and what to do about it. */
@@ -22,4 +23,5 @@ export const DELTA_090_ISSUES: ReadonlyArray<(data: Spec, custom: SpecAddIssue) 
     scheduleWakeIssues,
     modelPriceIssues,
     budgetPeriodIssues,
+    repositoriesIssues,
   ]);

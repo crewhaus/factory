@@ -33,6 +33,7 @@ import {
   BuiltinToolError,
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
+  type SpecRepositoryBlocks,
   readmeToolFacts,
   resolveBuiltinTools,
 } from "@crewhaus/tool-categories";
@@ -79,9 +80,10 @@ export function emitManaged(ir: IrManagedV0, opts: EmitReadmeOptions = {}): Bund
     files.push({
       path: "README.md",
       content: renderBundleReadme(ir, {
-        toolFacts: readmeToolFacts([
-          { tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {}, path: AGENT_TOOL_CONFIG },
-        ]),
+        toolFacts: readmeToolFacts(
+          [{ tools: ir.tools ?? [], toolConfigs: ir.toolConfigs ?? {}, path: AGENT_TOOL_CONFIG }],
+          { ...(ir.repositories !== undefined ? { repositories: ir.repositories } : {}) },
+        ),
       }),
     });
   }
@@ -117,6 +119,7 @@ const AGENT_TOOL_CONFIG = "agent.tool_config";
 function resolveManagedTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
+  blocks?: SpecRepositoryBlocks,
 ): {
   imports: ReadonlyArray<string>;
   inits: ReadonlyArray<string>;
@@ -126,9 +129,11 @@ function resolveManagedTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("managed", [
-      { tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG },
-    ]);
+    resolved = resolveBuiltinTools(
+      "managed",
+      [{ tools: toolNames, toolConfigs, path: AGENT_TOOL_CONFIG }],
+      blocks,
+    );
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;
@@ -622,7 +627,11 @@ import type { RegisteredTool } from "@crewhaus/tool-catalog";`
   // context; this registers the shared base catalog.
   const toolsOn = ir.tools !== undefined && ir.tools.length > 0;
   const resolvedTools = toolsOn
-    ? resolveManagedTools(ir.tools ?? [], ir.toolConfigs ?? {})
+    ? resolveManagedTools(ir.tools ?? [], ir.toolConfigs ?? {}, {
+        ...(ir.repositories !== undefined ? { repositories: ir.repositories } : {}),
+        ...(ir.intent !== undefined ? { intent: ir.intent } : {}),
+        ...(ir.evaluation !== undefined ? { evaluation: ir.evaluation } : {}),
+      })
     : { imports: [], inits: [], registrations: [], sandbox: false };
   const thredzImports = thredzOn
     ? `

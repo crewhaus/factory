@@ -27,7 +27,8 @@ import { RUNTIME_SCHEMAS } from "../schemas/runtime.js";
 import { AREA_MODULES } from "./index.js";
 
 const HRN = "hrn_0123456789abcdef";
-const WORK_ROWS = OPERATIONS.filter((op) => op.id.startsWith("work."));
+// The work half's rows; `work.publish` is the workspace half's (`runtime-workspace.test.ts`).
+const WORK_ROWS = OPERATIONS.filter((op) => op.id.startsWith("work.") && op.id !== "work.publish");
 
 describe("the runtime area's work half", () => {
   test("composes into the build, after the areas before it", () => {
@@ -48,7 +49,11 @@ describe("the runtime area's work half", () => {
     ]);
     expect(CAPABILITY_NAMES).toContain("work.items");
     expect(CURSOR_SOURCES).toContain("work");
-    expect([...RUNTIME_MODULE.rawExclusions]).toEqual([".crewhaus/run/control/work/items/"]);
+    expect([...RUNTIME_MODULE.rawExclusions]).toEqual([
+      ".crewhaus/run/control/work/items/",
+      ".crewhaus/run/control/work/checks/",
+      ".crewhaus/workspaces/",
+    ]);
   });
 
   test("no log key and no schema field is a name the masker hides", () => {

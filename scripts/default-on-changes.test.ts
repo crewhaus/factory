@@ -786,6 +786,28 @@ describe("the release notes name every change a harness without provability: see
     expect(floor).toContain("`RunCommand`");
   });
 
+  test("the runtime-state floor: each steward workspace's git directory is named with the rest", () => {
+    // Only a binding directory under `.crewhaus/workspaces` adds this root, so the
+    // check above never sees it. Its binding segment is the spec's, so the notes
+    // name it with a placeholder.
+    const cwd = realpathSync(mkdtempSync(join(tmpdir(), "crewhaus-default-on-workspaces-")));
+    try {
+      mkdirSync(join(cwd, ".crewhaus", "workspaces", "app"), { recursive: true });
+      const roots = runtimeStateRoots(undefined, undefined, cwd, {})
+        .filter((root) => !isAbsolute(root))
+        .map((root) => root.split(sep).join("/"))
+        .filter((root) => root.startsWith(".crewhaus/workspaces/"));
+      expect(roots).toEqual([".crewhaus/workspaces/app/repo"]);
+      const named = roots.map((root) =>
+        root.replace(/^(\.crewhaus\/workspaces\/)[^/]+/, "$1<binding>"),
+      );
+      expect(named).toEqual([".crewhaus/workspaces/<binding>/repo"]);
+      expect(unlisted(named, notes, { shipped: SHIPPED_ROOTS, laterNotes })).toEqual([]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("the runtime-state floor: what a harness's own directory adds is named with the rest", async () => {
     // Only a spec at the working directory, or a bundle's manifest beside the
     // process's entry, adds these, so the check above never sees them. The sets

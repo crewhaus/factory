@@ -20,6 +20,16 @@
  */
 import type { ToolShape } from "./shapes";
 
+/** The kinds of action a preset decides by, from reading to deciding how a harness is run. */
+export const ACTION_CLASSES = Object.freeze([
+  "research",
+  "draft",
+  "publish",
+  "ship",
+  "govern",
+] as const);
+export type ActionClass = (typeof ACTION_CLASSES)[number];
+
 /** One builtin tool, keyed in {@link BUILTIN_TOOLS} by the camelCase spec key. */
 export type BuiltinToolEntry = {
   /** The package that exports the tool. */
@@ -42,6 +52,19 @@ export type BuiltinToolEntry = {
    * compiles with a `tool-unwired` warning and refuses every call.
    */
   readonly chainSymbol?: string;
+  /**
+   * The registrar that binds what this tool works on from the spec's `repositories` block
+   * (and, for the acceptance check alone, `intent`) — a key of
+   * {@link TOOL_BOOT_REGISTRARS}. Without a `repositories` block the tool compiles with a
+   * `tool-unwired` warning and refuses every call.
+   */
+  readonly repositorySymbol?: string;
+  /**
+   * Which kind of action the tool is, for a preset that decides by kind. Declared in the
+   * wiring manifest where the tool's flags would answer wrongly: a tool that runs a
+   * project's own checks crosses a process boundary, and it is drafting all the same.
+   */
+  readonly actionClass?: ActionClass;
   /** Mirrors `RegisteredTool.ioCapability`: the tool crosses this boundary. */
   readonly io?: "process" | "network";
   /** Mirrors `RegisteredTool.requiresSandbox`: runs model-written code. */
@@ -73,6 +96,9 @@ export type BuiltinToolEntry = {
  *    the own key or registered name of a tool that names this registrar.
  *  - `chains` — the spec's `chains`, `wallets`, `contracts` and
  *    `transaction_policy` blocks, as a {@link ChainBootConfig}.
+ *  - `repositories` — the spec's `repositories` block (and `intent`), as a
+ *    {@link RepositoryBootConfig}, taken literally: no `$NAME` in it is read
+ *    from the environment.
  *
  * `binds` lists the package's other boot seams this registrar sets. The
  * guard in `apps/cli/src/boot-seams.test.ts` reads the registrar's source
@@ -81,7 +107,7 @@ export type BuiltinToolEntry = {
  */
 export type BootRegistrar = {
   readonly package: string;
-  readonly source: "tool_config" | "chains";
+  readonly source: "tool_config" | "chains" | "repositories";
   /** Words for messages: "the http tools", "code execution". */
   readonly label: string;
   /** `tool_config` only: the package-level keys, the documented one first. */
@@ -314,6 +340,11 @@ export const TOOL_BOOT_REGISTRARS: Readonly<Record<string, BootRegistrar>> = Obj
     source: "chains",
     label: "EvmSimulate and EvmSendTransaction",
     binds: ["setWalletResolver", "setTransactionPolicyResolver", "setWalletEngineResolver"],
+  },
+  bindWorkspaceRepositories: {
+    package: "@crewhaus/tool-work",
+    source: "repositories",
+    label: "the workspace tools",
   },
 });
 
@@ -2757,4 +2788,33 @@ export const BUILTIN_TOOLS: Readonly<Record<string, BuiltinToolEntry>> = Object.
     chainSymbol: "bindEvmTxChains",
     shapes: ["graph", "workflow", "crew"],
   },
+  workspaceOpen: {
+    package: "@crewhaus/tool-work",
+    export: "workspaceOpen",
+    name: "WorkspaceOpen",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "draft",
+    io: "network",
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
+  workspaceCheck: {
+    package: "@crewhaus/tool-work",
+    export: "workspaceCheck",
+    name: "WorkspaceCheck",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "draft",
+    io: "process",
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
+  workspacePublish: {
+    package: "@crewhaus/tool-work",
+    export: "workspacePublish",
+    name: "WorkspacePublish",
+    repositorySymbol: "bindWorkspaceRepositories",
+    actionClass: "publish",
+    io: "network",
+    justify: true,
+    shapes: ["cli", "workflow", "channel", "managed", "batch"],
+  },
+  // ---- scripts/wire-tool-package.ts inserts new shape-specific builtins above this line ----
 });

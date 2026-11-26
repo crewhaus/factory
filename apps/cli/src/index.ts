@@ -514,6 +514,7 @@ import {
   CATEGORIES,
   LOOP_TOOL_NAMES,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   ToolCategoryError,
   type ToolShape,
   builtinToolsFor,
@@ -3919,7 +3920,8 @@ async function applyToolConfigs(
   ir: {
     readonly tools: readonly string[];
     readonly toolConfigs: Readonly<Record<string, unknown>>;
-  } & SpecChainBlocks,
+  } & SpecChainBlocks &
+    SpecRepositoryBlocks,
 ): Promise<void> {
   try {
     await registerToolConfigs(
@@ -3928,6 +3930,7 @@ async function applyToolConfigs(
       {
         env: process.env,
         chains: ir,
+        repositories: ir,
       },
     );
   } catch (err) {
@@ -24697,6 +24700,20 @@ switch (subcommand) {
     try {
       const { runWorkCommand } = await import("./work-cmd");
       const out = await runWorkCommand(rest);
+      const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+      for (const line of out.lines) sink.write(`${line}\n`);
+      if (out.exitCode !== 0) process.exit(out.exitCode);
+    } catch (err) {
+      if (err instanceof Error) die(err.message);
+      throw err;
+    }
+    break;
+  }
+  case "workspace": {
+    // A harness's isolated checkouts (./workspace-cmd): reads only, with Home running or not.
+    try {
+      const { runWorkspaceCommand } = await import("./workspace-cmd");
+      const out = await runWorkspaceCommand(rest);
       const sink = out.exitCode === 0 ? process.stdout : process.stderr;
       for (const line of out.lines) sink.write(`${line}\n`);
       if (out.exitCode !== 0) process.exit(out.exitCode);

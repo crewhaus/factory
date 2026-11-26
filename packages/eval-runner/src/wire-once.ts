@@ -128,6 +128,7 @@ async function wireBuiltinTools(
     await registerToolConfigs([{ tools: ir.tools, toolConfigs: ir.toolConfigs }], load, {
       env: process.env,
       chains: ir,
+      repositories: ir,
     });
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new RunnerError(err.message, err);

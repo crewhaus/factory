@@ -5,7 +5,7 @@
  * yet and a Thredz task names Home's verb; every change refuses under an agent's tool;
  * `start` starts a run whose queued row names the item.
  */
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,6 +14,15 @@ import { readPage, runsLedger, writeHarnessIdentity } from "@crewhaus/control-re
 import { AREA_RUNTIMES, type ControlService, wireControl } from "@crewhaus/control-service";
 import type { ApiRunInput } from "@crewhaus/harness-supervisor";
 import { openWorkStore } from "@crewhaus/tool-work/work-items";
+// The package's own test set-up: a fake code host with a real git server half.
+import { writeBindings } from "../../../packages/tool-work/src/workspace/bindings";
+import {
+  type Bench,
+  HARNESS,
+  TOKEN_VARIABLE,
+  bench,
+  plainGit,
+} from "../../../packages/tool-work/src/workspace/test-helpers";
 import { runWorkCommand } from "./work-cmd";
 
 const HRN = "hrn_00000000000000e1";
@@ -165,6 +174,7 @@ describe("crewhaus work", () => {
       ["decline", wi, "--reason", "other"],
       ["rank", wi, "--above", mintId("wi"), "--scope", "all"],
       ["start", wi],
+      ["publish", wi],
     ]) {
       const out = await w.run(argv, { CREWHAUS_AGENT_TOOL: "Bash" });
       expect(`${argv[0]} ${out.exitCode}`).toBe(`${argv[0]} ${EXIT_FOR_ERROR.forbidden}`);
@@ -188,6 +198,65 @@ describe("crewhaus work", () => {
     expect(start.exitCode).toBe(EXIT_FOR_ERROR.unsupported);
     expect(start.lines[0]).toContain("Turn on the Work tools");
   });
+});
+
+describe("crewhaus work publish", () => {
+  const benches: Bench[] = [];
+  afterEach(async () => {
+    for (const b of benches.splice(0)) await b.stop();
+  });
+
+  /** A harness with a change in a workspace, its bindings and its own token on disk. */
+  async function delivering() {
+    const w = world("tools: [read, workList, workGet, workspaceOpen, workspacePublish]");
+    const b = await bench(w.harness);
+    benches.push(b);
+    writeBindings(w.harness, b.bindings);
+    writeFileSync(join(w.harness, ".env"), `${TOKEN_VARIABLE}=${b.token}\n`, { mode: 0o600 });
+    const engine = b.engine();
+    const wi = await b.item();
+    const opened = await engine.open(wi, { actor: HARNESS });
+    if (!opened.ok) throw new Error(opened.message);
+    b.write(opened.worktree, "src/dates.ts", "export const parse = 2;\n");
+    return { ...w, b, engine, wi };
+  }
+
+  test("publishes what a run judged, names the pull request, and says where to look", async () => {
+    const t = await delivering();
+    // A run judged the change, and the answer to its create was lost.
+    t.b.fake.interruptNextCreate("error");
+    expect(await t.b.publish(t.engine, t.wi)).toMatchObject({ state: "unknown" });
+    const out = await t.run(["publish", t.wi]);
+    expect(`${out.exitCode} ${out.lines[0]}`).toBe(`0 ${t.wi} published as pull request #1`);
+    expect(out.lines).toContain(`  see: crewhaus workspace show ${t.wi}`);
+    expect(out.lines.at(-1)).toMatch(/^ {2}receipt cmd_/);
+    const json = JSON.parse((await t.run(["publish", t.wi, "--json"])).lines.join("\n")) as {
+      receipt: { kind: string; via: string; state: string };
+      attempt: { pr: number; state: string };
+    };
+    expect(json.receipt).toMatchObject({ kind: "work.publish", via: "cli", state: "succeeded" });
+    expect(json.attempt).toMatchObject({ pr: 1, state: "done" });
+  }, 60_000); // real git children and a loopback host
+
+  test("a change no run judged is not published, and the next step is named", async () => {
+    const t = await delivering();
+    plainGit(join(t.harness, ".crewhaus/workspaces/app/wt", t.wi.slice(3, 13).toLowerCase()), [
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      "By hand",
+    ]);
+    const out = await t.run(["publish", t.wi]);
+    expect(out.exitCode).toBe(EXIT_FOR_ERROR.conflict);
+    expect(out.lines[0]).toStartWith("work publish: not published: ");
+    expect(t.b.hostWrites().filter((x) => x.path.endsWith("/pulls"))).toEqual([]);
+    const bare = await t.b.item({ title: "Nothing yet" });
+    const none = await t.run(["publish", bare]);
+    expect(none.exitCode).toBe(EXIT_FOR_ERROR.conflict);
+    expect(none.lines.join("\n")).toContain(`crewhaus work start ${bare}`);
+    expect((await t.run(["publish", "wi_nope"])).exitCode).toBe(EXIT_FOR_ERROR.invalid);
+  }, 60_000); // real git children and a loopback host
 });
 
 type WorkPage = {

@@ -5,6 +5,7 @@
  */
 export const COMPILER_FEATURE_KEYS = [
   "features.intent",
+  "features.repositories",
   "features.evaluation.protected",
   "features.provability.protected",
   "features.judge.protected",

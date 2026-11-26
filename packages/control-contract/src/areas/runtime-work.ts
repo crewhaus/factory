@@ -125,7 +125,7 @@ export const CORRECTION_SCOPES = deepFreeze(["item", "similar", "all"] as const)
 export type CorrectionScope = (typeof CORRECTION_SCOPES)[number];
 
 /** What a run delivered for an item. */
-export const WORK_DELIVERY_KINDS = deepFreeze(["report", "answer", "artifact"] as const);
+export const WORK_DELIVERY_KINDS = deepFreeze(["report", "answer", "artifact", "pr"] as const);
 
 export type WorkDeliveryKind = (typeof WORK_DELIVERY_KINDS)[number];
 

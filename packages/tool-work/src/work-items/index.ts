@@ -12,6 +12,9 @@ export {
   ACCEPT_RULE,
   HARNESS_CLOSE_OUTCOMES,
   HARNESS_SOURCE_KINDS,
+  OUTCOME_ACTOR,
+  OUTCOME_RULE,
+  PR_CLOSED_REASON,
   WORK_ACTOR_RULES,
   type WorkMove,
   mayMove,
@@ -26,6 +29,22 @@ export {
   parseAssessment,
 } from "./assessment";
 export { type WorkConfig, WorkConfigError, parseWorkConfig } from "./config";
+export {
+  type DeliveryFacts,
+  type FoldedAttempt,
+  type FoldedWorkspace,
+  type OutcomeLine,
+  type PublishLine,
+  type WorkspaceLine,
+  outcomesLedger,
+  publishLedger,
+  readAttempts,
+  readDeliveryFacts,
+  readOutcomes,
+  readWorkspaces,
+  workspacesLedger,
+} from "./delivery";
+export { type EvidenceContext, type Proposer, verifiedObservedEvidence } from "./evidence";
 export {
   FEED_SECTION_MAX,
   type ThredzTasksAnswer,
@@ -74,9 +93,14 @@ export { type WorkSeed, continuityGoalSource, workSeed } from "./seed";
 export { WORK_TOOL_KEYS, type WorkSpecFacts, workSpecFacts } from "./spec";
 export { WORK_STATUS_WORDS, type WorkStateFacts, effectiveWorkState, statusOf } from "./state";
 export {
+  APPEND_MAX_BYTES,
   type AdoptRead,
   type AdoptedText,
+  DELIVERED_MAX,
+  EDIT_RESERVE_BYTES,
+  NOTES_MAX,
   WORK_READ_CAP,
+  type WorkApply,
   type WorkAcceptPolicy,
   type WorkInput,
   type WorkItemRead,

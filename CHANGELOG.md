@@ -113,8 +113,8 @@ these on: they reach every harness that uses what each one names.
   as before, and a Thredz-backed wiki is not affected.
 
 - **The runtime-state floor also covers the staged proposals, the routing
-  freeze marker, the scope-audit baseline, the security corpus and the SLO
-  intake gate.** Beside
+  freeze marker, the scope-audit baseline, the security corpus, the SLO
+  intake gate, watchme's records and each steward workspace's git directory.** Beside
   `.crewhaus/sessions`, `.crewhaus/tool-results` and `.crewhaus/proofs`, no
   permission rule lets an agent's tool write: `.crewhaus/run` (the runfiles, logs
   and control files a daemon keeps there); the settings file
@@ -129,11 +129,16 @@ these on: they reach every harness that uses what each one names.
   `.crewhaus/routing/freeze.json`, the scope-audit baseline
   `.crewhaus/scope-audit/baseline.json`, the security corpus
   `.crewhaus/security-corpus/corpus.json` and the SLO intake gate
-  `.crewhaus/slo/intake.json`, exactly each of those files; the specs
+  `.crewhaus/slo/intake.json`, exactly each of those files; watchme's
+  records, the judgments `crewhaus watchme report` appends and the specs
   `crewhaus watchme synthesize` writes for a person to adopt,
-  `.crewhaus/watchme/synthesized`; the ratings the web UI, the gateway and the
+  `.crewhaus/watchme`; the ratings the web UI, the gateway and the
   CLI record, `.crewhaus/feedback`, and the few-shot pools
-  `crewhaus fewshot harvest` writes, `.crewhaus/fewshot`; the
+  `crewhaus fewshot harvest` writes, `.crewhaus/fewshot`; each steward
+  workspace's git directory, `.crewhaus/workspaces/<binding>/repo`, the managed
+  clone a harness that declares `repositories:` publishes from (its worktrees
+  are where the agent works, and the `.git` file in each is a `.git` name the
+  floor already keeps from a write); the
   durable-execution idempotency records,
   `.crewhaus/idempotency` and the directory `CREWHAUS_IDEMPOTENCY_STORE=file:<dir>`
   names; the continuity store's own files under `.crewhaus/state/<spec>/`,
@@ -831,8 +836,8 @@ these on: they reach every harness that uses what each one names.
   `strategy.cascade` on pipeline, crew, research, batch and browser, where no
   gate escalates to it. A Cloudflare Worker build also warns for `chains`,
   `contracts`, `wallets`, `transaction_policy` and `failure_taxonomy` on cli,
-  workflow and graph specs; for `mcp_servers` on cli and workflow; for
-  `parallel` on graph; and on cli for `continuity`, `cli`, `expose`,
+  workflow and graph specs; for `mcp_servers` and `repositories` on cli and
+  workflow; for `parallel` on graph; and on cli for `continuity`, `cli`, `expose`,
   `feedback`, `knowledge`, `learning`, `memory`, `observability` (every
   sub-block but `trace`), `plugins`, `thredz` and `watchme`. A build without
   `--emit-as cf-worker` warns for `cf_worker.public_chat` on cli, workflow and

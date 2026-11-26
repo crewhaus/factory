@@ -265,3 +265,161 @@ describe("webhooks", () => {
     );
   });
 });
+
+describe("what a publisher and a tracker need", () => {
+  const TOKEN = ["fake", "gh", "token"].join("-");
+  const authed = (fake: FakeGitHub, method: string, path: string, body?: unknown, extra = {}) =>
+    fetch(`${fake.url}${path}`, {
+      method,
+      headers: { "content-type": "application/json", authorization: `Bearer ${TOKEN}`, ...extra },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+    });
+
+  /** A repository with `main` and a branch `b`, pushed through the real git with the token. */
+  async function seeded(fake: FakeGitHub): Promise<string> {
+    const work = tempDir();
+    const remote = fake.gitUrl("acme/widgets");
+    const header = `http.${new URL(remote).origin}/.extraheader=AUTHORIZATION: basic ${Buffer.from(`x-access-token:${TOKEN}`).toString("base64")}`;
+    await git(work, "-c", header, "clone", "--quiet", remote, "one");
+    const one = join(work, "one");
+    await git(one, "checkout", "--quiet", "-b", "main");
+    writeFileSync(join(one, "a.txt"), "a\n");
+    await git(one, "add", "a.txt");
+    await git(one, "commit", "--quiet", "-m", "base");
+    await git(one, "-c", header, "push", "--quiet", "origin", "main");
+    await git(one, "checkout", "--quiet", "-b", "b");
+    writeFileSync(join(one, "b.txt"), "b\n");
+    await git(one, "add", "b.txt");
+    await git(one, "commit", "--quiet", "-m", "change");
+    await git(one, "-c", header, "push", "--quiet", "origin", "b");
+    return one;
+  }
+
+  test("with requireToken, REST and git without it are 401", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    expect((await api(fake, "GET", "/repos/acme/widgets")).status).toBe(401);
+    expect((await authed(fake, "GET", "/repos/acme/widgets")).status).toBe(200);
+    const work = tempDir();
+    await expect(git(work, "clone", "--quiet", fake.gitUrl("acme/widgets"), "x")).rejects.toThrow();
+    await seeded(fake);
+  }, 20_000); // several real git children
+
+  test("a pull's head SHA comes from the repository; a second create for its head is a 422; a PATCH lands", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    const made = await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    expect(made.status).toBe(201);
+    const pull = (await made.json()) as { number: number; head: { sha: string } };
+    expect(pull.head.sha).toBe(fake.branchSha("acme/widgets", "b") as string);
+    const again = await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    expect(again.status).toBe(422);
+    expect(await again.text()).toContain("A pull request already exists");
+    const patched = await authed(fake, "PATCH", `/repos/acme/widgets/pulls/${pull.number}`, {
+      title: "New",
+    });
+    expect(((await patched.json()) as { title: string }).title).toBe("New");
+    expect(fake.writes().map((w) => w.method)).toContain("PATCH");
+  }, 20_000); // several real git children
+
+  test("a read carries an ETag and answers 304 while nothing changed", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    const first = await authed(fake, "GET", "/repos/acme/widgets/pulls/1");
+    const etag = first.headers.get("etag") ?? "";
+    expect(etag).not.toBe("");
+    const same = await authed(fake, "GET", "/repos/acme/widgets/pulls/1", undefined, {
+      "if-none-match": etag,
+    });
+    expect(same.status).toBe(304);
+    fake.closePull("acme/widgets", 1);
+    const moved = await authed(fake, "GET", "/repos/acme/widgets/pulls/1", undefined, {
+      "if-none-match": etag,
+    });
+    expect(moved.status).toBe(200);
+  }, 20_000); // several real git children
+
+  test("merge with changes, then a revert on the base, listed by the commits route", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    const pushed = fake.branchSha("acme/widgets", "b");
+    const merged = fake.mergePull("acme/widgets", 1, { changeFirst: true });
+    expect(merged.headSha).not.toBe(pushed);
+    const view = (await (await authed(fake, "GET", "/repos/acme/widgets/pulls/1")).json()) as {
+      merged: boolean;
+      merge_commit_sha: string;
+      head: { sha: string };
+    };
+    expect(view).toMatchObject({ merged: true, merge_commit_sha: merged.mergeSha });
+    fake.commitOnBranch(
+      "acme/widgets",
+      "main",
+      `Revert\n\nThis reverts commit ${merged.mergeSha}.`,
+    );
+    const commits = (await (
+      await authed(fake, "GET", "/repos/acme/widgets/commits?sha=main")
+    ).json()) as Array<{ commit: { message: string } }>;
+    expect(commits[0]?.commit.message).toContain(`This reverts commit ${merged.mergeSha}`);
+  }, 20_000); // several real git children
+
+  test("an interrupted create lands, and its answer fails", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    fake.interruptNextCreate("error");
+    const res = await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    expect(res.status).toBe(201);
+    await expect(res.json()).rejects.toThrow();
+    const listed = (await (
+      await authed(fake, "GET", "/repos/acme/widgets/pulls?head=acme:b&state=all")
+    ).json()) as unknown[];
+    expect(listed).toHaveLength(1);
+  }, 20_000); // several real git children
+
+  test("a review moves a pull request's validator, and a rate limit is a 429 that passes", async () => {
+    const fake = start({ repos: ["acme/widgets"], requireToken: TOKEN });
+    await seeded(fake);
+    await authed(fake, "POST", "/repos/acme/widgets/pulls", {
+      title: "T",
+      head: "b",
+      base: "main",
+    });
+    const path = "/repos/acme/widgets/pulls/1";
+    const etag = (await authed(fake, "GET", path)).headers.get("etag");
+    fake.setReviews("acme/widgets", 1, [{ login: "max", state: "APPROVED" }]);
+    expect((await authed(fake, "GET", path)).headers.get("etag")).not.toBe(etag);
+    fake.closePull("acme/widgets", 1);
+    const closed = (await (await authed(fake, "GET", path)).json()) as { head: { sha?: string } };
+    expect(closed.head.sha).toBe(fake.branchSha("acme/widgets", "b"));
+    fake.rateLimitNext(1, 7);
+    const limited = await authed(fake, "GET", path);
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("retry-after")).toBe("7");
+    expect((await authed(fake, "GET", path)).status).toBe(200);
+
+    fake.refuseNext("/reviews", 503);
+    expect((await authed(fake, "GET", path)).status).toBe(200);
+    expect((await authed(fake, "GET", `${path}/reviews`)).status).toBe(503);
+    expect((await authed(fake, "GET", `${path}/reviews`)).status).toBe(200);
+  }, 20_000); // several real git children
+});

@@ -191,6 +191,37 @@ export {
   type WorkStatus,
   type WorkUpdateRequest,
 } from "./areas/runtime-work.js";
+export {
+  WORKSPACE_EVENTS,
+  WORKSPACE_LOG_KEYS,
+  WORKSPACE_STATES,
+  WORK_ACCEPTANCE_VERDICTS,
+  WORK_CHECK_VERDICTS,
+  WORK_PR_LOG_KEYS,
+  WORK_PR_REVIEWS,
+  WORK_PR_STATES,
+  WORK_PUBLISH_CODES,
+  WORK_PUBLISH_LOG_KEYS,
+  WORK_PUBLISH_REQUIREMENTS,
+  WORK_PUBLISH_STATES,
+  WORK_PUBLISH_TRANSIENT_WHYS,
+  WORK_PUBLISH_WHYS,
+  type WorkPublishWhy,
+  type WorkPrReview,
+  type WorkPrState,
+  type WorkPrView,
+  type WorkPublishAnswer,
+  type WorkPublishCode,
+  type WorkPublishState,
+  type WorkPublishVerdict,
+  type WorkPublishView,
+  type WorkspaceAnswer,
+  type WorkspaceCheckView,
+  type WorkspaceEvent,
+  type WorkspaceState,
+  type WorkspaceSummaryView,
+  type WorkspaceView,
+} from "./areas/runtime-workspace.js";
 
 export {
   AUDIENCE_BASES,
@@ -359,6 +390,7 @@ export {
   type ChangeAdoptionSubject,
   type DecisionRecordView,
   type DecisionSensitivity,
+  type RunStarter,
   type StandingRuleTerms,
   type DecisionSupersedes,
   type EffectiveDecisionState,
@@ -378,6 +410,7 @@ export {
   classAllows,
   effectiveDecisionState,
   memberMayDecide,
+  starterOf,
   verifyDecision,
 } from "./decisions.js";
 export {

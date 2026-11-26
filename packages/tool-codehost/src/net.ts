@@ -424,20 +424,26 @@ function isLoopback(ip: string): boolean {
  * `signal` is the call's deadline: a name that needs resolving is looked up
  * under it, so a resolver that never answers cannot outlive the deadline it
  * is supposed to run inside.
+ *
+ * `allowLoopback` admits a LOOPBACK address, and only that: a caller passes it
+ * for a code host the spec itself declared private (a steward workspace
+ * binding's `allow_private_target`). RFC1918, link-local, CGNAT and mDNS stay
+ * refused, and the vetted IP is pinned as for any other host.
  */
 export async function assertNotSsrf(
   hostname: string,
   signal?: AbortSignal,
   capMs: number = DNS_TIMEOUT_MS,
+  allowLoopback = false,
 ): Promise<string> {
   const lower = hostname.toLowerCase();
   const unbracketed = lower.replace(/^\[/, "").replace(/\]$/, "");
+  const loopbackAdmitted = privateHostsAllowedForTest || allowLoopback;
 
-  const refused = (ip: string): boolean =>
-    isPrivateIp(ip) && !(privateHostsAllowedForTest && isLoopback(ip));
+  const refused = (ip: string): boolean => isPrivateIp(ip) && !(loopbackAdmitted && isLoopback(ip));
 
   if (lower === "localhost" || lower.endsWith(".localhost")) {
-    if (!privateHostsAllowedForTest) {
+    if (!loopbackAdmitted) {
       throw new CodehostPermissionError(`SSRF: host "${hostname}" resolves to loopback`);
     }
   } else if (lower.endsWith(".local")) {
@@ -991,6 +997,8 @@ export type OpenOptions = {
    * without the token, as a redirect there already is.
    */
   readonly credentialOrigin?: string | undefined;
+  /** Admit a loopback host on every hop (`assertNotSsrf`'s `allowLoopback`). */
+  readonly allowLoopback?: true;
 };
 
 export type OpenResult = {
@@ -1061,7 +1069,12 @@ export async function openRequest(o: OpenOptions): Promise<OpenResult> {
     }
     // The call's own signal bounds the lookup; DNS_TIMEOUT_MS is the backstop
     // for a caller that opened no deadline at all.
-    const pinnedIp = await assertNotSsrf(current.hostname, o.signal);
+    const pinnedIp = await assertNotSsrf(
+      current.hostname,
+      o.signal,
+      DNS_TIMEOUT_MS,
+      o.allowLoopback === true,
+    );
 
     const init: RequestInit = {
       method,

@@ -106,6 +106,22 @@ export {
   workRefOf,
 } from "./work";
 export {
+  type CloseAnswer as WorkspaceCloseAnswer,
+  type SettleAnswer as WorkspaceSettleAnswer,
+  type TrackAnswer as WorkspaceTrackAnswer,
+  WORKSPACE_REVOKER,
+  type WorkspaceCommands,
+  type WorkspaceHomeDeps,
+  type WorkspacePublishPlan,
+  type WorkspacePublishValue,
+  closeFinishedWorkspaces,
+  homeWorkspaceEngine,
+  reconcilePublish,
+  settleAttempts,
+  trackHarnessOutcomes,
+  workspaceCommands,
+} from "./workspaces";
+export {
   type ActiveCeiling,
   APPLY_NOTE,
   type ApplySummary,

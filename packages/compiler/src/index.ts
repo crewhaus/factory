@@ -181,6 +181,7 @@ import { lowerBudgetPeriod } from "./lower/budget-period";
 import { lowerDelegation } from "./lower/delegation";
 import { lowerDeclaredPricing, lowerModelPrice, priceOverridesTable } from "./lower/model-price";
 import { lowerPlugins } from "./lower/plugins";
+import { lowerRepositories } from "./lower/repositories";
 import { lowerSchedule, parseDurationToMs } from "./lower/schedule";
 import { PERMISSION_RULE_NOTES } from "./permission-rules";
 import { toolConfigWidenings } from "./tool-config-widening";
@@ -1405,6 +1406,8 @@ export function checkProviderToolLimits(ir: IrNode): {
  *   is a restriction that is not in force;
  * - a tool that reads a chain, with no `chains` block, is a `tool-unwired`
  *   WARNING naming the block to write;
+ * - a workspace tool with no `repositories` block is the same warning, and a `repositories`
+ *   block with no workspace tool to read it is a `tool-config-unused` WARNING;
  * - a model_pool candidate whose block admits more than the agent-level
  *   block (the candidate's REPLACES it per call) is the informational
  *   `model-plan-tool-config-widens` notice.
@@ -1485,6 +1488,28 @@ function checkToolConfigDelivery(ir: IrNode): {
       }
     }
   }
+  const repositories = (ir as { readonly repositories?: readonly unknown[] }).repositories ?? [];
+  const workspaceTools = sites.flatMap((site) =>
+    [...new Set(site.tools)]
+      .filter((key) => BUILTIN_TOOLS[key]?.repositorySymbol !== undefined)
+      .map((key) => ({ key, path: site.path })),
+  );
+  if (repositories.length === 0) {
+    for (const { key, path } of workspaceTools) {
+      warnings.push({
+        code: "tool-unwired",
+        path,
+        message: `tool "${key}" works in a repository, and the spec declares none, so every call returns an error. Declare it — ${REPOSITORIES_BLOCK_EXAMPLE}.`,
+      });
+    }
+  } else if (workspaceTools.length === 0) {
+    warnings.push({
+      code: "tool-config-unused",
+      path: "repositories",
+      message:
+        "ignored, because no workspace tool is in tools. Add workspaceOpen, workspaceCheck and workspacePublish to tools, or remove the block.",
+    });
+  }
   return { errors, warnings };
 }
 
@@ -1525,6 +1550,9 @@ function narrowingCandidateProblems(
   }
   return out;
 }
+
+/** What a spec writes to give the workspace tools a repository. */
+const REPOSITORIES_BLOCK_EXAMPLE = "repositories: { app: { host: github, repo: owner/name } }";
 
 /** What a spec writes to give a chain tool its chain. Mirrors `@crewhaus/chain-adapter-base`. */
 const CHAINS_BLOCK_EXAMPLE =
@@ -1794,6 +1822,13 @@ const CF_WORKER_UNREAD: ReadonlyArray<CfWorkerUnread> = [
           (irField(ir, "models") as Record<string, IrModelProfile> | undefined) ?? {},
         ).some((profile) => profile.price !== undefined),
       ),
+  },
+  {
+    shapes: ["cli", "workflow"],
+    path: "repositories",
+    detail: "the worker has no checkout, so it runs no workspace tool",
+    declaredAt: (ir) =>
+      at("repositories", nonEmpty(irField(ir, "repositories") as readonly unknown[] | undefined)),
   },
 ];
 
@@ -6536,6 +6571,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec, ctx),
+        ...lowerRepositories(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
@@ -6646,6 +6682,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec, ctx),
+        ...lowerRepositories(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter
@@ -6698,6 +6735,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec, ctx),
+        ...lowerRepositories(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch B, G02) — in-loop output evaluation.
@@ -6892,6 +6930,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec, ctx),
+        ...lowerRepositories(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // Loop contract 0.4 (Batch F) — cron/interval wake trigger.
@@ -7131,6 +7170,7 @@ function lowerWithContext(spec: Spec, ctx: LowerContext): IrNode {
         compaction: lowerCompaction(spec, ctx),
         ...lowerFailureTaxonomy(spec),
         ...lowerBudget(spec, ctx),
+        ...lowerRepositories(spec),
         ...lowerLimits(spec),
         ...lowerHooks(spec),
         // v0.3.0 — carried only when declared (NOT default-on); the emitter

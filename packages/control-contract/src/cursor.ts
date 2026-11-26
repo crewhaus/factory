@@ -25,6 +25,9 @@ export const CURSOR_SOURCES = deepFreeze([
   "decisions",
   "approvals",
   "work",
+  "publish",
+  "outcomes",
+  "workspaces",
   "attention",
 ] as const);
 

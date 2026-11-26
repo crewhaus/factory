@@ -57,15 +57,16 @@ const PINNED: Readonly<Record<string, readonly [controls: number, json: number]>
   // `plugins:` on cli and channel takes a name or a `{name, tools}` entry, so it is a JSON node.
   // `cf_worker.public_chat` on cli, workflow and graph is one control.
   // `budget.period` adds its four keys on every shape with a `budget:`.
-  cli: [173, 22],
-  workflow: [40, 11],
-  channel: [184, 23],
+  // `repositories:` on cli, workflow, channel, managed and batch is a map of bindings: one JSON node.
+  cli: [173, 23],
+  workflow: [40, 12],
+  channel: [184, 24],
   graph: [41, 11],
-  managed: [160, 18],
+  managed: [160, 19],
   pipeline: [70, 7],
   crew: [87, 15],
   research: [116, 17],
-  batch: [91, 15],
+  batch: [91, 16],
   voice: [26, 6],
   browser: [85, 11],
   eval: [15, 3],

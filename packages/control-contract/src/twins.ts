@@ -84,7 +84,9 @@ export const CLI_VERBS = deepFreeze({
     "start",
     "adopt",
     "rank",
+    "publish",
   ],
+  workspace: ["list", "show"],
   budget: ["show", "history", "extend"],
 } as const);
 

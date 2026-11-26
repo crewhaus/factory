@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -147,7 +148,9 @@ describe("the sweep ages out fallback markers", () => {
     markers(800, 1);
     _setKnowledgeRetentionSeamsForTest({
       afterMarkersRead: () => {
-        rmSync(markersFile());
+        // Moved aside, not removed: a removed file's inode can be handed straight to its
+        // replacement (Linux does), and then the swap is the same file by every measure.
+        renameSync(markersFile(), `${markersFile()}.old`);
         markers(1, 800);
       },
     });

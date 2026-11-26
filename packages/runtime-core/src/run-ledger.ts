@@ -70,10 +70,12 @@ import {
   CANONICAL_RUN_ID_RE,
   EXECUTION_RUN_ID_RE,
   type RunCause,
+  type RunStarter,
   TRIGGER_KINDS,
   type Trigger,
   formatResumeScope,
   isId,
+  starterOf,
 } from "@crewhaus/control-contract";
 import {
   type Ledger,
@@ -238,6 +240,15 @@ export function parkingRunIdOf(ctx: RunContext): string {
  */
 export function continuesOf(ctx: RunContext): string | undefined {
   return openRunOf(ctx.runId)?.continues ?? ctx.continues;
+}
+
+/**
+ * Who started the run a call inside `ctx` belongs to, from the door its trigger names:
+ * the open top run's trigger, else the context's own. `undefined` when neither names a
+ * door, which is not a person.
+ */
+export function starterOfRun(ctx: RunContext): RunStarter | undefined {
+  return starterOf((openRunOf(ctx.runId)?.trigger ?? ctx.trigger)?.via);
 }
 
 /**

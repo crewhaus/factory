@@ -44,6 +44,16 @@ for a cli spec that also declares a mode and a rule, compared as JSON text so a 
 (`delegation-ceiling.test.ts`). The key reaches no emitter: the same test compiles every shape that has
 `permissions:` with and without it and holds the files equal, so it adds no digest file here.
 
+## The repositories block
+
+`repositories.present.digests.json` pins what a declared `repositories:` compiles to: the five specs in
+[`../../repositories-corpus.ts`](../../repositories-corpus.ts), one per shape that delivers work, each
+with the workspace tools, the token variable's name, two bindings out of name order and an `intent:`.
+The bundle makes one `bindWorkspaceRepositories(...)` call with the bindings sorted by name and their
+defaults resolved, and the intent is inside that call and nowhere else. It pins a feature that is
+present, so a deliberate change to how the block is emitted moves it: regenerate it in that pull request
+and add a delta note below.
+
 ## When to regenerate
 
 Only for a deliberate emitter change, and never to quiet a failure you cannot explain. A pull request
@@ -107,3 +117,7 @@ each model-wiring block; `renderModelWiringFields` appends `declaredPricing: {..
 fields only when it is present, and a workflow's shared budget meter prices with it.
 `models-price.present.digests.json` pins cli, workflow and crew. A spec that declares neither compiles
 to the same bytes, so no other digest moves.
+
+**Repositories — new pins only.** `repositories:` lowers on cli, workflow, channel, managed and batch, and a
+declared `intent:` beside it. `repositories.present.digests.json` is new. `intent:` alone compiles to the same
+bytes as before on every shape, so no other digest moves.

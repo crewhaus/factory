@@ -36,6 +36,12 @@ export type CallCtx = {
   readonly maxBytes: number;
   /** Scrubs the token out of anything on its way to the caller. */
   readonly redact: (text: string) => string;
+  /**
+   * Admit a loopback host, and only that, on every request of this call. Set
+   * only by a caller whose spec declared a private code host
+   * (`repositories.<binding>.allow_private_target`); no tool here sets it.
+   */
+  readonly allowLoopback?: true;
 };
 
 export type ApiRequestInit = {
@@ -49,6 +55,8 @@ export type ApiRequestInit = {
   readonly accept?: string;
   /** Override the ctx cap for one call, e.g. a log body. */
   readonly maxBytes?: number;
+  /** An `If-None-Match` validator: the host answers 304 when nothing changed. */
+  readonly ifNoneMatch?: string;
 };
 
 export type ApiResult = {
@@ -148,6 +156,7 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
     ...authHeaders(c.host, c.token),
   };
   if (c.host === "github") headers["X-GitHub-Api-Version"] = "2022-11-28";
+  if (init.ifNoneMatch !== undefined) headers["If-None-Match"] = init.ifNoneMatch;
 
   let body: string | undefined;
   if (init.body !== undefined) {
@@ -163,6 +172,7 @@ export async function apiRequest(c: CallCtx, init: ApiRequestInit): Promise<ApiR
     signal: c.deadline.signal,
     cfg: c.cfg,
     credentialOrigin: c.tokenOrigin,
+    ...(c.allowLoopback === true ? { allowLoopback: true as const } : {}),
   });
   const drained = await readCapped(opened.res, init.maxBytes ?? c.maxBytes, c.deadline.signal, [
     c.token,

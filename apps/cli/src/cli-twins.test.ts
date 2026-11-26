@@ -1207,4 +1207,18 @@ describe("the Work page's twins, by import", () => {
     // proposed: accept, decline, edit; open: start, cancel, edit; closed: reopen.
     expect(checked).toBe(7 + 5 + 3);
   });
+
+  test("the delivery part's twins, publishing and reading a workspace, are commands the CLI takes", async () => {
+    const url = new URL(
+      "../../../packages/hangar-ui/assets/js/views/work-delivery.js",
+      import.meta.url,
+    ).href;
+    const part = (await import(url)) as {
+      publishTwin(wi: string, hrn: string): string;
+      workspaceTwin(wi: string, hrn: string): string;
+    };
+    const wi = mintId("wi");
+    expectRunnable("Retry publishing", part.publishTwin(wi, "hrn_0123456789abcdef"));
+    expectRunnable("workspace", part.workspaceTwin(wi, "hrn_0123456789abcdef"));
+  });
 });

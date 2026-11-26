@@ -43,17 +43,23 @@ export type ToolSite = {
 
 /** One boot registration: call `initSymbol(config)` from `package`. */
 export type ToolConfigInit = {
-  /** The spec key the block was written under (`http`, `httpRequest`), or `chains`. */
+  /** The spec key the block was written under (`http`, `httpRequest`), `chains`, or `repositories`. */
   readonly key: string;
   readonly package: string;
   readonly initSymbol: string;
   readonly config: unknown;
   /**
    * Where the block sits in the spec: `tool_config.http`,
-   * `steps[1].tool_config.fetch`; empty for the chain blocks, whose paths
-   * start at the top of the spec.
+   * `steps[1].tool_config.fetch`; empty for the chain and repository blocks,
+   * whose paths start at the top of the spec.
    */
   readonly where: string;
+  /**
+   * The config is handed over exactly as written: a string that is `$NAME` is
+   * that text, never a variable's value. Set for the `repositories` block,
+   * whose `intent` is prose.
+   */
+  readonly literal?: true;
 };
 
 /** A problem with one key: where it is and what to do about it. */
@@ -85,6 +91,9 @@ function registrarForFamilyKey(key: string): string | undefined {
   }
   return undefined;
 }
+
+/** The `tool_config` key that names the code host's token variable, lower-cased. */
+const CODEHOST_KEY = "codehost";
 
 function documentedKey(initSymbol: string): string {
   return TOOL_BOOT_REGISTRARS[initSymbol]?.keys?.[0] ?? initSymbol;
@@ -203,8 +212,11 @@ export function checkToolConfigs(sites: ReadonlyArray<ToolSite>): ToolConfigChec
         });
       }
     }
+    // The workspace tools take the code host's token variable from this block.
+    const readsCodehost = site.tools.some((key) => entryOf(key)?.repositorySymbol !== undefined);
     for (const [key, value] of entries) {
       if (consumed.has(key)) continue;
+      if (readsCodehost && key.toLowerCase() === CODEHOST_KEY) continue;
       unused.push({ path: `${base}.${key}`, message: unusedMessage(key, site, value) });
     }
   }
@@ -772,7 +784,7 @@ export function renderToolConfigInit(init: ToolConfigInit): {
   readonly readsEnv: boolean;
 } {
   const json = JSON.stringify(init.config);
-  if (toolConfigEnvRefs(init.config, init.where).length === 0) {
+  if (init.literal === true || toolConfigEnvRefs(init.config, init.where).length === 0) {
     return { line: `${init.initSymbol}(${json});`, readsEnv: false };
   }
   return {
@@ -813,6 +825,7 @@ export function renderToolConfigEnvGate(
   const named = new Set<string>();
   return plan.map((init) => {
     const lines: string[] = [];
+    if (init.literal === true) return lines;
     for (const { path, name } of toolConfigEnvRefs(init.config, init.where)) {
       if (named.has(name)) continue;
       named.add(name);
@@ -918,6 +931,132 @@ export function planChainInits(
 }
 
 // ---------------------------------------------------------------------------
+// the repositories block
+// ---------------------------------------------------------------------------
+
+/** One repository binding as the IR carries it. Structural: this package does not import the IR. */
+export type RepositoryBindingConfig = {
+  readonly name: string;
+  readonly host: "github";
+  readonly repo: string;
+  readonly base: string;
+  readonly branchPrefix: string;
+  readonly checks: ReadonlyArray<ReadonlyArray<string>>;
+  readonly checkTimeoutMs: number;
+  readonly checkImage?: string;
+  readonly pullRequests: {
+    readonly draft: boolean;
+    readonly maxFiles: number;
+    readonly maxLines: number;
+    readonly revalidate: "rebase" | "refresh";
+    readonly require: ReadonlyArray<"checks" | "acceptance">;
+  };
+  readonly server: { readonly api: string; readonly git: string };
+  readonly allowPrivateTarget?: true;
+};
+
+/** The spec's `repositories` and `intent`, and the judge its `evaluation` names. */
+export type SpecRepositoryBlocks = {
+  readonly repositories?: ReadonlyArray<RepositoryBindingConfig>;
+  readonly intent?: {
+    readonly purpose: string;
+    readonly serves?: ReadonlyArray<string>;
+    readonly outcomes?: ReadonlyArray<string>;
+    readonly excludes?: ReadonlyArray<string>;
+  };
+  readonly evaluation?: {
+    readonly grader: {
+      readonly type: string;
+      readonly model?: string;
+      readonly judges?: ReadonlyArray<string>;
+      readonly params?: unknown;
+    };
+  };
+};
+
+/** What every `repositories`-sourced registrar receives. */
+export type RepositoryBootConfig = {
+  readonly repositories: ReadonlyArray<RepositoryBindingConfig>;
+  /** The NAME of the variable that holds the code host's token, never its value. */
+  readonly tokenEnv?: string;
+  /** The acceptance judge's input, and nothing else's. */
+  readonly intent?: NonNullable<SpecRepositoryBlocks["intent"]>;
+  /** The model the acceptance check judges with; its own default when absent. */
+  readonly judge?: { readonly model: string; readonly params?: unknown };
+};
+
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+
+/** The spec's own in-loop judge: its one model, else the first of its panel. */
+function judgeOf(
+  evaluation: SpecRepositoryBlocks["evaluation"],
+): RepositoryBootConfig["judge"] | undefined {
+  const grader = evaluation?.grader;
+  if (grader === undefined || grader.type !== "llm_judge") return undefined;
+  const model = grader.model ?? grader.judges?.[0];
+  if (model === undefined) return undefined;
+  return { model, ...(grader.params !== undefined ? { params: grader.params } : {}) };
+}
+
+/** `tool_config.codehost.token_env` at a site, when it is a variable's name. */
+function tokenEnvOf(site: ToolSite): string | undefined {
+  for (const [key, block] of Object.entries(site.toolConfigs ?? {})) {
+    if (key.toLowerCase() !== CODEHOST_KEY) continue;
+    if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
+    const named =
+      (block as Record<string, unknown>)["token_env"] ??
+      (block as Record<string, unknown>)["tokenEnv"];
+    if (typeof named === "string" && ENV_NAME_RE.test(named)) return named;
+  }
+  return undefined;
+}
+
+/**
+ * The `repositories`-sourced registrations the listed tools need: one, when a listed tool is
+ * a workspace tool and the spec declares `repositories`. The token variable's NAME is copied
+ * from the site's `tool_config.codehost`, whose own registrar is planned only when a codehost
+ * tool is listed; two sites that name different variables are an error, since one process
+ * holds one. The config is literal: nothing in it is read from the environment at boot.
+ */
+export function planRepositoryInits(
+  sites: ReadonlyArray<ToolSite>,
+  blocks: SpecRepositoryBlocks | undefined,
+): ReadonlyArray<ToolConfigInit> {
+  const repositories = blocks?.repositories ?? [];
+  if (repositories.length === 0) return [];
+  const out: ToolConfigInit[] = [];
+  for (const key of sites.flatMap((s) => s.tools)) {
+    const symbol = entryOf(key)?.repositorySymbol;
+    if (symbol === undefined || out.some((i) => i.initSymbol === symbol)) continue;
+    const reading = sites.filter((s) =>
+      s.tools.some((t) => entryOf(t)?.repositorySymbol === symbol),
+    );
+    const named = [...new Set(reading.map(tokenEnvOf).filter((n) => n !== undefined))];
+    if (named.length > 1) {
+      throw new BuiltinToolError(
+        `${reading.map(sitePath).join(" and ")} name different variables under codehost.token_env for ${labelOf(symbol)}. One process reads one: name the same variable in both.`,
+      );
+    }
+    const judge = judgeOf(blocks?.evaluation);
+    const config: RepositoryBootConfig = {
+      repositories: repositories.map((r) => ({ ...r })),
+      ...(named[0] !== undefined ? { tokenEnv: named[0] } : {}),
+      ...(blocks?.intent !== undefined ? { intent: blocks.intent } : {}),
+      ...(judge !== undefined ? { judge } : {}),
+    };
+    out.push({
+      key: "repositories",
+      package: TOOL_BOOT_REGISTRARS[symbol]?.package ?? "",
+      initSymbol: symbol,
+      config,
+      where: "",
+      literal: true,
+    });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // what a bundle README says about a builtin
 // ---------------------------------------------------------------------------
 
@@ -937,12 +1076,13 @@ export type ReadmeToolFact = {
  */
 export function readmeToolFacts(
   sites: ReadonlyArray<ToolSite>,
-  chains?: SpecChainBlocks,
+  blocks?: SpecChainBlocks & SpecRepositoryBlocks,
 ): (name: string) => ReadmeToolFact | undefined {
   const check = checkToolConfigs(sites);
   const bySymbol = new Map<string, string>();
   for (const init of check.inits) bySymbol.set(init.initSymbol, init.where);
-  const chainsDeclared = chainBootConfig(chains) !== undefined;
+  const chainsDeclared = chainBootConfig(blocks) !== undefined;
+  const repositoriesDeclared = (blocks?.repositories ?? []).length > 0;
   return (name) => {
     const builtin = builtinFor(name);
     if (builtin === undefined) return undefined;
@@ -954,6 +1094,11 @@ export function readmeToolFacts(
     if (where !== undefined) notes.push(`configured by \`${where}\``);
     if (entry.chainSymbol !== undefined) {
       notes.push(chainsDeclared ? "chains from the `chains` block" : "needs a `chains` block");
+    }
+    if (entry.repositorySymbol !== undefined) {
+      notes.push(
+        repositoriesDeclared ? "configured by `repositories`" : "needs a `repositories` block",
+      );
     }
     return { scope: entry.io !== undefined ? "external" : "built-in", notes };
   };
@@ -970,5 +1115,6 @@ export function toolConfigHint(key: string): string | undefined {
   const parts: string[] = [];
   if (entry.initSymbol !== undefined) parts.push(`tool_config.${documentedKey(entry.initSymbol)}`);
   if (entry.chainSymbol !== undefined) parts.push("a chains block");
+  if (entry.repositorySymbol !== undefined) parts.push("a repositories block");
   return parts.length > 0 ? parts.join(", and ") : undefined;
 }
