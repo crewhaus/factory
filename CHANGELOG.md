@@ -156,7 +156,9 @@ these on: they reach every harness that uses what each one names.
   `sh -c` and wrappers such as `env`, `exec` and `timeout`; not a word built
   when the hook runs, a here-document, a package script or a module, or what
   that script runs in turn); for `crewhaus run` or `crewhaus runs resume` of
-  a spec in another directory, that directory's `.crewhaus/run/spec`; the `approvals.jsonl`
+  a spec in another directory, that directory's `.crewhaus/run` (its spec
+  record, and the period ledger and intake state a declared `budget.period`
+  keeps there); the `approvals.jsonl`
   beside session logs that `CREWHAUS_SESSION_DIR` puts at the working directory;
   a managed run's whole tenants root; on a `channel` or `managed` run, and in
   the loops it starts, whose spec at the working directory has that target or
@@ -207,7 +209,7 @@ these on: they reach every harness that uses what each one names.
   matrices included), `crewhaus optimize` (`--from-advice` included),
   `crewhaus flywheel`, `crewhaus model-scan`, `crewhaus model right-size`,
   `crewhaus deploy canary`, `crewhaus changes check` (for the spec the change
-  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run/spec` is
+  targets) or `crewhaus serve --mcp`, that directory's `.crewhaus/run` is
   on the runtime-state floor, as it is for `crewhaus run`.
 
 - **An approval covers the work it was asked in, and is used once.** A grant
@@ -846,7 +848,9 @@ these on: they reach every harness that uses what each one names.
   saved it.** Each Recall result reads `• (<id> · <score>) <text>`, so an
   answer can name the memory it used and `crewhaus memory show <id>` opens it.
   Remember stamps `provenance.sessionId` from the run that called it, never
-  from what the model passes. If an eval grades Recall's exact output,
+  from what the model passes, and marks the fact as written by the agent
+  (`provenance.author`), so a dream pass does not count it as a conversation
+  that corroborates another. If an eval grades Recall's exact output,
   rebaseline it.
 
 - **Runs record which knowledge they used.** A tool call that returns stored
@@ -856,7 +860,10 @@ these on: they reach every harness that uses what each one names.
   the plan tail and those calls also add lines to
   `.crewhaus/run/knowledge/usage/`, one per item the first time a run uses it
   each way: the item as a keyed digest under the harness's digest key, its
-  store, version and status, no text. `CREWHAUS_RUN_STAMPS=0` turns both off.
+  store, version and status, no text. Usage lines are kept 13 months:
+  `crewhaus retention sweep` removes older segments, and
+  `knowledge.usageMaxAgeDays` in `.crewhaus/retention.json` sets another
+  window. `CREWHAUS_RUN_STAMPS=0` turns both off.
 
 - **A harness with `knowledge:` writes `.crewhaus/run/knowledge/corpus.json`
   at boot.** It lists each declared source by its label, whether it was
@@ -867,15 +874,17 @@ these on: they reach every harness that uses what each one names.
 - **A declared Thredz backend that falls back is recorded.** When `thredz:` or
   `memory.backend: thredz` is declared and no connection comes up, boot adds
   one line per part Thredz would have served (the wiki, the goal mirror,
-  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, beside the
-  warning it prints.
+  learning's records) to `.crewhaus/run/knowledge/backends.jsonl`, once per
+  boot, beside the warning it prints. `crewhaus retention sweep` keeps 13
+  months of them.
 
 - **Text the runtime re-reads from earlier work is screened as remembered
   memory.** The plan, focus and goals in the `<current_plan>` block, a
   `LESSONS.md` that `crewhaus lessons update` wrote and the per-user
   preference files are checked with the screen recalled memories pass, line
-  by line, two adjacent lines at a time and as a whole. What it withholds
-  reaches the model as a notice. The findings
+  by line, two adjacent lines at a time and as a whole, and plan steps, goals
+  and list items are also read as their text, without the markers around it.
+  What it withholds reaches the model as a notice. The findings
   the dream pass starts from are checked the same way; a withheld one is left
   out and counted. `crewhaus optimize --few-shot` checks each example's input
   and output, leaves out one the screen withholds, prints the ids it injects,
@@ -917,10 +926,20 @@ these on: they reach every harness that uses what each one names.
   a call is sent, its worst case (its request at about four characters a
   token, plus its `max_tokens`) is reserved against the run's cap: it is
   admitted while the spend so far plus the other calls in flight stays under
-  the cap, and it settles to its real cost when it answers. Sub-agents spend
-  from their parent's budget as they go, so calls made at the same time pass
-  the cap by at most one call. A call that is not admitted ends the run with
-  exit 33, as reaching the cap does, and nothing of it is logged.
+  the cap, and it settles to its real cost when it answers. A call that
+  reached no provider spends nothing, and one the provider refused outright,
+  before any reply, counts $0; any other call that fails after it was sent, or
+  whose reply ends before its final counts, counts the usage it reported, or
+  its worst case when it reported none. A call made inside a tool never waits
+  on the call running that tool. Sub-agents spend from their parent's budget
+  as they go, so calls made at the same time pass the cap by at most one call.
+  A call of the run's own that is not admitted ends the run with exit 33, as
+  reaching the cap does, and nothing of it is logged. The in-run `evaluation:`
+  judge, the route classifier, and shadow and committee calls and their judges
+  reserve against the run's cap too: a refused evaluation judge call ends the
+  run with exit 33 under `on_fail: retry`, `halt` or `escalate` (under `note`
+  the turn stands ungraded), and a refused classifier, shadow or committee
+  call falls back as it does on any other error.
 
 - **Managed tenant budgets reserve an estimate of each request instead of
   zero.** A `runs.create` or `runs.continue` request, and a queued run,
@@ -944,6 +963,21 @@ these on: they reach every harness that uses what each one names.
   `data.retryable: false` and no `Retry-After`, where it answered 500
   `internal_error`. Sending the same request again starts a new run that
   spends again, so a client that retries a 429 should check `retryable` first.
+
+- **A graph run paused for a decision says so, and is resumed once.** A pause
+  records in the run's `_meta.json` (`pendingHitl`) which checkpoint waits, and
+  a resume clears it. A pause can be resumed once, and only where the run waits:
+  a second resume answers that it was already decided, and one naming another
+  checkpoint, or a run that recorded a pause and waits nowhere now, that the run
+  is not waiting there. A resume started for one pause never settles another:
+  `crewhaus runs resume` and Home bind it to the pause they read as waiting (or
+  the one `--checkpoint` names), and the build's engine, told it in
+  `CREWHAUS_GRAPH_RESUME_CHECKPOINT`, refuses to resume the run anywhere else.
+  The decision is checked at `api` before the paused node reads it: one the
+  check refuses fails the resume, and the pause still waits. A run
+  whose resumed step fails is run again from its checkpoint with
+  `--branch-from`. It reaches a `graph` harness with `hitl:` nodes once it is
+  compiled again.
 
 ## [0.8.3] - 2026-11-15
 

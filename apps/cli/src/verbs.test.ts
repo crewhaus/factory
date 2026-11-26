@@ -260,13 +260,13 @@ describe("every flag list answers --help", () => {
         }
       }
     }
-    // harness gained `capabilities` (#514); inbox is list, show and stats; runs gained `inspect`
-    // (#518); `work` came with its eleven and then `publish` (#516); budget is show, history and
-    // extend; workspace is list and show.
+    // harness gained `capabilities` (#514); inbox is list, show, stats and the ten that act;
+    // runs gained `inspect` (#518); `work` came with its eleven and then `publish` (#516); budget
+    // is show, history and extend; workspace is list and show.
     expect(asked).toBe(
-      2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 3 + 1 + 1 + 12 + 6 + 12 + 3 + 2),
+      2 * (13 + 1 + 7 + 2 + 5 + 8 + 10 + 10 + 13 + 13 + 1 + 1 + 12 + 6 + 12 + 3 + 2),
     );
-  }, 30_000); // seventeen modules' imports and two hundred and eighteen calls; slow on a loaded runner
+  }, 30_000); // seventeen modules' imports and 238 calls; slow on a loaded runner
 });
 
 describe("family parsers take their flags from CLI_FAMILY", () => {
@@ -484,8 +484,8 @@ describe("legacy sub-verbs match the dispatch", () => {
     expect(wiki?.[1]?.split(", ")).toEqual(subKeys("wiki"));
     const state = INDEX.match(/state action must be one of ([a-z, ]+) \(got/);
     expect(state?.[1]?.split(", ")).toEqual(subKeys("state"));
-    expect(INDEX).toContain('knowledge action must be "sync"');
-    expect(subKeys("knowledge")).toEqual(["sync"]);
+    const knowledge = INDEX.match(/knowledge action must be one of: ([a-z, ]+) \(got/);
+    expect(knowledge?.[1]?.split(", ")).toEqual(subKeys("knowledge"));
     expect(INDEX).toContain(
       'dreamFirst === "run" || dreamFirst === "status" || dreamFirst === "init"',
     );

@@ -53,13 +53,14 @@ describe("the fleet grammar", () => {
   });
 
   test("a query is decoded into route.query, and an unknown key is kept, not thrown on", () => {
-    for (const type of ["approvals", "review", "advice"]) {
-      expect(parseRoute(`#/home/needs-you?type=${type}`)).toEqual(
-        fleet("home", "needs-you", { type }),
-      );
-    }
-    expect(parseRoute("#/home/needs-you?type=review&zz=1&flag")).toEqual(
-      fleet("home", "needs-you", { type: "review", zz: "1", flag: "" }),
+    expect(parseRoute("#/home/needs-you?type=advice")).toEqual(
+      fleet("home", "needs-you", { type: "advice" }),
+    );
+    expect(parseRoute("#/home/needs-you?kind=permission")).toEqual(
+      fleet("home", "needs-you", { kind: "permission" }),
+    );
+    expect(parseRoute("#/home/needs-you?kind=review&zz=1&flag")).toEqual(
+      fleet("home", "needs-you", { kind: "review", zz: "1", flag: "" }),
     );
     expect(parseRoute("#/harnesses?by=group%20name")).toEqual(
       fleet("harnesses", null, { by: "group name" }),
@@ -170,7 +171,7 @@ describe("the href builders", () => {
 
   test("a fleet page, with its query", () => {
     expect(hrefFleet("home")).toBe("#/");
-    expect(hrefFleet("home", "needs-you", { type: "review" })).toBe("#/home/needs-you?type=review");
+    expect(hrefFleet("home", "needs-you", { kind: "review" })).toBe("#/home/needs-you?kind=review");
     expect(hrefFleet("settings", "readability")).toBe("#/settings/readability");
     expect(hrefFleet("connections")).toBe("#/connections");
   });
@@ -181,7 +182,7 @@ describe("ROUTE_TEMPLATES", () => {
     const fleetTemplates = ROUTE_TEMPLATES.filter((t) => !t.startsWith("#/h/"));
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
     // The device sign-in page is a fleet address of its own.
-    expect(fleetTemplates.length).toBe(21);
+    expect(fleetTemplates.length).toBe(19);
     // Setup › Delegations is the twenty-eighth; Work › Work items and an item's page follow.
     expect(harnessTemplates.length).toBe(30);
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/setup/delegations");
@@ -229,7 +230,7 @@ describe("ROUTE_TEMPLATES", () => {
     expect(routeFor("#/h/:id/work/runs/:run", { id: "a b", run: "r/1" })).toBe(
       "#/h/a%20b/work/runs/r%2F1",
     );
-    expect(routeFor("#/home/needs-you?type=review")).toBe("#/home/needs-you?type=review");
+    expect(routeFor("#/home/needs-you?type=advice")).toBe("#/home/needs-you?type=advice");
     expect(() => routeFor("#/h/:id/knowledge/wiki/:slug", { id: ID })).toThrow("needs slug");
   });
 });
@@ -237,7 +238,7 @@ describe("ROUTE_TEMPLATES", () => {
 describe("pageTitle", () => {
   test("a fleet page is named by its own title", () => {
     expect(pageTitle(parseRoute("#/"))).toBe("Home — Hangar");
-    expect(pageTitle(parseRoute("#/home/needs-you?type=review"))).toBe("Needs you — Hangar");
+    expect(pageTitle(parseRoute("#/home/needs-you?kind=review"))).toBe("Needs you — Hangar");
     expect(pageTitle(parseRoute("#/harnesses/health"))).toBe("Health — Hangar");
     expect(pageTitle(parseRoute("#/settings/home"))).toBe("Home settings — Hangar");
     expect(pageTitle(parseRoute("#/connections"))).toBe("Connections — Hangar");

@@ -6,9 +6,12 @@
   },
   "references": [
     { "path": "../audit-log" },
+    { "path": "../control-contract" },
+    { "path": "../control-records" },
     { "path": "../errors" },
     { "path": "../ir" },
-    { "path": "../spec-registry" }
+    { "path": "../spec-registry" },
+    { "path": "../tool-safety" }
   ],
   "include": ["src/**/*"]
 }

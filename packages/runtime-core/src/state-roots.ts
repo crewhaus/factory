@@ -571,10 +571,11 @@ function addSpellings(into: Set<string>, root: string, cwd: string): void {
  *   is given; not a word built when the hook runs, a package script or a
  *   module, or what that script runs in turn). Exact files: a neighbour such as
  *   `prep.sh.bak` is not one, and a path that is a directory names nothing.
- * - The spec record of a spec in another directory: `<spec dir>/.crewhaus/run/spec`
- *   when `more.specDir` (a run's `specDir` option, else {@link runSpecDirScope}'s
- *   value) is set and its real path is not the working directory's. In the
- *   spec's own directory the record is already under `.crewhaus/run`.
+ * - The run directory of a spec in another directory: `<spec dir>/.crewhaus/run`,
+ *   all of it (the spec's record, and a declared period's ledger and intake
+ *   state), when `more.specDir` (a run's `specDir` option, else
+ *   {@link runSpecDirScope}'s value) is set and its real path is not the working
+ *   directory's. In the spec's own directory it is already `.crewhaus/run`.
  * - Project memory and skills, on a run in {@link credentialFloorScope} (a
  *   `channel` or `managed` run, and the loops it starts) whose spec at the working
  *   directory has a target {@link MEMORY_FLOOR_TARGETS} names, or whose target
@@ -658,7 +659,7 @@ export function runtimeStateRoots(
     // The files the run's hooks name directly. A hook that names the working
     // directory names nothing (a directory), and one that holds it is left to the rules.
     { roots: hookTargetFiles(cwd, more.hookCommands ?? []), holdingCwd: "skip" },
-    // The spec record of a spec kept in another directory.
+    // The run directory (spec record, period ledger) of a spec kept in another directory.
     { roots: specRecordRoots(specDir, cwd), holdingCwd: "skip" },
     // Project memory and skills on a channel or managed run, which an operator edits.
     { roots: memoryFloorRoots(cwd), holdingCwd: "skip" },
@@ -835,10 +836,15 @@ function memoryFloorRoots(cwd: string): string[] {
  */
 export const runSpecDirScope = new AsyncLocalStorage<string>();
 
-/** `<real spec dir>/.crewhaus/run/spec`, unless the spec's directory is the working directory. */
+/**
+ * `<real spec dir>/.crewhaus/run`, all of it, unless the spec's directory is the
+ * working directory: the spec's record, and the period ledger and intake state a
+ * declared `budget.period` keeps there (`crewhaus run` roots its ledger at the
+ * spec's directory wherever it is started).
+ */
 function specRecordRoots(specDir: string | undefined, cwd: string): string[] {
   if (specDir === undefined || specDir === "") return [];
   const real = followed(resolve(cwd, specDir)) ?? resolve(cwd, specDir);
   const realCwd = followed(resolve(cwd)) ?? resolve(cwd);
-  return real === realCwd ? [] : [join(real, ".crewhaus", "run", "spec")];
+  return real === realCwd ? [] : [join(real, ".crewhaus", "run")];
 }

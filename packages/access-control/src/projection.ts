@@ -114,7 +114,11 @@ function standingRole(
   return grant?.role ?? null;
 }
 
-/** The highest class a principal may decide at on a harness, or `null`. */
+/**
+ * The highest class a principal may decide at on a harness, or `null`.
+ *
+ * First consumers: the approver projection, and the inbox before it gives a member an item.
+ */
 export function decideClassOf(
   snapshot: AccessSnapshot,
   principal: string,

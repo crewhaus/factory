@@ -42,7 +42,12 @@ export function isSingleFile(records: RecordsAt): records is { readonly file: st
   return "file" in records;
 }
 
-/** A segment's path relative to the root. A single file is always segment 0. */
+/**
+ * A segment's path relative to the root. A single file is always segment 0.
+ *
+ * First consumers: this package, then the knowledge index's usage fold and the retention
+ * sweep over usage segments.
+ */
 export function segmentRel(records: RecordsAt, seg: number): string {
   return isSingleFile(records) ? records.file : join(records.dir, segmentName(seg));
 }
@@ -102,7 +107,12 @@ export type RetainedSegments = {
   readonly watermark: number;
 };
 
-/** The segments a reader may use. Anything below the watermark is evicted, unlinked or not. */
+/**
+ * The segments a reader may use. Anything below the watermark is evicted, unlinked or not.
+ *
+ * First consumers: this package, then the knowledge index's usage fold and the retention
+ * sweep over usage segments.
+ */
 export function retainedSegments(source: RecordSource): RetainedSegments | SafeFsFailure {
   const mark = readWatermark(source);
   if (!mark.ok) return mark;

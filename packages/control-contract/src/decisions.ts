@@ -7,6 +7,7 @@
  * Bad input never throws. It answers the safe way: a time that cannot be read
  * counts as passed, and a check that cannot be made refuses.
  */
+import type { DeployQuorumSubject } from "./areas/attention.js";
 import { OPERATOR_SUPERSEDE_REASONS, VERIFY_REASONS } from "./areas/core.js";
 import type { DelegableDecisionKind, DelegationSubject } from "./areas/delegation.js";
 import { MODULES, type ModuleField } from "./areas/index.js";
@@ -237,6 +238,7 @@ export type DecisionRecordView = {
     | "input"
     | "standing-rule-proposal"
     | "change-adoption"
+    | "deploy-quorum"
     | DelegableDecisionKind;
   /** The decider as a stored actor: `prn_`, `local:#<digest>` or `sys:`. */
   readonly decidedByPrincipal?: string;
@@ -271,10 +273,11 @@ export type DecisionRecordView = {
   /** The tool approval a proposal was made from. */
   readonly derivedFrom?: string;
   /**
-   * What the decision is bound to: a change and the digests its check saw, or (a merge
-   * or a rollout) the subject's ref and revision.
+   * What the decision is bound to: a change and the digests its check saw, (a merge or a
+   * rollout) the subject's ref and revision, or (a protected environment's quorum) one
+   * version of one spec for that environment.
    */
-  readonly subject?: ChangeAdoptionSubject | DelegationSubject;
+  readonly subject?: ChangeAdoptionSubject | DelegationSubject | DeployQuorumSubject;
 };
 
 /** A change-adoption decision's subject: content-free ids, keyed digests and a revision. */

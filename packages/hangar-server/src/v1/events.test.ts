@@ -462,7 +462,7 @@ describe("a supervisor execution's stream", () => {
 });
 
 describe("a harness's stream", () => {
-  test("one frame per line, from all five core sources in one vector beside the work records', from now", async () => {
+  test("one frame per line, from all five core sources in one vector beside the work records' and the inbox's, from now", async () => {
     const h = await home.harness("harness-stream");
     row(h.dir, mintRunId(), "running"); // before the stream: not sent
     const feed = await open(`/api/v1/harnesses/${h.id}/events`);
@@ -506,6 +506,7 @@ describe("a harness's stream", () => {
       last.ok && last.cursor.kind === "vector" && Object.keys(last.cursor.sources).sort(),
     ).toEqual([
       "approvals",
+      "attention",
       "commands",
       "decisions",
       "deployments",

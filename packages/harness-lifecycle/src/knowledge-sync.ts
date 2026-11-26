@@ -125,12 +125,17 @@ export type SharedMemory = {
   readonly origin?: SharedOrigin;
 };
 
-/** A harness withdrawing a memory it shared: its fact was corrected or expired. */
+/** Why a shared memory was withdrawn. `erased`: it was a person's data, and its text is gone. */
+export type RetractionReason = "superseded" | "expired" | "erased";
+
+const RETRACTION_REASONS: readonly unknown[] = ["superseded", "expired", "erased"];
+
+/** A harness withdrawing a memory it shared: its fact was corrected, expired or erased. */
 export type Retraction = {
   readonly contentHash: string;
   readonly harness: string;
   readonly at: string;
-  readonly reason: "superseded" | "expired";
+  readonly reason: RetractionReason;
 };
 
 /** A fact in a harness that is not live: the push retracts its shared copy. */
@@ -606,8 +611,8 @@ export function validateRetraction(
     return { ok: false, reason: "harness not a string" };
   }
   if (typeof r["at"] !== "string") return { ok: false, reason: "at not a string" };
-  if (r["reason"] !== "superseded" && r["reason"] !== "expired") {
-    return { ok: false, reason: "reason is not superseded | expired" };
+  if (!RETRACTION_REASONS.includes(r["reason"])) {
+    return { ok: false, reason: "reason is not superseded | expired | erased" };
   }
   return {
     ok: true,
@@ -615,7 +620,7 @@ export function validateRetraction(
       contentHash: r["contentHash"],
       harness: r["harness"],
       at: r["at"],
-      reason: r["reason"],
+      reason: r["reason"] as RetractionReason,
     },
   };
 }

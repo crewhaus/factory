@@ -307,6 +307,7 @@
     { "path": "./packages/control-contract" },
     { "path": "./packages/control-records" },
     { "path": "./packages/control-service" },
+    { "path": "./packages/knowledge-index" },
     { "path": "./packages/people" },
     { "path": "./packages/people-service" },
     { "path": "./packages/quality-service" },

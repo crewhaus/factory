@@ -15,7 +15,7 @@ import {
   localActorOf,
   localPrincipalOf,
 } from "@crewhaus/access-control";
-import { readApproverProjection, storedLocalActor } from "@crewhaus/control-records";
+import { readApproverProjection, readDigestKey, storedLocalActor } from "@crewhaus/control-records";
 
 /** This process's OS user, as access-control names a local actor. */
 export function currentLocalIdentity(): LocalIdentity {
@@ -81,4 +81,25 @@ export async function storedActorFor(
     // An access tree or projection that cannot be read is the same as none: the digest stands in.
   }
   return storedLocalActor(key, localActorOf(identity));
+}
+
+/**
+ * The stored actor {@link storedActorFor} answers for this identity on a harness, as a
+ * reader finds it: under the key the harness already has, and none made. `undefined` where
+ * no member is linked and there is no key yet, or it cannot be read.
+ *
+ * First consumer: `crewhaus inbox`, which shows a person what they hid from themselves.
+ */
+export async function readStoredActor(
+  hangarRoot: string,
+  harnessDir: string,
+  identity: LocalIdentity,
+): Promise<string | undefined> {
+  const key = await readDigestKey(harnessDir);
+  if (key.state === "present") return storedActorFor(hangarRoot, harnessDir, identity, key.hmac);
+  try {
+    return linkedPrincipal(hangarRoot, harnessDir, identity);
+  } catch {
+    return undefined;
+  }
 }

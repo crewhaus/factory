@@ -3,14 +3,26 @@
  * calls that spend at the same time.
  *
  * Every model call in a budgeted run reserves its worst case before it is
- * dispatched, settles on its response and releases on failure. A call is
- * admitted while, in every scope it spends from (the run, each enclosing
- * sub-agent share, the harness's budget period), the spend so far plus the
- * OTHER active reservations stays under that scope's cap; equality refuses.
- * A call's own estimate is not added, so a run that makes one call at a time
- * decides exactly as a cap check on spend so far does. A sub-agent spends
- * from its parent's meter as it goes (`child()`), so its reservations count
- * against every ancestor's cap at once.
+ * dispatched and settles on its response. A call that reached no provider
+ * spends nothing (`release`); a call the provider refused outright, before
+ * any event, counts $0; any other call that failed counts the usage it
+ * reported, or its reserved worst case when it reported none
+ * (`settleUnreported`, {@link failedCallSpend}). A stream that ends without
+ * its final counts (an abort ends some streams silently) is counted at its
+ * worst case too. A call is admitted while, in every scope it spends
+ * from (the run, each enclosing sub-agent share, the harness's budget
+ * period), the spend so far plus the OTHER active reservations stays under
+ * that scope's cap; equality refuses. A call's own estimate is not added, so
+ * a run that makes one call at a time decides exactly as a cap check on spend
+ * so far does. A sub-agent spends from its parent's meter as it goes
+ * (`child()`), so its reservations count against every ancestor's cap at once.
+ *
+ * A call made inside a tool never waits on the call running that tool: that
+ * call settles only after the tool returns. A nested loop reserves through a
+ * view (`within(id)`) that names the enclosing call's reservation as an
+ * ancestor. An ancestor's reservation still counts against the cap, but it is
+ * never waited for: when spend so far plus the ancestors' reservations reach a
+ * cap, the answer is final (`on: "spent"`, `inFlight: true`).
  *
  * Unknown cost is never $0: an estimate of `undefined` (the model has no
  * price) reserves nothing and always admits, and a settle nothing can price
@@ -58,6 +70,12 @@ export type SpendAdmission =
       readonly on: "spent";
       readonly scope?: SpendScope;
       readonly held?: true;
+      /**
+       * The cap is reached only counting the reservation of a call still in
+       * progress that this call runs inside (an ancestor): it settles only
+       * after this call returns, so waiting could not end.
+       */
+      readonly inFlight?: true;
     }
   /**
    * Only other calls' reservations stand in the way: `settled` resolves when
@@ -79,11 +97,14 @@ export type SpendLedgerPort = {
   /**
    * Reserve `usdMicros` against the period under the same admission rule as
    * the meter's own scopes, with the period's cap plus its top-ups.
+   * `ancestors` names reservations of calls this one runs inside: they count,
+   * but are never waited for (the answer is `on: "spent"`, `inFlight: true`).
    */
   reserve(entry: {
     readonly id: string;
     readonly usdMicros: number;
     readonly meta?: SpendReserveMeta;
+    readonly ancestors?: readonly string[];
   }): Promise<SpendAdmission>;
   /** The call's real cost; `null` when nothing could price it. */
   settle(entry: {
@@ -103,6 +124,13 @@ export type SpendSnapshot = {
   readonly activeReservations: number;
   /** Settles nothing could price, in this scope and below. */
   readonly unknownCalls: number;
+  /**
+   * The part of `spentMicros` counted at a reserved worst case
+   * (`settleUnreported`): calls that failed after they were sent and reported
+   * no usage. Their real cost is not known, so a report never prints it as
+   * money spent.
+   */
+  readonly assumedMicros: number;
 };
 
 /** What a settle found the call cost. */
@@ -120,10 +148,26 @@ export type SpendMeter = {
   ): Promise<SpendAdmission>;
   /** The call answered: price `usage` with the meter's table and record the spend. */
   settle(id: string, usage: SpendUsage, meta?: SpendReserveMeta): Promise<SpendSettled>;
-  /** The call failed: drop its reservation, spending nothing. */
+  /** The call was never sent: drop its reservation, spending nothing. */
   release(id: string): Promise<void>;
+  /**
+   * The call was sent and reported no usage: count what it reserved as spent
+   * in every scope and on the period. A call that reserved nothing (an
+   * unpriced model) counts one unknown call and settles the period with
+   * `null`.
+   */
+  settleUnreported(id: string, meta?: SpendReserveMeta): Promise<SpendSettled>;
   /** A meter for a sub-agent, spending from this one live, with its own share cap. */
   child(opts?: { readonly capMicros?: number }): SpendMeter;
+  /**
+   * A view on the same scopes, ledger and pricing whose reservations treat
+   * `ancestor` (the reservation of the call a nested loop runs inside) as an
+   * ancestor: it counts against the caps but is never waited for. The id is
+   * fixed when the view is made. Views chain: a view's `within()` adds to the
+   * ancestors it has, and its `child()` keeps them. An id reserved through a
+   * view settles or releases through the view or its base alike.
+   */
+  within(ancestor: string | undefined): SpendMeter;
   snapshot(): SpendSnapshot;
   /** The table this meter prices with. */
   readonly pricing: PricingTable;
@@ -151,6 +195,8 @@ type Scope = {
   readonly capMicros: number | undefined;
   spent: number;
   unknownCalls: number;
+  /** The part of `spent` counted at a reserved worst case. */
+  assumed: number;
   readonly active: Map<string, Reservation>;
 };
 
@@ -160,11 +206,28 @@ function scopeChain(scope: Scope): Scope[] {
   return chain;
 }
 
-function othersIn(scope: Scope, id: string): number {
-  let sum = 0;
-  for (const [rid, r] of scope.active) if (rid !== id) sum += r.micros;
-  return sum;
+/** The scope's active reservations other than `id`, split into ancestors and the rest. */
+function standingIn(
+  scope: Scope,
+  id: string,
+  ancestors: ReadonlySet<string>,
+): { anc: number; others: number; waitOn: Promise<void>[] } {
+  let anc = 0;
+  let others = 0;
+  const waitOn: Promise<void>[] = [];
+  for (const [rid, r] of scope.active) {
+    if (rid === id) continue;
+    if (ancestors.has(rid)) {
+      anc += r.micros;
+    } else {
+      others += r.micros;
+      waitOn.push(r.done);
+    }
+  }
+  return { anc, others, waitOn };
 }
+
+const NO_ANCESTORS: ReadonlySet<string> = new Set();
 
 /** Create the meter for one run tree. */
 export function createSpendMeter(opts: CreateSpendMeterOptions): SpendMeter {
@@ -173,19 +236,21 @@ export function createSpendMeter(opts: CreateSpendMeterOptions): SpendMeter {
     capMicros: opts.capMicros,
     spent: Math.max(0, opts.seedMicros ?? 0),
     unknownCalls: 0,
+    assumed: 0,
     active: new Map(),
   };
-  return meterFor(root, opts.ledger, opts.pricing);
+  return meterFor(root, opts.ledger, opts.pricing, NO_ANCESTORS, new Set());
 }
 
 function meterFor(
   scope: Scope,
   ledger: SpendLedgerPort | undefined,
   pricing: PricingTable,
+  ancestors: ReadonlySet<string>,
+  /** Ids the run tree reserved on the ledger, so settle and release know to write. */
+  onLedger: Set<string>,
 ): SpendMeter {
   const chain = scopeChain(scope);
-  /** Ids this meter reserved on the ledger, so settle and release know to write. */
-  const onLedger = new Set<string>();
 
   const drop = (id: string): void => {
     const held = scope.active.get(id);
@@ -198,11 +263,17 @@ function meterFor(
     let others: Promise<void>[] | undefined;
     for (const s of chain) {
       if (s.capMicros === undefined) continue;
+      const scopeName: SpendScope = s.parent === undefined ? "run" : "share";
       if (s.spent >= s.capMicros) {
-        return { admit: false, on: "spent", scope: s.parent === undefined ? "run" : "share" };
+        return { admit: false, on: "spent", scope: scopeName };
       }
-      if (s.spent + othersIn(s, id) >= s.capMicros) {
-        others = [...(others ?? []), ...[...s.active.values()].map((r) => r.done)];
+      const standing = standingIn(s, id, ancestors);
+      // An ancestor settles only after this call returns: never wait on it.
+      if (s.spent + standing.anc >= s.capMicros) {
+        return { admit: false, on: "spent", scope: scopeName, inFlight: true };
+      }
+      if (s.spent + standing.anc + standing.others >= s.capMicros) {
+        others = [...(others ?? []), ...standing.waitOn];
       }
     }
     if (others !== undefined) {
@@ -228,10 +299,12 @@ function meterFor(
       if (ledger === undefined) return { admit: true };
       let answer: SpendAdmission;
       try {
+        const onPeriod = [...ancestors].filter((a) => a !== id && onLedger.has(a));
         answer = await ledger.reserve({
           id,
           usdMicros: held.micros,
           ...(meta !== undefined ? { meta } : {}),
+          ...(onPeriod.length > 0 ? { ancestors: onPeriod } : {}),
         });
       } catch (err) {
         drop(id);
@@ -245,6 +318,7 @@ function meterFor(
           on: "spent",
           scope: "period",
           ...(answer.held === true ? { held: true as const } : {}),
+          ...(answer.inFlight === true ? { inFlight: true as const } : {}),
         };
       }
       onLedger.add(id);
@@ -281,6 +355,28 @@ function meterFor(
       drop(id);
       if (ledger !== undefined && onLedger.delete(id)) await ledger.release(id);
     },
+    async settleUnreported(id, meta) {
+      const held = scope.active.get(id);
+      drop(id);
+      const micros = held?.micros;
+      for (const s of chain) {
+        if (micros === undefined) {
+          s.unknownCalls += 1;
+        } else {
+          s.spent += micros;
+          s.assumed += micros;
+        }
+      }
+      if (ledger !== undefined) {
+        onLedger.delete(id);
+        await ledger.settle({
+          id,
+          usdMicros: micros ?? null,
+          ...(meta !== undefined ? { meta } : {}),
+        });
+      }
+      return { usdMicros: micros };
+    },
     child(childOpts = {}) {
       return meterFor(
         {
@@ -288,11 +384,20 @@ function meterFor(
           capMicros: childOpts.capMicros,
           spent: 0,
           unknownCalls: 0,
+          assumed: 0,
           active: new Map(),
         },
         ledger,
         pricing,
+        ancestors,
+        onLedger,
       );
+    },
+    within(ancestor) {
+      if (ancestor === undefined || ancestors.has(ancestor)) {
+        return meterFor(scope, ledger, pricing, ancestors, onLedger);
+      }
+      return meterFor(scope, ledger, pricing, new Set([...ancestors, ancestor]), onLedger);
     },
     snapshot() {
       let reserved = 0;
@@ -303,6 +408,7 @@ function meterFor(
         reservedMicros: reserved,
         activeReservations: scope.active.size,
         unknownCalls: scope.unknownCalls,
+        assumedMicros: scope.assumed,
       };
     },
   };
@@ -349,4 +455,121 @@ export function actualCallMicros(
   const row = resolvePricing(pricing, provider, modelId);
   if (!row) return undefined;
   return computeCostMicros(row, usage.input, usage.output, usage.cacheRead ?? 0);
+}
+
+/** A call's stream as {@link notingUsage} saw it. */
+export type StreamReport = {
+  /** Set once any event arrived: the provider answered the request. */
+  started?: true;
+  /** Set once the stream reported its final counts. */
+  usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+    readonly cacheCreate?: number;
+  };
+};
+
+/** The slice of a provider stream event {@link notingUsage} reads. */
+export type UsageStreamEvent = {
+  readonly kind: string;
+  readonly usage?: {
+    readonly input: number;
+    readonly output: number;
+    readonly cacheRead?: number;
+    readonly cacheCreate?: number;
+  };
+  readonly stopReason?: string;
+};
+
+/**
+ * `stream`, unchanged, noting on `report` that an event arrived and the usage
+ * it reported once the counts are final: a closing `message_delta` (one with
+ * a stop reason), or the `message_stop` after a delta that carried counts.
+ * The counts merge as the stream's consumers merge them. A stream that ends
+ * before that, or that counted nothing, leaves `report.usage` undefined: its
+ * cost is not known. A stream an abort ends silently is such a stream.
+ */
+export async function* notingUsage<E extends UsageStreamEvent>(
+  stream: AsyncIterable<E>,
+  report: StreamReport,
+): AsyncGenerator<E> {
+  let seen: NonNullable<StreamReport["usage"]> = { input: 0, output: 0 };
+  let counted = false;
+  for await (const ev of stream) {
+    report.started = true;
+    if (ev.kind === "message_start" && ev.usage !== undefined) seen = ev.usage;
+    if (ev.kind === "message_delta" && ev.usage !== undefined) {
+      const { input, output, cacheRead, cacheCreate } = ev.usage;
+      seen = {
+        ...seen,
+        ...(input > 0 ? { input } : {}),
+        ...(output > 0 ? { output } : {}),
+        ...(cacheRead !== undefined ? { cacheRead } : {}),
+        ...(cacheCreate !== undefined ? { cacheCreate } : {}),
+      };
+      counted = output > 0 || input > 0;
+    }
+    const closing =
+      ev.kind === "message_stop" || (ev.kind === "message_delta" && ev.stopReason !== undefined);
+    if (closing && counted) report.usage = seen;
+    yield ev;
+  }
+}
+
+/**
+ * What a call that threw before it reported its usage is counted as:
+ *
+ * - `"release"`: the request reached no provider (nothing arrived, and the
+ *   error is a refused connection, a failed name lookup or TLS handshake, a
+ *   missing credential, an open circuit breaker, or a failover chain with no
+ *   candidate left). It spends nothing.
+ * - `"zero"`: nothing arrived and the provider refused the request outright
+ *   with an HTTP status that does no billed work (400, 401, 403, 404, 413,
+ *   429, 529). The attempt is counted at $0, so it still has its line.
+ * - `"worst"`: anything else (an event arrived, a timeout, a reset
+ *   connection, a server error): its cost is not known, so it is counted at
+ *   its reserved worst case.
+ */
+export function failedCallSpend(err: unknown, started: boolean): "release" | "zero" | "worst" {
+  if (started) return "worst";
+  // The error and its causes, outermost first (an SDK or adapter error wraps the transport's).
+  const chain: { name?: unknown; code?: unknown; status?: unknown; cause?: unknown }[] = [];
+  for (let e: unknown = err; e !== null && typeof e === "object" && chain.length < 8; ) {
+    const o = e as { name?: unknown; code?: unknown; status?: unknown; cause?: unknown };
+    if (chain.includes(o)) break;
+    chain.push(o);
+    e = o.cause;
+  }
+  // An HTTP status anywhere in the chain: the provider answered the request.
+  const status = chain.find((o) => typeof o.status === "number")?.status as number | undefined;
+  if (status !== undefined) return REJECTED_STATUS.has(status) ? "zero" : "worst";
+  for (const o of chain) {
+    if (typeof o.name === "string" && UNSENT_NAMES.has(o.name)) return "release";
+    if (typeof o.code === "string" && isUnsentCode(o.code)) return "release";
+  }
+  return "worst";
+}
+
+const REJECTED_STATUS: ReadonlySet<number> = new Set([400, 401, 403, 404, 413, 429, 529]);
+/** Error names that mean the request was never handed to a provider. */
+const UNSENT_NAMES: ReadonlySet<string> = new Set([
+  "ProviderAuthError",
+  "CircuitBreakerOpenError",
+  "FailoverExhaustedError",
+]);
+/** Connection, name-lookup and TLS-handshake failures (Node and Bun spellings). */
+const UNSENT_CODES: ReadonlySet<string> = new Set([
+  "ECONNREFUSED",
+  "ConnectionRefused",
+  "FailedToOpenSocket",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EAI_NONAME",
+  "EAI_FAIL",
+  "DNSException",
+]);
+
+function isUnsentCode(code: string): boolean {
+  return UNSENT_CODES.has(code) || /CERT|SSL|TLS/.test(code);
 }

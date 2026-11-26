@@ -9,6 +9,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import type { ProviderAdapter, ProviderRequest, StreamEvent } from "@crewhaus/adapter-anthropic";
+import { DEFAULT_PRICING } from "@crewhaus/cost-tracker";
+import { createSpendMeter } from "@crewhaus/cost-tracker/spend";
 import type { IrModelPool } from "@crewhaus/ir";
 import { type TraceEvent, TraceEventBus } from "@crewhaus/trace-event-bus";
 import { CLASSIFIER_WIRING_KEYS, MODEL_WIRING_KEYS, wireModels } from "./index";
@@ -100,6 +102,50 @@ describe("wireModels — routeClassifier (§7.2.3)", () => {
     expect(req?.toolChoice).toEqual({ type: "tool", name: "submit_route_label" });
     expect(seen.map((e) => e.kind)).toEqual(["model_request", "model_response"]);
     for (const e of seen) expect((e as { role?: string }).role).toBe("classifier");
+  });
+
+  test("a budgeted run's label call settles on the run's spend meter, and a used-up one sends nothing", async () => {
+    const call = (capMicros: number) => {
+      const adapter = labelAdapter("strong");
+      const spend = createSpendMeter({ capMicros, pricing: DEFAULT_PRICING });
+      const wired = wireModels({ modelPool: CLASSIFIED_POOL }, { _classifierAdapter: adapter });
+      const verdict = wired.routeClassifier?.({
+        userText: "hi",
+        labels: ["cheap", "strong"],
+        bus: new TraceEventBus({ runId: "run_z", sessionId: "sess_z" }),
+        signal: new AbortController().signal,
+        spend,
+      });
+      return { adapter, spend, verdict };
+    };
+    const ok = call(1_000_000);
+    expect(await ok.verdict).toMatchObject({ label: "strong", costUsdMicros: 50 });
+    // 30 in at $1/M and 4 out at $5/M.
+    expect(ok.spend.snapshot()).toMatchObject({ spentMicros: 50, activeReservations: 0 });
+    const none = call(0);
+    await expect(none.verdict).rejects.toThrow("the run's budget is used up");
+    expect(none.adapter.requests).toHaveLength(0);
+  });
+
+  test("a label call waiting for room stops when the turn's signal aborts, and sends nothing", async () => {
+    const adapter = labelAdapter("strong");
+    const spend = createSpendMeter({ capMicros: 1_000_000, pricing: DEFAULT_PRICING });
+    // Another call holds the whole cap and never settles.
+    await spend.reserve("other", 1_000_000);
+    const stop = new AbortController();
+    stop.abort();
+    const wired = wireModels({ modelPool: CLASSIFIED_POOL }, { _classifierAdapter: adapter });
+    await expect(
+      wired.routeClassifier?.({
+        userText: "hi",
+        labels: ["cheap", "strong"],
+        bus: new TraceEventBus({ runId: "run_z", sessionId: "sess_z" }),
+        signal: stop.signal,
+        spend,
+      }) as Promise<unknown>,
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(adapter.requests).toHaveLength(0);
+    expect(spend.snapshot().activeReservations).toBe(1);
   });
 
   test("an undeclared label propagates as a throw (the loop falls back to heuristic)", async () => {

@@ -14,12 +14,19 @@ import type { PreflightItem } from "./types";
 
 export type PortStatus = {
   readonly port: number;
-  readonly free: boolean;
+  /** `undefined`: it was not checked, which is neither free nor taken. */
+  readonly free: boolean | undefined;
   /** OS detail when not free (e.g. the error code). */
   readonly detail?: string;
 };
 
 export type PortChecker = (port: number) => Promise<PortStatus>;
+
+/**
+ * A checker that binds nothing and says so: for a background read, which must not take a
+ * port a daemon may be about to bind.
+ */
+export const PORTS_NOT_CHECKED: PortChecker = async (port) => ({ port, free: undefined });
 
 /**
  * True-up whether `port` is currently bindable on `host` (default
@@ -48,7 +55,8 @@ export type PortRequest = { readonly port: number; readonly source: string };
 
 /**
  * The ports area of the report: one item per requested port — blocking
- * when taken (the daemon's bind will fail), info when free. `check` is
+ * when taken (the daemon's bind will fail), info when free or when the
+ * checker did not look. `check` is
  * injectable for tests and for managers that consult their own port
  * ledger instead of the OS.
  */
@@ -63,12 +71,15 @@ export async function portItems(
     seen.add(port);
     const status = await check(port);
     items.push(
-      status.free
+      status.free !== false
         ? {
             id: `ports.${port}`,
             area: "ports",
             level: "info",
-            message: `port ${port} (${source}) is free`,
+            message:
+              status.free === true
+                ? `port ${port} (${source}) is free`
+                : `port ${port} (${source}) was not checked`,
           }
         : {
             id: `ports.${port}`,

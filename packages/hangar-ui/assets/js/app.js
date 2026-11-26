@@ -15,7 +15,7 @@
 
 import { ApiError, onUnauthorized } from "./api.js";
 import { clear, el } from "./dom.js";
-import { bindingSheet, globalKey, inboxKindOf, initialKeyState, keyShape } from "./keys.js";
+import { bindingSheet, globalKey, inboxOn, initialKeyState, keyShape } from "./keys.js";
 import { createNavigator } from "./navigation.js";
 import { notifications } from "./notify.js";
 import { openOmnibox } from "./omnibox.js";
@@ -96,7 +96,7 @@ function dispatch(route) {
   // The screens that bind `?` for their own inbox sheet. Tracked here rather
   // than sniffed from the DOM so the ownership rule stays a pure input to the
   // `keys.js` reducer.
-  keyState = { ...keyState, inboxMounted: inboxKindOf(route) };
+  keyState = { ...keyState, inboxMounted: inboxOn(route) };
   viewStale = false;
   return navigator.navigate(route).then((outcome) => {
     if (outcome === "done") {

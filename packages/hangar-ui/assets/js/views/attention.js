@@ -3,31 +3,60 @@
  * harnesses you can see, read from Home's inbox (`attention.list`). Three
  * labelled bands, Decide, Fix and Consider, newest first within each; a card
  * per item says what it is, why now, which harness, since when, the deadline
- * only when there is a real one, who may decide, and the command that shows it
- * (`crewhaus inbox show <id>`), and each choice with its own command or why
- * there is none. Acting stays on the screens the filters open (Approvals,
- * Review, Advice) and on the harness page that fixes a problem: each card
- * links there.
+ * only when there is a real one, who may decide, who has it, and each choice
+ * as a button with what choosing it does and its exact command, or why there
+ * is none. A problem also links the page that fixes it.
+ *
+ * Acting is done here (`./attention-acts.js`). A verdict opens one confirm
+ * step; afterwards the list is read again, focus is on the next card, and
+ * what happened is said politely with how many are left. `?kind=` shows one
+ * kind; "Show settled" adds what was already settled, so a problem set aside
+ * can be taken up again.
  *
  * Reading never moves anything under you: the list is fetched again now and
  * then, and new items wait behind "Show N new", which keeps what was open and
- * moves focus to the first new card. `j`/`k` (and the arrows) move
- * between cards only while focus is inside the list, and the letters follow
- * the "Single-key shortcuts" setting. `?item=<id>` moves focus to that card,
- * or says it is no longer open.
+ * moves focus to the first new card. `j`/`k` (and the arrows) move between
+ * cards only while focus is inside the list, and a letter (`g`, `d`, `p`,
+ * `f`, `u`) opens a verdict's confirm step there; the letters follow the
+ * "Single-key shortcuts" setting. `?item=<id>` moves focus to that card, or
+ * says it is no longer open.
  *
  * The decisions are pure functions this package tests without a browser; the
  * DOM is built with `createElement` and `textContent` only.
  */
 
-import { clear, el } from "../dom.js";
+import { clear, el, skeleton } from "../dom.js";
+import { actionBar } from "../inspect/actions.js";
 import { readPrefs } from "../prefs.js";
-import { hrefFleet, hrefHarness } from "../router.js";
+import { hrefFleet, hrefHarness, hrefInspect } from "../router.js";
 import { emptyFor } from "../ui/empty.js";
 import { rovingList } from "../ui/listbox.js";
 import { announce } from "../ui/live.js";
+import { toggleBtn } from "../ui/toggle.js";
 import { parseTs } from "../util.js";
 import { call } from "../v1.js";
+import {
+  afterWords,
+  asksFirst,
+  choiceLabel,
+  choiceModels,
+  classWord,
+  confirmChoice,
+  discussion,
+  doneWords,
+  harnessesOf,
+  isStale,
+  itemIdOf,
+  oneHarness,
+  problemText,
+  reachOf,
+  runSideAct,
+  sendChoice,
+  sideActs,
+  verdictOf,
+} from "./attention-acts.js";
+
+export { classWord, itemIdOf };
 
 /** The bands, in the order they are shown. */
 export const BANDS = Object.freeze([
@@ -40,6 +69,9 @@ const s = (n) => (Number(n) === 1 ? "" : "s");
 const MINUTE_MS = 60_000;
 const HOUR_MS = 3_600_000;
 const word = (value, fallback) => (typeof value === "string" && value !== "" ? value : fallback);
+/** A spec and its version, as far as they are named. */
+const version = (p, fallback) =>
+  [p.spec, p.version].filter((v) => typeof v === "string" && v !== "").join(" ") || fallback;
 
 /**
  * Every closed text id an item may carry → its sentence. A param is an id, a
@@ -54,7 +86,18 @@ export const ATTENTION_TEXT = Object.freeze({
   "delegation-proposal.pending": (p) =>
     `Letting it ${word(p.delegationAction, "act")} on its own is proposed`,
   "quality-adoption.pending": () => "A change is ready to adopt",
-  "decision.pending": (p) => `A ${word(p.decisionKind, "pending")} decision is waiting`,
+  "decision.pending": (p) => {
+    const kind = word(p.decisionKind, "other");
+    return kind === "other" ? "A decision is waiting" : `A ${kind} decision is waiting`;
+  },
+  "checkpoint.waiting": (p) =>
+    typeof p.node === "string" && p.node !== ""
+      ? `A graph run is paused before ${p.node}`
+      : "A graph run is paused for a decision",
+  "deploy-approval.pending": (p) =>
+    `Approve ${version(p, "a version")} for ${word(p.environment, "an environment")}`,
+  "deploy-approval.ready": (p) =>
+    `${version(p, "A version")} is approved for ${word(p.environment, "an environment")}`,
   "credential.failing": (p) =>
     `Runs can't sign in to ${word(p.provider, "the model provider")} (${word(p.envName, "its key")})`,
   "provider-limit.hit": (p) => `${word(p.provider, "The model provider")} is limiting requests`,
@@ -94,10 +137,16 @@ export const ATTENTION_TEXT = Object.freeze({
   "why.runs-failed": (p) => `${p.runs ?? "Some"} run${s(p.runs)} failed this way.`,
   "why.review-open": () => "An answer was set aside for a person to check.",
   "why.decision-open": () => "It waits until someone decides.",
+  "why.graph-paused": () => "The run goes no further until someone decides.",
+  "why.deploy-blocked": () => "The environment is protected: it takes approvals.",
+  "why.deploy-approved": () => "It has its approvals and is not there yet.",
   "why.advisor-critical": () => "The harness can't do its job until this is fixed.",
   "why.advisor-warn": () => "The harness is at risk.",
   "why.advisor-suggestion": () => "It would run better.",
   "recommend.refused-before": () => "Refused before: the same request was refused recently.",
+  "budget.raise-spec": () => "Raise the limit in the spec",
+  "budget.raise-period": () => "Raise this period's limit",
+  "note.deadline-unchanged": () => "Its own deadline is unchanged.",
   "if-unanswered.continue-independent": () => "If no one answers, it carries on with other work.",
   "if-unanswered.defer": () => "If no one answers, it is put off.",
   "if-unanswered.pause-lane": () => "If no one answers, this line of work pauses.",
@@ -115,13 +164,6 @@ export function textOf(text) {
   const params = text?.params && typeof text.params === "object" ? text.params : {};
   const build = Object.hasOwn(ATTENTION_TEXT, id) ? ATTENTION_TEXT[id] : null;
   return build === null ? UNKNOWN_TEXT : build(params);
-}
-
-/** Who may decide, as words. Pure. */
-export function classWord(requiredClass) {
-  if (requiredClass === "owner") return "Owner only";
-  if (requiredClass === "maintainer") return "Needs a maintainer";
-  return "Needs an operator";
 }
 
 /**
@@ -192,22 +234,9 @@ export function asksLine(item, nowMs) {
   return refused === null ? asked : `${asked} Refused ${refused.label} ago.`;
 }
 
-/** The `att_` id of a ref. Pure. */
-export function itemIdOf(ref) {
-  const text = String(ref ?? "");
-  return text.slice(text.lastIndexOf("/") + 1);
-}
-
 /** The command that shows an item in full. Pure. */
 export function showTwin(ref) {
   return `crewhaus inbox show ${itemIdOf(ref)}`;
-}
-
-/** The one harness an item is about, or `null` for a group across several. Pure. */
-function oneHarness(item) {
-  if (typeof item?.harness === "string" && item.harness !== "") return item.harness;
-  const list = Array.isArray(item?.harnesses) ? item.harnesses : [];
-  return list.length === 1 && typeof list[0] === "string" ? list[0] : null;
 }
 
 /** Where a problem is fixed: the harness page that changes what broke. Pure. */
@@ -248,70 +277,94 @@ function fixOn(item) {
   return null;
 }
 
-/** Where an item is acted on today, or `null` when nowhere yet. Pure. */
-export function actOn(item) {
-  const kind = item?.kind;
-  if (kind === "permission" || kind === "question") {
-    return {
-      label: "Decide in Approvals",
-      href: hrefFleet("home", "needs-you", { type: "approvals" }),
-    };
-  }
-  if (kind === "review") {
-    return { label: "Review in Review", href: hrefFleet("home", "needs-you", { type: "review" }) };
-  }
-  if (item?.title?.template === "delegation-proposal.pending" && typeof item.harness === "string") {
-    const action = item.title.params?.delegationAction;
-    if (typeof action === "string" && action !== "" && action !== "unknown") {
-      return {
-        label: "See what it would allow",
-        href: hrefHarness(item.harness, "setup", "delegations", "new", action, item.source?.id),
-      };
-    }
+/** The page beside the choices: where a problem is fixed or a question was asked. Pure. */
+export function placeOf(item) {
+  if (item?.kind === "question") {
+    // A question is answered, not allowed or refused: the run that asked it says where.
+    const harness = oneHarness(item);
+    const run = Array.isArray(item?.affected?.runs) ? item.affected.runs[0] : undefined;
+    return harness === null || typeof run !== "string"
+      ? null
+      : { label: "See the run that asked", href: hrefInspect(`${harness}/run/${run}`) };
   }
   if (item?.source?.kind === "advisor") {
-    return { label: "Open in Advice", href: hrefFleet("home", "needs-you", { type: "advice" }) };
+    // A finding that opens a place says so on its own button: one control, one place.
+    const opens = Array.isArray(item?.choices) && item.choices.some((c) => c?.id === "open");
+    return opens
+      ? null
+      : { label: "Open in Advice", href: hrefFleet("home", "needs-you", { type: "advice" }) };
   }
   return fixOn(item);
 }
 
-/** A choice's name, as words. */
-const CHOICE_WORDS = Object.freeze({
-  grant: "Grant",
-  deny: "Deny",
-  resolve: "Resolve",
-  review: "Preview",
-  adopt: "Adopt",
+/**
+ * A member's name, from an answer's `people`, else "Someone else": a raw id is technical
+ * detail, never what a person reads. Pure.
+ */
+export function personOf(people, id) {
+  const hit = Array.isArray(people) ? people.find((p) => p?.id === id) : undefined;
+  return typeof hit?.name === "string" && hit.name !== "" ? hit.name : "Someone else";
+}
+
+/** Who has an item and until when it is out of the way. Pure. */
+export function standingLines(item, ctx = {}) {
+  const nowMs = typeof ctx.nowMs === "number" ? ctx.nowMs : Date.now();
+  const back = (at) => {
+    const span = spanOf(at, nowMs);
+    return span === null ? "later" : span.ahead ? `in ${span.label}` : "now";
+  };
+  const out = [];
+  if (typeof item?.assignee === "string") {
+    out.push(
+      item.assignee === ctx.meId ? "With you." : `With ${personOf(ctx.people, item.assignee)}.`,
+    );
+  }
+  if (item?.deferral) {
+    out.push(
+      item.deferral.deadlineMoved
+        ? `Put off. It is due again ${back(item.deferral.until)}.`
+        : `Put off. It comes back ${back(item.deferral.until)}.`,
+    );
+    if (!item.deferral.deadlineMoved && item.source?.kind === "decision") {
+      out.push(ATTENTION_TEXT["note.deadline-unchanged"]());
+    }
+  }
+  if (typeof item?.snoozedUntil === "string") {
+    out.push(`Hidden from you. It comes back ${back(item.snoozedUntil)}.`);
+  }
+  if (item?.previously) out.push("It was set aside before, and happened again.");
+  return out;
+}
+
+const HOW_WORDS = Object.freeze({
+  decided: "Decided",
+  cleared: "Cleared by itself",
+  dismissed: "Set aside",
+  acted: "Acknowledged",
+  answered: "Answered",
+  fallback: "Settled when its time ran out",
 });
 
-/** Each choice with its exact command, or why there is none. Pure. */
-export function choiceLines(item) {
-  const list = Array.isArray(item?.choices) ? item.choices : [];
-  return list
-    .filter((c) => c && typeof c.id === "string")
-    .map((c) => ({
-      label: Object.hasOwn(CHOICE_WORDS, c.id) ? CHOICE_WORDS[c.id] : c.id,
-      twin: typeof c.cliTwin === "string" && c.cliTwin !== "" ? c.cliTwin : null,
-      reason:
-        typeof c.cliTwin === "string" && c.cliTwin !== ""
-          ? null
-          : typeof c.nullReason === "string" && c.nullReason !== ""
-            ? c.nullReason
-            : "There is no command for this.",
-    }));
+/** How a settled item was settled, or `null` for one that still waits. Pure. */
+export function settledLine(item, nowMs) {
+  const state = item?.state;
+  if (state === "open" || state === "assigned" || state === "deferred") return null;
+  if (state === "expired") return "It expired.";
+  if (state === "superseded") return "A newer one replaced it.";
+  const how = item?.resolution?.how;
+  const label = Object.hasOwn(HOW_WORDS, how) ? HOW_WORDS[how] : "Settled";
+  const span = spanOf(item?.resolution?.at, nowMs);
+  return span === null ? `${label}.` : `${label} ${span.label} ago.`;
 }
 
 /** Everything a card says, in the order it says it. Pure. */
 export function cardModel(item, ctx = {}) {
   const nowMs = typeof ctx.nowMs === "number" ? ctx.nowMs : Date.now();
   const names = ctx.names ?? [];
-  const harnessIds = Array.isArray(item?.harnesses)
-    ? item.harnesses
-    : typeof item?.harness === "string"
-      ? [item.harness]
-      : [];
+  const harnessIds = harnessesOf(item);
   const decide = item?.band === "decide";
   const recommendation = item?.recommendation;
+  const settled = settledLine(item, nowMs);
   return {
     id: itemIdOf(item?.ref),
     ref: String(item?.ref ?? ""),
@@ -319,21 +372,79 @@ export function cardModel(item, ctx = {}) {
     whyNow: textOf(item?.whyNow),
     harnesses: harnessIds.map((id) => nameOf(names, id)),
     since: sinceLine(item, nowMs),
-    deadline: decide ? deadlineLine(item, nowMs) : null,
+    settled,
+    standing: standingLines(item, { nowMs, meId: ctx.me?.id, people: ctx.people }),
+    deadline: decide && settled === null ? deadlineLine(item, nowMs) : null,
     ifUnanswered: item?.ifUnanswered ? textOf({ template: item.ifUnanswered.template }) : null,
     who: decide ? classWord(item?.requiredClass) : null,
     cause: causeLine(item),
     asks: asksLine(item, nowMs),
     recommendation:
       recommendation && typeof recommendation === "object"
-        ? `Suggested: ${recommendation.choiceId}. ${textOf(recommendation.reason)}`
+        ? `Suggested: ${choiceLabel(item?.kind, recommendation.choiceId)}. ${textOf(recommendation.reason)}`
         : null,
     twin: showTwin(item?.ref),
-    act: actOn(item),
-    choices: choiceLines(item),
+    place: placeOf(item),
+    choices: choiceModels(item, ctx.you),
+    side: sideActs(item, ctx.you),
     hasBody: item !== null && typeof item === "object" && "body" in item,
     bodyWithheld: item?.bodyWithheld === true,
   };
+}
+
+/** Every kind of item, with its name in the kind filter. */
+export const KIND_WORDS = Object.freeze({
+  permission: "Permissions",
+  question: "Questions",
+  review: "Reviews",
+  "standing-rule-proposal": "Standing permissions",
+  "quality-adoption": "Changes to adopt",
+  decision: "Other decisions",
+  checkpoint: "Paused graph runs",
+  "deploy-approval": "Deployment approvals",
+  credential: "Sign-in problems",
+  "provider-limit": "Provider limits",
+  budget: "Budget",
+  spec: "Spec problems",
+  "run-failures": "Failed runs",
+  security: "Security",
+  "quality-regression": "Quality drops",
+  setup: "Setup",
+});
+
+/** The old `?type=` addresses, as the kind each became. */
+const KIND_OF_TYPE = Object.freeze({ approvals: "permission", review: "review" });
+
+/** The kind a route shows, or `null` for all of them. Pure. */
+export function kindFilter(route) {
+  const { kind, type } = route?.query ?? {};
+  if (typeof kind === "string" && Object.hasOwn(KIND_WORDS, kind)) return kind;
+  return typeof type === "string" && Object.hasOwn(KIND_OF_TYPE, type) ? KIND_OF_TYPE[type] : null;
+}
+
+/** The kind filter's links: All, then each kind the list holds, with its count. Pure. */
+export function kindLinks(items, current) {
+  const counts = new Map();
+  for (const item of Array.isArray(items) ? items : []) {
+    if (Object.hasOwn(KIND_WORDS, item?.kind)) {
+      counts.set(item.kind, (counts.get(item.kind) ?? 0) + 1);
+    }
+  }
+  // The one being shown stays, so it can be left even when it holds nothing.
+  if (current !== null && !counts.has(current)) counts.set(current, 0);
+  const total = Array.isArray(items) ? items.length : 0;
+  const link = (kind, label, n) => ({
+    kind,
+    label: `${label} (${n})`,
+    href: hrefFleet("home", "needs-you", kind === null ? null : { kind }),
+    current: kind === current,
+  });
+  return [
+    link(null, "All", total),
+    ...Object.keys(KIND_WORDS)
+      .filter((kind) => counts.has(kind))
+      .map((kind) => link(kind, KIND_WORDS[kind], counts.get(kind))),
+  ];
 }
 
 /** The bands with their items, in order; a band with none is left out. Pure. */
@@ -415,9 +526,58 @@ function line(cls, text) {
   return text === null || text === undefined ? null : el("div", { class: cls, text });
 }
 
-function drawCard(item, names, nowMs) {
-  const m = cardModel(item, { names, nowMs });
+/** One choice: its button or link, what it does, and its command or why there is none. */
+function drawChoice(item, model, card, ctx) {
+  const effectId = `${card.id}-${model.id}`;
+  const described = `${card.titleId} ${effectId}`;
+  const control =
+    model.does === "open" && model.why === null
+      ? el("a", {
+          class: "btn",
+          href: model.href,
+          text: model.label,
+          "aria-describedby": described,
+        })
+      : el("button", {
+          class: model.does === "open" ? "btn" : "btn attention-verdict",
+          type: "button",
+          disabled: model.why !== null,
+          "data-choice": model.id,
+          text: model.label,
+          "aria-describedby": described,
+          onClick: (event) => ctx.choose(item, model, event.currentTarget),
+        });
+  return el("li", null, [
+    control,
+    el("span", { class: "attention-effect", id: effectId, text: model.why ?? model.effect }),
+    model.twin === null
+      ? el("span", { class: "muted", text: model.reason })
+      : el("code", { text: model.twin }),
+  ]);
+}
+
+/** One act beside the choices, with why the reader may not take it. */
+function drawSide(item, side, card, ctx) {
+  const whyId = `${card.id}-${side.id}-why`;
+  return el("span", { class: "attention-side" }, [
+    el("button", {
+      class: "btn btn-ghost",
+      type: "button",
+      disabled: side.why !== null,
+      "data-act": side.id,
+      text: side.label,
+      "aria-describedby": side.why === null ? card.titleId : `${card.titleId} ${whyId}`,
+      onClick: (event) => ctx.side(item, side.id, event.currentTarget),
+    }),
+    side.why === null ? null : el("span", { class: "muted", id: whyId, text: side.why }),
+  ]);
+}
+
+function drawCard(item, ctx) {
+  const m = cardModel(item, ctx);
   const titleId = `att-${m.id}`;
+  const card = { id: m.id, titleId };
+  const reach = reachOf(ctx.you, item);
   return el(
     "li",
     {
@@ -434,6 +594,8 @@ function drawCard(item, names, nowMs) {
         m.since,
         m.who === null ? "" : ` · ${m.who}`,
       ]),
+      line("attention-settled", m.settled),
+      ...m.standing.map((text) => line("attention-standing", text)),
       line("attention-deadline", m.deadline),
       line("muted attention-fallback", m.ifUnanswered),
       line("attention-cause", m.cause),
@@ -450,21 +612,34 @@ function drawCard(item, names, nowMs) {
               "What it sent is hidden: you can't read this harness's content.",
             )
           : null,
-      el("div", { class: "inbox-actions" }, [
-        m.act === null ? null : el("a", { class: "btn", href: m.act.href, text: m.act.label }),
-      ]),
       m.choices.length === 0
         ? null
         : el(
             "ul",
             { class: "attention-choices", "aria-label": "Choices" },
-            m.choices.map((c) =>
-              el("li", null, [
-                el("span", { class: "muted", text: `${c.label}: ` }),
-                c.twin === null ? el("span", { text: c.reason }) : el("code", { text: c.twin }),
-              ]),
-            ),
+            m.choices.map((model) => drawChoice(item, model, card, ctx)),
           ),
+      el("div", { class: "inbox-actions" }, [
+        m.place === null
+          ? null
+          : el("a", { class: "btn", href: m.place.href, text: m.place.label }),
+        ...m.side.map((side) => drawSide(item, side, card, ctx)),
+        actionBar({
+          ref: m.ref,
+          label: m.title,
+          operation: { id: "attention.get", params: { ref: m.ref } },
+        }),
+      ]),
+      discussion(item, {
+        harnesses: reach.harnesses,
+        content: reach.content,
+        mayAct: reach.act,
+        meId: ctx.me?.id,
+        ago: (at) => {
+          const span = spanOf(at, Date.now());
+          return span === null ? "" : `${span.label} ago`;
+        },
+      }),
       el("div", { class: "inbox-twins" }, [
         el("span", { class: "muted", text: "Show it in a terminal: " }),
         el("code", { text: m.twin }),
@@ -474,10 +649,11 @@ function drawCard(item, names, nowMs) {
 }
 
 /** The bands and their cards; `j`/`k` move between cards while focus is inside. */
-function drawList(list, nowMs) {
+function drawList(items, ctx) {
   // The list sits in the labelled section that holds it; each band is a region of its own.
   const region = el("div", { class: "attention" });
-  for (const band of bandsOf(list.items)) {
+  const byRef = new Map(items.map((item) => [String(item.ref), item]));
+  for (const band of bandsOf(items)) {
     const bandHeading = `attention-band-${band.id}`;
     region.appendChild(
       el("section", { class: "attention-band", "aria-labelledby": bandHeading }, [
@@ -485,7 +661,7 @@ function drawList(list, nowMs) {
         el(
           "ul",
           { class: "inbox attention-list", "aria-label": band.label },
-          band.items.map((item) => drawCard(item, list.names, nowMs)),
+          band.items.map((item) => drawCard(item, ctx)),
         ),
       ]),
     );
@@ -495,9 +671,21 @@ function drawList(list, nowMs) {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const target = event.target;
       if (target instanceof Element && target.closest("input, textarea, select, summary")) return;
-      const move = moveOf(event.key, readPrefs().singleKeys !== false);
+      const singleKeys = readPrefs().singleKeys !== false;
+      const rows = roving.rows();
+      const item = byRef.get(rows[index]?.getAttribute("data-ref") ?? "");
+      const verdict =
+        item === undefined || event.repeat
+          ? null
+          : verdictOf(event.key, choiceModels(item, ctx.you), singleKeys);
+      if (verdict !== null) {
+        event.preventDefault();
+        ctx.choose(item, verdict, rows[index]);
+        return;
+      }
+      const move = moveOf(event.key, singleKeys);
       if (move === null) return;
-      const count = roving.rows().length;
+      const count = rows.length;
       if (count === 0) return;
       event.preventDefault();
       const at = index < 0 ? 0 : index;
@@ -528,25 +716,56 @@ function focusItem(drawn, itemId, status) {
   drawn.roving.focus(index);
 }
 
-/** The cards whose "What the harness sent" is open, by ref. */
-function openBodyRefs(host) {
-  return [...host.querySelectorAll(".attention-card details[open]")]
-    .map((details) => details.closest("[data-ref]")?.getAttribute("data-ref"))
-    .filter((ref) => typeof ref === "string");
+/** The disclosures a card keeps open across a redraw, each known by its own class. */
+const KEPT_DISCLOSURES = ["attention-body", "attention-thread"];
+
+/**
+ * What a reader left on each card, by ref: which of its disclosures are open, and what they
+ * typed in its discussion and have not sent. Read before a redraw replaces the cards.
+ */
+export function cardMemory(root) {
+  const memory = new Map();
+  for (const card of root?.querySelectorAll?.(".attention-card") ?? []) {
+    const ref = card.getAttribute("data-ref");
+    if (typeof ref !== "string") continue;
+    const open = KEPT_DISCLOSURES.filter(
+      (name) => card.querySelector(`details.${name}`)?.open === true,
+    );
+    const draft = card.querySelector(".attention-discuss textarea")?.value ?? "";
+    if (open.length > 0 || draft !== "") memory.set(ref, { open, draft });
+  }
+  return memory;
+}
+
+/** Put back what {@link cardMemory} kept, on the cards that are still there. */
+export function restoreCards(rows, memory) {
+  if (!(memory instanceof Map) || memory.size === 0) return;
+  for (const row of rows) {
+    const kept = memory.get(row.getAttribute("data-ref"));
+    if (kept === undefined) continue;
+    for (const name of kept.open) {
+      const details = row.querySelector(`details.${name}`);
+      if (details !== null && details !== undefined) details.open = true;
+    }
+    const text = row.querySelector(".attention-discuss textarea");
+    if (kept.draft !== "" && text !== null && text !== undefined) text.value = kept.draft;
+  }
+}
+
+/** Focus the list's own heading: where there is no card to go to. */
+function focusHeading(host) {
+  const heading = host.closest("section")?.querySelector("h2, h3") ?? host.querySelector("h3");
+  if (heading === null || heading === undefined) return;
+  if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
+  heading.focus();
 }
 
 /**
- * After "Show N new": what was open stays open, focus moves to the first new card (or
- * the list's heading when none is left), and the count is said.
+ * After "Show N new": focus moves to the first new card (or the list's heading when none
+ * is left), and the count is said. What was open and typed was put back by the redraw.
  */
 function restoreAfterNew(host, drawn, restore) {
   const rows = drawn.roving.rows();
-  const open = new Set(restore.openRefs ?? []);
-  for (const row of rows) {
-    if (!open.has(row.getAttribute("data-ref"))) continue;
-    const details = row.querySelector("details");
-    if (details !== null) details.open = true;
-  }
   const refs = rows.map((row) => row.getAttribute("data-ref"));
   const index = firstNewIndex(restore.shownRefs, refs);
   const added = refs.filter((ref) => !new Set(restore.shownRefs ?? []).has(ref)).length;
@@ -554,69 +773,239 @@ function restoreAfterNew(host, drawn, restore) {
     drawn.roving.setCurrent(index);
     drawn.roving.focus(index);
   } else {
-    const heading = host.closest("section")?.querySelector("h2, h3") ?? host.querySelector("h3");
-    if (heading !== null && heading !== undefined) {
-      if (!heading.hasAttribute("tabindex")) heading.setAttribute("tabindex", "-1");
-      heading.focus();
-    }
+    focusHeading(host);
   }
   announce(added > 0 ? `Showing ${added} new` : "The list is up to date.");
 }
 
+/**
+ * The card focus goes to once one was acted on: the one that took its place, the next one
+ * when it is still there, the last one when it was last; -1 with none left. Pure.
+ */
+export function nextIndex(refs, acted) {
+  const list = Array.isArray(refs) ? refs : [];
+  if (list.length === 0) return -1;
+  const at = Math.min(Math.max(Number(acted?.index) || 0, 0), list.length - 1);
+  return list[at] === acted?.ref ? Math.min(at + 1, list.length - 1) : at;
+}
+
+/** After an act: focus on the next card, and what happened said with what is left. */
+function restoreAfterAct(host, drawn, acted, left) {
+  const refs = drawn.roving.rows().map((row) => row.getAttribute("data-ref"));
+  const index = nextIndex(refs, acted);
+  if (index >= 0) {
+    drawn.roving.setCurrent(index);
+    drawn.roving.focus(index);
+  } else focusHeading(host);
+  announce(afterWords(acted.words, left));
+}
+
+/** The reader, as Home knows them: who they are and what they may do somewhere. */
+async function whoAmI() {
+  const answer = await call("me.get");
+  const id = answer.ok ? answer.body?.principal?.id : undefined;
+  return typeof id === "string" ? { id, can: answer.body?.can ?? {} } : null;
+}
+
+/** The kind filter's links, redrawn with their counts. */
+function drawKinds(list, items, kind) {
+  list.replaceChildren(
+    ...kindLinks(items, kind).map((link) =>
+      el("li", null, [
+        el("a", {
+          class: `tab${link.current ? " active" : ""}`,
+          href: link.href,
+          "aria-current": link.current ? "page" : null,
+          text: link.label,
+        }),
+      ]),
+    ),
+  );
+}
+
+/**
+ * The list's frame, built once per mount: the kind filter, "Show settled" (kept, so it
+ * keeps its focus), a status line, the "Show N new" slot and the list's own body.
+ */
+function buildFrame(host, redraw) {
+  const kinds = el("ul", { class: "tabs page-nav-list" });
+  const toggle = toggleBtn({
+    label: "Show settled",
+    pressed: false,
+    onToggle: (next) => redraw({ settled: next }),
+  });
+  const status = el("p", { class: "muted attention-status", role: "status" });
+  const fresh = el("div", { class: "attention-fresh" });
+  const body = el("div", { class: "attention-list-body" });
+  clear(host).append(
+    el("div", { class: "attention-filters" }, [
+      el("nav", { class: "attention-kinds", "aria-label": "Kind" }, kinds),
+      toggle,
+    ]),
+    status,
+    fresh,
+    body,
+  );
+  return { kinds, status, fresh, body };
+}
+
 /** Needs you, All: Home's inbox. */
 export async function renderAttention(host, ctx = {}) {
-  const fetchList = () => call("attention.list", { query: { limit: "500" } });
-  const answer = await fetchList();
-  if (ctx.signal?.aborted) return;
+  host.appendChild(skeleton(4));
+  const view = { frame: null, settled: false, me: undefined, seq: 0 };
+  const redraw = async (over = {}) => {
+    if (typeof over.settled === "boolean") view.settled = over.settled;
+    try {
+      await drawInbox(host, view, ctx, redraw, over);
+    } catch (err) {
+      if (ctx.signal?.aborted || view.frame === null) throw err;
+      view.frame.status.textContent = err instanceof Error ? err.message : String(err);
+    }
+  };
+  await redraw();
+}
+
+async function drawInbox(host, view, ctx, redraw, over) {
+  const fetchList = () =>
+    call("attention.list", {
+      query: { limit: "500", ...(view.settled ? { state: "all" } : {}) },
+    });
+  view.seq += 1;
+  const mine = view.seq;
+  const [answer, me] = await Promise.all([
+    fetchList(),
+    view.me !== undefined ? Promise.resolve(view.me) : whoAmI(),
+  ]);
+  // A newer redraw already asked, or the page is gone: this answer is out of date.
+  if (ctx.signal?.aborted || mine !== view.seq) return;
+  view.me = me;
   if (!answer.ok) {
     if (answer.status === 403) {
       clear(host).appendChild(emptyFor({ cause: "no-access", detail: answer.error.message }));
+      view.frame = null;
       return;
     }
     throw new Error(answer.error.message);
   }
+  view.frame ??= buildFrame(host, redraw);
+  const { frame } = view;
+  const { status } = frame;
   const list = answer.body ?? {};
   const nowMs = Date.now();
-  clear(host);
-  const status = el("p", { class: "muted attention-status", role: "status" });
-  const fresh = el("div", { class: "attention-fresh" });
-  host.append(status, fresh);
-  for (const note of listNotes(list)) host.appendChild(el("p", { class: "muted", text: note }));
-  const items = Array.isArray(list.items) ? list.items : [];
+  const kind = kindFilter(ctx.route);
+  const all = Array.isArray(list.items) ? list.items : [];
+  const items = kind === null ? all : all.filter((item) => item?.kind === kind);
+  drawKinds(frame.kinds, all, kind);
+  status.textContent = "";
+  frame.fresh.replaceChildren();
+  // Whatever redrew the list, an open discussion and its unsent words stay as they were.
+  const memory = cardMemory(frame.body);
+  clear(frame.body);
+  for (const note of listNotes(list)) {
+    frame.body.appendChild(el("p", { class: "muted", text: note }));
+  }
+  const asked =
+    over.acted === undefined && over.restore === undefined && over.settled === undefined;
+  const wanted = asked ? ctx.route?.query?.item : undefined;
   if (items.length === 0) {
-    host.appendChild(emptyFor(emptyOptsOf(list)));
-    host.appendChild(
+    frame.body.append(
+      emptyFor(
+        kind === null
+          ? emptyOptsOf(list)
+          : {
+              cause: "filtered",
+              detail: `Nothing under ${KIND_WORDS[kind]}.`,
+              onAction: () => {
+                location.hash = hrefFleet("home", "needs-you");
+              },
+            },
+      ),
       el("p", { class: "muted" }, ["In a terminal: ", el("code", { text: "crewhaus inbox list" })]),
     );
-    focusItem({ roving: { rows: () => [] } }, ctx.route?.query?.item, status);
+    focusItem({ roving: { rows: () => [] } }, wanted, status);
+    if (over.acted !== undefined) {
+      focusHeading(host);
+      announce(afterWords(over.acted.words, 0));
+    }
     return;
   }
-  const drawn = drawList(list, nowMs);
-  host.appendChild(drawn.region);
-  focusItem(drawn, ctx.route?.query?.item, status);
-  if (ctx.restore !== undefined) restoreAfterNew(host, drawn, ctx.restore);
-  const shownRefs = items.map((i) => i.ref);
+
+  const names = list.names ?? [];
+  /** What an act needs to know about its card, and what follows it. */
+  const actContext = (item, opener) => {
+    const ref = String(item.ref);
+    const index = drawn.roving.rows().findIndex((row) => row.getAttribute("data-ref") === ref);
+    const reach = reachOf(list.you, item);
+    return {
+      title: textOf(item.title),
+      where: harnessesOf(item)
+        .map((id) => nameOf(names, id))
+        .join(", "),
+      deadline: item.band === "decide" ? deadlineLine(item, Date.now()) : null,
+      opener,
+      nowMs: Date.now(),
+      harnesses: reach.harnesses,
+      me,
+      deps: { kept: new Map() },
+      onDone: (done, stale, words) => {
+        if (ctx.signal?.aborted) return;
+        if (done === null) {
+          // Cancelled; a list that changed meanwhile is read again.
+          if (stale) void redraw({ acted: { index, ref, words: "The list was read again." } });
+          return;
+        }
+        if (!done.ok) {
+          const problem = problemText(done.error);
+          if (isStale(done)) void redraw({ acted: { index, ref, words: problem } });
+          else {
+            status.textContent = problem;
+            announce(problem, { assertive: true });
+          }
+          return;
+        }
+        const said = done.detail === undefined ? words : `${words} ${done.detail}`;
+        void redraw({ acted: { index, ref, words: said } });
+      },
+    };
+  };
+  const drawn = drawList(items, {
+    names,
+    people: list.people ?? [],
+    nowMs,
+    you: list.you,
+    me: me ?? undefined,
+    choose: async (item, model, opener) => {
+      const act = actContext(item, opener);
+      const onDone = (done, stale) => act.onDone(done, stale, doneWords(model.id));
+      if (asksFirst(model)) confirmChoice(item, model, { ...act, onDone });
+      else onDone(await sendChoice(item, model, act), false);
+    },
+    side: (item, id, opener) => void runSideAct(id, item, actContext(item, opener)),
+  });
+  frame.body.appendChild(drawn.region);
+  restoreCards(drawn.roving.rows(), memory);
+  const waiting = items.filter((item) => settledLine(item, nowMs) === null).length;
+  focusItem(drawn, wanted, status);
+  if (over.restore !== undefined) restoreAfterNew(host, drawn, over.restore);
+  if (over.acted !== undefined) restoreAfterAct(host, drawn, over.acted, waiting);
+  const shownRefs = all.map((i) => i.ref);
   // New items wait behind a button, so nothing moves under focus or under the reader.
   const recheck = () => {
-    if (ctx.signal?.aborted || !host.isConnected) return;
+    const gone = () => ctx.signal?.aborted || !drawn.region.isConnected;
+    if (gone()) return;
     setTimeout(async () => {
-      if (ctx.signal?.aborted || !host.isConnected) return;
+      if (gone()) return;
       try {
         const next = await fetchList();
         const n = next.ok ? newCount(shownRefs, next.body?.items) : 0;
-        if (n > 0 && !ctx.signal?.aborted) {
+        if (n > 0 && !gone()) {
           const label = `Show ${n} new`;
-          fresh.replaceChildren(
+          frame.fresh.replaceChildren(
             el("button", {
               class: "btn",
               type: "button",
               text: label,
-              onClick: () =>
-                renderAttention(host, {
-                  ...ctx,
-                  route: { ...ctx.route, query: {} },
-                  restore: { shownRefs, openRefs: openBodyRefs(host) },
-                }),
+              onClick: () => redraw({ restore: { shownRefs } }),
             }),
           );
           announce(`${n} new item${s(n)} waiting. ${label} to see them.`);

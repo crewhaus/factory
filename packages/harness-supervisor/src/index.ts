@@ -240,6 +240,7 @@ export {
   entryFileFor,
   findHarnessRoot,
   findSpecPath,
+  GRAPH_RESUME_CHECKPOINT_ENV,
   homeCrewhausArgv,
   isInside,
   isSupervisedClass,

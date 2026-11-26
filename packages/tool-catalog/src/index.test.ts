@@ -13,7 +13,9 @@ import {
   hasModelChosenDestination,
   hasSelfCheckedOpening,
   legacyMcpToolName,
+  markReportsKnowledge,
   mcpToolName,
+  reportsKnowledge,
   schemaDeclaresJustification,
   stripJustificationField,
   toolListEntryNames,
@@ -365,5 +367,44 @@ describe("withoutSelfCheckedOpenings", () => {
     const bare = { field: "path", kind: "path" as const };
     expect(hasSelfCheckedOpening(bare)).toBe(false);
     expect(withoutSelfCheckedOpenings(bare)).toBe(bare);
+  });
+});
+
+describe("the knowledge-reads mark", () => {
+  test("a marked tool is marked, and the same object comes back", () => {
+    const tool = makeTool("Recall");
+    expect(reportsKnowledge(tool)).toBe(false);
+    expect(markReportsKnowledge(tool)).toBe(tool);
+    expect(reportsKnowledge(tool)).toBe(true);
+  });
+
+  test("a copy keeps the mark, through the catalog too", () => {
+    const tool = markReportsKnowledge(makeTool("wiki_get"));
+    expect(reportsKnowledge({ ...tool, name: "renamed" })).toBe(true);
+    expect(reportsKnowledge(Object.assign({}, tool))).toBe(true);
+    const catalog = new ToolCatalog();
+    catalog.register(tool);
+    expect(reportsKnowledge(catalog.get("wiki_get") as RegisteredTool)).toBe(true);
+  });
+
+  test("a name, a property or a symbol of the same words is not the mark", () => {
+    for (const name of ["Recall", "wiki_get", "wiki_recall", "Retrieve"]) {
+      expect(reportsKnowledge(makeTool(name))).toBe(false);
+    }
+    const lookalike = {
+      ...makeTool("Recall"),
+      reportsKnowledge: true,
+      "reports-knowledge": true,
+      [Symbol("reports-knowledge")]: true,
+      [Symbol.for("reports-knowledge")]: true,
+    };
+    expect(reportsKnowledge(lookalike)).toBe(false);
+  });
+
+  test("the mark is a symbol of its own: no string key, and it never reaches JSON", () => {
+    const tool = markReportsKnowledge(makeTool("Recall"));
+    expect(Object.keys(tool)).toEqual(Object.keys(makeTool("Recall")));
+    expect(Object.getOwnPropertySymbols(tool)).toHaveLength(1);
+    expect(JSON.stringify(tool)).toBe(JSON.stringify(makeTool("Recall")));
   });
 });

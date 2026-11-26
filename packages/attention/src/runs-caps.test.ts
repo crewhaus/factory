@@ -1,11 +1,13 @@
 /**
  * Reading failure messages is bounded per harness: only the sessions of the newest failed
- * runs, at most {@link FAILURE_SESSIONS_MAX} logs and {@link FAILURE_READ_BYTES} in all,
- * each file once however many names reach it; past a cap the section says `truncated`.
+ * runs, at most {@link FAILURE_SESSIONS_MAX} logs and {@link FAILURE_READ_BYTES} read in
+ * all, whatever size a file was when it was looked at, each file once however many names
+ * reach it; past a cap the section says `truncated`.
  */
 import { afterEach, describe, expect, test } from "bun:test";
-import { symlinkSync } from "node:fs";
+import { symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { CHUNK_BYTES } from "@crewhaus/control-records";
 import { HOUR, MIN, NOW, failure, harnessDir, iso, tempRoot, testFacts } from "./__test__/fleet";
 import { FAILURE_READ_BYTES, FAILURE_SESSIONS_MAX, readFailuresSection } from "./adapters/runs";
 import { emptyModel } from "./fold";
@@ -88,15 +90,83 @@ describe("failure messages are read under caps", () => {
     expect(reader.tails).toEqual([`${sessionOf(0)}.jsonl`]);
   });
 
-  test("the bytes read across sessions stop at the budget", () => {
-    const dir = harnessDir(root(), "big");
-    // Each log says it is larger than one read takes: the budget holds this many reads.
-    const big = SESSION_CAPS.maxBytes * 2;
-    const reads = Math.ceil(FAILURE_READ_BYTES / SESSION_CAPS.maxBytes);
+  test("the bytes read across sessions stay inside the budget, however the logs grow", () => {
+    const dir = harnessDir(root(), "grown");
+    // Each log says 10 bytes when it is looked at, and holds all a read takes by then.
+    let bytes = 0;
+    let reads = 0;
+    const reader: AttentionReader = {
+      stamp: () => "10:1",
+      tail(_root, _rel, caps) {
+        reads++;
+        bytes += caps.maxBytes;
+        return {
+          state: "read",
+          records: [],
+          truncated: true,
+          gaps: [],
+          torn: false,
+          bytesRead: caps.maxBytes,
+        };
+      },
+    };
+    const section = readFailuresSection(
+      dir,
+      failedRuns(FAILURE_SESSIONS_MAX),
+      testFacts(),
+      reader,
+      undefined,
+    );
+    expect(reads).toBeGreaterThan(1);
     expect(reads).toBeLessThan(FAILURE_SESSIONS_MAX);
-    const reader = counting({ stamp: () => `${big}:1`, identity: () => undefined });
-    const section = readFailuresSection(dir, failedRuns(40), testFacts(), reader, undefined);
-    expect(reader.tails.length).toBe(reads);
+    expect(bytes).toBeLessThanOrEqual(FAILURE_READ_BYTES);
+    expect(section.truncated).toBe(true);
+  });
+
+  test("a reader that does not say what it read is charged all it was given", () => {
+    const dir = harnessDir(root(), "quiet");
+    let handed = 0;
+    const reader: AttentionReader = {
+      stamp: () => "0:1",
+      tail(_root, _rel, caps) {
+        handed += caps.maxBytes;
+        return { state: "read", records: [], truncated: false, gaps: [], torn: false };
+      },
+    };
+    const section = readFailuresSection(
+      dir,
+      failedRuns(FAILURE_SESSIONS_MAX),
+      testFacts(),
+      reader,
+      undefined,
+    );
+    expect(handed).toBeGreaterThan(0);
+    expect(handed).toBeLessThanOrEqual(FAILURE_READ_BYTES);
+    expect(section.truncated).toBe(true);
+  });
+
+  test("real logs are charged what was read from them, one chunk past a read included", () => {
+    const dir = harnessDir(root(), "real");
+    const sessions = join(dir, ".crewhaus", "sessions");
+    const line = `${JSON.stringify({ kind: "note", text: "x".repeat(900) })}\n`;
+    const log = line.repeat(Math.ceil((SESSION_CAPS.maxBytes * 1.5) / line.length));
+    for (let i = 0; i < 12; i++) writeFileSync(join(sessions, `${sessionOf(i)}.jsonl`), log);
+    let read = 0;
+    const reader: AttentionReader = {
+      ...DEFAULT_READER,
+      tail(r, rel, caps) {
+        const answer = DEFAULT_READER.tail(r, rel, caps);
+        if (answer.state === "read") {
+          expect(answer.bytesRead).toBeGreaterThan(0);
+          expect(answer.bytesRead).toBeLessThanOrEqual(caps.maxBytes + CHUNK_BYTES + 1);
+          read += answer.bytesRead ?? 0;
+        }
+        return answer;
+      },
+    };
+    const section = readFailuresSection(dir, failedRuns(12), testFacts(), reader, undefined);
+    expect(read).toBeGreaterThan(SESSION_CAPS.maxBytes);
+    expect(read).toBeLessThanOrEqual(FAILURE_READ_BYTES);
     expect(section.truncated).toBe(true);
   });
 });

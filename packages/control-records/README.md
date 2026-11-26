@@ -31,6 +31,7 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `operator.json` | whether intake is paused and the deployment disabled |
 | `approvers.json` | the harness's copy of who may decide what, Home's address (`homeUrl`) when the owner set one, and the Home root whose access records wrote it (`accessRoot`) |
 | `runs/NNNNNN.jsonl` | the run ledger (`runsLedger(harnessDir)`, on the run machine) |
+| `attention/NNNNNN.jsonl` | what people did about inbox items (`attentionActionsLedger(harnessDir)`, on no machine): ids, closed codes and times |
 
 `controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control
 token and outside `control/`: when a daemon last said it was alive.
@@ -155,6 +156,8 @@ Stored digests join forever, so this format is a pin. The label keeps two purpos
 | `withMutatingLease(harnessDir, who, fn, options)` | Runs `fn` holding the lease, and releases it when `fn` returns or throws. | Home's job runner and the CLI's long mutating verbs |
 | `readMutatingLease(harnessDir)` | A pure read. | Home's job runner and the CLI's long mutating verbs |
 | `holderProvablyDead({pid, startedAtMs?, host}, probe, host)` | The lease's own liveness rule, for any recorded process. | the lease; command recovery, judging a receipt's executor |
+| `systemLeaseProbe` | A probe that knows this process's own start time from its clock, reads another process's from `/proc` on Linux, and answers "could not tell" (`undefined`) elsewhere. It starts no program. | the budget ledger (`./budget`) |
+| `parsePsLstart`, `parseProcStartTime`, `parseProcBtime` | Pure parsers for `ps -p <pid> -o lstart=`, `/proc/<pid>/stat` and `/proc/stat`'s `btime`. | harness-supervisor's `ProcessOps`; `systemLeaseProbe` |
 
 Only a provably dead holder loses the lease: the same host, and `isAlive(pid) === false`, or a recorded
 start time more than 2 seconds from the probe's. A probe that cannot answer means held, a foreign host
@@ -162,6 +165,11 @@ is always held, and there is no age rule, because an eval holds it for an hour. 
 file is held, with a refusal that says how to clear it. The default probe is `kill(pid, 0)` with an
 unknown start time, so holders it records carry no `startedAt`; a caller that may spawn injects
 harness-supervisor's `ProcessOps`. This package never imports harness-supervisor.
+
+The budget ledger (`./budget`) records its holders with `systemLeaseProbe` by default, so every
+reservation a process writes carries its start time, and a holder on a recycled pid is told apart on
+Linux; on macOS and Windows another process's start time cannot be read without starting a program,
+so there a holder past its lease stays held until it is provably gone.
 
 ## Rules
 

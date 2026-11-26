@@ -42,6 +42,7 @@ import {
   type CapabilityRequirement,
   DEFAULT_CAPABILITIES,
   DEFAULT_PRICING,
+  type DeclaredPricing,
   type PricingTable,
   classifyPricingStaleness,
   computeCacheSavingsMicros,
@@ -154,6 +155,7 @@ import {
   readHeldOutUses,
   verifySplitHashes,
 } from "@crewhaus/dataset-registry";
+import { openQuorumDecision, settleQuorumDecision } from "@crewhaus/deployment-controller/quorum";
 // Loop contract 0.4 (Batch A) — `memory.embedder`: the run path constructs
 // the fact-store embedder and hands it to wireMemory as `deps.embedder`,
 // which memory-service prefers over the fragment's `wiki.embedder` (the
@@ -585,6 +587,7 @@ import {
   DATASETS_SCHEMA,
   DATASET_SCHEMA,
   DEPLOY_ACTIVATE_SCHEMA,
+  DEPLOY_APPROVE_SCHEMA,
   DEPLOY_SCHEMA,
   DEV_SCHEMA,
   DISTILL_SCHEMA,
@@ -1424,6 +1427,7 @@ import {
 } from "./regression-pin";
 import { parseReplayToolsFlags } from "./replay-flags";
 import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
+import { alreadyTakenLine, localReviewActor } from "./review-actor";
 // Wave 3 (B20) — the persistent human-review queue
 // (.crewhaus/review/queue.jsonl): pure entry builders/formatters + the
 // append-only JSONL store, in a side-effect-free module so it is
@@ -1433,6 +1437,7 @@ import { type HeavyRetireSteps, retireCommand } from "./retire-cmd";
 import {
   REVIEW_KINDS,
   type ReviewKind,
+  claimReviewEntry,
   enqueueReviewEntries,
   entriesFromEvalRun,
   entriesFromQuarantine,
@@ -5155,6 +5160,10 @@ async function runRunCli(
         : {}),
       // Item 27 — run-level spend cap (--budget-usd flag > spec `budget`).
       ...(runBudget !== undefined ? { budget: runBudget } : {}),
+      // A declared period's ledger lives in the spec's directory, wherever the run starts.
+      ...(runBudget?.period !== undefined
+        ? { spendLedgerRoot: runSpecDirOf(resolve(specPath)) }
+        : {}),
       ...(resumeId !== undefined ? { resume: { sessionId: resumeId } } : {}),
       ...(justificationJudge !== undefined ? { justificationJudge } : {}),
       ...(justificationAuditSink !== undefined ? { justificationAuditSink } : {}),
@@ -8211,7 +8220,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
           traceBus,
           ...(stageMutator !== undefined ? { mutator: stageMutator } : {}),
           ...(stageBudget !== undefined ? { budgetUsd: stageBudget } : {}),
-          ...optimizeSpendLedger(optimizeSpecPath),
+          ...optimizeSpendLedger(absSpec),
         });
         process.stdout.write(
           `[optimize] stage ${stage.name} score: ${r.scoreBefore.toFixed(3)} → ${r.scoreAfter.toFixed(3)} ` +
@@ -8321,7 +8330,7 @@ async function runOptimize(args: ParsedArgs): Promise<void> {
         ...(mutatorImpl !== undefined ? { mutator: mutatorImpl } : {}),
         ...(budgetUsd !== undefined ? { budgetUsd } : {}),
         // The harness's spending period, when its spec declares one.
-        ...optimizeSpendLedger(optimizeSpecPath),
+        ...optimizeSpendLedger(absSpec),
       }),
     );
 
@@ -16269,15 +16278,24 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
     const id = args.positional[0];
     if (typeof id !== "string" || id === "") die("missing <id> — see `crewhaus review list`");
     const note = strFlag(args, "note");
-    const result = resolveReviewEntry(root, id, note ?? "resolved", new Date().toISOString());
+    const result = resolveReviewEntry(
+      root,
+      id,
+      note ?? "resolved",
+      new Date().toISOString(),
+      await localReviewActor(root),
+    );
     if (result.outcome === "not-found") {
       die(`no review item "${id}" — see \`crewhaus review list --all\``);
     }
+    if (result.outcome === "unavailable") die(`review item ${id}: ${result.reason}`);
     if (result.outcome === "already-resolved") {
       process.stdout.write(
-        `review item ${id} was already resolved${
-          result.entry.resolution !== undefined ? ` (${result.entry.resolution})` : ""
-        }\n`,
+        result.winner !== undefined
+          ? alreadyTakenLine(id, result.winner)
+          : `review item ${id} was already resolved${
+              result.entry.resolution !== undefined ? ` (${result.entry.resolution})` : ""
+            }\n`,
       );
       return;
     }
@@ -16328,6 +16346,18 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
       process.stdout.write("  → skipped (still open)\n");
       return;
     }
+    // Claimed first, so of two verdicts on one item only the first records a rating.
+    const actor = await localReviewActor(root);
+    const at = new Date().toISOString();
+    const claim = claimReviewEntry(root, item.id, {
+      at,
+      ...(actor !== undefined ? { actor } : {}),
+    });
+    if (claim.outcome === "unavailable") die(`review item ${item.id}: ${claim.reason}`);
+    if (claim.outcome === "taken") {
+      process.stdout.write(alreadyTakenLine(item.id, claim.winner));
+      return;
+    }
     // Route through the SAME capture machinery `crewhaus rate` uses, marked
     // as a B19 adjudication so the disagreement closes at the source too.
     await captureFeedback(
@@ -16338,7 +16368,9 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
       "cli",
       { thumbs: verdict as "up" | "down", adjudicate: true },
     );
-    resolveReviewEntry(root, item.id, `adjudicated: thumbs ${verdict}`, new Date().toISOString());
+    resolveReviewEntry(root, item.id, `adjudicated: thumbs ${verdict}`, at, actor, {
+      claimed: true,
+    });
     process.stdout.write(`  → resolved ${item.id} (adjudicated thumbs ${verdict})\n`);
     return;
   }
@@ -16353,7 +16385,18 @@ async function runReview(args: ParsedArgs, action: string): Promise<void> {
     process.stdout.write("  → skipped (still open)\n");
     return;
   }
-  resolveReviewEntry(root, item.id, verdict, new Date().toISOString());
+  const result = resolveReviewEntry(
+    root,
+    item.id,
+    verdict,
+    new Date().toISOString(),
+    await localReviewActor(root),
+  );
+  if (result.outcome === "unavailable") die(`review item ${item.id}: ${result.reason}`);
+  if (result.outcome === "already-resolved") {
+    process.stdout.write(alreadyTakenLine(item.id, result.winner));
+    return;
+  }
   process.stdout.write(`  → resolved ${item.id} (${verdict})\n`);
 }
 
@@ -19678,6 +19721,8 @@ async function runDeploy(args: ParsedArgs, action: string): Promise<void> {
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
         "  crewhaus deploy rollback <name> <env> <version>   re-pin env to version\n" +
         "       [--require-approval] [--check-pr]            gate a protected env (item 59)\n" +
+        "  crewhaus deploy approve <spec> --env <env> [--version <v>] [--deny]\n" +
+        "       [--harness <hrn|dir>] [--json]               answer a protected env's approval\n" +
         "  crewhaus deploy activate [<dep>] [--harness <hrn|dir>] [--environment <e>]\n" +
         "       [--no-autostart] [--json]                    make a prepared build the one this\n" +
         "                                                    harness runs (newest prepared by default)\n" +
@@ -20269,6 +20314,17 @@ async function enforceProtectedEnvGate(opts: {
   process.stdout.write(
     `[approval] ${opts.name} → ${opts.toEnv}@${opts.toVersion}: ${decision.reason}\n`,
   );
+  // The quorum is a decision in the inbox: opened when it is missing, closed when it is met.
+  const quorum = {
+    spec: opts.name,
+    environment: opts.toEnv,
+    version: opts.toVersion,
+    specHash: decisionInput.specHash,
+  };
+  const answered = decision.satisfied
+    ? settleQuorumDecision(opts.harnessRoot, quorum, { now: Date.now() })
+    : openQuorumDecision(opts.harnessRoot, quorum, { now: Date.now() });
+  await answered.catch(() => undefined);
   if (!decision.satisfied) {
     throw new ApprovalGateError(
       `${opts.verb} of ${opts.name} to protected env "${opts.toEnv}" is blocked — ${decision.reason}`,
@@ -22944,6 +23000,14 @@ function buildWatchmeJudgePhase(
    *  `runChatLoop` call so the profile means the same thing here as on a
    *  serving slot. Absent → the loop's defaults, byte-identical. */
   params?: NonNullable<WatchmeIrView["watchme"]>["judgeParams"],
+  /** The harness's spending period and the spec's directory its ledger lives in:
+   *  each judge call reserves on it. Absent → no period, no ledger. */
+  spend?: {
+    readonly period: NonNullable<NonNullable<WatchmeIrView["budget"]>["period"]>;
+    readonly ledgerRoot: string;
+    /** The spec's declared prices, so a judge model priced only there reserves. */
+    readonly declaredPricing?: DeclaredPricing;
+  },
 ): WatchmeJudgePhase {
   // Judge sessions live in an ISOLATED root the report NEVER enumerates
   // (enumeration is scoped to `<crewhausDir>/sessions`). This keeps judged-turn
@@ -23031,7 +23095,12 @@ function buildWatchmeJudgePhase(
           budget: {
             usdMicros: Math.max(0, Math.round(input.budgetRemainingUsd * 1_000_000)),
             onExceed: { kind: "stop" },
+            ...(spend !== undefined ? { period: spend.period } : {}),
           },
+          ...(spend !== undefined ? { spendLedgerRoot: spend.ledgerRoot } : {}),
+          ...(spend?.declaredPricing !== undefined
+            ? { declaredPricing: spend.declaredPricing }
+            : {}),
           spinner: false,
         });
         if (verdict === undefined) {
@@ -23056,6 +23125,8 @@ function buildWatchmeJudgePhase(
 type WatchmeIrView = {
   readonly name: string;
   readonly target: string;
+  /** The harness's spending period, when the spec declares one. */
+  readonly budget?: { readonly period?: NonNullable<IrBudget["period"]> };
   readonly watchme?: {
     readonly enabled: boolean;
     readonly capture: "full" | "mirrors";
@@ -23102,9 +23173,25 @@ function watchmeSessionRows(
   return rows;
 }
 
+/** The watch-me judge's period: its ledger in the spec's directory, and the spec's declared prices. */
+function watchmeSpendOf(
+  ir: WatchmeIrView,
+  period: NonNullable<NonNullable<WatchmeIrView["budget"]>["period"]>,
+  specPath: string,
+): NonNullable<Parameters<typeof buildWatchmeJudgePhase>[4]> {
+  const declared = declaredPricingOfIr(ir as unknown as IrNode);
+  return {
+    period,
+    ledgerRoot: runSpecDirOf(specPath),
+    ...(declared !== undefined ? { declaredPricing: declared } : {}),
+  };
+}
+
 /** One-harness phase-1(+2) report with the real seams wired (watch-me §11). */
 async function runWatchmeHarnessReport(opts: {
   readonly ir: WatchmeIrView;
+  /** The watched harness's spec file: its directory holds the period ledger. */
+  readonly specPath: string;
   readonly crewhausDir: string;
   readonly sessionId?: string;
   readonly outDir?: string;
@@ -23141,6 +23228,9 @@ async function runWatchmeHarnessReport(opts: {
             opts.ir.name,
             opts.crewhausDir,
             opts.ir.watchme?.judgeParams,
+            opts.ir.budget?.period !== undefined
+              ? watchmeSpendOf(opts.ir, opts.ir.budget.period, opts.specPath)
+              : undefined,
           ),
         }
       : {}),
@@ -23362,7 +23452,7 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
 
   switch (action) {
     case "start": {
-      const { ir } = loadWatchmeIr(args);
+      const { ir, specPath } = loadWatchmeIr(args);
       const store = openWatchmeStore(crewhausDir, { specName: ir.name });
       const registry = openHarnessRegistry(globalRoot);
       const capture = ir.watchme?.capture ?? "full";
@@ -23375,7 +23465,7 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
           target: ir.target,
           share: ir.watchme?.share === true,
         },
-        runBackfill: () => runWatchmeHarnessReport({ ir, crewhausDir, noModel: true }),
+        runBackfill: () => runWatchmeHarnessReport({ ir, specPath, crewhausDir, noModel: true }),
       });
       process.stdout.write(
         `[watchme] ${result.alreadyWatching ? "already watching" : "watching"} ${ir.name} (capture: ${capture})\n`,
@@ -23498,10 +23588,11 @@ async function runWatchme(args: ParsedArgs, action: string): Promise<void> {
         }
         return;
       }
-      const { ir } = loadWatchmeIr(args);
+      const { ir, specPath } = loadWatchmeIr(args);
       const sessionFlag = strFlag(args, "session");
       const result = await runWatchmeHarnessReport({
         ir,
+        specPath,
         crewhausDir,
         ...(sessionFlag !== undefined ? { sessionId: sessionFlag } : {}),
         ...(outFlag !== undefined ? { outDir: resolve(outFlag) } : {}),
@@ -24696,8 +24787,36 @@ switch (subcommand) {
   case "knowledge": {
     // Item 63 — cross-harness knowledge sync (memories/graders/prompts).
     const action = rest[0] ?? "";
+    // What one harness knows: the reads, `reindex` and `erase` (knowledge-cmd.ts).
+    if (
+      action === "status" ||
+      action === "list" ||
+      action === "show" ||
+      action === "why" ||
+      action === "usage" ||
+      action === "search" ||
+      action === "reindex" ||
+      action === "erase"
+    ) {
+      const { KNOWLEDGE_SCHEMAS, KnowledgeCmdError, runKnowledgeCmd } = await import(
+        "./knowledge-cmd"
+      );
+      try {
+        const code = await runKnowledgeCmd(
+          action,
+          parseFor(rest.slice(1), KNOWLEDGE_SCHEMAS[action]),
+        );
+        if (code !== 0) process.exitCode = code;
+      } catch (err) {
+        if (err instanceof KnowledgeCmdError || err instanceof CrewhausError) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "" && action !== "sync") {
-      die(`knowledge action must be "sync" (got "${action}")`);
+      die(
+        `knowledge action must be one of: sync, status, list, show, why, usage, search, reindex, erase (got "${action}")`,
+      );
     }
     await runKnowledge(parseFor(rest.slice(1), KNOWLEDGE_SCHEMA), action || "sync");
     break;
@@ -25106,9 +25225,22 @@ switch (subcommand) {
       if (result.exitCode !== 0) process.exit(result.exitCode);
       break;
     }
+    if (action === "approve") {
+      const { deployApprove } = await import("./deploy-approve-cmd");
+      try {
+        const out = await deployApprove(parseFor(rest.slice(1), DEPLOY_APPROVE_SCHEMA));
+        const sink = out.exitCode === 0 ? process.stdout : process.stderr;
+        for (const line of out.lines) sink.write(`${line}\n`);
+        if (out.exitCode !== 0) process.exit(out.exitCode);
+      } catch (err) {
+        if (err instanceof Error) die(err.message);
+        throw err;
+      }
+      break;
+    }
     if (action !== "promote" && action !== "rollback" && action !== "canary") {
       die(
-        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary, activate, list (got "${action}")`,
+        `deploy action must be one of: fly, render, railway, heroku, promote, rollback, canary, approve, activate, list (got "${action}")`,
       );
     }
     try {

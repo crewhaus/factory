@@ -120,9 +120,9 @@ describe("the gate is every route", () => {
     }
   });
 
-  test("the toured screens are fourteen of them, each a route the gate holds", () => {
-    expect(TOURED_TEMPLATES.length).toBe(14);
-    expect(new Set(TOURED_TEMPLATES).size).toBe(14);
+  test("the toured screens are twelve of them, each a route the gate holds", () => {
+    expect(TOURED_TEMPLATES.length).toBe(12);
+    expect(new Set(TOURED_TEMPLATES).size).toBe(12);
     for (const template of TOURED_TEMPLATES) {
       expect(`${template}:${GATED.includes(template)}`).toBe(`${template}:true`);
     }

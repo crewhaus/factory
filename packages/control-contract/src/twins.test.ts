@@ -45,6 +45,17 @@ const RUN = mintRunId();
 
 /** An attention item's id as the area derives it, from a digest's bytes. */
 const ATT = attIdFromDigest(new Uint8Array(32).map((_, i) => (i * 37 + 11) % 256));
+const ACT = {
+  attChoice: "grant",
+  prn: mintId("prn"),
+  dismissReason: "known",
+  grun: "grun_0123456789abcdef",
+  ckpt: "ckpt_0123456789abcdef",
+  graphDecision: "approve",
+  specName: "support-bot",
+  env: "prod",
+  version: "v1.2.0",
+};
 const WORK = { wi: mintId("wi"), belowWi: mintId("wi"), workSource: "continuity-goal:goal-0001" };
 
 const SAMPLES = [
@@ -68,6 +79,7 @@ const SAMPLES = [
     delegationAction: "merge",
     run: RUN,
     att: ATT,
+    ...ACT,
     ...WORK,
     declineReason: "not-now",
     correctionScope: "item",
@@ -94,6 +106,10 @@ const SAMPLES = [
     delegationAction: "rollout",
     run: RUN,
     att: ATT,
+    ...ACT,
+    attChoice: "wait-for-renewal",
+    graphDecision: "reject",
+    version: DEP,
     ...WORK,
     declineReason: "needs-evidence",
     correctionScope: "all",
@@ -123,6 +139,20 @@ describe("round trips", () => {
       }
     }
     expect(checked).toBeGreaterThanOrEqual(2 * 13);
+  });
+
+  test("a flag on its own parses with no value, once, and only where the template has it", () => {
+    const twin: CliTwin = { argv: ["inbox", "show", "{att}", "--messages"] };
+    const params = { att: ATT };
+    expect(renderTwin(twin, params)).toEqual({ argv: ["inbox", "show", ATT, "--messages"] });
+    expect(parseTwin(twin, ["inbox", "show", "--messages", ATT])).toEqual({ params });
+    expect(parseTwin(twin, ["inbox", "show", ATT])).toBeNull();
+    expect(parseTwin(twin, ["inbox", "show", ATT, "--messages", "--messages"])).toBeNull();
+    expect(parseTwin(twin, ["inbox", "show", ATT, "--messages", "--json"])).toBeNull();
+    const both: CliTwin = { argv: ["inbox", "show", "{att}", "--messages", "--dir", "{dir}"] };
+    expect(parseTwin(both, ["inbox", "show", ATT, "--dir", "/h", "--messages"])).toEqual({
+      params: { att: ATT, dir: "/h" },
+    });
   });
 
   test("flag pairs parse in any order", () => {
@@ -230,6 +260,15 @@ test("the placeholders, pinned, with empty flags", () => {
     "{delegationAction}",
     "{run}",
     "{att}",
+    "{attChoice}",
+    "{prn}",
+    "{dismissReason}",
+    "{grun}",
+    "{ckpt}",
+    "{graphDecision}",
+    "{specName}",
+    "{env}",
+    "{version}",
     "{wi}",
     "{belowWi}",
     "{declineReason}",
@@ -452,4 +491,35 @@ describe("the work placeholders", () => {
       expect(parseTwin(adopt, ["work", "adopt", "--from", source])).toBeNull();
     }
   });
+});
+
+test("a choice, a decision and a name are their own grammar, never a flag", () => {
+  const fits = (token: keyof typeof TWIN_PLACEHOLDERS, value: string) =>
+    TWIN_PLACEHOLDERS[token].test(value);
+  for (const value of ["grant", "wait-for-renewal", "up", "promote"]) {
+    expect(fits("{attChoice}", value)).toBe(true);
+  }
+  for (const value of ["inspect", "open", "adopt", "grant;id", "--force", ""]) {
+    expect(fits("{attChoice}", value)).toBe(false);
+  }
+  expect(fits("{graphDecision}", "approve")).toBe(true);
+  expect(fits("{graphDecision}", "ship it")).toBe(false);
+  expect(fits("{grun}", "grun_0123456789abcdef")).toBe(true);
+  expect(fits("{grun}", "run_0123456789abcdef")).toBe(false);
+  expect(fits("{ckpt}", "ckpt_0123456789abcdef")).toBe(true);
+  expect(fits("{ckpt}", "--checkpoint")).toBe(false);
+  expect(fits("{ckpt}", "ckpt_0123456789ABCDEF")).toBe(false);
+  expect(fits("{prn}", mintId("prn"))).toBe(true);
+  expect(fits("{prn}", "local:sam@laptop")).toBe(false);
+  expect(fits("{dismissReason}", "not-a-problem")).toBe(true);
+  expect(fits("{dismissReason}", "because")).toBe(false);
+  for (const token of ["{specName}", "{env}", "{version}"] as const) {
+    expect(fits(token, "prod")).toBe(true);
+    for (const value of ["--prod", "-p", "a b", "a;b", "", "$(id)", "a/b"]) {
+      expect(`${token} ${value}: ${fits(token, value)}`).toBe(`${token} ${value}: false`);
+    }
+  }
+  // An environment has no dot; a name and a version may.
+  expect(fits("{env}", "prod.eu")).toBe(false);
+  expect(fits("{version}", "v1.2.0")).toBe(true);
 });

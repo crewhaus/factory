@@ -415,33 +415,49 @@ export function screenStates(harness: RouteHarness): readonly ScreenState[] {
       },
     },
     {
-      template: "#/home/needs-you?type=approvals",
-      state: "row armed",
-      route: "#/home/needs-you?type=approvals",
+      template: "#/home/needs-you",
+      state: "a verdict to confirm",
+      route: "#/home/needs-you?kind=permission",
       open: async (page) => {
-        await page.locator(".inbox-card").first().focus();
-        await page.keyboard.press("g");
-        await waitFor(page, ".inbox-armed", "the armed prompt");
+        await page.locator('.attention-verdict[data-choice="grant"]').first().click();
+        await waitFor(page, "dialog[open] .attention-form", "the confirm step");
       },
     },
     {
-      template: "#/home/needs-you?type=approvals",
-      state: "row menu",
-      route: "#/home/needs-you?type=approvals",
+      template: "#/home/needs-you",
+      state: "put off",
+      route: "#/home/needs-you?kind=permission",
       open: async (page) => {
-        await page.locator(".inbox-card").first().focus();
-        await page.keyboard.press(".");
-        await waitFor(page, ".rowmenu button", "the row menu");
+        await page.locator('button[data-act="defer"]').first().click();
+        await waitFor(page, "dialog[open] .attention-set", "the times to put it off until");
       },
     },
     {
-      template: "#/home/needs-you?type=approvals",
-      state: "inbox help",
-      route: "#/home/needs-you?type=approvals",
+      template: "#/home/needs-you",
+      state: "given to someone",
+      route: "#/home/needs-you?kind=permission",
       open: async (page) => {
-        await page.locator(".inbox-card").first().focus();
-        await page.keyboard.press("?");
-        await waitFor(page, ".keyhelp li", "the inbox help");
+        await page.locator('button[data-act="assign"]').first().click();
+        await waitFor(page, "dialog[open] select[name=to]", "who it can be given to");
+      },
+    },
+    {
+      template: "#/home/needs-you",
+      state: "a discussion",
+      route: "#/home/needs-you?kind=permission",
+      open: async (page) => {
+        await page.locator(".attention-thread summary").first().click();
+        await waitFor(page, ".attention-discuss textarea", "the discussion's form");
+      },
+    },
+    {
+      template: "#/home/needs-you",
+      state: "the settled ones too",
+      route: "#/home/needs-you",
+      open: async (page) => {
+        await page.locator('button.toggle:has-text("Show settled")').click();
+        await settle(page, "the settled items");
+        await waitFor(page, '.toggle[aria-pressed="true"]', "Show settled, pressed");
       },
     },
     {

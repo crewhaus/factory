@@ -4,7 +4,7 @@
  * whose receipt is written before anything answers. It never enters a compiled harness and
  * never imports `@crewhaus/hangar-server`.
  */
-export { currentLocalIdentity, storedActorFor } from "./actor";
+export { currentLocalIdentity, readStoredActor, storedActorFor } from "./actor";
 export {
   DECISION_EXECUTORS,
   DECISION_RECONCILERS,
@@ -282,11 +282,13 @@ export {
   reconcileRunCreate,
   reconcileRunResume,
   childRunsOf,
+  intakeRefusal,
   runAdapterFor,
   runBundleRefusal,
   runRefOf,
   runRowOf,
   versionAtLeast,
+  withdrawQueued,
 } from "./runs";
 export {
   type ControlDeps,
