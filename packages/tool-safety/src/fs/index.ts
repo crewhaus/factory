@@ -38,6 +38,10 @@
  * - {@link namesGitDirectory} / {@link landsInGitDirectory}: whether a path
  *   lies in a repository's git directory, which a tool that writes beneath a
  *   directory also refuses to reach ({@link gitDirectoryWriteRefusal}).
+ * - {@link recordChain} / {@link chainUnchanged}: the identity of every
+ *   directory from a root down to one inside it, and whether each is still
+ *   the same real directory, so a removal can re-check before and after each
+ *   step.
  * - {@link credentialRootsOf} / {@link isCredentialFileName}: the files a run
  *   keeps from its tools, by the roots on its bridge and by name;
  *   {@link isHeldFile} and {@link heldInTree} ask of one path and of a tree, and
@@ -52,6 +56,7 @@ export {
   SafeFsError,
 } from "./failure";
 export { type FileKind, fileKind } from "../streams/file";
+export { type DirChain, chainUnchanged, recordChain } from "./descriptor";
 export { homeHeldBy } from "./home";
 export { type KindProbe, assertRegularFile, probeKind } from "./kind";
 export {
@@ -65,6 +70,7 @@ export {
   type ContainedFd,
   type ContainedRead,
   type OpenForReadOptions,
+  _setOpenHooksForTest,
   openForRead,
   openForReadFd,
   openForReadSync,

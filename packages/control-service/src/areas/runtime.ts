@@ -1,11 +1,16 @@
 /**
  * The runtime area's running code (#516, module brief 333), composed from one half per
- * file so each half lands on its own lines. The work half and the budget half are here.
+ * file so each half lands on its own lines. The work half and the budget half are here; the
+ * workspace half is `../workspaces`.
  *
  * Work commands run as inline effects, so recovery never acts again: each kind's executor
  * observes whether the work log (or, for `work.start`, the run ledger) has a line carrying
  * the receipt's id, and the kinds that are not safe to repeat have a reconciler that does
  * the same. Every work kind but `work.start` acts on records alone (`unsupervised`).
+ *
+ * `work.publish` acts on the code host, so it has a reconciler: the attempt that names the
+ * receipt, looked up there when its outcome is not known. Its retire revoker closes the
+ * harness's worktrees.
  *
  * `budget.extend` also runs as an inline effect: its executor and reconciler observe whether
  * a period's ledger holds a topup carrying the receipt's id. It acts on records alone.
@@ -15,7 +20,8 @@ import { runsLedger } from "@crewhaus/control-records";
 import { workLedger } from "@crewhaus/tool-work/work-items";
 import { budgetTopupWritten } from "../budget";
 import type { AreaRuntime, Executor, Reconciler } from "../executor";
-import { NEEDS_DECISION } from "../refusal";
+import { NEEDS_DECISION, RECONCILED_NOT_DONE } from "../refusal";
+import { WORKSPACE_REVOKER, reconcilePublish } from "../workspaces";
 import { ledgerNames } from "./delegation";
 
 const BUDGET_KINDS = ["budget.extend"] as const;
@@ -66,10 +72,34 @@ export const WORK_UNSUPERVISED: readonly string[] = Object.keys(WORK_KINDS).filt
   (kind) => kind !== "work.start",
 );
 
+/** Publishing acts once, in the command's own effect: an executor only observes it. */
+export const WORKSPACE_EXECUTORS: Readonly<Record<string, Executor>> = {
+  "work.publish": async ({ receipt, harnessDir, now, probe }) => {
+    const answer = await reconcilePublish(receipt, harnessDir, {
+      now,
+      ...(probe !== undefined ? { probe } : {}),
+    });
+    if (answer === "done") return { state: "succeeded" };
+    return answer === "not-done"
+      ? { state: "failed", outcome: RECONCILED_NOT_DONE }
+      : { state: "unknown", outcome: NEEDS_DECISION };
+  },
+};
+
+export const WORKSPACE_RECONCILERS: Readonly<Record<string, Reconciler>> = {
+  "work.publish": async (receipt, { harnessDir, now, probe }) =>
+    harnessDir === undefined ? "unknown" : reconcilePublish(receipt, harnessDir, { now, probe }),
+};
+
+/** No daemon takes part: the engine and the records are enough. */
+export const WORKSPACE_UNSUPERVISED: readonly string[] = Object.keys(WORKSPACE_EXECUTORS);
+
 export const RUNTIME_RUNTIME: AreaRuntime = {
   area: "runtime",
   executors: {
     ...WORK_EXECUTORS,
+
+    ...WORKSPACE_EXECUTORS,
 
     "budget.extend": async ({ receipt, harnessDir }) =>
       budgetTopupWritten(harnessDir, receipt.id)
@@ -79,12 +109,17 @@ export const RUNTIME_RUNTIME: AreaRuntime = {
   reconcilers: {
     ...WORK_RECONCILERS,
 
+    ...WORKSPACE_RECONCILERS,
+
     "budget.extend": (receipt, { harnessDir }) =>
       harnessDir !== undefined && budgetTopupWritten(harnessDir, receipt.id) ? "done" : "unknown",
   },
   unsupervised: [
     ...WORK_UNSUPERVISED,
 
+    ...WORKSPACE_UNSUPERVISED,
+
     ...BUDGET_KINDS,
   ],
+  retireRevokers: [WORKSPACE_REVOKER],
 };

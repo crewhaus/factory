@@ -13,6 +13,7 @@
  * | `decline <wi> --reason <code> [--note <text>]` | declines a proposal |
  * | `rank <wi> --above <wi> --scope item\|similar\|all` | puts an item ahead of another |
  * | `adopt --from continuity-goal:<id>` | one item per goal; a repeat names the item it opened |
+ * | `publish <wi>` | publishes the change a run of the harness made and judged, as a pull request |
  *
  * Every change refuses when the command was started by an agent's tool: the harness
  * proposes through its own Work tools, and a person decides.
@@ -36,12 +37,16 @@ import {
   type RunHome,
   THREDZ_ADOPTION_NEEDS_HOME,
   type WorkCaller,
+  type WorkCommandRefusal,
   type WorkHead,
   type WorkPlan,
+  type WorkspaceHomeDeps,
   ensureHarnessIdentity,
   workCommands,
   workRefOf,
+  workspaceCommands,
 } from "@crewhaus/control-service";
+import { terminalSafe } from "@crewhaus/run-inspect";
 import {
   type WorkSpecFacts,
   historyOf,
@@ -51,6 +56,7 @@ import {
   viewContext,
   workSpecFacts,
 } from "@crewhaus/tool-work/work-items";
+import { attemptView } from "@crewhaus/tool-work/workspace";
 import { parse as parseYaml } from "yaml";
 import { AGENT_TOOL_ENV } from "./approvals-cmd";
 import {
@@ -87,6 +93,8 @@ export const CLI_FAMILY = {
     start: { flags: COMMON },
     adopt: { flags: { ...COMMON, from: "value" } },
     rank: { flags: { ...COMMON, above: "value", scope: "value" } },
+
+    publish: { flags: COMMON },
   },
 } as const satisfies CliFamily;
 
@@ -99,6 +107,8 @@ export type WorkDeps = {
   readonly control?: () => ControlService;
   /** What `start` and `cancel` lend the run adapter; the CLI's own by default. */
   readonly home?: (harnessDir: string) => RunHome;
+  /** Ports a test replaces for `publish`. */
+  readonly workspace?: WorkspaceHomeDeps;
   readonly now?: () => number;
 };
 
@@ -113,6 +123,7 @@ const USAGE = [
   `       crewhaus work decline <wi> --reason ${DECLINE_REASONS.join("|")} [--note <text>]`,
   "       crewhaus work rank <wi> --above <wi> --scope item|similar|all",
   "       crewhaus work adopt --from continuity-goal:<id>",
+  "       crewhaus work publish <wi> [--harness <h>] [--json]",
   "  A harness's work items. <h> is a harness id or its directory; without it, the current",
   `  directory. <kind> is one of ${WORK_KINDS.join(", ")}.`,
 ];
@@ -128,6 +139,7 @@ const WRITES: ReadonlySet<Sub> = new Set([
   "start",
   "adopt",
   "rank",
+  "publish",
 ]);
 
 const KIND: Readonly<Record<Exclude<Sub, "list" | "show">, string>> = {
@@ -140,6 +152,7 @@ const KIND: Readonly<Record<Exclude<Sub, "list" | "show">, string>> = {
   start: "work.start",
   adopt: "work.adopt",
   rank: "work.rank",
+  publish: "work.publish",
 };
 
 /** The most bytes `--goal-file` reads: a goal's own bound. */
@@ -280,6 +293,84 @@ export async function runWorkCommand(
   }
 }
 
+function refusedOutput(verb: Sub, r: WorkCommandRefusal): WorkOutput {
+  return {
+    lines: [
+      `work ${verb}: ${r.message}${r.current !== undefined ? ` (now: ${r.current})` : ""}`,
+      ...(r.verb !== undefined && r.verb !== null ? [`  try: ${r.verb}`] : []),
+    ],
+    exitCode: refusalExit(r.code),
+  };
+}
+
+/**
+ * `work publish`: the change a run of the harness made and judged, as a pull request. It
+ * acts on the code host, so its answer says what is known: opened, not published, or not
+ * confirmed yet.
+ */
+async function publishVerb(
+  wi: string,
+  head: WorkHead,
+  json: boolean,
+  deps: WorkDeps,
+  opts: DaemonCommandOptions,
+): Promise<WorkOutput> {
+  const plan = workspaceCommands(deps.workspace).publish(head, PERSON, wi);
+  if (!plan.ok) return refusedOutput("publish", plan.refusal);
+  const control = deps.control?.() ?? directControl(opts);
+  const answer = await control.commands.submit(
+    {
+      kind: KIND.publish,
+      target: workRefOf(head.harness, wi),
+      ledger: { harness: head.harnessDir },
+      via: "cli",
+      body: {},
+    },
+    plan.effect,
+  );
+  if (!answer.ok) {
+    return {
+      lines: [`work publish: ${answer.refusal.message}`],
+      exitCode: refusalExit(answer.refusal.code),
+    };
+  }
+  const { receipt } = answer;
+  const value = answer.replayed ? undefined : answer.value;
+  const attempt = value?.attempt;
+  const exitCode =
+    receipt.state === "succeeded"
+      ? 0
+      : receipt.state === "unknown"
+        ? EXIT_FOR_ERROR.unavailable
+        : EXIT_FOR_ERROR.conflict;
+  if (json) {
+    return {
+      lines: [
+        JSON.stringify(
+          {
+            receipt,
+            ...(attempt !== undefined ? { attempt: attemptView(attempt) } : {}),
+            ...(value?.problem !== undefined ? { problem: value.problem } : {}),
+          },
+          null,
+          2,
+        ),
+      ],
+      exitCode,
+    };
+  }
+  const first =
+    receipt.state === "succeeded"
+      ? `${wi} published${attempt?.pr !== undefined ? ` as pull request #${attempt.pr}` : ""}`
+      : receipt.state === "unknown"
+        ? "work publish: the code host did not confirm the pull request; it is looked up before anything is tried again"
+        : `work publish: not published${value?.problem !== undefined ? `: ${value.problem}` : ""}`;
+  return {
+    lines: [terminalSafe(first), `  see: crewhaus workspace show ${wi}`, `  receipt ${receipt.id}`],
+    exitCode,
+  };
+}
+
 async function runVerb(verb: Sub, rest: readonly string[], deps: WorkDeps): Promise<WorkOutput> {
   const label = `work ${verb}`;
   const args = parseArgs(label, rest, CLI_FAMILY.sub[verb].flags);
@@ -379,6 +470,7 @@ async function runVerb(verb: Sub, rest: readonly string[], deps: WorkDeps): Prom
     ...(spec !== undefined ? { tools: spec.tools } : {}),
     now,
   };
+  if (verb === "publish") return publishVerb(itemIdOf(verb, args), head, json, deps, opts);
   const work = workCommands();
   const home = (deps.home ?? cliRunHome(opts, deps.now))(dir);
   const control = (): ControlService => deps.control?.() ?? directControl(opts);
@@ -469,16 +561,7 @@ async function runVerb(verb: Sub, rest: readonly string[], deps: WorkDeps): Prom
       break;
     }
   }
-  if (!plan.ok) {
-    const r = plan.refusal;
-    return {
-      lines: [
-        `work ${verb}: ${r.message}${r.current !== undefined ? ` (now: ${r.current})` : ""}`,
-        ...(r.verb !== undefined && r.verb !== null ? [`  try: ${r.verb}`] : []),
-      ],
-      exitCode: refusalExit(r.code),
-    };
-  }
+  if (!plan.ok) return refusedOutput(verb, plan.refusal);
   const answer = await control().commands.submit(
     { kind: KIND[verb], target, ledger: { harness: dir }, via: "cli", body },
     plan.effect,

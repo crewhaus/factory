@@ -11,6 +11,9 @@
  * | `WorkPropose` | no | no | a proposal, with its assessment; the same source is one item |
  * | `WorkUpdate` | no | yes | a note, a linked run, a delivery, an edit of its own proposal, or a close with a reason |
  *
+ * The workspace tools beside them (`./workspace-tools`) deliver an accepted item as one pull
+ * request.
+ *
  * The tools propose, add notes, link runs and close with a reason. They never accept,
  * decline or cancel, never rewrite an accepted item, and never claim an operator's or an
  * API caller's source: the store refuses each (`WORK_ACTOR_RULES`). Only the owner's
@@ -50,12 +53,13 @@ import {
   parseRef,
 } from "@crewhaus/control-contract";
 import { type RunContext, tagContent } from "@crewhaus/run-context";
-import { currentTenantContext } from "@crewhaus/tenancy";
 import { buildTool } from "@crewhaus/tool-builder";
 import type { RegisteredTool, ToolExecuteContext } from "@crewhaus/tool-catalog";
 import { z } from "zod";
+import { inManagedTenant } from "./tenant";
 import {
   type FoldedWorkItem,
+  type Proposer,
   type WorkActor,
   type WorkConfig,
   type WorkRefusal,
@@ -67,8 +71,16 @@ import {
   parseWorkConfig,
   viewContext,
 } from "./work-items/index";
+import { createWorkspaceTools } from "./workspace-tools";
 
+export { WORK_HOME_TENANT } from "./tenant";
 export { WorkConfigError } from "./work-items/index";
+export { bindWorkspaceRepositories } from "./workspace/bindings";
+export {
+  WorkspaceToolError,
+  type WorkspaceToolsDeps,
+  createWorkspaceTools,
+} from "./workspace-tools";
 
 let workConfig: WorkConfig = {};
 
@@ -90,16 +102,9 @@ export class WorkToolError extends Error {
   override readonly name = "WorkToolError";
 }
 
-/**
- * The tenant Home's own runs serve on a managed daemon (the gateway's `HOME_RUN_TENANT`;
- * a control-service test pins the two equal). The only tenant whose runs reach the store.
- */
-export const WORK_HOME_TENANT = "home";
-
 /** Refuse inside any tenant context but Home's own: the store is the harness's, not a tenant's. */
 function assertHarnessTenant(): void {
-  const ctx = currentTenantContext();
-  if (ctx !== undefined && ctx.tenant.id !== WORK_HOME_TENANT) {
+  if (inManagedTenant()) {
     throw new WorkToolError("Work items are not available to a managed tenant's runs.");
   }
 }
@@ -129,6 +134,21 @@ function actorOf(rc: RunContext | undefined): WorkActor {
     via: "tool",
     role: "harness",
     ...(run !== undefined && CANONICAL_RUN_ID_RE.test(run) ? { run } : {}),
+  };
+}
+
+/**
+ * Who proposes, for the accept policy's evidence check: the top run (a sub-agent proposes
+ * as the run it belongs to), its session and the run it continues. A run with no canonical
+ * id proposes as nobody, so none of its own records can count as evidence.
+ */
+function proposerOf(rc: RunContext | undefined): Proposer | undefined {
+  const top = rc?.parent ?? rc?.runId;
+  if (rc === undefined || top === undefined || !CANONICAL_RUN_ID_RE.test(top)) return undefined;
+  return {
+    run: top,
+    ...(rc.sessionId !== undefined && rc.sessionId !== "" ? { session: rc.sessionId } : {}),
+    ...(rc.continues !== undefined ? { continues: rc.continues } : {}),
   };
 }
 
@@ -554,7 +574,10 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
           ...(input.priority !== undefined ? { priority: input.priority } : {}),
         },
         actorOf(rc),
-        accept !== undefined ? { policy: { accept } } : {},
+        {
+          ...(accept !== undefined ? { policy: { accept } } : {}),
+          proposer: proposerOf(rc) ?? null,
+        },
       );
       if (!written.ok) fail(written);
       return JSON.stringify({ work: written.item.id, state: written.item.state });
@@ -564,7 +587,7 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
   const workUpdate = buildTool({
     name: "WorkUpdate",
     description:
-      "Update a work item: add a note, link this run, record what you delivered, change your own proposal before it is accepted, or close an accepted item as done, failed or superseded with a reason code. You cannot accept, decline or cancel work.",
+      "Update a work item: add a note, link this run, record what you delivered, change your own proposal before it is accepted, or close an accepted item as done, failed or superseded with a reason code. You cannot accept, decline or cancel work. One call is one change: if any part is refused, nothing is written. An item keeps at most 100 notes and 100 deliveries, and their text has a size budget; once full, further notes or deliveries are refused.",
     inputSchema: updateInput,
     readOnly: false,
     destructive: true,
@@ -585,71 +608,52 @@ export function createWorkTools(deps: WorkToolsDeps = {}): {
         throw new WorkToolError("Say what to change: note, link, deliver, edit or close.");
       // A run started for this item links on its first update, while the item is not
       // closed: after a close the run still records a note or a delivery. Only an
-      // explicit link is refused on a closed item.
-      let implicit = false;
-      if (input.link !== true && rc?.workItem === wi) {
-        const read = store.get(wi);
-        implicit = !("ok" in read) && read.item.state !== "closed";
+      // explicit link is refused on a closed item. One write: every check first, so a
+      // refused call writes nothing and a retry duplicates nothing.
+      if (input.link === true && actor.run === undefined) {
+        throw new WorkToolError("This run has no id a work item can link to.");
       }
-      const linkRun = input.link === true || implicit;
-      if (linkRun) {
-        if (actor.run === undefined) {
-          if (input.link === true)
-            throw new WorkToolError("This run has no id a work item can link to.");
-        } else {
-          const linked = await store.link(wi, actor.run, actor);
-          if (!linked.ok) fail(linked);
-        }
-      }
-      if (input.edit !== undefined) {
-        const { expect, ...edit } = input.edit;
-        const written = await store.update(
-          wi,
-          {
-            expect,
-            ...(edit as Omit<typeof edit, "kind" | "basis">),
-            ...(edit.kind !== undefined ? { kind: edit.kind as FoldedWorkItem["kind"] } : {}),
-            ...(edit.basis !== undefined
-              ? { basis: edit.basis as NonNullable<FoldedWorkItem["basis"]> }
-              : {}),
-            ...(input.note !== undefined ? { note: input.note } : {}),
-          },
-          actor,
-        );
-        if (!written.ok) fail(written);
-      } else if (input.note !== undefined) {
-        // A note needs no guard of its own: one retry covers a write that landed between.
-        for (let attempt = 0; ; attempt++) {
-          const read = store.get(wi);
-          if ("ok" in read) fail(read);
-          const written = await store.update(
-            wi,
-            { expect: read.item.rev, note: input.note },
-            actor,
-          );
-          if (written.ok) break;
-          if (written.code !== "precondition_failed" || attempt > 0) fail(written);
-        }
-      }
-      if (input.deliver !== undefined) {
-        const written = await store.deliver(wi, input.deliver, actor);
-        if (!written.ok) fail(written);
-      }
-      if (input.close !== undefined) {
-        const written = await store.transition(
-          wi,
-          "closed",
-          {
-            outcome: input.close.outcome,
-            reasonCode: input.close.reasonCode,
-            ...(input.close.supersededBy !== undefined
-              ? { supersededBy: workIdOf(input.close.supersededBy) }
-              : {}),
-          },
-          actor,
-        );
-        if (!written.ok) fail(written);
-      }
+      const link =
+        actor.run === undefined
+          ? undefined
+          : input.link === true
+            ? { run: actor.run }
+            : rc?.workItem === wi
+              ? { run: actor.run, whileOpen: true }
+              : undefined;
+      const edit = input.edit;
+      const written = await store.apply(
+        wi,
+        {
+          ...(link !== undefined ? { link } : {}),
+          ...(input.note !== undefined ? { note: input.note } : {}),
+          ...(edit !== undefined
+            ? {
+                edit: {
+                  ...(edit as Omit<typeof edit, "kind" | "basis">),
+                  ...(edit.kind !== undefined ? { kind: edit.kind as FoldedWorkItem["kind"] } : {}),
+                  ...(edit.basis !== undefined
+                    ? { basis: edit.basis as NonNullable<FoldedWorkItem["basis"]> }
+                    : {}),
+                },
+              }
+            : {}),
+          ...(input.deliver !== undefined ? { deliver: input.deliver } : {}),
+          ...(input.close !== undefined
+            ? {
+                close: {
+                  outcome: input.close.outcome,
+                  reasonCode: input.close.reasonCode,
+                  ...(input.close.supersededBy !== undefined
+                    ? { supersededBy: workIdOf(input.close.supersededBy) }
+                    : {}),
+                },
+              }
+            : {}),
+        },
+        actor,
+      );
+      if (!written.ok) fail(written);
       const after = store.get(wi);
       if ("ok" in after) fail(after);
       return JSON.stringify({ work: wi, state: after.item.state });
@@ -669,3 +673,12 @@ export const workGet: RegisteredTool = DEFAULT_TOOLS.workGet;
 export const workPropose: RegisteredTool = DEFAULT_TOOLS.workPropose;
 /** `WorkUpdate`: a note, a link, a delivery, an edit of its own proposal, or a close. */
 export const workUpdate: RegisteredTool = DEFAULT_TOOLS.workUpdate;
+
+const DEFAULT_WORKSPACE_TOOLS = createWorkspaceTools();
+
+/** `WorkspaceOpen`: a worktree for an accepted item, on its own branch. */
+export const workspaceOpen: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspaceOpen;
+/** `WorkspaceCheck`: the declared checks on an item's worktree, in the sandbox. */
+export const workspaceCheck: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspaceCheck;
+/** `WorkspacePublish`: an item's change as one pull request, after every gate. */
+export const workspacePublish: RegisteredTool = DEFAULT_WORKSPACE_TOOLS.workspacePublish;

@@ -52,14 +52,21 @@ export type EntryKind = keyof typeof ENTRY_KINDS;
 /** The check outcomes that are detail: everything else a check says is a key event. */
 export const DETAIL_OUTCOMES: ReadonlySet<string> = new Set(["allow", "pass"]);
 
+/** The kind's row, read as the table's own: a name the table does not hold is `other`. */
+function rowOf(kind: string): EntryKindRow {
+  return Object.hasOwn(ENTRY_KINDS, kind)
+    ? ((ENTRY_KINDS as Readonly<Record<string, EntryKindRow>>)[kind] as EntryKindRow)
+    : ENTRY_KINDS.other;
+}
+
 export function importanceOf(kind: EntryKind, outcome?: string): EntryImportance {
-  const row: EntryKindRow = ENTRY_KINDS[kind];
+  const row = rowOf(kind);
   if (row.importance !== "by-outcome") return row.importance;
   return outcome !== undefined && DETAIL_OUTCOMES.has(outcome) ? "detail" : "key";
 }
 
 export function groupOf(kind: EntryKind): EntryGroup {
-  return ENTRY_KINDS[kind].group;
+  return rowOf(kind).group;
 }
 
 /** The entry kind of a session-log line kind; `undefined` for a line merged into another. */
@@ -107,3 +114,13 @@ export const LINE_KINDS: Readonly<Record<string, EntryKind | undefined>> = Objec
   crew_done: "crew",
   dream_run: "other",
 });
+
+/**
+ * What a session-log line kind becomes: its entry kind; `merged` for a line another entry
+ * carries; `unknown` for a kind the table does not hold. Read as the table's own, so a
+ * recorded kind never resolves to a property of a built-in object.
+ */
+export function lineKindOf(kind: string): EntryKind | "merged" | "unknown" {
+  if (!Object.hasOwn(LINE_KINDS, kind)) return "unknown";
+  return LINE_KINDS[kind] ?? "merged";
+}

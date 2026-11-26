@@ -702,6 +702,41 @@ export const KNOWLEDGE_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// `crewhaus knowledge status|list|show|why|usage|search|reindex|erase`: what one harness
+// knows. Each verb takes only the flags it reads, so a flag another verb takes (sync's
+// `--dry-run` above all) is refused, never quietly ignored.
+const KNOWLEDGE_READ_FLAGS = [
+  { name: "json", takesValue: false },
+  { name: "help", short: "h" },
+] as const;
+export const KNOWLEDGE_STATUS_SCHEMA: ParseArgsSchema = { flags: [...KNOWLEDGE_READ_FLAGS] };
+export const KNOWLEDGE_LIST_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "type", takesValue: true },
+    { name: "status", takesValue: true },
+    { name: "scope", takesValue: true },
+    ...KNOWLEDGE_READ_FLAGS,
+  ],
+};
+export const KNOWLEDGE_SHOW_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "history", takesValue: false }, ...KNOWLEDGE_READ_FLAGS],
+};
+export const KNOWLEDGE_WHY_SCHEMA: ParseArgsSchema = { flags: [...KNOWLEDGE_READ_FLAGS] };
+export const KNOWLEDGE_USAGE_SCHEMA: ParseArgsSchema = { flags: [...KNOWLEDGE_READ_FLAGS] };
+export const KNOWLEDGE_SEARCH_SCHEMA: ParseArgsSchema = {
+  flags: [{ name: "harness", takesValue: true }, ...KNOWLEDGE_READ_FLAGS],
+};
+export const KNOWLEDGE_REINDEX_SCHEMA: ParseArgsSchema = { flags: [...KNOWLEDGE_READ_FLAGS] };
+export const KNOWLEDGE_ERASE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "include-sources", takesValue: false },
+    { name: "shared", takesValue: true },
+    { name: "yes", takesValue: false },
+    { name: "confirm", takesValue: true },
+    ...KNOWLEDGE_READ_FLAGS,
+  ],
+};
+
 // Item 58 — `crewhaus fleet list|status|run`. `--root` scopes discovery;
 // `--filter` narrows a bulk `run`; `--allow-mutating` + per-harness confirm
 // gates a mutating bulk op; `--yes` skips the interactive confirm (CI).
@@ -1906,6 +1941,19 @@ export const FEDERATION_SCHEMA: ParseArgsSchema = {
   flags: [
     { name: "srv-domain", takesValue: true },
     { name: "format", takesValue: true },
+    { name: "help", short: "h" },
+  ],
+};
+
+// `crewhaus deploy approve <spec> --env <env>`: one answer to a protected environment's
+// approval (deploy-approve-cmd.ts).
+export const DEPLOY_APPROVE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "env", takesValue: true },
+    { name: "version", takesValue: true },
+    { name: "deny", takesValue: false },
+    { name: "harness", takesValue: true },
+    { name: "json", takesValue: false },
     { name: "help", short: "h" },
   ],
 };

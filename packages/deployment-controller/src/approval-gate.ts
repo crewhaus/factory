@@ -26,8 +26,10 @@
  *
  * WHAT SATISFIES THE GATE — two independent, OR-combined witnesses:
  *   1. Recorded approvals: `.crewhaus/approvals/<spec>__<env>.json` holds an
- *      array of `{ approver, ts, specHash, version? }`. Distinct approvers count
- *      toward `minApprovals`. An approval binds content: it counts only when its
+ *      array of `{ approver, ts, specHash, version?, principal? }`. Distinct people
+ *      count toward `minApprovals`: an entry a member's own vote recorded (`./quorum`)
+ *      names its `principal`, and a hand-written entry is the person its `approver`
+ *      names. An approval binds content: it counts only when its
  *      `specHash` (`@crewhaus/ir/policy`'s `specRevision` of the spec text) is the
  *      candidate's, and, when it also names a `version`, that version is the one
  *      being pinned. A record that names no `specHash` counts for nothing, and the
@@ -140,6 +142,8 @@ export type ApprovalRecord = {
    *  version being promoted to count. */
   readonly version?: string;
   readonly comment?: string;
+  /** Who it is, as a stored actor, on an entry a person's own vote recorded. */
+  readonly principal?: string;
 };
 
 /** Approvals file name for a (spec, env) pair. `/` is not possible in a spec
@@ -178,6 +182,7 @@ export function readApprovals(rootDir: string, specName: string, env: string): A
       ...(typeof rec["specHash"] === "string" ? { specHash: rec["specHash"] } : {}),
       ...(typeof rec["version"] === "string" ? { version: rec["version"] } : {}),
       ...(typeof rec["comment"] === "string" ? { comment: rec["comment"] } : {}),
+      ...(typeof rec["principal"] === "string" ? { principal: rec["principal"] } : {}),
     });
   }
   return out;
@@ -301,16 +306,37 @@ export type ApprovalDecision = {
 };
 
 /**
- * Decide whether the gate is satisfied. Counts DISTINCT approvers whose
- * approval names the candidate's `specHash` (and, when it names a version,
- * `toVersion`), plus one collective witness for a green PR check. Satisfied
+ * The distinct people behind approvals, one display name each. An entry that names its
+ * `principal` is that person's, however it is signed; an entry that names none is the
+ * person whose own entry carries the same `approver`, or else its `approver` alone. So a
+ * hand-written "alice" and Alice's own vote are one approval.
+ */
+export function distinctApprovers(approvals: ReadonlyArray<ApprovalRecord>): string[] {
+  const people = new Map<string, string>();
+  const names = new Set<string>();
+  for (const a of approvals) {
+    if (a.principal === undefined) continue;
+    if (!people.has(a.principal)) people.set(a.principal, a.approver);
+    names.add(a.approver);
+  }
+  for (const a of approvals) {
+    if (a.principal !== undefined || names.has(a.approver)) continue;
+    people.set(`approver ${a.approver}`, a.approver);
+  }
+  return [...people.values()];
+}
+
+/**
+ * Decide whether the gate is satisfied. Counts DISTINCT people
+ * ({@link distinctApprovers}) whose approval names the candidate's `specHash` (and, when
+ * it names a version, `toVersion`), plus one collective witness for a green PR check. Satisfied
  * when `witnesses >= required`. Revisions compare with `sameRevision`: an
  * approval naming no well-formed `specHash` counts for nothing, and when the
  * candidate itself names none, no recorded approval counts.
  */
 export function decideApproval(input: ApprovalDecisionInput): ApprovalDecision {
   const required = input.policy.minApprovals;
-  const counted = new Set<string>();
+  const counting: ApprovalRecord[] = [];
   const candidateNamed = sameRevision(input.specHash, input.specHash);
   let namingNoContent = 0;
   for (const a of input.approvals) {
@@ -320,24 +346,25 @@ export function decideApproval(input: ApprovalDecisionInput): ApprovalDecision {
     }
     if (!sameRevision(a.specHash, input.specHash)) continue;
     if (a.version !== undefined && a.version !== input.toVersion) continue;
-    counted.add(a.approver);
+    counting.push(a);
   }
+  const counted = distinctApprovers(counting);
   const prWitness = input.prCheck?.conclusion === "success";
-  const witnesses = counted.size + (prWitness ? 1 : 0);
+  const witnesses = counted.length + (prWitness ? 1 : 0);
   const satisfied = witnesses >= required;
 
   let reason: string;
   if (satisfied) {
     const parts: string[] = [];
-    if (counted.size > 0)
-      parts.push(`${counted.size} recorded approval(s): ${[...counted].sort().join(", ")}`);
+    if (counted.length > 0)
+      parts.push(`${counted.length} recorded approval(s): ${[...counted].sort().join(", ")}`);
     if (prWitness) parts.push(`green PR check (#${input.prCheck?.prNumber ?? "?"})`);
     reason = `quorum met (${witnesses}/${required}) — ${parts.join("; ")}`;
   } else {
     const missing = required - witnesses;
     const detail: string[] = [];
     detail.push(`have ${witnesses} witness(es), need ${required}`);
-    if (counted.size > 0) detail.push(`approvers: ${[...counted].sort().join(", ")}`);
+    if (counted.length > 0) detail.push(`approvers: ${[...counted].sort().join(", ")}`);
     if (input.prCheck !== undefined && !prWitness) {
       detail.push(`PR check: ${input.prCheck.conclusion}`);
     }
@@ -345,7 +372,7 @@ export function decideApproval(input: ApprovalDecisionInput): ApprovalDecision {
       detail.push(`${namingNoContent} recorded approval(s) ignored for naming no specHash`);
     }
     reason = candidateNamed
-      ? `quorum NOT met — ${detail.join("; ")} (${missing} more needed; record approvals in ${APPROVALS_RELDIR}/${approvalsFileName(input.specName, input.toEnv)} with "specHash": "${input.specHash}", or land a green proposal PR)`
+      ? `quorum NOT met — ${detail.join("; ")} (${missing} more needed; approve with \`crewhaus deploy approve\`, record approvals in ${APPROVALS_RELDIR}/${approvalsFileName(input.specName, input.toEnv)} with "specHash": "${input.specHash}", or land a green proposal PR)`
       : `quorum NOT met — ${detail.join("; ")} (${missing} more needed; the candidate names no spec revision, so no recorded approval can bind to it)`;
   }
   return { satisfied, countedApprovers: [...counted].sort(), prWitness, required, reason };

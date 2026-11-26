@@ -254,11 +254,31 @@ export type TranscriptGutterItem = {
   readonly payload: unknown;
 };
 
+/** What a synthetic user message the runtime or an operator wrote is. */
+export type TranscriptMarkerKind =
+  | "wake"
+  | "eval-nudge"
+  | "provability-nudge"
+  | "toolset"
+  | "other";
+
+/**
+ * A synthetic user message: never a turn, so it is marked instead. `text` is masked like
+ * a turn's and flattened onto one line.
+ */
+export type TranscriptMarker = {
+  readonly line: number;
+  readonly kind: TranscriptMarkerKind;
+  readonly text: string;
+};
+
 export type TranscriptView = {
   readonly id: string;
   readonly evicted: boolean;
   readonly turns: readonly TranscriptTurn[];
   readonly tools: readonly TranscriptToolCall[];
+  /** The synthetic user messages, in line order. */
+  readonly markers: readonly TranscriptMarker[];
   readonly gutter: readonly TranscriptGutterItem[];
   /** Tally of kinds seen but not rendered (unknown/future kinds tolerated). */
   readonly otherKinds: Record<string, number>;
@@ -289,6 +309,49 @@ function textOfContent(content: unknown): string {
   return "";
 }
 
+/** The lines that are the conversation itself; every other line is side-channel. */
+const CONVERSATIONAL_KINDS: ReadonlySet<string> = new Set([
+  "user_message",
+  "assistant_message",
+  "tool_use",
+  "tool_result",
+]);
+
+/** Free text on one line: controls, format characters and line breaks are spaces. */
+function flatText(text: string): string {
+  return text
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/**
+ * What a synthetic user message is: an operator's wake (`control.synthetic`), the
+ * toolset the runtime announced (`toolset`), a nudge answering the nearest earlier
+ * side-channel line since the model's last answer when that is an eval or proof verdict
+ * or grade, or other.
+ */
+function markerKindOf(
+  payload: Readonly<Record<string, unknown>>,
+  side: { readonly kind: string; readonly payload: unknown } | undefined,
+): TranscriptMarkerKind {
+  const control = payload["control"];
+  if (typeof control === "object" && control !== null) {
+    if ((control as Record<string, unknown>)["synthetic"] === true) return "wake";
+  }
+  if (payload["toolset"] !== undefined) return "toolset";
+  if (side !== undefined) {
+    const gate = (side.payload as { gate?: unknown } | null | undefined)?.gate;
+    if (side.kind === "provability_graded" || side.kind === "proof_checked") {
+      return "provability-nudge";
+    }
+    if (side.kind === "judge_verdict" || side.kind === "eval_graded") return "eval-nudge";
+    if (side.kind === "verdict" && gate === "provability") return "provability-nudge";
+    if (side.kind === "verdict" && gate === "eval") return "eval-nudge";
+  }
+  return "other";
+}
+
 /** True when a session id string has the on-disk shape. */
 export function isSessionId(id: string): boolean {
   return SESSION_ID_RE.test(id);
@@ -314,12 +377,18 @@ export function readTranscript(sessionRoot: string, id: string): TranscriptView 
   const tools: TranscriptToolCall[] = [];
   const byToolUseId = new Map<string, number>(); // toolUseId → index into tools
   const gutter: TranscriptGutterItem[] = [];
+  const markers: TranscriptMarker[] = [];
   const otherKinds: Record<string, number> = {};
+  // The latest line that is not part of the conversation, since the model last answered:
+  // what a nudge answers.
+  let lastSide: { readonly kind: string; readonly payload: unknown } | undefined;
 
   read.objects.forEach((obj, line) => {
     if (typeof obj !== "object" || obj === null) return;
     const { kind, payload } = obj as { kind?: unknown; payload?: unknown };
     if (typeof kind !== "string") return;
+    if (kind === "assistant_message") lastSide = undefined;
+    else if (!CONVERSATIONAL_KINDS.has(kind)) lastSide = { kind, payload };
 
     if (kind === "user_message") {
       const p = (payload ?? {}) as { synthetic?: unknown; content?: unknown };
@@ -335,7 +404,14 @@ export function readTranscript(sessionRoot: string, id: string): TranscriptView 
           isError: b.is_error === true,
         };
       }
-      if (p.synthetic === true) return;
+      if (p.synthetic === true) {
+        markers.push({
+          line,
+          kind: markerKindOf(p as Readonly<Record<string, unknown>>, lastSide),
+          text: maskCredentialTokens(flatText(textOfContent(p.content))),
+        });
+        return;
+      }
       const text = textOfContent(p.content);
       const toolResultOnly = blocks.length > 0 && blocks.every((b) => b.type === "tool_result");
       if (!toolResultOnly && (typeof p.content === "string" || text !== "")) {
@@ -379,6 +455,7 @@ export function readTranscript(sessionRoot: string, id: string): TranscriptView 
     evicted: false,
     turns,
     tools,
+    markers,
     gutter,
     otherKinds,
     truncated: read.truncated,
@@ -387,21 +464,59 @@ export function readTranscript(sessionRoot: string, id: string): TranscriptView 
   };
 }
 
+/** A block of model thinking inside a raw line: which line, where in it, and what kind. */
+export type RawAnnotation = {
+  readonly line: number;
+  readonly path: readonly (string | number)[];
+  readonly label: "thinking" | "redacted-thinking";
+};
+
 export type RawTranscript = {
   readonly id: string;
   readonly raw: readonly string[];
+  /** The model's thinking blocks the raw lines hold, labelled so a reader knows them. */
+  readonly annotations: readonly RawAnnotation[];
   readonly truncated: boolean;
 };
 
-/** The `?raw=1` escape hatch: capped raw lines, still masked. */
+/** The thinking blocks of one parsed raw line, at its index. */
+function thinkingBlocks(obj: unknown, line: number): RawAnnotation[] {
+  if (typeof obj !== "object" || obj === null) return [];
+  const { kind, payload } = obj as { kind?: unknown; payload?: unknown };
+  if (kind !== "assistant_message") return [];
+  const content = (payload as { content?: unknown } | null | undefined)?.content;
+  if (!Array.isArray(content)) return [];
+  const out: RawAnnotation[] = [];
+  content.forEach((block, i) => {
+    const type = (block as { type?: unknown } | null)?.type;
+    if (type === "thinking" || type === "redacted_thinking") {
+      out.push({
+        line,
+        path: ["payload", "content", i],
+        label: type === "thinking" ? "thinking" : "redacted-thinking",
+      });
+    }
+  });
+  return out;
+}
+
+/** The `?raw=1` escape hatch: capped raw lines, still masked, with thinking labelled. */
 export function readTranscriptRaw(sessionRoot: string, id: string): RawTranscript | undefined {
   const logPath = resolveContained(sessionRoot, `${id}.jsonl`);
   if (logPath === undefined) return undefined;
   if (!existsSync(logPath)) return undefined;
   const read = readJsonlCapped(logPath, MAX_RAW_LINES);
+  const annotations = read.rawLines.flatMap((raw, line) => {
+    try {
+      return thinkingBlocks(JSON.parse(raw), line);
+    } catch {
+      return [];
+    }
+  });
   return {
     id,
     raw: read.rawLines.map((l) => maskCredentialTokens(l)),
+    annotations,
     truncated: read.truncated,
   };
 }

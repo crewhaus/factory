@@ -3,6 +3,7 @@
  * evidence, and the few words every surface shares (a shell-safe command, a class order).
  */
 import {
+  ATTENTION_TWINS,
   type AttentionChoice,
   type AttentionEvidence,
   type AttentionFreshness,
@@ -12,7 +13,7 @@ import {
   type AttentionText,
   type CliTwin,
   type DecisionClass,
-  TWIN_PLACEHOLDERS,
+  RECEIPT_VIA,
   type TwinParams,
   attentionBandOf,
   renderTwin,
@@ -37,6 +38,7 @@ type ItemExtras = Partial<
     | "body"
     | "bodyWithheld"
     | "sensitivity"
+    | "deferral"
   >
 >;
 
@@ -90,6 +92,7 @@ export function draftItem(spec: ItemSpec): Drafted {
     ...pick("cause"),
     ...pick("binding"),
     ...pick("sensitivity"),
+    ...pick("deferral"),
     evidenceRev: evidenceRevOf(spec.revision),
     since: spec.since,
     ...pick("asks"),
@@ -134,9 +137,20 @@ export function twinOf(twin: CliTwin, params: TwinParams): string | undefined {
   return ["crewhaus", ...rendered.argv].map(shellWord).join(" ");
 }
 
-/** Whether a directory fits a command's `{dir}`: no control character, no leading `-`. */
-export function dirFits(dir: string): boolean {
-  return TWIN_PLACEHOLDERS["{dir}"].test(dir);
+/** A choice carried out by `attention.resolve`, with the command that does it. */
+export function decideChoice(
+  att: string,
+  id: string,
+  needs: DecisionClass,
+  permission?: string,
+): AttentionChoice {
+  const cliTwin = twinOf(ATTENTION_TWINS.decide, { att, attChoice: id });
+  return {
+    id,
+    needs,
+    ...(cliTwin !== undefined ? { cliTwin } : { cliTwin: null, nullReason: "Decide it in Home." }),
+    ...(permission !== undefined ? { permission } : {}),
+  };
 }
 
 /** A time in ms, or `undefined` for one that does not parse. */
@@ -144,6 +158,26 @@ export function msOf(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const ms = Date.parse(value);
   return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * The grammar a record's writer gives a time: an ISO date and time with `Z` or an offset.
+ * A parser takes more than this (words in brackets, a month by name), so a time is kept
+ * only when the whole value is one.
+ */
+const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+/** A recorded time, or `undefined` for anything that is not one. */
+export function timeOf(value: unknown): string | undefined {
+  return typeof value === "string" && TIME_RE.test(value) && msOf(value) !== undefined
+    ? value
+    : undefined;
+}
+
+/** The door a decision came through, `unknown` for a word that is not one. */
+export function viaOf(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  return (RECEIPT_VIA as readonly unknown[]).includes(value) ? (value as string) : "unknown";
 }
 
 /** The ISO form of a time in ms. */

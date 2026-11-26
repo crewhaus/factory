@@ -20,7 +20,7 @@ import { DELEGATION_MODULE } from "./delegation.js";
 
 import { HOME_MODULE } from "./home.js";
 
-// import { INSPECTION_MODULE } from "./inspection.js";
+import { INSPECTION_MODULE } from "./inspection.js";
 
 import { INTEGRATIONS_MODULE } from "./integrations.js";
 
@@ -47,7 +47,7 @@ export const AREA_MODULES = [
 
   HOME_MODULE,
 
-  // INSPECTION_MODULE,
+  INSPECTION_MODULE,
 
   INTEGRATIONS_MODULE,
 

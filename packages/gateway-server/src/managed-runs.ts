@@ -74,6 +74,8 @@ import { boundaryRuleIds } from "@crewhaus/boundary-classifier";
 import {
   CANONICAL_RUN_ID_RE,
   EXECUTION_RUN_ID_RE,
+  RECEIPT_VIA,
+  type ReceiptVia,
   SESSION_ID_RE,
   type Trigger,
   canonicalJson,
@@ -141,9 +143,24 @@ export {
 /** What started a run this module records. */
 const API_TRIGGER: Trigger = Object.freeze({ kind: "api" });
 
-/** What started a run that serves a work item. */
-function workTrigger(workItem: string): Trigger {
-  return { kind: "api", workItem };
+/**
+ * What started a run: the API, for a work item when it serves one, through the door its
+ * command came through when it was queued by one (a work item's grant is spent by a run
+ * a person started).
+ */
+function triggerFor(workItem: string | undefined, via?: ReceiptVia): Trigger {
+  if (workItem === undefined && via === undefined) return API_TRIGGER;
+  return {
+    kind: "api",
+    ...(workItem !== undefined ? { workItem } : {}),
+    ...(via !== undefined ? { via } : {}),
+  };
+}
+
+/** The door a queued row's trigger names, when it names one. */
+function viaOf(trigger: unknown): ReceiptVia | undefined {
+  const via = (trigger as { readonly via?: unknown } | null | undefined)?.via;
+  return (RECEIPT_VIA as readonly unknown[]).includes(via) ? (via as ReceiptVia) : undefined;
 }
 
 /** How many run buses `runs.subscribe` can resolve; the oldest goes past it. */
@@ -468,6 +485,10 @@ export type QueueManagedRunOptions = {
    * picks it up again.
    */
   readonly workItem?: string;
+  /** The run this one starts again, on its `queued` row. */
+  readonly attemptOf?: string;
+  /** The door the command that queued it came through, on its trigger. */
+  readonly via?: ReceiptVia;
   readonly now?: () => number;
   readonly env?: Readonly<Record<string, string | undefined>>;
 };
@@ -518,6 +539,9 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
   if (opts.workItem !== undefined && !isId("wi", opts.workItem)) {
     return { ok: false, reason: "workItem must be a work item id (wi_…)" };
   }
+  if (opts.attemptOf !== undefined && !CANONICAL_RUN_ID_RE.test(opts.attemptOf)) {
+    return { ok: false, reason: "attemptOf must be a crewhaus run id: run_ and 26 characters" };
+  }
   const now = opts.now ?? Date.now;
   const record: QueuedInput = {
     v: 1,
@@ -551,13 +575,14 @@ export function queueManagedRun(opts: QueueManagedRunOptions): QueueManagedRunAn
     id: runId,
     state: "queued",
     at: new Date(now()).toISOString(),
-    trigger: opts.workItem !== undefined ? workTrigger(opts.workItem) : API_TRIGGER,
+    trigger: triggerFor(opts.workItem, opts.via),
     ...(opts.workItem !== undefined ? { workItem: opts.workItem } : {}),
     tenant: opts.tenant,
     by: opts.by,
     ...(opts.byCredential !== undefined ? { byCredential: opts.byCredential } : {}),
     ...(opts.deployment !== undefined ? { deployment: opts.deployment } : {}),
     ...(opts.cmd !== undefined ? { cmd: opts.cmd } : {}),
+    ...(opts.attemptOf !== undefined ? { attemptOf: opts.attemptOf } : {}),
   });
   if (!queued.ok) {
     rmSync(file, { force: true });
@@ -633,13 +658,14 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
       readonly session: string;
       readonly resumeScope: string | undefined;
       readonly workItem?: string;
+      readonly via?: ReceiptVia;
     },
   ): RunRows {
     const running = append(ledger, {
       id: runId,
       state: "running",
       at: stamp(),
-      trigger: fields.workItem !== undefined ? workTrigger(fields.workItem) : API_TRIGGER,
+      trigger: triggerFor(fields.workItem, fields.via),
       session: fields.session,
       ...(fields.resumeScope !== undefined ? { resumeScope: fields.resumeScope } : {}),
       ...(fields.workItem !== undefined ? { workItem: fields.workItem } : {}),
@@ -777,6 +803,8 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
     readonly subject: string | undefined;
     /** The work item the run serves, when it was queued for one. */
     readonly workItem?: string;
+    /** The door the command that queued it came through. */
+    readonly via?: ReceiptVia;
     readonly rows: RunRows;
     readonly run: LiveRun;
     readonly log: AuditLog;
@@ -788,7 +816,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
    */
   function runTurn(plan: TurnPlan): Promise<ManagedRunResult> {
     const scope: RunScope = {
-      trigger: plan.workItem !== undefined ? workTrigger(plan.workItem) : API_TRIGGER,
+      trigger: triggerFor(plan.workItem, plan.via),
       ...(plan.resumeScope !== undefined ? { resumeScope: plan.resumeScope } : {}),
       ...(plan.subject !== undefined ? { subject: plan.subject } : {}),
       ...(plan.workItem !== undefined ? { workItem: plan.workItem } : {}),
@@ -1102,7 +1130,12 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
   }
 
   /** Run one queued run whose claim this process won. Never rejects. */
-  async function runQueued(runId: string, tenantId: string, workItem?: string): Promise<void> {
+  async function runQueued(
+    runId: string,
+    tenantId: string,
+    workItem?: string,
+    via?: ReceiptVia,
+  ): Promise<void> {
     const run: LiveRun = { tenantId, cancelled: false };
     live.set(runId, run);
     try {
@@ -1120,6 +1153,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         session: sessionId,
         resumeScope,
         ...(workItem !== undefined ? { workItem } : {}),
+        ...(via !== undefined ? { via } : {}),
       });
       const subject = input?.subject;
       let tenant: Tenant;
@@ -1182,6 +1216,7 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
               resumeScope,
               subject,
               ...(workItem !== undefined ? { workItem } : {}),
+              ...(via !== undefined ? { via } : {}),
               rows,
               run,
               log,
@@ -1279,7 +1314,14 @@ export function createManagedRuns(opts: CreateManagedRunsOptions): ManagedRuns {
         continue;
       }
       const workItem = object.record["workItem"];
-      runs.push(runQueued(id, tenantId, isId("wi", workItem) ? (workItem as string) : undefined));
+      runs.push(
+        runQueued(
+          id,
+          tenantId,
+          isId("wi", workItem) ? (workItem as string) : undefined,
+          viaOf(object.record["trigger"]),
+        ),
+      );
     }
     await Promise.all(runs);
   }

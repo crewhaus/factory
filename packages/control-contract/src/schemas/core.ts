@@ -12,10 +12,12 @@ import {
   DECISION_CLASSES,
   DECISION_LOG_REASONS,
   DELEGABLE_DECISION_KINDS,
+  DEPLOY_QUORUM_KIND,
   type DecisionState,
   type DeferReason,
   type DeploymentState,
   EMPTY_REASONS,
+  ENVIRONMENT_NAME_RE,
   ERROR_CODES,
   type EventType,
   HARNESS_DISPLAY_STATES,
@@ -35,6 +37,9 @@ import {
   type RunState,
   SCOPED_ACTS,
   SESSION_ID_RE,
+  SPEC_NAME_RE,
+  SPEC_REVISION_RE,
+  SPEC_VERSION_RE,
   type SupersedeReason,
   TRIGGER_KINDS,
   WORK_KINDS,
@@ -341,15 +346,29 @@ export const workCreateSpec = z
   })
   .strict();
 
+/**
+ * What starts a run: its input, or `from`, a run of this harness whose recorded request
+ * the new run starts with (exactly one of the two).
+ */
 export const runCreateRequest = z
   .object({
-    input: z.string().min(1),
+    input: z.string().min(1).optional(),
+    from: canonicalRunId.optional(),
     subject: z.string().min(1).optional(),
     admission: z.enum(["reject", "queue"]).default("reject"),
     // A work item of this harness (`<hrn>/work/<wi>` or a bare `wi_` id), or one to create.
     work: z.union([refString, workItemId, workCreateSpec]).optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, ctx) => {
+    if ((value.input === undefined) === (value.from === undefined)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: [value.input === undefined ? "input" : "from"],
+        message: "name the run's input or the run to start again (from), not both",
+      });
+    }
+  });
 
 export const runCreated = z.object({ run, receipt: commandReceipt }).passthrough();
 
@@ -382,6 +401,7 @@ export const decisionBinding = z
     resumeScope,
     sessionId: z.string(),
     workItem: workItemId.optional(),
+    starter: z.enum(["person", "service", "system"]).optional(),
     deploymentId: deploymentId.optional(),
     specHash: z.string().optional(),
     placesDigest: z.string(),
@@ -457,6 +477,7 @@ export const decision = z
         "standing-rule-proposal",
         "change-adoption",
         ...DELEGABLE_DECISION_KINDS,
+        DEPLOY_QUORUM_KIND,
       ])
       .optional(),
     decidedByPrincipal: storedActor.optional(),
@@ -505,6 +526,14 @@ export const decision = z
           })
           .passthrough(),
         z.object({ ref: refString, revision: z.string().min(1) }).passthrough(),
+        z
+          .object({
+            spec: z.string().regex(SPEC_NAME_RE),
+            environment: z.string().regex(ENVIRONMENT_NAME_RE),
+            version: z.string().regex(SPEC_VERSION_RE),
+            specHash: z.string().regex(SPEC_REVISION_RE),
+          })
+          .passthrough(),
       ])
       .optional(),
   })
@@ -985,6 +1014,7 @@ export const eventEnvelope = z
     harness: harnessId.optional(),
     run: z.string().optional(),
     work: z.string().optional(),
+    attention: refString.optional(),
     decision: z.string().optional(),
     command: z.string().optional(),
     deployment: z.string().optional(),

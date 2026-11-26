@@ -5,7 +5,14 @@
  * family, every other one as setup. The pending-approvals finding is left out: each
  * request is an item of its own.
  */
-import type { AttentionChoice, AttentionKind } from "@crewhaus/control-contract";
+import {
+  ATTENTION_JOBS,
+  ATTENTION_PLACES,
+  type AttentionChoice,
+  type AttentionJob,
+  type AttentionKind,
+  type AttentionPlace,
+} from "@crewhaus/control-contract";
 import { draftItem, msOf } from "../items";
 import type { AdvisorFinding, AdvisorSnapshot, Drafted, ItemContext } from "../types";
 
@@ -81,16 +88,34 @@ export function advisorTitleOf(item: AdvisorFinding): {
   return { template: "advisor.other", params: { screen: item.screen } };
 }
 
+const isJob = (value: unknown): value is AttentionJob =>
+  typeof value === "string" && (ATTENTION_JOBS as readonly string[]).includes(value);
+const isPlace = (value: unknown): value is AttentionPlace =>
+  typeof value === "string" && (ATTENTION_PLACES as readonly string[]).includes(value);
+
+/**
+ * A finding's one choice: the job it starts, or the screen it goes to, each named from a
+ * closed list so every surface words what it does. A job or a screen outside them is not
+ * named, and the choice is worded as a suggestion.
+ */
 function choicesOf(item: AdvisorFinding): AttentionChoice[] {
   const action = item.action;
   if (action === null) return [];
+  const job = action.kind === "job" && isJob(action.jobKind) ? { job: action.jobKind } : {};
+  const place = action.kind !== "job" && isPlace(item.screen) ? { place: item.screen } : {};
   return [
     {
       id: action.kind === "job" ? "act" : "open",
       needs: "operator",
       cliTwin: action.cliTwin,
+      ...job,
+      ...place,
       ...(action.cliTwin === null
-        ? { nullReason: `Open the ${item.screen} screen in Home; there is no command for this.` }
+        ? {
+            nullReason: isPlace(item.screen)
+              ? `Open the ${item.screen} screen in Home; there is no command for this.`
+              : "Open it in Home; there is no command for this.",
+          }
         : {}),
     },
   ];

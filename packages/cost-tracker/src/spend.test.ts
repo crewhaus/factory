@@ -1,16 +1,21 @@
 /**
- * The spend meter: reservations before dispatch, settles on response,
- * releases on failure, child meters that spend from their parent live, and an
- * injected period ledger. No timers: concurrency is promise order.
+ * The spend meter: reservations before dispatch, settles on response, a
+ * release only for a call that reached no provider, child meters that spend
+ * from their parent live, and an injected period ledger. No timers:
+ * concurrency is promise order.
  */
 import { describe, expect, test } from "bun:test";
 import type { PricingTable } from "./pricing";
 import {
   type SpendAdmission,
   type SpendLedgerPort,
+  type StreamReport,
+  type UsageStreamEvent,
   actualCallMicros,
   createSpendMeter,
   estimateCallMicros,
+  failedCallSpend,
+  notingUsage,
 } from "./spend";
 
 /** $1 per million tokens on both axes: one token is one micro. */
@@ -223,5 +228,254 @@ describe("worst-case estimates", () => {
     expect(estimateCallMicros(400, 0, 50, "openai", "no-price", FLAT)).toBeUndefined();
     expect(actualCallMicros({ input: 3, output: 4 }, "anthropic", "claude-test", FLAT)).toBe(7);
     expect(actualCallMicros({ input: 3, output: 4 }, "openai", "no-price", FLAT)).toBeUndefined();
+  });
+});
+
+describe("a call made inside another call's tool", () => {
+  test("never waits on the enclosing call's reservation: the answer is final at the first ask", async () => {
+    const meter = createSpendMeter({ capMicros: 100, pricing: FLAT });
+    expect(await meter.reserve("P", 100)).toEqual({ admit: true });
+    // Without the view the same reserve waits on P, which settles only after the tool returns.
+    const plain = await meter.reserve("c0", 10);
+    expect(plain.admit === false && plain.on).toBe("others");
+    expect(await meter.within("P").reserve("c", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    expect(meter.snapshot().activeReservations).toBe(1);
+  });
+
+  test("a child of a view, and a view of a view, keep the ancestor; a view made before is fixed", async () => {
+    const meter = createSpendMeter({ capMicros: 100, pricing: FLAT });
+    // Made while no call is in progress: it names no ancestor, and never adopts a later one.
+    const early = meter.within(undefined);
+    await meter.reserve("P", 100);
+    const child = meter.within("P").child({ capMicros: 1_000 });
+    expect(await child.reserve("k", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    const nested = meter.within("P").within("Q");
+    expect(await nested.reserve("n", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "run",
+      inFlight: true,
+    });
+    const late = await early.reserve("e", 10);
+    expect(late.admit === false && late.on).toBe("others");
+  });
+
+  test("a sibling still in progress is waited for, and the wait ends when the sibling settles", async () => {
+    const meter = createSpendMeter({ capMicros: 100, seedMicros: 10, pricing: FLAT });
+    await meter.reserve("P", 40);
+    await meter.reserve("S", 60);
+    const answer = await meter.within("P").reserve("c", 5);
+    if (answer.admit || answer.on !== "others") throw new Error("expected a wait on the sibling");
+    let ended = false;
+    void answer.settled.then(() => {
+      ended = true;
+    });
+    await Promise.resolve();
+    expect(ended).toBe(false);
+    await meter.settle("S", costing(1));
+    // P never settles: the wait ended on S alone.
+    await answer.settled;
+    expect(ended).toBe(true);
+    expect(await meter.within("P").reserve("c", 5)).toEqual({ admit: true });
+  });
+
+  test("the ancestor's id goes to the period ledger only when it was reserved there", async () => {
+    const seen: (readonly string[] | undefined)[] = [];
+    const ledger: SpendLedgerPort = {
+      reserve: async ({ ancestors }) => {
+        seen.push(ancestors);
+        return { admit: false, on: "spent", inFlight: true };
+      },
+      settle: async () => {},
+      release: async () => {},
+    };
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    // A period refusal that counts an ancestor is final too.
+    expect(await meter.within("never-reserved").reserve("c", 10)).toEqual({
+      admit: false,
+      on: "spent",
+      scope: "period",
+      inFlight: true,
+    });
+    expect(seen).toEqual([undefined]);
+    const lines: string[] = [];
+    const recording: SpendLedgerPort = {
+      reserve: async ({ id, ancestors }) => {
+        lines.push(`reserve ${id} ${(ancestors ?? []).join(",")}`);
+        return { admit: true };
+      },
+      settle: async () => {},
+      release: async () => {},
+    };
+    const tree = createSpendMeter({ capMicros: 1_000, ledger: recording, pricing: FLAT });
+    await tree.reserve("P", 10);
+    await tree.within("P").child().reserve("k", 10);
+    expect(lines).toEqual(["reserve P ", "reserve k P"]);
+  });
+});
+
+describe("a call that was sent and reported no usage", () => {
+  function recordingLedger(): SpendLedgerPort & { lines: string[] } {
+    const lines: string[] = [];
+    return {
+      lines,
+      reserve: async ({ id, usdMicros }) => {
+        lines.push(`reserve ${id} ${usdMicros}`);
+        return { admit: true };
+      },
+      settle: async ({ id, usdMicros }) => {
+        lines.push(`settle ${id} ${usdMicros}`);
+      },
+      release: async (id) => {
+        lines.push(`release ${id}`);
+      },
+    };
+  }
+
+  test("counts its reserved worst case as spent, on the meter and the period", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("a", 70);
+    expect(await meter.settleUnreported("a")).toEqual({ usdMicros: 70 });
+    expect(meter.snapshot()).toMatchObject({
+      spentMicros: 70,
+      assumedMicros: 70,
+      activeReservations: 0,
+    });
+    expect(ledger.lines).toEqual(["reserve a 70", "settle a 70"]);
+  });
+
+  test("an assumed worst case is told apart from priced spend, in every scope", async () => {
+    const meter = createSpendMeter({ capMicros: 1_000, pricing: FLAT });
+    const child = meter.child({ capMicros: 500 });
+    await child.reserve("a", 40);
+    await child.settleUnreported("a");
+    await meter.reserve("b", 10);
+    await meter.settle("b", costing(7));
+    expect(child.snapshot()).toMatchObject({ spentMicros: 40, assumedMicros: 40 });
+    expect(meter.snapshot()).toMatchObject({ spentMicros: 47, assumedMicros: 40 });
+  });
+
+  test("an unpriced call counts one unknown call and settles the period with null", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("u", undefined);
+    expect(await meter.settleUnreported("u")).toEqual({ usdMicros: undefined });
+    expect(meter.snapshot()).toMatchObject({ spentMicros: 0, unknownCalls: 1 });
+    expect(ledger.lines).toEqual(["settle u null"]);
+  });
+
+  test("an id reserved through a view settles on the period through the base", async () => {
+    const ledger = recordingLedger();
+    const meter = createSpendMeter({ capMicros: 1_000, ledger, pricing: FLAT });
+    await meter.reserve("P", 10);
+    await meter.within("P").reserve("v", 20);
+    await meter.release("v");
+    await meter.within("P").reserve("w", 30);
+    await meter.settle("w", costing(5));
+    expect(ledger.lines).toEqual([
+      "reserve P 10",
+      "reserve v 20",
+      "release v",
+      "reserve w 30",
+      "settle w 5",
+    ]);
+  });
+});
+
+describe("a call's stream, as the meter reads it", () => {
+  async function drain(events: UsageStreamEvent[], throwAfter?: number): Promise<StreamReport> {
+    const report: StreamReport = {};
+    async function* source(): AsyncGenerator<UsageStreamEvent> {
+      let n = 0;
+      for (const ev of events) {
+        if (throwAfter !== undefined && n === throwAfter) throw new Error("reset");
+        n += 1;
+        yield ev;
+      }
+    }
+    try {
+      for await (const _ of notingUsage(source(), report)) {
+        // consumed
+      }
+    } catch {
+      // the report is what the caller reads
+    }
+    return report;
+  }
+
+  test("final counts are noted once the closing delta arrives", async () => {
+    const report = await drain([
+      { kind: "message_start", usage: { input: 12, output: 1 } },
+      { kind: "message_delta", stopReason: "end_turn", usage: { input: 0, output: 30 } },
+      { kind: "message_stop" },
+    ]);
+    expect(report).toEqual({ started: true, usage: { input: 12, output: 30 } });
+  });
+
+  test("a stream that ends before its counts, or reports none, leaves usage unknown", async () => {
+    // An abort that ends a stream silently: content, then nothing.
+    expect(
+      await drain([{ kind: "message_start", usage: { input: 12, output: 1 } }, { kind: "x" }]),
+    ).toEqual({ started: true });
+    // A server that reports no usage at all.
+    expect(
+      await drain([{ kind: "message_delta", stopReason: "end_turn" }, { kind: "message_stop" }]),
+    ).toEqual({ started: true });
+    expect(await drain([{ kind: "message_start" }], 0)).toEqual({});
+  });
+});
+
+describe("what a failed call counts as", () => {
+  const status = (n: number) => Object.assign(new Error(`HTTP ${n}`), { status: n });
+  const code = (c: string) => Object.assign(new Error(c), { code: c });
+  const named = (n: string) => Object.assign(new Error(n), { name: n });
+  const wrapped = (cause: unknown) =>
+    Object.assign(new Error("Connection error."), { name: "APIConnectionError", cause });
+
+  test("a request that reached no provider is released", () => {
+    for (const err of [
+      code("ECONNREFUSED"),
+      wrapped(code("ConnectionRefused")),
+      wrapped(code("ENOTFOUND")),
+      wrapped(code("DEPTH_ZERO_SELF_SIGNED_CERT")),
+      named("ProviderAuthError"),
+      named("CircuitBreakerOpenError"),
+      named("FailoverExhaustedError"),
+    ]) {
+      expect(failedCallSpend(err, false)).toBe("release");
+    }
+  });
+
+  test("a provider's outright refusal counts $0", () => {
+    for (const n of [400, 401, 403, 404, 413, 429, 529]) {
+      expect(failedCallSpend(status(n), false)).toBe("zero");
+      expect(failedCallSpend(wrapped(status(n)), false)).toBe("zero");
+    }
+  });
+
+  test("anything else, and any failure after an event arrived, counts its worst case", () => {
+    for (const err of [
+      status(500),
+      code("ECONNRESET"),
+      named("AbortError"),
+      named("APIConnectionTimeoutError"),
+      new Error("stream broke"),
+      "a string",
+    ]) {
+      expect(failedCallSpend(err, false)).toBe("worst");
+    }
+    expect(failedCallSpend(code("ECONNREFUSED"), true)).toBe("worst");
+    expect(failedCallSpend(status(429), true)).toBe("worst");
   });
 });

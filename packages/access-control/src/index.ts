@@ -104,7 +104,12 @@ export {
   writeOwnerBlock,
 } from "./owner-settings";
 export type { PlannedRow, Planning, RefusalCode } from "./mutate";
-export type { AccessHarness, ProjectionFailure, ProjectionReport } from "./projection";
+export {
+  type AccessHarness,
+  type ProjectionFailure,
+  type ProjectionReport,
+  decideClassOf,
+} from "./projection";
 export type {
   CredentialRow,
   GovernedRow,

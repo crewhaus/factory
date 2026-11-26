@@ -1,8 +1,9 @@
 /**
- * `crewhaus inbox list|show|stats`: the bare verb lists; `--json` is the list Home's API
- * answers; a harness whose sessions folder lies outside it is named, beside the others'
- * items or alone; what a harness sent is shown masked; an unknown item says which
- * command lists what is open; and nothing is written, created or touched while reading.
+ * `crewhaus inbox list|show|stats`, the reads (`inbox-acts.test.ts` has the acts): the bare
+ * verb lists; `--json` is the list Home's API answers; a harness whose sessions folder lies
+ * outside it is named, beside the others' items or alone; what a harness sent is shown
+ * masked; an unknown item says which command lists what is open; and nothing is written,
+ * created or touched while reading.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -19,6 +20,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createCheckpointStore, newGraphRunId } from "@crewhaus/checkpoint-store";
 import { mintRunId } from "@crewhaus/control-contract";
 import { SCHEMAS } from "@crewhaus/control-contract/schemas";
 import { append, runsLedger } from "@crewhaus/control-records";
@@ -28,7 +30,7 @@ import {
   generateApprovalId,
   hashApprovalInput,
 } from "@crewhaus/session-store";
-import { SHOW_NEEDS_ONE, runInboxCommand } from "./inbox-cmd";
+import { SHOW_NEEDS_ONE, runInboxCommand, whoOf } from "./inbox-cmd";
 
 type Schema = { safeParse(value: unknown): { success: boolean; error?: unknown } };
 const schemaOf = (id: string) => (SCHEMAS as unknown as Readonly<Record<string, Schema>>)[id];
@@ -136,8 +138,12 @@ describe("crewhaus inbox", () => {
     expect(text.indexOf("Decide")).toBeGreaterThan(-1);
     expect(text.indexOf("Fix")).toBeGreaterThan(text.indexOf("Decide"));
     expect(text).toContain("Permission to use SendMessage");
-    expect(text).toContain("crewhaus approvals grant appr_");
+    expect(text).toMatch(/grant: crewhaus inbox decide att_[0-9a-z]{26} grant\n/);
+    expect(text).toContain("Allows this one call, and the run goes on.");
     expect(text).toContain("alpha");
+    // A harness with no members is its machine's user's: they allow it themselves.
+    expect(text).toContain("grant-always:");
+    expect(text).not.toContain("grant-propose:");
   });
 
   test("--json is the list Home's API answers, with what a harness sent masked", async () => {
@@ -165,7 +171,9 @@ describe("crewhaus inbox", () => {
     expect(kind.empty.reason).toBe("filtered");
     expect((await run(["list", "--band", "urgent"])).exitCode).toBe(55);
     expect((await run(["list", "--kind", "nope"])).exitCode).toBe(55);
-    await expect(run(["nope"])).rejects.toThrow("(expected: list | show | stats)");
+    await expect(run(["nope"])).rejects.toThrow(
+      "(expected: list | show | stats | decide | assign | unassign | defer | undefer | snooze | dismiss | reopen | acknowledge | discuss)",
+    );
   });
 
   test("a harness whose sessions folder lies outside it is named, beside others' items or alone", async () => {
@@ -243,7 +251,8 @@ describe("crewhaus inbox", () => {
     );
     const text = (await run(["list"])).lines.join("\n");
     expect(text).toContain("Permission to use SendMessage");
-    expect(text).toContain("Permission to use Send[2J31mMessage");
+    // A name no tool has is left out, so neither it nor its controls are shown.
+    expect(text).toContain("Permission to use a tool");
     for (const bad of ["curl", "$(", "pwned", "\u001b", "\u009b"]) {
       expect(`${bad}:${text.includes(bad)}`).toBe(`${bad}:false`);
     }
@@ -276,6 +285,39 @@ describe("crewhaus inbox", () => {
     await run(["stats"]);
     const listed = JSON.parse((await run(["--json"])).lines.join("\n"));
     await run(["show", listed.items[0].ref]);
+    expect(treeOf(base)).toEqual(before);
+  });
+
+  test("reading a paused graph run, what was done about an item and what was said touches nothing", async () => {
+    const a = harness("alpha");
+    const graphs = join(a.dir, ".crewhaus", "graphs");
+    const store = createCheckpointStore({ rootDir: graphs });
+    const grun = newGraphRunId();
+    const cp = await store.save({ graphRunId: grun, nodeName: "ship", state: {} });
+    await store.markWaiting(grun, { checkpointId: cp.id, nodeName: "ship", prompt: "Ship it?" });
+    failRun(a.dir);
+    const listed = JSON.parse((await run(["--json"])).lines.join("\n"));
+    const refOf = (kind: string): string =>
+      listed.items.find((i: { kind: string }) => i.kind === kind).ref;
+    const message = join(base, "message.txt");
+    writeFileSync(message, "ask the platform team");
+    const acted = [
+      await run(["discuss", refOf("checkpoint"), "--file", message]),
+      await run([
+        "snooze",
+        refOf("credential"),
+        "--until",
+        new Date(NOW + 3_600_000).toISOString(),
+      ]),
+    ];
+    expect(acted.map((out) => out.exitCode)).toEqual([0, 0]);
+    const before = treeOf(base);
+    const open = JSON.parse((await run(["--json"])).lines.join("\n"));
+    expect(open.items.map((i: { kind: string }) => i.kind)).toEqual(["checkpoint"]);
+    await run(["list", "--all", "--mine"]);
+    const said = await run(["show", refOf("checkpoint"), "--messages"]);
+    expect(said.lines.join("\n")).toContain("ask the platform team");
+    await run(["show", refOf("checkpoint")]);
     expect(treeOf(base)).toEqual(before);
   });
 
@@ -319,4 +361,20 @@ describe("crewhaus inbox", () => {
     expect(outputs).toEqual(["inbox --json: 0", "inbox stats: 0", "inbox show nope: 55"]);
     expect(records()).toEqual(before);
   }, 30_000); // three CLI processes, each loading the whole entry file; slow on a loaded runner
+});
+
+describe("who an item is with, in words", () => {
+  test("you, someone at this computer, or someone else: never a raw id", () => {
+    const root = mkdtempSync(join(tmpdir(), "crewhaus-inbox-who-"));
+    try {
+      const me = "prn_00000000000000000000000001";
+      const who = whoOf(join(root, "no-hangar"), new Set([me]));
+      expect(who(me)).toBe("you");
+      expect(who(`local:#${"a".repeat(64)}`)).toBe("someone at this computer");
+      expect(who("prn_00000000000000000000000002")).toBe("someone else");
+      expect(who("not a principal")).toBe("someone else");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });

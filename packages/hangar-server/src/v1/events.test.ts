@@ -329,6 +329,47 @@ describe("a run's stream", () => {
     expect(states(feed.frames())).toEqual(["queued", "preparing", "running"]);
   });
 
+  test("an execution whose trace capture another process holds says so once, before any trace frame", async () => {
+    const h = await home.harness("run-capture-held");
+    const execution = "run_00000000000000d4";
+    const held = mintRunId();
+    appendRunLedger(h.dir, {
+      runId: execution,
+      kind: "daemon",
+      argv: ["crewhaus", "daemon"],
+      startedAt: AT,
+      logFile: `logs/${execution}.log`,
+    });
+    patchRunLedger(h.dir, {
+      runId: execution,
+      traceCapture: "held-elsewhere",
+      traceCaptureSince: AT,
+    });
+    row(h.dir, held, "running", { execution });
+    traceLine(h.dir, execution, { kind: "turn_start", runId: held, timestamp: AT });
+    row(h.dir, held, "succeeded");
+    const feed = await open(`/api/v1/runs/${held}/events`);
+    await feed.until(() => false, 2000);
+    const frames = feed.frames();
+    const gaps = frames.filter((f) => f.event === "stream.gap");
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]?.data["payload"]).toEqual({
+      reason: "unreadable",
+      source: "trace",
+      cause: "capture-held",
+    });
+    const gapAt = frames.findIndex((f) => f.event === "stream.gap");
+    const traceAt = frames.findIndex((f) => f.event === "run.trace");
+    expect(traceAt).toBeGreaterThan(-1);
+    expect(gapAt).toBeLessThan(traceAt);
+    everyFrameParses(frames);
+    // Taken again by this manager: no gap.
+    patchRunLedger(h.dir, { runId: execution, traceCapture: "captured" });
+    const again = await open(`/api/v1/runs/${held}/events`);
+    await again.until(() => false, 2000);
+    expect(events(again.frames())).not.toContain("stream.gap");
+  });
+
   test("a run with no trace and no session says so; a caller without content reads no trace", async () => {
     const h = await home.harness("run-no-trace");
     const bare = mintRunId();
@@ -462,7 +503,7 @@ describe("a supervisor execution's stream", () => {
 });
 
 describe("a harness's stream", () => {
-  test("one frame per line, from all five core sources in one vector beside the work log's, from now", async () => {
+  test("one frame per line, from all five core sources in one vector beside the work records' and the inbox's, from now", async () => {
     const h = await home.harness("harness-stream");
     row(h.dir, mintRunId(), "running"); // before the stream: not sent
     const feed = await open(`/api/v1/harnesses/${h.id}/events`);
@@ -504,7 +545,18 @@ describe("a harness's stream", () => {
     const last = decodeCursor(frames.at(-1)?.id);
     expect(
       last.ok && last.cursor.kind === "vector" && Object.keys(last.cursor.sources).sort(),
-    ).toEqual(["approvals", "commands", "decisions", "deployments", "runs", "work"]);
+    ).toEqual([
+      "approvals",
+      "attention",
+      "commands",
+      "decisions",
+      "deployments",
+      "outcomes",
+      "publish",
+      "runs",
+      "work",
+      "workspaces",
+    ]);
     everyFrameParses(frames);
   });
 });

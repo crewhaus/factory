@@ -39,7 +39,7 @@ import type {
   UnsealedBinding,
 } from "@crewhaus/session-store";
 import type { RegisteredTool } from "@crewhaus/tool-catalog";
-import { continuesOf, parkingRunIdOf, resumeScopeOf } from "./run-ledger";
+import { continuesOf, parkingRunIdOf, resumeScopeOf, starterOfRun } from "./run-ledger";
 
 /**
  * The lowest class that may decide a parked call of `tool`: a destructive tool,
@@ -156,11 +156,13 @@ export async function bindingFor(args: {
   const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput, {
     signal: runContext.abortSignal,
   });
+  const starter = starterOfRun(runContext);
   return {
     runId: parkingRunIdOf(runContext),
     resumeScope: resumeScopeOf(runContext, sessionId),
     sessionId,
     ...(runContext.workItem !== undefined ? { workItem: runContext.workItem } : {}),
+    ...(starter !== undefined ? { starter } : {}),
     ...runRevisions(),
     ...(resourceRevision !== undefined ? { resourceRevision } : {}),
     resourceRevisionBound: resourceRevision !== undefined,
@@ -244,6 +246,7 @@ export async function consumeHeld(args: {
   const { store, grant, runContext } = args;
   const runId = parkingRunIdOf(runContext);
   const continues = continuesOf(runContext);
+  const starter = starterOfRun(runContext);
   const resumeScope = resumeScopeOf(runContext, args.sessionId);
   const revisions = runRevisions();
   const resourceRevision = await resourceRevisionOf(args.tool, args.operativeInput, {
@@ -254,6 +257,7 @@ export async function consumeHeld(args: {
     runId,
     resumeScope,
     ...(continues !== undefined ? { continues } : {}),
+    ...(starter !== undefined ? { starter } : {}),
     ...revisions,
     ...(resourceRevision !== undefined ? { resourceRevision } : {}),
   };

@@ -12,6 +12,7 @@ import type {
   WorkRankDimension,
 } from "@crewhaus/control-contract";
 import { foldStates, intakeVerdict, runsLedger } from "@crewhaus/control-records";
+import { type DeliveryFacts, readDeliveryFacts } from "./delivery";
 import type { FoldedWorkItem, WorkCorrection, WorkFold } from "./fold";
 import { type RankedItem, rankWork } from "./ranker";
 import type { WorkRevision } from "./records";
@@ -22,6 +23,8 @@ export type WorkViewContext = {
   /** Each run's newest state, by id. */
   readonly runStates: ReadonlyMap<string, string>;
   readonly harness: WorkStateFacts["harness"];
+  /** Each item's newest publish attempt and pull request; absent reads as none. */
+  readonly delivery?: ReadonlyMap<string, DeliveryFacts>;
   readonly weights?: Readonly<Partial<Record<WorkRankDimension, number>>>;
   readonly corrections: readonly WorkCorrection[];
 };
@@ -53,6 +56,7 @@ export function viewContext(
   return {
     runStates: readRunStates(harnessDir),
     harness: harnessFacts(harnessDir),
+    delivery: readDeliveryFacts(harnessDir),
     ...(weights !== undefined ? { weights } : {}),
     corrections: fold.corrections,
   };
@@ -60,6 +64,7 @@ export function viewContext(
 
 /** The status facts of one item. */
 export function factsOf(item: FoldedWorkItem, ctx: WorkViewContext): WorkStateFacts {
+  const delivery = ctx.delivery?.get(item.id);
   return {
     state: item.state,
     ...(item.outcome !== undefined ? { outcome: item.outcome } : {}),
@@ -67,6 +72,8 @@ export function factsOf(item: FoldedWorkItem, ctx: WorkViewContext): WorkStateFa
       const state = ctx.runStates.get(run);
       return state === undefined ? [] : [state];
     }),
+    ...(delivery?.pr !== undefined ? { pr: delivery.pr } : {}),
+    ...(delivery?.publish !== undefined ? { publish: delivery.publish } : {}),
     ...(ctx.harness !== undefined ? { harness: ctx.harness } : {}),
   };
 }

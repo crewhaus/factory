@@ -46,6 +46,10 @@ export const RUN_OPERATIONS = [
     qualifiers: ["subject-assert"],
     modelBound: {
       input: { origin: "api", at: "run-entry" },
+      from: {
+        none: true,
+        reason: "Names a run; its recorded input is classified at api where the new run starts.",
+      },
       subject: NOT_MODEL_BOUND.subject,
       // A work item created with the run: its text is classified at api when a tool reads it.
       work: { origin: "api", at: "write" },

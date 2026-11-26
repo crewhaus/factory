@@ -55,8 +55,8 @@
  * hand-branch, so it dispatches from ONE table (`m3-routes.ts`) through one
  * function (`runM3` below) that applies every guard above uniformly; the
  * per-area handler modules receive an already-validated `M3Context` and can
- * only be about their own subject. The handlers ship as 501 stubs whose
- * docblocks carry the write covenant each must honour.
+ * only be about their own subject. Each handler's docblock carries the write
+ * covenant it honours.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, hostname as osHostname, uptime, userInfo } from "node:os";
@@ -121,7 +121,7 @@ import {
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { EXPORT_JOB_KIND } from "@crewhaus/harness-supervisor/job-kinds";
-import { runPreflight } from "@crewhaus/preflight";
+import { type PortChecker, runPreflight } from "@crewhaus/preflight";
 import {
   type AccessView,
   type Caller,
@@ -438,6 +438,8 @@ export type HangarServerOptions = {
   readonly schedulerTimers?: SchedulerTimers;
   /** Gathers one harness's Advisor findings for the attention sweep; injected in tests. */
   readonly advisorItems?: HomePorts["advisorItems"];
+  /** How an Advisor read a person opened looks at a port; injected in tests. */
+  readonly checkPort?: PortChecker;
   /** When the machine last booted, epoch ms; injected in tests. */
   readonly hostBootedAt?: () => number;
 };
@@ -906,6 +908,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       actor: null,
       via: noAuth ? "no-auth" : "bootstrap",
     };
+  /**
+   * This request's caller as a harness's own records store one; `undefined` outside a
+   * harness, and where its digest key cannot be read.
+   */
+  const storedCaller = async (dir: string | null): Promise<string | undefined> => {
+    if (dir === null) return undefined;
+    const { principal, via } = requestCaller();
+    return controlService.decisions
+      .storedActorOf(dir, {
+        kind: "principal",
+        principal,
+        ...(via === "service" ? { service: true as const } : {}),
+      })
+      .catch(() => undefined);
+  };
   const loadOwnerOr = (label: string): string => {
     const read = signIn.snapshot();
     return read.state === "present" ? (read.snapshot.owner ?? label) : label;
@@ -2028,6 +2045,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       now,
       operator,
       principal: requestCaller().principal,
+      storedActor: async () => storedCaller(dir),
+      ...(opts.checkPort !== undefined ? { checkPort: opts.checkPort } : {}),
       authorize: (permission, target) => {
         const access = currentRequestAccess();
         const at = target ?? (entry !== null ? { harness: entry.id } : undefined);
@@ -2395,12 +2414,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           throw new HttpError(400, 'missing "verdict" — one of: up, down, pass, fail');
         }
         const note = typeof body["note"] === "string" ? body["note"] : undefined;
+        const reviewDir = liveDirOr404(entry);
+        const principal = requestCaller().principal;
+        // A harness whose digest key cannot be read records no one; the verdict stands.
+        const by = await storedCaller(reviewDir);
         const result = await adjudicateReview({
-          harnessDir: liveDirOr404(entry),
+          harnessDir: reviewDir,
           itemId,
           verdict,
           ...(note !== undefined ? { note } : {}),
-          by: requestCaller().principal,
+          by: principal,
+          ...(by !== undefined ? { actor: { by, via: "home" } } : {}),
           nowIso: new Date(now()).toISOString(),
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such review item");
@@ -3334,7 +3358,7 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|PUT /api/notifications   POST /api/notifications/clear",
       "GET|PUT /api/read-only",
       "GET  /api/plugins     GET /api/plugins/:name/panes/:paneId   GET /api/h/:id/panes",
-      "--- M3 (handlers are stubs: every route below answers 501) ---",
+      "--- M3 ---",
       "PUT  /api/h/:id/spec  POST /api/h/:id/spec/{patch,diff,pin,rollback,propose}",
       "GET  /api/h/:id/spec/{schema,trust,versions[/:version[/diff]]}",
       "GET|POST /api/builders/…   GET|POST|DELETE /api/h/:id/builders/{graders,dataset,mcp}",
@@ -3348,6 +3372,10 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       "GET|PUT|POST|DELETE /api/h/:id/thredz/…   GET /api/thredz",
       "GET  /api/h/:id/inspect[/:store[/:name]]   PUT /api/h/:id/inspect/settings",
       "GET|POST /api/h/:id/{mcp-servers,dev}/…",
+      "--- crewhaus.hangar.v1: the run inspector ---",
+      "GET  /api/v1/runs/:run/{inspect,timeline,request,export,raw}",
+      "GET  /api/v1/runs/:run/why/:action   GET /api/v1/runs/:run/context/:call",
+      "GET  /api/v1/harnesses/:h/sessions/:sess/inspect   GET /api/v1/work/:ref/inspect",
     ];
     const items = routes.map((r) => `<li><code>${r}</code></li>`).join("\n");
     const html = `<!doctype html><meta charset="utf-8"><title>Hangar</title><h1>Hangar manager API</h1><p>No UI assets embedded in this build. Every <code>/api</code> route requires <code>Authorization: Bearer &lt;session&gt;</code>.</p><ul>${items}</ul>`;
@@ -3420,6 +3448,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         argv,
         commandId: command.commandId,
         by: command.by,
+      }),
+    // What an inbox item's choice starts: a closed command in the harness folder.
+    submitItemJob: (entry, job, command) =>
+      processes.jobs.submit({
+        harnessDir: entry.dir,
+        harnessId: entry.id,
+        kind: job.kind,
+        argv: job.argv,
+        commandId: command.commandId,
+        by: command.by,
+        ...(job.needs.length > 0 ? { needs: [...job.needs] } : {}),
       }),
     ...(processes.apiRunCapacity !== undefined
       ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }

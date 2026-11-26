@@ -100,6 +100,7 @@ describe("requireJustification (permission-integration#11)", () => {
     "VectorDelete",
     "WebhookPost",
     "WorkflowRunRerun",
+    "WorkspacePublish",
   ];
 
   test("the gated set is exactly the reviewed one", () => {
@@ -222,6 +223,8 @@ describe("what auto mode runs without asking (permission-integration#13)", () =>
     Typecheck: "runs the project's type checker with --noEmit; changes nothing",
     WorkPropose:
       "records a proposal in this harness's own work list; a person or the owner's policy decides whether it is accepted",
+    WorkspaceOpen:
+      "fetches the repository the owner declared into this harness's own directory and makes a worktree for an item a person accepted; writes nothing to the code host",
   };
 
   test("the tools auto mode allows without a rule are exactly the reviewed ones", () => {

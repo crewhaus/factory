@@ -241,6 +241,50 @@ describe("rightSizeSlots", () => {
   });
 });
 
+describe("rightSizeSlots over the slots the walk adds", () => {
+  test("the shadow arm, a sub-agent's allowed profiles, a federation peer and a defaulted judge are never searched", () => {
+    const ir = cliIrOf(`
+name: new-slots
+target: cli
+models:
+  fast:
+    model: claude-haiku-4-5
+  strong:
+    model: claude-opus-4-8
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+  model_pool:
+    candidates:
+      - { model: claude-haiku-4-5, tags: [cheap] }
+      - { model: claude-sonnet-4-6, tags: [strong] }
+    strategy:
+      shadow: { candidate: $strong, sample_rate: 0.2 }
+  sub_agents:
+    peer:
+      description: a remote peer
+      instructions: delegate
+      federation:
+        url: https://peer.example.com
+    helper:
+      description: helps
+      instructions: help
+      model: claude-opus-5
+      allowed_profiles: [$fast]
+security:
+  justification: { judge: claude }
+`);
+    const walked = enumerateModelSlots(ir);
+    // Not vacuous: the walk lists all four.
+    expect(walked.some((s) => s.kind === "federation")).toBe(true);
+    expect(walked.some((s) => s.label === "agent.model_pool.strategy.shadow.candidate")).toBe(true);
+    expect(rightSizeSlots(walked).map((s) => s.label)).toEqual([
+      "agent.model",
+      "sub_agents.helper.model",
+    ]);
+  });
+});
+
 describe("patchIrModelSlot", () => {
   test("the candidate IR DIFFERS from the baseline for every slot right-size enumerates", () => {
     const ir = cliIrOf(SUB_AGENT_SPEC);

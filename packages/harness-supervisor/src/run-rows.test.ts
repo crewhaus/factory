@@ -27,7 +27,7 @@ import {
 import type { ProcessOps, SpawnRequest } from "./process-ops";
 import { RUN_LEDGER_DIR, closeExecution, openApiRoot, runLedgerFor } from "./run-rows";
 import { writeRunfile } from "./runfiles";
-import { buildSpawnPlan } from "./spawn-contracts";
+import { GRAPH_RESUME_CHECKPOINT_ENV, buildSpawnPlan } from "./spawn-contracts";
 import { type HarnessSupervisor, type StartResult, createHarnessSupervisor } from "./supervisor";
 import { type FakeProcessOps, createFakeClock, createFakeProcessOps } from "./testkit";
 import { RUNFILE_VERSION } from "./types";
@@ -587,6 +587,58 @@ describe("a run the control API queued", () => {
       apiRun: { runId, stdinFile },
     });
     expect(crewPlan.stdinFile).toBe(stdinFile);
+  });
+
+  test("a graph resume: the bundle's own `--resume`, the run and the decision as arguments, no input", () => {
+    const dir = tempHarness("graph");
+    const runId = mintRunId();
+    const grun = "grun_0123456789abcdef";
+    const bundle = {
+      bundleDir: join(dir, "dist"),
+      entry: "agent.ts",
+      entryPath: join(dir, "x.ts"),
+    };
+    const ckpt = "ckpt_0123456789abcdef";
+    const planned = (
+      graphResume: { grun: string; ckpt: string; decision: string },
+      target = "graph",
+    ) =>
+      buildSpawnPlan({
+        harnessDir: dir,
+        target,
+        processEnv: {},
+        bundle: bundle as never,
+        apiRun: { runId, graphResume },
+      });
+    const decision = "approve; $(id) `whoami`";
+    const plan = planned({ grun, ckpt, decision });
+    expect(plan.argv).toEqual([
+      "bun",
+      "--no-env-file",
+      bundle.entryPath,
+      "--resume",
+      grun,
+      decision,
+    ]);
+    expect(plan.stdinFile).toBeUndefined();
+    expect(plan.env["CREWHAUS_RUN_ID"]).toBe(runId);
+    // It carries no input of its own, so none is declared.
+    expect(plan.env["CREWHAUS_INPUT_ORIGIN"]).toBeUndefined();
+    // The build's engine is told the pause the person decided, and resumes there or nowhere.
+    expect(plan.env[GRAPH_RESUME_CHECKPOINT_ENV]).toBe(ckpt);
+    expect(GRAPH_RESUME_CHECKPOINT_ENV).toBe("CREWHAUS_GRAPH_RESUME_CHECKPOINT");
+    expect(plan.apiRun).toEqual({ runId });
+    expect(() => planned({ grun: "run_x", ckpt, decision: "approve" })).toThrow("graph run id");
+    for (const bad of ["", "ckpt_x", "--decision", grun]) {
+      expect(() => planned({ grun, ckpt: bad, decision: "approve" })).toThrow(
+        "the pause it settles",
+      );
+    }
+    expect(() => planned({ grun, ckpt, decision: "" })).toThrow("needs a decision");
+    expect(() => planned({ grun, ckpt, decision: "--branch-from" })).toThrow("needs a decision");
+    expect(() => planned({ grun, ckpt, decision: "approve" }, "workflow")).toThrow(
+      "no graph pause",
+    );
   });
 });
 

@@ -10,12 +10,16 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { hostname } from "node:os";
+import { basename, dirname, join } from "node:path";
 import {
   type BudgetPeriodDef,
+  type BudgetSweepStop,
+  _setBudgetSweepSeamsForTest,
   budgetPeriodProblem,
   extendBudget,
   foldBudget,
@@ -27,7 +31,8 @@ import {
   writeBudgetState,
 } from "./budget";
 import { intakeVerdict } from "./intake";
-import type { LeaseProbe } from "./lease";
+import { type LeaseProbe, defaultLeaseProbe } from "./lease";
+import { systemLeaseProbe } from "./process-start";
 import { assertRunnable } from "./runnable";
 import { controlFile, jsonLine, plant, removeTempDirs, tempDir } from "./test-helpers";
 
@@ -626,5 +631,313 @@ describe("the budget intake reason", () => {
     } finally {
       clock.mockRestore();
     }
+  });
+});
+
+describe("a reserve made inside a call still in progress", () => {
+  const DEF: BudgetPeriodDef = { every: "month", usdMicros: 1_000 };
+  const NOW = at("2026-11-17T08:00:00Z");
+
+  test("never waits on that call's reservation, and closes no intake", async () => {
+    const dir = tempDir();
+    const live = probeOf(new Set([1]));
+    const port = openBudgetLedger(dir, DEF, { now: () => NOW, pid: 1, host: "h", probe: live });
+    expect(await port.reserve({ id: "A", usdMicros: 1_000 })).toEqual({ admit: true });
+    // Without naming A the same reserve waits on it.
+    const plain = await port.reserve({ id: "c0", usdMicros: 1 });
+    expect(plain.admit === false && plain.on).toBe("others");
+    expect(await port.reserve({ id: "c", usdMicros: 1, ancestors: ["A"] })).toEqual({
+      admit: false,
+      on: "spent",
+      inFlight: true,
+    });
+    expect(existsSync(join(dir, ".crewhaus/run/control/budget-state.json"))).toBe(false);
+  });
+
+  test("an ancestor that leaves room counts once, and the call is admitted", async () => {
+    const dir = tempDir();
+    const port = openBudgetLedger(dir, DEF, {
+      now: () => NOW,
+      pid: 1,
+      host: "h",
+      probe: probeOf(new Set([1])),
+    });
+    expect(await port.reserve({ id: "A", usdMicros: 600 })).toEqual({ admit: true });
+    expect(await port.reserve({ id: "c", usdMicros: 1, ancestors: ["A"] })).toEqual({
+      admit: true,
+    });
+  });
+
+  test("an ancestor plus a sibling: the call waits on the sibling only, and is admitted once it settles", async () => {
+    const dir = tempDir();
+    const port = openBudgetLedger(dir, DEF, {
+      now: () => NOW,
+      pid: 1,
+      host: "h",
+      probe: probeOf(new Set([1])),
+    });
+    expect(await port.reserve({ id: "A", usdMicros: 600 })).toEqual({ admit: true });
+    expect(await port.reserve({ id: "S", usdMicros: 400 })).toEqual({ admit: true });
+    const first = await port.reserve({ id: "c", usdMicros: 1, ancestors: ["A"] });
+    expect(first.admit === false && first.on).toBe("others");
+    await port.settle({ id: "S", usdMicros: 0 });
+    // A is still open: only the sibling stood in the way.
+    expect(await port.reserve({ id: "c", usdMicros: 1, ancestors: ["A"] })).toEqual({
+      admit: true,
+    });
+  });
+
+  test("an ancestor plus a sibling whose holder never finished answers held", async () => {
+    const dir = tempDir();
+    let clock = NOW;
+    // Another process's reservation, past its lease, whose holder is still alive.
+    const theirs = openBudgetLedger(dir, DEF, {
+      now: () => clock,
+      pid: 2,
+      host: "h",
+      probe: probeOf(new Set([1, 2])),
+      leaseMs: 60_000,
+    });
+    expect(await theirs.reserve({ id: "S", usdMicros: 400 })).toEqual({ admit: true });
+    clock = NOW + 120_000;
+    const port = openBudgetLedger(dir, DEF, {
+      now: () => clock,
+      pid: 1,
+      host: "h",
+      probe: probeOf(new Set([1, 2])),
+    });
+    expect(await port.reserve({ id: "A", usdMicros: 600 })).toEqual({ admit: true });
+    expect(await port.reserve({ id: "c", usdMicros: 1, ancestors: ["A"] })).toEqual({
+      admit: false,
+      on: "spent",
+      held: true,
+    });
+  });
+
+  test("a reservation this port holds open is in progress past its lease; another process reads it as held", async () => {
+    const dir = tempDir();
+    const live = probeOf(new Set([1, 2]));
+    let clock = NOW;
+    const mine = openBudgetLedger(dir, DEF, {
+      now: () => clock,
+      pid: 1,
+      host: "h",
+      probe: live,
+      leaseMs: 60_000,
+    });
+    expect(await mine.reserve({ id: "A", usdMicros: 1_000 })).toEqual({ admit: true });
+    clock = NOW + 120_000;
+    const own = await mine.reserve({ id: "B", usdMicros: 1 });
+    expect(own.admit === false && own.on).toBe("others");
+    const theirs = openBudgetLedger(dir, DEF, { now: () => clock, pid: 2, host: "h", probe: live });
+    expect(await theirs.reserve({ id: "C", usdMicros: 1 })).toEqual({
+      admit: false,
+      on: "spent",
+      held: true,
+    });
+  });
+});
+
+describe("holders carry their start time", () => {
+  const DEF: BudgetPeriodDef = { every: "month", usdMicros: 1_000 };
+  const NOW = at("2026-11-17T08:00:00Z");
+  const segment = (dir: string): string =>
+    join(dir, ".crewhaus/run/control/budget/month-2026-11-01/000001.jsonl");
+
+  test("a ledger opened with no probe records this process's start time", async () => {
+    const dir = tempDir();
+    await openBudgetLedger(dir, DEF, { now: () => NOW }).reserve({ id: "r", usdMicros: 1 });
+    const line = JSON.parse(readFileSync(segment(dir), "utf8").trim()) as {
+      holder?: { pid?: number; startedAt?: number };
+    };
+    expect(line.holder?.pid).toBe(process.pid);
+    expect(typeof line.holder?.startedAt).toBe("number");
+    const own = Date.now() - process.uptime() * 1000;
+    expect(Math.abs((line.holder?.startedAt ?? 0) - own)).toBeLessThan(2_000);
+  });
+
+  test("a holder on this pid with another start time is another process: past its lease it no longer counts", async () => {
+    const dir = tempDir();
+    // Planted as if by an earlier process that had this pid.
+    await openBudgetLedger(dir, DEF, {
+      now: () => NOW,
+      probe: { isAlive: () => true, startTimeMs: () => 1 },
+      leaseMs: 1,
+    }).reserve({ id: "old", usdMicros: 1_000 });
+    const line = JSON.parse(readFileSync(segment(dir), "utf8").trim()) as {
+      holder?: { pid?: number; host?: string; startedAt?: number };
+    };
+    expect(line.holder).toEqual({ pid: process.pid, startedAt: 1, host: hostname() });
+    const later = NOW + 60_000;
+    expect(
+      await openBudgetLedger(dir, DEF, { now: () => later }).reserve({ id: "mine", usdMicros: 1 }),
+    ).toEqual({
+      admit: true,
+    });
+    // A probe that cannot tell start times keeps it held.
+    const dir2 = tempDir();
+    await openBudgetLedger(dir2, DEF, {
+      now: () => NOW,
+      probe: { isAlive: () => true, startTimeMs: () => 1 },
+      leaseMs: 1,
+    }).reserve({ id: "old", usdMicros: 1_000 });
+    expect(
+      await openBudgetLedger(dir2, DEF, { now: () => later, probe: defaultLeaseProbe }).reserve({
+        id: "mine",
+        usdMicros: 1,
+      }),
+    ).toEqual({ admit: false, on: "spent", held: true });
+  });
+
+  test("the system probe knows this process's own start time", () => {
+    const own = systemLeaseProbe.startTimeMs(process.pid);
+    expect(own).toBeDefined();
+    expect(Math.abs((own ?? 0) - (Date.now() - process.uptime() * 1000))).toBeLessThan(2_000);
+    expect(systemLeaseProbe.startTimeMs(0)).toBeUndefined();
+  });
+
+  test.if(process.platform !== "win32")(
+    "another process's start time: read on Linux, could not tell elsewhere",
+    async () => {
+      const spawnedAt = Date.now();
+      const child = Bun.spawn([process.execPath, "-e", "setTimeout(() => {}, 10_000)"], {
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+      try {
+        const started = systemLeaseProbe.startTimeMs(child.pid);
+        if (process.platform === "linux") {
+          expect(started).toBeDefined();
+          expect(Math.abs((started ?? 0) - spawnedAt)).toBeLessThan(2_000);
+        } else {
+          // It starts no program to ask, so another process's start is "could not tell".
+          expect(started).toBeUndefined();
+        }
+      } finally {
+        child.kill();
+        await child.exited;
+      }
+    },
+  );
+});
+
+describe("a swapped period directory is left whole", () => {
+  test("the sweep stops when the directory it checked is replaced, and removes nothing outside", async () => {
+    const dir = tempDir();
+    const outside = tempDir();
+    writeFileSync(join(outside, "000001.jsonl"), "precious\n");
+    const def: BudgetPeriodDef = { every: "day", usdMicros: 100 };
+    await openBudgetLedger(dir, def, { now: () => at("2026-11-01T12:00:00Z") }).settle({
+      id: "a",
+      usdMicros: 1,
+    });
+    sweepBudgetPeriods(dir, def, at("2026-11-03T12:00:00Z"));
+    const stops: BudgetSweepStop[] = [];
+    _setBudgetSweepSeamsForTest({
+      beforeRemove: (period) => {
+        renameSync(period, `${period}.moved`);
+        symlinkSync(outside, period);
+      },
+      onStop: (reason) => {
+        stops.push(reason);
+      },
+    });
+    try {
+      expect(sweepBudgetPeriods(dir, def, at("2026-11-04T12:00:00Z")).removed).toEqual([]);
+    } finally {
+      _setBudgetSweepSeamsForTest(undefined);
+    }
+    expect(stops).toEqual(["chain-changed"]);
+    expect(readFileSync(join(outside, "000001.jsonl"), "utf8")).toBe("precious\n");
+  });
+
+  /** A closed day period with two segments, already summarized, ready for removal. */
+  async function closedTwoSegments(): Promise<{ dir: string; def: BudgetPeriodDef }> {
+    const dir = tempDir();
+    const def: BudgetPeriodDef = { every: "day", usdMicros: 100 };
+    await openBudgetLedger(dir, def, { now: () => at("2026-11-01T12:00:00Z") }).settle({
+      id: "a",
+      usdMicros: 1,
+    });
+    const periodDir = join(dir, ".crewhaus", "run", "control", "budget");
+    for (const name of readdirSync(periodDir)) {
+      if (name.startsWith("day-")) writeFileSync(join(periodDir, name, "000002.jsonl"), "x\n");
+    }
+    sweepBudgetPeriods(dir, def, at("2026-11-03T12:00:00Z"));
+    return { dir, def };
+  }
+
+  /** Sweep with `beforeStep`; answer what was removed and why it stopped. */
+  function sweepWith(
+    dir: string,
+    def: BudgetPeriodDef,
+    beforeStep: (step: "entry" | "unlink" | "rmdir", period: string, file?: string) => void,
+  ): { removed: readonly string[]; stops: BudgetSweepStop[] } {
+    const stops: BudgetSweepStop[] = [];
+    _setBudgetSweepSeamsForTest({ beforeStep, onStop: (r) => stops.push(r) });
+    try {
+      return { removed: sweepBudgetPeriods(dir, def, at("2026-11-04T12:00:00Z")).removed, stops };
+    } finally {
+      _setBudgetSweepSeamsForTest(undefined);
+    }
+  }
+
+  /** Swap `period` for a link to `outside`, where a same-named `file` waits. */
+  function swapForLink(period: string, outside: string, file: string): void {
+    writeFileSync(join(outside, file), "precious\n");
+    renameSync(period, `${period}.moved`);
+    symlinkSync(outside, period);
+  }
+
+  test("a swap after the first segment was removed leaves the outside file whole", async () => {
+    const { dir, def } = await closedTwoSegments();
+    const outside = tempDir();
+    let entries = 0;
+    let target = "";
+    const r = sweepWith(dir, def, (step, period, file) => {
+      if (step !== "entry" || file === undefined) return;
+      entries += 1;
+      if (entries === 2) {
+        target = file;
+        swapForLink(period, outside, file);
+      }
+    });
+    expect(entries).toBe(2);
+    expect(r.removed).toEqual([]);
+    expect(r.stops).toEqual(["chain-changed"]);
+    expect(readFileSync(join(outside, target), "utf8")).toBe("precious\n");
+  });
+
+  test("a swap between a segment's lstat and its unlink leaves the outside file whole", async () => {
+    const { dir, def } = await closedTwoSegments();
+    const outside = tempDir();
+    let target = "";
+    const r = sweepWith(dir, def, (step, period, file) => {
+      if (step !== "unlink" || file === undefined || target !== "") return;
+      target = file;
+      swapForLink(period, outside, file);
+    });
+    expect(r.removed).toEqual([]);
+    expect(r.stops).toEqual(["chain-changed"]);
+    expect(readFileSync(join(outside, target), "utf8")).toBe("precious\n");
+  });
+
+  test("a swap of a directory above the period before its rmdir removes nothing outside", async () => {
+    const { dir, def } = await closedTwoSegments();
+    const outside = tempDir();
+    let name = "";
+    const r = sweepWith(dir, def, (step, period) => {
+      if (step !== "rmdir") return;
+      // The budget directory itself becomes a link to an outside one holding an
+      // empty directory of the period's name.
+      name = basename(period);
+      const budget = dirname(period);
+      mkdirSync(join(outside, name));
+      renameSync(budget, `${budget}.moved`);
+      symlinkSync(outside, budget);
+    });
+    expect(r.removed).toEqual([]);
+    expect(r.stops).toEqual(["chain-changed"]);
+    expect(existsSync(join(outside, name))).toBe(true);
   });
 });

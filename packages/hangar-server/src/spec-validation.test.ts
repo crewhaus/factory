@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative } from "node:path";
+import { checkSpec as serviceCheckSpec } from "@crewhaus/compile-service";
 import {
   type HangarHarnessEntry,
   REGISTRY_FILENAME,
@@ -26,7 +27,9 @@ import {
 } from "@crewhaus/harness-registry";
 import { SECURITY_SURFACES as SPEC_PATCH_SURFACES } from "@crewhaus/spec-patch";
 import { specRev } from "@crewhaus/spec-patch/commit";
+import { specSchemaIdentity } from "@crewhaus/spec/identity";
 import { makeFixtureHarness } from "./fixture";
+import { maskText } from "./mask";
 import { jobCrewhausBin } from "./process";
 import {
   SECURITY_SURFACES,
@@ -132,16 +135,54 @@ function adopt(t: TestServer, id: string): void {
 const revOf = (dir: string) => specRev(readFileSync(join(dir, "crewhaus.yaml"), "utf8"));
 const put = (body: unknown): RequestInit => ({ method: "PUT", body: JSON.stringify(body) });
 
+/**
+ * A spec with several cross-field issues, so the list the editor gets is the
+ * compile service's whole list, not the first one `parseSpec` throws.
+ */
+const MANY_ISSUES = [
+  SPEC.trimEnd(),
+  "models:",
+  "  a: { model: cheapest, price: { input_per_1m: 1, output_per_1m: 2 } }",
+  "  b: { model: strongest, price: { input_per_1m: 1, output_per_1m: 2 } }",
+  "",
+].join("\n");
+
+/**
+ * What a check with Home's schema answers: the compile service's issues for
+ * the text, masked, from the schema this Home carries, with the note that
+ * names adopting the harness.
+ */
+function expectHomeSchema(body: Record<string, unknown>, id: string, yaml: string): void {
+  expect(body["schemaSource"]).toBe("manager");
+  expect(body["schemaVersion"]).toBe(specSchemaIdentity().version);
+  expect(String(body["note"])).toBe(notAdoptedNote(id));
+  expect(String(body["note"])).toContain(`crewhaus harness adopt ${id}`);
+  const expected = serviceCheckSpec(yaml).issues.map((i) => ({
+    path: i.path.map(String),
+    message: maskText(i.message),
+    code: i.code ?? null,
+  }));
+  expect(body["issues"]).toEqual(expected);
+  if (yaml === MANY_ISSUES) expect(expected.length).toBe(2);
+}
+
 describe("a harness's schema never runs in Home's process", () => {
   test("a harness not adopted here is checked with Home's schema and its code is never loaded", async () => {
     const t = boot();
     const { dir, marker } = harness(t, "not-adopted");
     const id = await register(t, dir);
+    // Registered under this release, with no `home`: it does not run its own code here.
+    const row = openHangarRegistry({ root: t.registryRoot, env: {} }).get(id);
+    expect(row?.home).toBeUndefined();
     const schema = await t.api(`/api/h/${id}/spec/schema`);
     expect(schema.body["schemaSource"]).toBe("manager");
     expect(String(schema.body["note"])).toBe(
       `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`,
     );
+    expectHomeSchema(schema.body, id, SPEC);
+    writeFileSync(join(dir, "crewhaus.yaml"), MANY_ISSUES);
+    expectHomeSchema((await t.api(`/api/h/${id}/spec/schema`)).body, id, MANY_ISSUES);
+    writeFileSync(join(dir, "crewhaus.yaml"), SPEC);
     await t.api(`/api/h/${id}/spec/trust`);
     await t.api(`/api/h/${id}/spec/diff`, { method: "POST", body: JSON.stringify({ edits: [] }) });
     const wrote = await t.api(
@@ -171,6 +212,9 @@ describe("a harness's schema never runs in Home's process", () => {
     expect(String(schema.body["note"])).toBe(
       `Checked with this CrewHaus's schema. To check it with its own, run crewhaus harness adopt ${id}.`,
     );
+    expectHomeSchema(schema.body, id, SPEC);
+    writeFileSync(join(dir, "crewhaus.yaml"), MANY_ISSUES);
+    expectHomeSchema((await t.api(`/api/h/${id}/spec/schema`)).body, id, MANY_ISSUES);
     expect(existsSync(marker)).toBe(false);
   });
 
@@ -179,9 +223,12 @@ describe("a harness's schema never runs in Home's process", () => {
     const { dir, marker } = harness(t, "adopted");
     const id = await register(t, dir);
     adopt(t, id);
+    expect(openHangarRegistry({ root: t.registryRoot, env: {} }).get(id)?.home).toBeDefined();
     const schema = await t.api(`/api/h/${id}/spec/schema`);
     expect(schema.body["schemaSource"]).toBe("harness");
     expect(schema.body["schemaVersion"]).toBe("9.9.9");
+    expect(schema.body["schemaVersion"]).not.toBe(specSchemaIdentity().version);
+    expect(schema.body["note"]).toBeNull();
     expect(existsSync(marker)).toBe(true);
     const pid = (JSON.parse(readFileSync(marker, "utf8")) as { pid: number }).pid;
     expect(pid).not.toBe(process.pid);

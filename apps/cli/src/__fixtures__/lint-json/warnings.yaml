@@ -1,0 +1,14 @@
+name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+thredz: true
+mcp_servers:
+  thredz:
+    transport: stdio
+    command: bun
+    args: ["./thredz-mcp/server.ts"]
+  bad__name:
+    transport: stdio
+    command: other-mcp

@@ -1,0 +1,54 @@
+{
+  "name": "@crewhaus/compile-service",
+  "version": "0.8.3",
+  "type": "module",
+  "description": "Check and compile a draft spec without registering or writing anything: every issue in one result, the files a build would hold, and compile --check over files in memory",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./check-build": "./src/check-build.ts"
+  },
+  "scripts": {
+    "test": "bun test src"
+  },
+  "dependencies": {
+    "@crewhaus/compiler": "workspace:*",
+    "@crewhaus/errors": "workspace:*",
+    "@crewhaus/ir": "workspace:*",
+    "@crewhaus/ir-passes": "workspace:*",
+    "@crewhaus/migration-engine": "workspace:*",
+    "@crewhaus/preflight": "workspace:*",
+    "@crewhaus/smoke-harness": "workspace:*",
+    "@crewhaus/spec": "workspace:*",
+    "@crewhaus/target-cf-worker-cli": "workspace:*",
+    "@crewhaus/target-cf-worker-graph": "workspace:*",
+    "@crewhaus/target-cf-worker-workflow": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/compiler-worker": "workspace:*",
+    "@crewhaus/justification-judge-claude": "workspace:*"
+  },
+  "license": "Apache-2.0",
+  "author": {
+    "name": "Max Meier",
+    "email": "max@crewhaus.ai",
+    "url": "https://crewhaus.ai"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/crewhaus/factory.git",
+    "directory": "packages/compile-service"
+  },
+  "homepage": "https://github.com/crewhaus/factory/tree/main/packages/compile-service#readme",
+  "bugs": {
+    "url": "https://github.com/crewhaus/factory/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": ["src", "README.md", "LICENSE", "NOTICE"],
+  "engines": {
+    "bun": ">=1.3.14"
+  }
+}

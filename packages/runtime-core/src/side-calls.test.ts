@@ -1006,3 +1006,107 @@ describe("the budget cap gates every side call (§7.12 / §14(2))", () => {
     expect(gate).toBeUndefined();
   });
 });
+
+describe("a shadow's spend view is fixed when it is scheduled", () => {
+  test("a shadow still running when the next turn's call starts waits for that call, never treating it as its own", async () => {
+    const answers: string[] = [];
+    let turn2Started: (() => void) | undefined;
+    const turn2 = new Promise<void>((r) => {
+      turn2Started = r;
+    });
+    let openGate: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      openGate = r;
+    });
+    let call = 0;
+    let shadows = 0;
+    const TIE: ShadowVerdict = {
+      verdict: "tie",
+      agreed: true,
+      model: STRONG,
+      provider: "anthropic",
+      usage: { input: 1, output: 1 },
+      latencyMs: 1,
+    };
+    const adapter: ProviderAdapter = {
+      providerId: "anthropic",
+      features: {
+        caching: false,
+        tool_use: true,
+        vision: false,
+        thinking: false,
+        web_search: false,
+      },
+      estimateTokens: () => 0,
+      stream(): AsyncIterable<StreamEvent> {
+        call += 1;
+        const second = call === 2;
+        return (async function* () {
+          yield { kind: "message_start", usage: { input: 10, output: 0 } };
+          if (second) {
+            turn2Started?.();
+            await gate;
+          }
+          yield { kind: "content_block_start", index: 0, block: { type: "text", text: "" } };
+          yield {
+            kind: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "ok" },
+          };
+          yield { kind: "content_block_stop", index: 0 };
+          yield { kind: "message_delta", stopReason: "end_turn", usage: { input: 10, output: 5 } };
+          yield { kind: "message_stop" };
+        })();
+      },
+    };
+    const { runContext } = watch();
+    await runChatLoop({
+      model: CHEAP,
+      instructions: "You are the executor.",
+      _adapter: adapter,
+      modelPool: POOL,
+      _poolAdapters: new Map([
+        [CHEAP, adapter],
+        [STRONG, adapter],
+      ]),
+      _scoreboard: tmpScoreboard(),
+      // Haiku's 64k-token worst case ($0.32) alone fills the $0.30 cap.
+      maxTokens: 64_000,
+      budget: { usdMicros: 300_000, onExceed: { kind: "stop" } },
+      sideCalls: {
+        shadow: {
+          candidate: STRONG,
+          profile: "strong",
+          sampleRate: 1,
+          run: async (ctx) => {
+            // Turn 1's shadow asks while turn 2's call is in progress (turn 2's own
+            // shadow runs after it, and is not what this test reads).
+            shadows += 1;
+            if (shadows > 1) return { ...TIE };
+            await turn2;
+            const spend = ctx.spend;
+            if (spend === undefined) throw new Error("the shadow got no spend view");
+            const first = await spend.reserve("rsv_probe", 1_000, { role: "shadow" });
+            answers.push(first.admit ? "admit" : first.on);
+            openGate?.();
+            if (!first.admit && first.on === "others") {
+              await first.settled;
+              const again = await spend.reserve("rsv_probe", 1_000, { role: "shadow" });
+              answers.push(again.admit ? "admit" : again.on);
+            }
+            await spend.release("rsv_probe");
+            return { ...TIE };
+          },
+        },
+      },
+      input: interactiveStdin(runContext.eventBus, ["first", "second"]),
+      runContext,
+      installSigintHandler: false,
+      spinner: false,
+      stdout: () => {},
+      persistSession: false,
+    });
+    // It waited on turn 2's call (another call), and was admitted once that call settled.
+    expect(answers).toEqual(["others", "admit"]);
+  });
+});

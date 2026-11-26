@@ -29,7 +29,7 @@ describe("every configurable package is in the registrar table", () => {
   test("each row's registrar exists, and each registrar is named by a row", () => {
     const named = new Set<string>();
     for (const [key, entry] of Object.entries(BUILTIN_TOOLS)) {
-      for (const symbol of [entry.initSymbol, entry.chainSymbol]) {
+      for (const symbol of [entry.initSymbol, entry.chainSymbol, entry.repositorySymbol]) {
         if (symbol === undefined) continue;
         named.add(symbol);
         expect({ key, symbol, known: Object.hasOwn(TOOL_BOOT_REGISTRARS, symbol) }).toEqual({
@@ -43,6 +43,9 @@ describe("every configurable package is in the registrar table", () => {
       }
       if (entry.chainSymbol !== undefined) {
         expect(TOOL_BOOT_REGISTRARS[entry.chainSymbol]?.source).toBe("chains");
+      }
+      if (entry.repositorySymbol !== undefined) {
+        expect(TOOL_BOOT_REGISTRARS[entry.repositorySymbol]?.source).toBe("repositories");
       }
     }
     expect([...named].sort()).toEqual(Object.keys(TOOL_BOOT_REGISTRARS).sort());
@@ -63,6 +66,10 @@ describe("every configurable package is in the registrar table", () => {
     registerSecureConfig: {
       rows: ["piiRedact", "pseudonymize", "redactForExport", "signPayload", "verifyPayload"],
       why: "only these five read an HMAC key, and key_env_vars is all the block sets; naming it from every tool-secure row made two differing blocks under unkeyed tools (piiScan, secretScan) a compile error and told `tools show` those tools read tool_config.secure",
+    },
+    registerWorkConfig: {
+      rows: ["workGet", "workList", "workPropose", "workUpdate"],
+      why: "the work tools read accept and ranking; the workspace tools in the same package are configured by the repositories block and read nothing from tool_config.work",
     },
   };
 

@@ -4,6 +4,7 @@
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -662,5 +663,52 @@ describe("the run stamp records --ignore-pause", () => {
     }
     expect(ops).toContain("reserve");
     expect(ops).toContain("settle");
+  }, 20_000); // one CLI subprocess loading the whole entry file
+
+  test("a run started from another directory keeps the period's ledger in the spec's directory", async () => {
+    const dir = harness("absent");
+    const elsewhere = harness("absent");
+    writeFileSync(
+      join(dir, "crewhaus.yaml"),
+      [
+        "name: gate-fixture",
+        "target: cli",
+        "models:",
+        "  stub:",
+        `    model: local/stub@http://127.0.0.1:${stub.port}/v1`,
+        "    price: {input_per_1m: 1, output_per_1m: 2}",
+        "agent:",
+        "  model: $stub",
+        "  instructions: Reply briefly.",
+        "budget:",
+        "  usd: 50",
+        "  period: {every: month, usd: 100}",
+        "",
+      ].join("\n"),
+    );
+    const proc = Bun.spawn(
+      [process.execPath, CLI_PATH, "run", join(dir, "crewhaus.yaml"), "--prompt", "x"],
+      {
+        cwd: elsewhere,
+        env: { PATH: process.env["PATH"] ?? "", HOME: elsewhere, CREWHAUS_NO_REGISTRY: "1" },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+    const [stderr, exitCode] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    expect([exitCode, stderr]).toEqual([0, stderr]);
+    const budget = join(dir, ".crewhaus", "run", "control", "budget");
+    const ops: string[] = [];
+    for (const period of readdirSync(budget)) {
+      if (!period.startsWith("month-")) continue;
+      for (const seg of readdirSync(join(budget, period))) {
+        for (const line of readFileSync(join(budget, period, seg), "utf8").split("\n")) {
+          if (line !== "") ops.push(String((JSON.parse(line) as { op?: unknown }).op));
+        }
+      }
+    }
+    expect(ops).toEqual(["reserve", "settle"]);
+    expect(existsSync(join(elsewhere, ".crewhaus", "run", "control", "budget"))).toBe(false);
   }, 20_000); // one CLI subprocess loading the whole entry file
 });

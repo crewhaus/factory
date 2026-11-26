@@ -10,7 +10,16 @@
  * the default Hangar root is only ever spelled.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import {
@@ -21,6 +30,8 @@ import {
 } from "@crewhaus/permission-engine";
 import { buildTenant } from "@crewhaus/tenancy";
 import { protectedRootHolding } from "@crewhaus/tool-safety/fs";
+// The store `crewhaus watchme report` writes through; runtime-core does not depend on it.
+import { openWatchmeStore } from "../../watchme-store/src/store";
 import { CANONICAL_MEMORY_FILES } from "./project-memory";
 import {
   MEMORY_FLOOR_TARGETS,
@@ -66,7 +77,7 @@ const GATE_RECORDS = [
   join("scope-audit", "baseline.json"),
   join("security-corpus", "corpus.json"),
   join("slo", "intake.json"),
-  join("watchme", "synthesized"),
+  "watchme",
   "feedback",
   "fewshot",
 ].map((name) => join(".crewhaus", name));
@@ -1464,7 +1475,7 @@ describe("the delegation rules and their application log", () => {
   });
 });
 
-describe("the specs watchme synthesizes for a person to adopt", () => {
+describe("watchme's records, the ratings and the few-shot pools", () => {
   const write = (path: string): ToolCallContext => ({
     toolName: "Write",
     input: { path },
@@ -1477,22 +1488,69 @@ describe("the specs watchme synthesizes for a person to adopt", () => {
     flag: [{ type: "alwaysAllow", pattern: "Write", source: "flag" }],
   };
 
-  test("are a root, and an agent's write there is refused with the floor's reason", () => {
+  test("watchme's directory is a root: an agent's write to its judgments or its specs is refused with the floor's reason", () => {
     const cwd = tempDir("crewhaus-watchme-floor-");
     const roots = runtimeStateRoots(undefined, undefined, cwd, {});
-    const dir = join(".crewhaus", "watchme", "synthesized");
+    const dir = join(".crewhaus", "watchme");
     expect(roots).toContain(dir);
     expect(roots).toContain(join(cwd, dir));
-    const verdict = evaluateWithReason(write(join(cwd, dir, "mimic.yaml")), "auto", allowWrite, {
-      protectedRoots: roots,
-    });
-    expect(verdict.decision).toBe("deny");
-    expect(verdict.reason).toContain("no rule can allow that");
+    for (const file of ["judgments.jsonl", join("synthesized", "mimic.yaml"), "notes.md"]) {
+      const verdict = evaluateWithReason(write(join(cwd, dir, file)), "auto", allowWrite, {
+        protectedRoots: roots,
+      });
+      expect(`${file}:${verdict.decision}`).toBe(`${file}:deny`);
+      expect(verdict.reason).toContain("no rule can allow that");
+    }
     // A neighbour outside the root is left to the rules.
-    const beside = join(cwd, ".crewhaus", "watchme", "notes.md");
+    const beside = join(cwd, ".crewhaus", "watchme-notes.md");
     expect(
       evaluateWithReason(write(beside), "auto", allowWrite, { protectedRoots: roots }).decision,
     ).toBe("allow");
+  });
+
+  test("each steward workspace's git directory is a root; its worktrees are left to the rules", () => {
+    const cwd = tempDir("crewhaus-workspace-floor-");
+    expect(
+      runtimeStateRoots(undefined, undefined, cwd, {}).some((r) => r.includes("workspaces")),
+    ).toBe(false);
+    mkdirSync(join(cwd, ".crewhaus", "workspaces", "app"), { recursive: true });
+    mkdirSync(join(cwd, ".crewhaus", "workspaces", "docs"), { recursive: true });
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    for (const name of ["app", "docs"]) {
+      const repo = join(".crewhaus", "workspaces", name, "repo");
+      expect(roots).toContain(repo);
+      expect(roots).toContain(join(cwd, repo));
+    }
+    const repoConfig = join(cwd, ".crewhaus", "workspaces", "app", "repo", "config");
+    const denied = evaluateWithReason(write(repoConfig), "auto", allowWrite, {
+      protectedRoots: roots,
+    });
+    expect(denied.decision).toBe("deny");
+    expect(denied.reason).toContain("no rule can allow that");
+    const source = join(cwd, ".crewhaus", "workspaces", "app", "wt", "01jabcdefg", "src", "a.ts");
+    expect(
+      evaluateWithReason(write(source), "auto", allowWrite, { protectedRoots: roots }).decision,
+    ).toBe("allow");
+  });
+
+  test("the store `crewhaus watchme report` writes through still appends its judgments under a run", () => {
+    const cwd = tempDir("crewhaus-watchme-writer-");
+    const roots = runtimeStateRoots(undefined, undefined, cwd, {});
+    const store = openWatchmeStore(join(cwd, ".crewhaus"));
+    store.appendJudgment({
+      sessionId: "sess_00000000000000aa",
+      turnNumber: 1,
+      score: 0.8,
+      rationale: "close to what the person did",
+      at: new Date(0).toISOString(),
+    } as never);
+    const file = join(cwd, ".crewhaus", "watchme", "judgments.jsonl");
+    expect(existsSync(file)).toBe(true);
+    expect(readFileSync(file, "utf8")).toContain("sess_00000000000000aa");
+    // The same file, written by a tool call, is the floor's to refuse.
+    expect(
+      evaluateWithReason(write(file), "auto", allowWrite, { protectedRoots: roots }).decision,
+    ).toBe("deny");
   });
 
   test("the recorded ratings and the few-shot pools are roots, and an agent's write there is refused", () => {

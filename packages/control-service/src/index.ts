@@ -4,7 +4,7 @@
  * whose receipt is written before anything answers. It never enters a compiled harness and
  * never imports `@crewhaus/hangar-server`.
  */
-export { currentLocalIdentity, storedActorFor } from "./actor";
+export { currentLocalIdentity, readStoredActor, storedActorFor } from "./actor";
 export {
   DECISION_EXECUTORS,
   DECISION_RECONCILERS,
@@ -105,6 +105,22 @@ export {
   workCommands,
   workRefOf,
 } from "./work";
+export {
+  type CloseAnswer as WorkspaceCloseAnswer,
+  type SettleAnswer as WorkspaceSettleAnswer,
+  type TrackAnswer as WorkspaceTrackAnswer,
+  WORKSPACE_REVOKER,
+  type WorkspaceCommands,
+  type WorkspaceHomeDeps,
+  type WorkspacePublishPlan,
+  type WorkspacePublishValue,
+  closeFinishedWorkspaces,
+  homeWorkspaceEngine,
+  reconcilePublish,
+  settleAttempts,
+  trackHarnessOutcomes,
+  workspaceCommands,
+} from "./workspaces";
 export {
   type ActiveCeiling,
   APPLY_NOTE,
@@ -266,12 +282,20 @@ export {
   reconcileRunCreate,
   reconcileRunResume,
   childRunsOf,
+  intakeRefusal,
   runAdapterFor,
   runBundleRefusal,
   runRefOf,
   runRowOf,
   versionAtLeast,
+  withdrawQueued,
 } from "./runs";
+export {
+  RERUN_INPUT_MAX_BYTES,
+  type RerunInput,
+  type RerunOptions,
+  rerunInputOf,
+} from "./rerun";
 export {
   type ControlDeps,
   type ControlService,

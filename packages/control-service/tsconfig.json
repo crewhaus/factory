@@ -17,6 +17,7 @@
     { "path": "../ir" },
     { "path": "../permission-engine" },
     { "path": "../run-context" },
+    { "path": "../run-inspect" },
     { "path": "../runtime-core" },
     { "path": "../session-store" },
     { "path": "../spec-patch" },

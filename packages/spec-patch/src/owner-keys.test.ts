@@ -62,6 +62,7 @@ describe("the lists derive from the table", () => {
       ["evaluation", "protected"],
       ["provability", "protected"],
       ["plugins"],
+      ["repositories"],
     ]);
     expect(Object.isFrozen(OPTIMIZER_REFUSED_ROOTS)).toBe(true);
   });

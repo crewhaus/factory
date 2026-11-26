@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { BUILTIN_TOOLS } from "./builtins";
-import { planToolConfigInits } from "./config";
+import { ACTION_CLASSES, BUILTIN_TOOLS } from "./builtins";
+import { planRepositoryInits, planToolConfigInits } from "./config";
 import { CATEGORIES, leafCategories } from "./registry";
 import {
   BuiltinToolError,
@@ -9,6 +9,7 @@ import {
   builtinKeyForName,
   builtinToolsFor,
   checkBuiltinTool,
+  registerToolConfigs,
   registeredToolName,
   resolveBuiltinTools,
   unknownToolMessage,
@@ -214,11 +215,33 @@ describe("checkBuiltinTool", () => {
     expect(checked).toBeGreaterThan(KEYS.length * 5);
   });
 
-  test("the cli shape carries every categorized builtin and nothing shape-specific", () => {
+  test("the cli shape carries every categorized builtin, and the shape-specific ones that name it", () => {
     const cli = builtinToolsFor("cli");
     const categorized = new Set(leafCategories().flatMap((c) => CATEGORIES[c]?.tools ?? []));
     expect([...categorized].filter((k) => !cli.includes(k))).toEqual([]);
-    expect(cli.filter((k) => !categorized.has(k))).toEqual([]);
+    expect(cli.filter((k) => !categorized.has(k))).toEqual(
+      KEYS.filter((k) => BUILTIN_TOOLS[k]?.shapes?.includes("cli") === true).sort(),
+    );
+  });
+
+  test("the workspace tools are carried by exactly the shapes that deliver work", () => {
+    for (const key of ["workspaceOpen", "workspaceCheck", "workspacePublish"]) {
+      expect(BUILTIN_TOOLS[key]?.shapes).toEqual([
+        "cli",
+        "workflow",
+        "channel",
+        "managed",
+        "batch",
+      ]);
+      expect(BUILTIN_TOOLS[key]?.repositorySymbol).toBe("bindWorkspaceRepositories");
+    }
+    // Running a project's own checks is drafting; only publishing publishes.
+    expect(BUILTIN_TOOLS["workspaceCheck"]?.actionClass).toBe("draft");
+    expect(BUILTIN_TOOLS["workspaceOpen"]?.actionClass).toBe("draft");
+    expect(BUILTIN_TOOLS["workspacePublish"]?.actionClass).toBe("publish");
+    for (const entry of Object.values(BUILTIN_TOOLS)) {
+      if (entry.actionClass !== undefined) expect(ACTION_CLASSES).toContain(entry.actionClass);
+    }
   });
 });
 
@@ -421,5 +444,92 @@ describe("a daemon shape checks each variable its blocks read just before the re
       "crew",
       "managed",
     ]);
+  });
+});
+
+describe("planRepositoryInits — the repositories block reaches the workspace tools", () => {
+  const binding = {
+    name: "app",
+    host: "github",
+    repo: "acme/app",
+    base: "main",
+    branchPrefix: "crewhaus/",
+    checks: [],
+    checkTimeoutMs: 600_000,
+    pullRequests: {
+      draft: true,
+      maxFiles: 20,
+      maxLines: 800,
+      revalidate: "rebase",
+      require: ["acceptance"],
+    },
+    server: { api: "https://api.github.com", git: "https://github.com" },
+  } as const;
+  const site = {
+    tools: ["workspaceOpen", "workspacePublish"],
+    toolConfigs: { codehost: { token_env: "GITHUB_TOKEN" } },
+  };
+
+  test("one literal registration, with the token variable's name and no value", () => {
+    const plan = planRepositoryInits([site], {
+      repositories: [binding],
+      intent: { purpose: "$HOME" },
+      evaluation: { grader: { type: "contains" } },
+    });
+    expect(plan).toEqual([
+      {
+        key: "repositories",
+        package: "@crewhaus/tool-work",
+        initSymbol: "bindWorkspaceRepositories",
+        config: {
+          repositories: [binding],
+          tokenEnv: "GITHUB_TOKEN",
+          intent: { purpose: "$HOME" },
+        },
+        where: "",
+        literal: true,
+      },
+    ]);
+  });
+
+  test("nothing without the block, and nothing without a workspace tool", () => {
+    expect(planRepositoryInits([site], {})).toEqual([]);
+    expect(planRepositoryInits([site], undefined)).toEqual([]);
+    expect(planRepositoryInits([{ tools: ["workList"] }], { repositories: [binding] })).toEqual([]);
+  });
+
+  test("a text that is a variable's name is handed over as that text", async () => {
+    let got: unknown;
+    const plan = await registerToolConfigs(
+      [site],
+      async () => ({
+        bindWorkspaceRepositories: (config: unknown) => {
+          got = config;
+        },
+      }),
+      {
+        env: { HOME: "/planted" },
+        repositories: { repositories: [binding], intent: { purpose: "$HOME" } },
+      },
+    );
+    expect(plan.map((p) => p.initSymbol)).toEqual(["bindWorkspaceRepositories"]);
+    expect((got as { intent: { purpose: string } }).intent.purpose).toBe("$HOME");
+    expect(JSON.stringify(got)).not.toContain("/planted");
+    // A bundle calls the registrar with the same text; a daemon's boot checks no variable for it.
+    const resolved = resolveBuiltinTools("managed", [site], {
+      repositories: [binding],
+      intent: { purpose: "$HOME" },
+    });
+    expect(resolved.inits).toEqual([
+      `bindWorkspaceRepositories(${JSON.stringify({
+        repositories: [binding],
+        tokenEnv: "GITHUB_TOKEN",
+        intent: { purpose: "$HOME" },
+      })});`,
+    ]);
+  });
+
+  test("the codehost block is read by a workspace tool, so it is not called unused", () => {
+    expect(planToolConfigInits([site])).toEqual([]);
   });
 });

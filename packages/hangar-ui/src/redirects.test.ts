@@ -27,8 +27,8 @@ describe("the fleet screens", () => {
   test("nine redirect, and Settings is its own index", () => {
     const cases: Array<[string, string | null]> = [
       ["#/runs", "#/home/working"],
-      ["#/approvals", "#/home/needs-you?type=approvals"],
-      ["#/review", "#/home/needs-you?type=review"],
+      ["#/approvals", "#/home/needs-you?kind=permission"],
+      ["#/review", "#/home/needs-you?kind=review"],
       ["#/activity", "#/home/changes"],
       ["#/credentials", "#/connections/credentials"],
       ["#/feedback", "#/harnesses/feedback"],
@@ -128,8 +128,8 @@ describe("the twenty harness tabs", () => {
 describe("the query, and what never redirects", () => {
   test("an old address keeps its query; a fixed key the new address sets wins", () => {
     expect(r.redirectFor("#/runs?x=1")).toBe("#/home/working?x=1");
-    expect(r.redirectFor("#/approvals?x=1&type=review")).toBe(
-      "#/home/needs-you?type=approvals&x=1",
+    expect(r.redirectFor("#/approvals?x=1&kind=review")).toBe(
+      "#/home/needs-you?kind=permission&x=1",
     );
     expect(r.redirectFor(`${H}/sessions/s1?turn=3`)).toBe(`${H}/work/sessions/s1?turn=3`);
   });
@@ -202,7 +202,7 @@ describe("the link builders speak the new grammar, through the same table", () =
   });
 
   test("the fleet builder maps old names and passes new ones", () => {
-    expect(r.hrefGlobal("approvals")).toBe("#/home/needs-you?type=approvals");
+    expect(r.hrefGlobal("approvals")).toBe("#/home/needs-you?kind=permission");
     expect(r.hrefGlobal("settings")).toBe("#/settings");
     expect(r.hrefGlobal("harnesses")).toBe("#/harnesses");
   });

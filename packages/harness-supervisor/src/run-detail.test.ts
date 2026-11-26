@@ -7,8 +7,16 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MAX_LEDGER_ROWS, isSupervisorRunId, runDetail, runLogFile, runsView } from "./run-detail";
-import { appendRunLedger, ensureRunDir, runEventsPath, runLogPath } from "./runfiles";
+import { _setIoTapForTest } from "@crewhaus/control-records";
+import {
+  MAX_LEDGER_ROWS,
+  isSupervisorRunId,
+  runDetail,
+  runEventsAt,
+  runLogFile,
+  runsView,
+} from "./run-detail";
+import { appendRunLedger, ensureRunDir, runEventsPath, runIndexPath, runLogPath } from "./runfiles";
 import type { Scrubber } from "./scrub";
 import type { RunLedgerEntry } from "./types";
 
@@ -228,5 +236,98 @@ describe.skipIf(process.platform === "win32")("containment", () => {
     expect(detail?.events).toEqual([]);
     expect(detail?.proseTail).toEqual([]);
     expect(JSON.stringify(detail)).not.toContain(SECRET);
+  });
+});
+
+describe("runEventsAt", () => {
+  const EXEC = "run_00000000000000d1";
+  const ONE = `run_${"0".repeat(25)}1`;
+  const TWO = `run_${"0".repeat(25)}2`;
+  const line = (run: string, turn: number) =>
+    `${JSON.stringify({ kind: "turn_end", runId: run, turn })}\n`;
+
+  function withEvents(dir: string): { second: number } {
+    ensureRunDir(dir);
+    const first = line(ONE, 1) + line(ONE, 2);
+    const rest = line(TWO, 1) + line(ONE, 3) + line(TWO, 2);
+    writeFileSync(runEventsPath(dir, EXEC), first + rest);
+    return { second: Buffer.byteLength(first) };
+  }
+
+  test("seeks to the run's index entry, and reads only from there", () => {
+    const dir = harness();
+    const { second } = withEvents(dir);
+    writeFileSync(
+      runIndexPath(dir, EXEC),
+      `${JSON.stringify({ run: ONE, off: 0, at: "t" })}\n${JSON.stringify({ run: TWO, off: second, at: "t" })}\n`,
+    );
+    const log: string[] = [];
+    _setIoTapForTest({
+      open: (given) => log.push(`open ${given.endsWith(".runs.jsonl") ? "index" : "events"}`),
+      read: (position) => log.push(`read ${position}`),
+    });
+    let got: ReturnType<typeof runEventsAt>;
+    try {
+      got = runEventsAt(dir, EXEC, { run: TWO, scrub: (text) => text });
+    } finally {
+      _setIoTapForTest(undefined);
+    }
+    expect(got.from).toBe("index");
+    expect(got.entries.map((e) => e.event["turn"])).toEqual([1, 2]);
+    expect(got.entries[0]?.off).toBe(second);
+    // The index is read from its start; the events file only from the run's offset on.
+    const afterIndex = log.slice(log.indexOf("open index") + 2);
+    expect(afterIndex.length).toBeGreaterThan(0);
+    expect(afterIndex[0]).toBe(`read ${second}`);
+    expect(
+      afterIndex.every((entry) => entry.startsWith("read ") && Number(entry.slice(5)) >= second),
+    ).toBe(true);
+  });
+
+  test("without an index entry it scans from the start, and says so", () => {
+    const dir = harness();
+    withEvents(dir);
+    const got = runEventsAt(dir, EXEC, { run: TWO, env: {} });
+    expect(got).toMatchObject({ present: true, from: "scan", torn: 0, truncated: false });
+    expect(got.entries.map((e) => `${e.event["runId"] === TWO}:${e.event["turn"]}`)).toEqual([
+      "true:1",
+      "true:2",
+    ]);
+  });
+
+  test("a damaged line is counted, a byte budget is said, and every event is scrubbed again", () => {
+    const dir = harness();
+    ensureRunDir(dir);
+    writeFileSync(
+      runEventsPath(dir, EXEC),
+      `${line(ONE, 1)}{"kind":"tor\n${JSON.stringify({ kind: "x", runId: ONE, text: SECRET })}\n{"kind":"cut`,
+    );
+    const got = runEventsAt(dir, EXEC, { scrub: (text) => text.replaceAll(SECRET, "«KEY»") });
+    expect(got.torn).toBe(2);
+    expect(JSON.stringify(got.entries)).not.toContain(SECRET);
+    expect(JSON.stringify(got.entries)).toContain("«KEY»");
+    expect(runEventsAt(dir, EXEC, { maxBytes: 10, env: {} })).toMatchObject({
+      truncated: true,
+      torn: 0,
+    });
+  });
+
+  test("a missing file says whether retention removed it; a planted link is refused", () => {
+    const dir = harness();
+    ensureRunDir(dir);
+    expect(runEventsAt(dir, EXEC, { env: {} })).toMatchObject({ present: false, pruned: false });
+    writeFileSync(
+      join(dir, ".crewhaus", "run", "pruned.jsonl"),
+      `${JSON.stringify({ v: 1, at: "t", runs: [EXEC] })}\n`,
+    );
+    expect(runEventsAt(dir, EXEC, { env: {} })).toMatchObject({ present: false, pruned: true });
+    const outside = join(harness(), "elsewhere.jsonl");
+    writeFileSync(outside, line(ONE, 1));
+    symlinkSync(outside, runEventsPath(dir, EXEC));
+    const linked = runEventsAt(dir, EXEC, { env: {} });
+    expect(linked.present).toBe(false);
+    expect(linked.refused).toBeDefined();
+    expect(linked.entries).toEqual([]);
+    expect(runEventsAt(dir, "not-an-execution", { env: {} }).present).toBe(false);
   });
 });

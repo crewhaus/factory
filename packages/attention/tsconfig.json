@@ -5,8 +5,12 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../access-control" },
+    { "path": "../checkpoint-store" },
     { "path": "../control-contract" },
     { "path": "../control-records" },
+    { "path": "../control-service" },
+    { "path": "../deployment-controller" },
     { "path": "../feedback-distill" },
     { "path": "../harness-advice" },
     { "path": "../preflight" },

@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMemoryStore } from "@crewhaus/memory-store";
-import type { ToolExecuteContext } from "@crewhaus/tool-catalog";
+import { type ToolExecuteContext, reportsKnowledge } from "@crewhaus/tool-catalog";
 import { createMemoryTools } from "./index";
 
 let tmp: string;
@@ -59,6 +59,8 @@ describe("createMemoryTools — Remember", () => {
     await remember.execute({ text: "deploys go out on Fridays" }, { runContext });
     const [item] = await store.list();
     expect(item?.entry.provenance?.sessionId).toBe("sess_00000000000000ab");
+    // Marked as the agent's own, apart from a fact auto-capture read out of the session.
+    expect(item?.entry.provenance?.author).toEqual({ kind: "agent", via: "remember" });
   });
 
   test("reads the session through the runtime bridge when that is where the run context is", async () => {
@@ -77,7 +79,8 @@ describe("createMemoryTools — Remember", () => {
       provenance: { sessionId: "sess_00000000000000ef" },
     } as unknown as { text: string });
     const [item] = await store.list();
-    expect(item?.entry.provenance).toBeUndefined();
+    expect(item?.entry.provenance).toEqual({ author: { kind: "agent", via: "remember" } });
+    expect(item?.entry.provenance?.sessionId).toBeUndefined();
   });
 
   test("a run session that is not a sess_ id is not written", async () => {
@@ -85,7 +88,8 @@ describe("createMemoryTools — Remember", () => {
     const runContext = createRunContext({ sessionId: "sess_NOT-HEX-0000000" });
     await remember.execute({ text: "the user likes coffee" }, { runContext });
     const [item] = await store.list();
-    expect(item?.entry.provenance).toBeUndefined();
+    expect(item?.entry.provenance).toEqual({ author: { kind: "agent", via: "remember" } });
+    expect(item?.entry.provenance?.sessionId).toBeUndefined();
   });
 
   test("schema validates text presence (zod rejects empty)", () => {
@@ -146,6 +150,11 @@ describe("createMemoryTools — Recall", () => {
         ids.map((id) => ({ store: "fact", backend: "local", spec: "notes-bot", localId: id })),
       ),
     );
+  });
+
+  test("Recall alone reports reads to the runtime", () => {
+    const { remember, recall, forget } = createMemoryTools({ specName: "s", rootDir: tmp });
+    expect([remember, recall, forget].map(reportsKnowledge)).toEqual([false, true, false]);
   });
 
   test("no result, no report", async () => {

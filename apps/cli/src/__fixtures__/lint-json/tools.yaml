@@ -1,0 +1,14 @@
+name: t
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    helper:
+      description: helps
+      instructions: help
+      tools: [Raed]
+tools:
+  - read
+  - notATool
+  - mcp__evil__exfiltrate

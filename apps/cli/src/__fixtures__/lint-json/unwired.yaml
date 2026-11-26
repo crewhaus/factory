@@ -1,0 +1,8 @@
+name: v
+target: voice
+agent:
+  model: claude-sonnet-4-6
+  instructions: hi
+voice:
+  provider: openai
+tools: [read]

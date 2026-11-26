@@ -10,11 +10,11 @@
 import { describe, expect, test } from "bun:test";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import {
+  ATTENTION_BINDINGS,
   GLOBAL_BINDINGS,
-  INBOX_BINDINGS,
   bindingSheet,
   globalKey,
-  inboxKindOf,
+  inboxOn,
   initialKeyState,
   isCharacterKey,
   keyShape,
@@ -25,6 +25,8 @@ import { createNotificationPoll } from "../assets/js/notify.js";
 import { canRunAction, omniRows } from "../assets/js/omnibox.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { LEGACY_GLOBAL_VIEWS, LEGACY_HARNESS_TABS, parseRoute } from "../assets/js/router.js";
+// @ts-expect-error — hand-written browser JS, typed as text for the embed map
+import { VERDICT_KEYS } from "../assets/js/views/attention-acts.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
 import { dashboardReach, isLoopbackHostname } from "../assets/js/views/channels.js";
 // @ts-expect-error — hand-written browser JS, typed as text for the embed map
@@ -43,7 +45,6 @@ type KeyShape = {
   alt?: boolean;
   shift?: boolean;
   inField?: boolean;
-  inboxFocused?: boolean;
   dialogOpen?: boolean;
 };
 
@@ -131,36 +132,13 @@ describe("globalKey — HM-190 ownership", () => {
     }
   });
 
-  // Changed deliberately: the inbox's keys belong to its LIST now, so `?` is
-  // the inbox's only while focus is inside that list. Keyed off the mounted
-  // screen, `?` would do nothing anywhere else on it.
-  test("`?` opens the app sheet unless focus is inside an inbox list", () => {
-    const noInbox = press(initialKeyState(), { key: "?" });
-    expect(noInbox.effect).toBe("toggle-sheet");
-    expect(noInbox.state.sheetOpen).toBe(true);
-
-    // Focus in the list: the inbox binds `?` for its own help; claiming it
-    // here would open two sheets on one keypress.
-    const inList = press(
-      { ...initialKeyState(), inboxMounted: true },
-      {
-        key: "?",
-        inboxFocused: true,
-      },
-    );
-    expect(inList.claimed).toBe(false);
-    expect(inList.effect).toBeNull();
-
-    // The inbox screen, focus outside the list: the global sheet opens.
-    const onScreen = press(
-      { ...initialKeyState(), inboxMounted: true },
-      {
-        key: "?",
-        inboxFocused: false,
-      },
-    );
-    expect(onScreen.effect).toBe("toggle-sheet");
-    expect(onScreen.claimed).toBe(true);
+  test("`?` opens the app sheet, wherever focus is", () => {
+    for (const inboxMounted of [false, true]) {
+      const opened = press({ ...initialKeyState(), inboxMounted }, { key: "?" });
+      expect(opened.effect).toBe("toggle-sheet");
+      expect(opened.claimed).toBe(true);
+      expect(opened.state.sheetOpen).toBe(true);
+    }
   });
 
   test("`/` opens the command menu, but never from a field", () => {
@@ -207,7 +185,7 @@ describe("globalKey — HM-190 ownership", () => {
   });
 
   test("the inbox's own keys always fall through unclaimed", () => {
-    for (const key of ["j", "k", "g", "d", "u", "p", "f", "."]) {
+    for (const key of ["j", "k", "g", "d", "u", "p", "f"]) {
       const r = press({ ...initialKeyState(), inboxMounted: true }, { key });
       expect(`${key}:${r.claimed}`).toBe(`${key}:false`);
     }
@@ -246,54 +224,42 @@ describe("globalKey — HM-190 ownership", () => {
     const sections = bindingSheet(false) as Array<{ section: string; bindings: unknown[] }>;
     expect(sections).toHaveLength(2);
     expect(sections.every((s) => s.bindings.length > 0)).toBe(true);
-    expect((bindingSheet(true) as Array<{ section: string }>)[1]?.section).toBe("This inbox");
+    expect((bindingSheet(true) as Array<{ section: string }>)[1]?.section).toBe("This list");
+    expect(sections[1]?.section).toBe("Needs you");
   });
 
-  test("Needs you, All lists only the keys its list answers to", () => {
-    const route = (type?: string) => ({
+  test("the list is on Needs you, whatever kind it shows, and not on Advice", () => {
+    const route = (query: Record<string, string> = {}) => ({
       view: "home",
       sub: "needs-you",
-      query: type === undefined ? {} : { type },
+      query,
     });
-    expect(inboxKindOf(route())).toBe("attention");
-    expect(inboxKindOf(route("approvals"))).toBe("triage");
-    expect(inboxKindOf(route("review"))).toBe("triage");
-    expect(inboxKindOf(route("advice"))).toBe(false);
-    expect(inboxKindOf({ view: "home", sub: "working", query: {} })).toBe(false);
-    const sheet = bindingSheet("attention") as Array<{
-      section: string;
-      bindings: Array<{ keys: string }>;
-    }>;
-    expect(sheet.map((g) => g.section)).toEqual(["Anywhere", "This list"]);
-    const keys = sheet[1]?.bindings.map((b) => b.keys) ?? [];
-    expect(keys).toEqual(["j / ↓", "k / ↑", "Home / End"]);
-    for (const absent of ["g / d", "u / d / p / f", "Enter", "."])
-      expect(keys).not.toContain(absent);
+    expect(inboxOn(route())).toBe(true);
+    expect(inboxOn(route({ kind: "permission" }))).toBe(true);
+    expect(inboxOn(route({ type: "advice" }))).toBe(false);
+    expect(inboxOn({ view: "home", sub: "working", query: {} })).toBe(false);
   });
 
   test("the sheet tells the truth: a letter chooses a verdict and Enter confirms it", () => {
-    const inbox = INBOX_BINDINGS as Array<{ keys: string; does: string }>;
-    const verdicts = inbox.filter((b) => b.keys === "g / d" || b.keys === "u / d / p / f");
-    expect(verdicts).toHaveLength(2);
+    const list = ATTENTION_BINDINGS as Array<{ keys: string; does: string }>;
+    expect(list.map((b) => b.keys)).toEqual([
+      "j / ↓",
+      "k / ↑",
+      "Home / End",
+      "g / d",
+      "p / f / u",
+      "Esc",
+    ]);
+    const verdicts = list.filter((b) => b.keys === "g / d" || b.keys === "p / f / u");
     for (const binding of verdicts) {
       expect(binding.does).toContain("choose");
       expect(binding.does).toContain("then Enter");
     }
-    expect(inbox.some((b) => b.does === "grant or deny (approvals inbox)")).toBe(false);
-    expect(inbox.map((b) => b.keys)).toContain("Enter");
+    // Every letter the sheet names is one the list answers to, and the other way round.
+    const letters = verdicts.flatMap((b) => b.keys.split(" / ")).sort();
+    expect(letters).toEqual(Object.keys(VERDICT_KEYS).sort());
     const global = GLOBAL_BINDINGS as Array<{ keys: string }>;
     expect(global.map((b) => b.keys)).toEqual(["⌘K / Ctrl-K", "/", "?", "Esc"]);
-  });
-
-  test("keyShape reads whether focus is inside an inbox list off the event", () => {
-    const inList = {
-      tagName: "LI",
-      closest: (sel: string) => (sel === "[data-triage]" ? {} : null),
-    };
-    expect(keyShape({ key: "?", target: inList }).inboxFocused).toBe(true);
-    const outside = { tagName: "BUTTON", closest: () => null };
-    expect(keyShape({ key: "?", target: outside }).inboxFocused).toBe(false);
-    expect(keyShape({ key: "?", target: { tagName: "BODY" } }).inboxFocused).toBe(false);
   });
 });
 

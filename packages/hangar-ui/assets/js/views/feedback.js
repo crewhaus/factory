@@ -4,7 +4,7 @@
  * channel reaction state. Plus the fleet-wide rollup screen, which answers
  * "which harnesses have enough feedback to distill".
  *
- * The review QUEUE and its adjudication are the M2 screen (`views/review.js`)
+ * The review QUEUE and its adjudication are Needs you (`views/attention.js`)
  * and stay there; this is what the ratings turn INTO.
  *
  * Two things this screen refuses to soften:

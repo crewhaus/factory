@@ -1,12 +1,12 @@
 /**
- * Every job route carries what it checked into the job's start-time check.
+ * Every route that queues a job carries what it checked into the job's start-time check.
  *
- * A route whose handler queues a job (`dispatch: "job"`) is authorized twice: at the
- * choke point for its row's permission, and again where the job starts, for the
- * permissions the request noted (`noteNeed`, which `requirePermission` calls when no
- * target is named). This guard reads each job handler's source and every function it
- * reaches, in its own module and in the sibling modules it imports, and holds each one to
- * that rule:
+ * Such a route is authorized twice: at the choke point for its row's permission, and again
+ * where the job starts, for the permissions the request noted (`noteNeed`, which
+ * `requirePermission` calls when no target is named). Which routes queue one is read from
+ * their code: this guard walks every handler of the M3 table, the ones written inline in
+ * the table included, through its own module and the sibling modules it imports, and holds
+ * each one that reaches a job submission to that rule, whatever its row says:
  *
  * - a permission is checked with `requirePermission(ctx, P)` and no target, or, when it is
  *   checked on an explicit target, that target is the route's own harness and `noteNeed(P)`
@@ -17,9 +17,10 @@
  *   literal of known keys, `authorize` reached any way but `ctx.authorize(…)`,
  *   `requirePermission` under another name, and a call into a relative import it cannot read.
  *
- * The rows come from the route table, the handlers from the M3 table, and the modules from
- * every non-test source under `src`, subdirectories included: nothing here is a hand-kept
- * list of routes. Planted handlers prove the checker can fail.
+ * The rows come from the route table, the handlers from the M3 table's own source, and the
+ * modules from every non-test source under `src`, subdirectories included. The one list kept
+ * by hand is the reviewed pair of read-only checks that run as jobs. Planted handlers prove
+ * the checker can fail.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
@@ -535,14 +536,65 @@ function unitFacts(mod: Module, unit: Unit, resolve: (local: string) => Resolved
   return { unit, sites, problems };
 }
 
+/** A route's handler: a function of a module, or the span of one written inline. */
+type Handler = {
+  readonly route: string;
+  readonly module: string;
+  readonly fn: string;
+  readonly span?: readonly [number, number];
+};
+
 /**
- * Check every job handler against the rule. `modules` maps a module's name (no `.ts`) to its
- * source; `handlers` names each job route's handler and the module that defines it.
+ * Every handler the M3 table names, read from the table's own source: a function it imports,
+ * one it declares, or one written inline in its row. A row whose handler is an expression
+ * the guard does not know is named with a module that does not exist.
+ */
+function tableHandlers(mod: Module): Handler[] {
+  const out: Handler[] = [];
+  for (const m of mod.masked.matchAll(/\broute\s*\(/g)) {
+    if (/\bfunction\s+$/.test(mod.masked.slice(0, m.index as number))) continue;
+    const spans = argSpans(mod.src, mod.masked, (m.index as number) + m[0].length - 1);
+    const named = spans[0] === undefined ? undefined : mod.src.slice(...spans[0]);
+    const key = /^"([^"]+)"$/.exec(named ?? "")?.[1] ?? `(unreadable: ${named})`;
+    const span = spans[4];
+    if (span === undefined || spans.length !== 5) {
+      out.push({ route: key, module: "(unreadable row)", fn: "(none)" });
+      continue;
+    }
+    const text = mod.src.slice(...span);
+    if (/^[A-Za-z_$][\w$]*$/.test(text)) {
+      const imported = mod.imports.get(text);
+      if (imported !== undefined) out.push({ route: key, module: imported[0], fn: imported[1] });
+      else if (mod.units.has(text)) out.push({ route: key, module: mod.name, fn: text });
+      else out.push({ route: key, module: `(unknown: ${text})`, fn: text });
+      continue;
+    }
+    const inline = /^(?:async\s+)?(?:\(|function\b|[A-Za-z_$][\w$]*\s*=>)/.test(text);
+    out.push(
+      inline
+        ? { route: key, module: mod.name, fn: `${key} (inline)`, span }
+        : { route: key, module: `(not a function: ${text})`, fn: text },
+    );
+  }
+  return out;
+}
+
+/** A walk of some handlers: which reach a job submission, the rule's breaks, and what was read. */
+type Walk = {
+  readonly violations: readonly Violation[];
+  readonly reached: ReadonlySet<string>;
+  /** The routes whose handler, or anything it reaches, queues a job. */
+  readonly queues: ReadonlySet<string>;
+};
+
+/**
+ * Check handlers against the rule. `modules` maps a module's name (no `.ts`) to its source;
+ * `handlers` names each route's handler and the module that defines it.
  */
 function checkJobHandlers(
   modules: ReadonlyMap<string, string>,
-  handlers: readonly { readonly route: string; readonly module: string; readonly fn: string }[],
-): { readonly violations: readonly Violation[]; readonly reached: ReadonlySet<string> } {
+  handlers: readonly Handler[],
+): Walk {
   const read = new Map<string, Module>();
   const moduleOf = (name: string): Module | undefined => {
     const hit = read.get(name);
@@ -604,12 +656,17 @@ function checkJobHandlers(
   };
   const violations: Violation[] = [];
   const reached = new Set<string>();
+  const queues = new Set<string>();
   for (const h of handlers) {
-    const root = unitOf(h.module, h.fn);
+    const root: Resolved =
+      h.span !== undefined
+        ? { module: h.module, name: h.fn, from: h.span[0], to: h.span[1] }
+        : unitOf(h.module, h.fn);
     if (root === undefined || "unreadable" in root) {
       violations.push({ route: h.route, handler: h.fn, why: `no ${h.fn} in ${h.module}.ts` });
       continue;
     }
+    if (reach(root).submits) queues.add(h.route);
     const todo = [root];
     const seen = new Set<string>();
     while (todo.length > 0) {
@@ -645,7 +702,18 @@ function checkJobHandlers(
       for (const s of f.sites) if (s.kind === "call" && s.callee !== undefined) todo.push(s.callee);
     }
   }
-  return { violations, reached };
+  return { violations, reached, queues };
+}
+
+/** Every `submitJob` in masked text that is neither called nor a name being defined. */
+function submitJobNotCalled(masked: string): number[] {
+  const out: number[] = [];
+  for (const m of masked.matchAll(/\bsubmitJob\b/g)) {
+    const at = m.index as number;
+    const after = masked.slice(at + "submitJob".length);
+    if (!/^\s*(?:\?\.\s*)?\(/.test(after)) out.push(at);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -674,16 +742,18 @@ const JOB_ROWS = ROUTE_TABLE.filter((row) => row.dispatch === "job");
 const M3_BY_KEY = new Map(M3_ROUTES.map((route) => [route.key, route]));
 const ROUTES_MODULE = readModule("m3-routes", MODULES.get("m3-routes") as string);
 
-/** Each job row's handler, and the module the M3 table imports it from. */
-function jobHandlers() {
-  return JOB_ROWS.flatMap((row) => {
-    const route = M3_BY_KEY.get(row.key);
-    if (route === undefined) return [];
-    const fn = route.handler.name;
-    const from = ROUTES_MODULE.imports.get(fn);
-    return [{ route: row.key, module: from?.[0] ?? "(not imported)", fn }];
-  });
+/** Every handler of the M3 table, and the routes whose handler reaches a job submission. */
+const HANDLERS = tableHandlers(ROUTES_MODULE);
+const WALKED = checkJobHandlers(MODULES, HANDLERS);
+const QUEUING = WALKED.queues;
+
+/** The handlers held to the rule: every one that queues a job. */
+function jobHandlers(): Handler[] {
+  return HANDLERS.filter((h) => QUEUING.has(h.route));
 }
+
+/** Read-only checks that run as jobs, so nothing a person waits on blocks Home. */
+const READ_ONLY_JOBS = ["datasetLint", "securityCorpusCheck"];
 
 /** The function a source offset sits in, or `(top level)`. */
 function unitAt(mod: Module, at: number): string {
@@ -729,22 +799,32 @@ const namesOrHidesATarget = (src: string, masked: string, open: number): boolean
 };
 
 describe("every job route carries what it checked into the job's start-time check", () => {
-  test("the job rows come from the route table, and every one but the jobs route is an M3 handler", () => {
+  test("every M3 row's handler is read from the table's own source", () => {
+    expect(M3_ROUTES.length).toBeGreaterThan(150);
+    expect(HANDLERS.map((h) => h.route).sort()).toEqual(M3_ROUTES.map((r) => r.key).sort());
+    // Each handler is a function the walk can read, where the table says it is.
+    for (const h of HANDLERS) {
+      expect(`${h.route}: ${MODULES.has(h.module)}`).toBe(`${h.route}: true`);
+      const found =
+        h.span !== undefined ||
+        readModule(h.module, MODULES.get(h.module) as string).units.has(h.fn);
+      expect(`${h.route}: ${found}`).toBe(`${h.route}: true`);
+    }
+  });
+
+  test("the routes that queue a job are found from their code, and all but the reviewed read-only checks are job rows", () => {
     expect(JOB_ROWS).toHaveLength(36);
-    const handlers = jobHandlers();
-    expect(handlers).toHaveLength(35);
     // A job route outside the M3 table fails here until this guard learns how to read it.
     expect(JOB_ROWS.filter((row) => !M3_BY_KEY.has(row.key)).map((row) => row.key)).toEqual([
       "submitJob",
     ]);
-    // Each handler is found where the M3 table imports it from.
-    for (const h of handlers) {
-      expect(`${h.route}: ${MODULES.has(h.module)}`).toBe(`${h.route}: true`);
-      expect(
-        `${h.route}: ${readModule(h.module, MODULES.get(h.module) as string).units.has(h.fn)}`,
-      ).toBe(`${h.route}: true`);
-    }
-    expect([...new Set(handlers.map((h) => h.module))].sort()).toEqual(
+    const flagged = new Set(JOB_ROWS.map((row) => row.key));
+    expect(QUEUING.size).toBe(37);
+    expect([...QUEUING].filter((key) => !flagged.has(key as never)).sort()).toEqual(READ_ONLY_JOBS);
+    // Every job row of the table queues one.
+    const idle = JOB_ROWS.filter((row) => M3_BY_KEY.has(row.key) && !QUEUING.has(row.key));
+    expect(idle.map((row) => row.key)).toEqual([]);
+    expect([...new Set(jobHandlers().map((h) => h.module))].sort()).toEqual(
       [
         "advisor",
         "channels-ops",
@@ -759,6 +839,21 @@ describe("every job route carries what it checked into the job's start-time chec
         "watchme-ops",
       ].sort(),
     );
+  });
+
+  test("a job is submitted by calling `submitJob`, never through another name", () => {
+    // The places that name it without a call: the context's member, the server that defines
+    // it, the sweep's context that refuses it, and the note on the jobs route.
+    expect(places(submitJobNotCalled)).toEqual([
+      "advisor.ts advisorSweepItems",
+      "m3.ts (top level)",
+      "route-twin-notes.ts ROUTE_TWIN_NOTES",
+      "server.ts startHangarServer",
+    ]);
+  });
+
+  test("a handler the walk cannot read is never taken to queue nothing", () => {
+    expect(WALKED.violations.filter((v) => v.why.includes("cannot read"))).toEqual([]);
   });
 
   test("no job handler checks a permission on another target, or after it queues its job", () => {
@@ -844,6 +939,8 @@ describe("every job route carries what it checked into the job's start-time chec
         "access.ts requestAllows",
         "server.ts startHangarServer",
         "v1/access-ops.ts manages",
+        "v1/attention-acts.ts requireOn",
+        "v1/attention.ts youOf",
         "v1/budget.ts get",
         "v1/decisions.ts decisionCommand",
         "v1/delegations.ts list",
@@ -851,6 +948,7 @@ describe("every job route carries what it checked into the job's start-time chec
         "v1/meta.ts me",
         "v1/meta.ts resolvePrincipal",
         "v1/runs.ts create",
+        "v1/runs.ts requireContentForFrom",
       ].sort(),
     );
     // A bare `ctx.authorize(P)` that does not note the need: two, both in the spec editor's
@@ -885,6 +983,71 @@ describe("the checker can fail", () => {
     checkJobHandlers(new Map([...MODULES, ["planted", source]]), [
       { route: "plantedRow", module: "planted", fn: "plantedRun" },
     ]).violations;
+
+  /** A route table with these rows, as a module of its own beside the real ones. */
+  const table = (rows: readonly string[], declared: readonly string[] = []) => {
+    const src = [
+      'import { requirePermission, type M3Handler } from "./m3";',
+      "",
+      ...declared,
+      "",
+      "export const PLANTED_ROUTES = [",
+      ...rows.map((row) => `  ${row}`),
+      "];",
+      "",
+    ].join("\n");
+    const handlers = tableHandlers(readModule("planted-routes", src));
+    return checkJobHandlers(new Map([...MODULES, ["planted-routes", src]]), handlers);
+  };
+
+  test("a handler written inline in the table that queues a job and then checks is found, and fails", () => {
+    const { queues, violations } = table([
+      'route("plantedInline", "POST", "/api/h/:id/planted", "evals", (ctx) => {',
+      '    const job = ctx.submitJob("doctor", ["doctor"]);',
+      '    requirePermission(ctx, "h.secrets.write");',
+      "    return { job };",
+      "  }),",
+      'route("plantedRead", "GET", "/api/h/:id/planted", "evals", async (ctx) => ({ id: ctx.entry })),',
+    ]);
+    // Its row says nothing about a job: what it does is read from its code.
+    expect([...queues]).toEqual(["plantedInline"]);
+    expect(violations).toEqual([
+      {
+        route: "plantedInline",
+        handler: "plantedInline (inline)",
+        why: 'planted-routes.plantedInline (inline) checks requirePermission("h.secrets.write") after it queues a job (submitJob)',
+      },
+    ]);
+  });
+
+  test("a handler the table declares itself, and one that queues through a helper, are found", () => {
+    const { queues, violations } = table(
+      [
+        'route("plantedOwn", "POST", "/api/h/:id/own", "evals", plantedOwn),',
+        'route("plantedHelper", "POST", "/api/h/:id/helper", "evals", (ctx) => queueIt(ctx)),',
+        'route("plantedJobs", "POST", "/api/h/:id/jobs", "evals", (ctx) => ctx.jobs.submit("doctor")),',
+        'route("plantedIdle", "POST", "/api/h/:id/idle", "evals", (ctx) => ({ ok: ctx.now() })),',
+      ],
+      [
+        "function queueIt(ctx: Parameters<M3Handler>[0]) {",
+        '  return ctx.submitJob("doctor", ["doctor"]);',
+        "}",
+        "",
+        "const plantedOwn: M3Handler = (ctx) => queueIt(ctx);",
+      ],
+    );
+    expect([...queues].sort()).toEqual(["plantedHelper", "plantedJobs", "plantedOwn"]);
+    expect(violations).toEqual([]);
+  });
+
+  test("a row whose handler is neither a name nor a function is a violation, never a pass", () => {
+    const { violations } = table([
+      'route("plantedBuilt", "POST", "/api/h/:id/built", "evals", build("doctor")),',
+      'route("plantedUnknown", "POST", "/api/h/:id/unknown", "evals", notDeclared),',
+    ]);
+    expect(violations.map((v) => v.route).sort()).toEqual(["plantedBuilt", "plantedUnknown"]);
+    for (const v of violations) expect(v.why.startsWith("no ")).toBe(true);
+  });
 
   test("a check on another harness is one violation naming the handler", () => {
     const found = check(

@@ -5,6 +5,7 @@
     "outDir": "dist"
   },
   "references": [
+    { "path": "../control-contract" },
     { "path": "../errors" },
     { "path": "../tool-safety" },
     { "path": "../infra-utils" },

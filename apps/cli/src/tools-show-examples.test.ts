@@ -504,7 +504,15 @@ const CALLS: Readonly<Record<string, Record<string, unknown>>> = {
   WorkflowRunLogs: { ...REPO, runId: 1 },
   WorkflowRunRerun: { ...REPO, runId: 1 },
   WorkflowRuns: { ...REPO },
+  WorkspaceCheck: { work: "nightly-report" },
+  WorkspaceOpen: { work: "nightly-report" },
   WorkspacePackages: { cwd: "src/app" },
+  WorkspacePublish: {
+    work: "nightly-report",
+    title: "Fix the nightly report",
+    summary: "The report runs again.",
+    justification: "on task",
+  },
   Write: { path: "src/a.ts", content: "export {};\n" },
   XlsxWrite: { path: "src/a.xlsx", sheets: [{ name: "Sheet1", rows: [["a", 1]] }] },
 };

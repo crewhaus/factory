@@ -26,12 +26,14 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
+        "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/chunker": "workspace:*",
         "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/cloud-adapter-flyio": "workspace:*",
         "@crewhaus/cloud-adapter-heroku": "workspace:*",
         "@crewhaus/cloud-adapter-railway": "workspace:*",
         "@crewhaus/cloud-adapter-render": "workspace:*",
+        "@crewhaus/compile-service": "workspace:*",
         "@crewhaus/compiler": "workspace:*",
         "@crewhaus/compliance-controls": "workspace:*",
         "@crewhaus/computer-use-driver": "workspace:*",
@@ -77,6 +79,7 @@
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/ir-passes": "workspace:*",
         "@crewhaus/justification-judge-claude": "workspace:*",
+        "@crewhaus/knowledge-index": "workspace:*",
         "@crewhaus/logging": "workspace:*",
         "@crewhaus/mcp-host": "workspace:*",
         "@crewhaus/mcp-server": "workspace:*",
@@ -350,13 +353,19 @@
       "name": "@crewhaus/attention",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
       },
     },
     "packages/audit-encryption": {
@@ -589,6 +598,27 @@
         "@anthropic-ai/sdk": "^0.96.0",
       },
     },
+    "packages/compile-service": {
+      "name": "@crewhaus/compile-service",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/compiler": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
+        "@crewhaus/ir-passes": "workspace:*",
+        "@crewhaus/migration-engine": "workspace:*",
+        "@crewhaus/preflight": "workspace:*",
+        "@crewhaus/smoke-harness": "workspace:*",
+        "@crewhaus/spec": "workspace:*",
+        "@crewhaus/target-cf-worker-cli": "workspace:*",
+        "@crewhaus/target-cf-worker-graph": "workspace:*",
+        "@crewhaus/target-cf-worker-workflow": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/compiler-worker": "workspace:*",
+        "@crewhaus/justification-judge-claude": "workspace:*",
+      },
+    },
     "packages/compiler": {
       "name": "@crewhaus/compiler",
       "version": "0.8.3",
@@ -668,6 +698,7 @@
       "name": "@crewhaus/continuity-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
@@ -721,6 +752,7 @@
         "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/run-inspect": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/spec-patch": "workspace:*",
         "@crewhaus/tool-executor": "workspace:*",
@@ -845,9 +877,12 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/docker-images": {
@@ -1169,8 +1204,11 @@
       "name": "@crewhaus/feedback-distill",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },
@@ -1292,6 +1330,7 @@
       "name": "@crewhaus/graph-engine",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
@@ -1324,6 +1363,7 @@
         "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/compile-service": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
@@ -1346,6 +1386,7 @@
         "@crewhaus/plugin-sdk": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
         "@crewhaus/routing-store": "workspace:*",
+        "@crewhaus/run-inspect": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/spec": "workspace:*",
         "@crewhaus/spec-changelog": "workspace:*",
@@ -1408,9 +1449,12 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/data-retention-engine": "workspace:*",
         "@crewhaus/memory-store": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/harness-registry": {
@@ -1488,6 +1532,29 @@
         "zod": "^3.23.8",
       },
     },
+    "packages/knowledge-index": {
+      "name": "@crewhaus/knowledge-index",
+      "version": "0.8.3",
+      "dependencies": {
+        "@crewhaus/continuity-store": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/dataset-registry": "workspace:*",
+        "@crewhaus/eval-grader": "workspace:*",
+        "@crewhaus/harness-lifecycle": "workspace:*",
+        "@crewhaus/memory-store": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
+        "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
+        "@crewhaus/tool-state": "workspace:*",
+        "@crewhaus/tool-work": "workspace:*",
+        "@crewhaus/wiki-store": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/memory-service": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+      },
+    },
     "packages/logging": {
       "name": "@crewhaus/logging",
       "version": "0.8.3",
@@ -1546,6 +1613,7 @@
       "name": "@crewhaus/memory-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
@@ -1950,10 +2018,12 @@
         "@crewhaus/control-records": "workspace:*",
         "@crewhaus/event-log": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
+        "@crewhaus/harness-supervisor": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
       },
       "devDependencies": {
         "@crewhaus/spec-patch": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/runtime-core": {
@@ -4022,13 +4092,26 @@
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/egress-classifier": "workspace:*",
+        "@crewhaus/errors": "workspace:*",
+        "@crewhaus/eval-judge": "workspace:*",
+        "@crewhaus/ir": "workspace:*",
         "@crewhaus/run-context": "workspace:*",
+        "@crewhaus/sandbox": "workspace:*",
+        "@crewhaus/session-store": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
         "@crewhaus/tool-builder": "workspace:*",
         "@crewhaus/tool-catalog": "workspace:*",
         "@crewhaus/tool-categories": "workspace:*",
+        "@crewhaus/tool-codehost": "workspace:*",
+        "@crewhaus/tool-git": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
         "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "@crewhaus/permission-engine": "workspace:*",
+        "@crewhaus/runtime-core": "workspace:*",
+        "service-fakes": "workspace:*",
       },
     },
     "packages/trace-event-bus": {
@@ -4085,6 +4168,7 @@
       "name": "@crewhaus/wiki-store",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/infra-utils": "workspace:*",
         "@crewhaus/tenancy": "workspace:*",
@@ -4258,6 +4342,8 @@
 
     "@crewhaus/compaction-snip": ["@crewhaus/compaction-snip@workspace:packages/compaction-snip"],
 
+    "@crewhaus/compile-service": ["@crewhaus/compile-service@workspace:packages/compile-service"],
+
     "@crewhaus/compiler": ["@crewhaus/compiler@workspace:packages/compiler"],
 
     "@crewhaus/compiler-worker": ["@crewhaus/compiler-worker@workspace:packages/compiler-worker"],
@@ -4395,6 +4481,8 @@
     "@crewhaus/ir-passes": ["@crewhaus/ir-passes@workspace:packages/ir-passes"],
 
     "@crewhaus/justification-judge-claude": ["@crewhaus/justification-judge-claude@workspace:packages/justification-judge-claude"],
+
+    "@crewhaus/knowledge-index": ["@crewhaus/knowledge-index@workspace:packages/knowledge-index"],
 
     "@crewhaus/logging": ["@crewhaus/logging@workspace:packages/logging"],
 

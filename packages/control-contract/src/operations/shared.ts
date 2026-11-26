@@ -66,7 +66,7 @@ export const NO_VERB = "The CLI has no command for this.";
 export const API_ONLY = "Only API clients call this; the CLI needs no sign-in on its own machine.";
 /** Why starting a run through the API has no twin: the CLI reads its input from a file. */
 export const RUNS_CREATE_VERB =
-  "`crewhaus runs create <harness> --input-file <path>` starts a run from a file on Home's computer.";
+  "`crewhaus runs create <harness> --input-file <path>` starts a run from a file on Home's computer; `crewhaus runs create <harness> --from <run>` starts one again with a run's recorded request.";
 /** Why a run's result has no twin of its own. */
 export const RUNS_RESULT_VERB = "`crewhaus runs show <run>` shows how a run ended.";
 /** Why resuming a run through the API has no twin: the CLI resumes it by its id alone. */

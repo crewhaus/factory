@@ -23,6 +23,7 @@ describe("purity", () => {
       (name) => name.endsWith(".ts") && !name.endsWith(".test.ts"),
     );
     expect(files.sort()).toEqual([
+      "exec.ts",
       "fold-context.ts",
       "fold-spans.ts",
       "fold-summary.ts",
@@ -32,6 +33,7 @@ describe("purity", () => {
       "lines.ts",
       "load.ts",
       "model.ts",
+      "projection.ts",
       "records.ts",
       "taxonomy.ts",
     ]);

@@ -3431,6 +3431,35 @@
             }
           ]
         },
+        "approve": {
+          "flags": [
+            {
+              "name": "env",
+              "takesValue": true
+            },
+            {
+              "name": "version",
+              "takesValue": true
+            },
+            {
+              "name": "deny",
+              "takesValue": false
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
         "activate": {
           "flags": [
             {
@@ -5973,6 +6002,10 @@
               "takesValue": true
             },
             {
+              "name": "mine",
+              "takesValue": false
+            },
+            {
               "name": "all",
               "takesValue": false
             },
@@ -5984,6 +6017,10 @@
         },
         "show": {
           "flags": [
+            {
+              "name": "messages",
+              "takesValue": false
+            },
             {
               "name": "json",
               "takesValue": false
@@ -5998,6 +6035,170 @@
             },
             {
               "name": "since",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "decide": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "expect",
+              "takesValue": true
+            },
+            {
+              "name": "note-file",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "assign": {
+          "flags": [
+            {
+              "name": "to",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "unassign": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "defer": {
+          "flags": [
+            {
+              "name": "until",
+              "takesValue": true
+            },
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "undefer": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "snooze": {
+          "flags": [
+            {
+              "name": "until",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "dismiss": {
+          "flags": [
+            {
+              "name": "reason",
+              "takesValue": true
+            },
+            {
+              "name": "note-file",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "reopen": {
+          "flags": [
+            {
+              "name": "note-file",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "acknowledge": {
+          "flags": [
+            {
+              "name": "note-file",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "discuss": {
+          "flags": [
+            {
+              "name": "file",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
               "takesValue": true
             },
             {
@@ -6374,6 +6575,146 @@
             },
             {
               "name": "no-redact",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "status": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "list": {
+          "flags": [
+            {
+              "name": "type",
+              "takesValue": true
+            },
+            {
+              "name": "status",
+              "takesValue": true
+            },
+            {
+              "name": "scope",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "history",
+              "takesValue": false
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "why": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "usage": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "search": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "reindex": {
+          "flags": [
+            {
+              "name": "json",
+              "takesValue": false
+            },
+            {
+              "name": "help",
+              "short": "h",
+              "takesValue": false
+            }
+          ]
+        },
+        "erase": {
+          "flags": [
+            {
+              "name": "include-sources",
+              "takesValue": false
+            },
+            {
+              "name": "shared",
+              "takesValue": true
+            },
+            {
+              "name": "yes",
+              "takesValue": false
+            },
+            {
+              "name": "confirm",
+              "takesValue": true
+            },
+            {
+              "name": "json",
               "takesValue": false
             },
             {
@@ -9911,6 +10252,10 @@
               "takesValue": true
             },
             {
+              "name": "from",
+              "takesValue": true
+            },
+            {
               "name": "admission",
               "takesValue": true
             },
@@ -9993,6 +10338,18 @@
             {
               "name": "ignore-pause",
               "takesValue": false
+            },
+            {
+              "name": "checkpoint",
+              "takesValue": true
+            },
+            {
+              "name": "decision",
+              "takesValue": true
+            },
+            {
+              "name": "harness",
+              "takesValue": true
             },
             {
               "name": "help",
@@ -12723,6 +13080,51 @@
             {
               "name": "scope",
               "takesValue": true
+            }
+          ]
+        },
+        "publish": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        }
+      },
+      "flags": null
+    },
+    {
+      "verb": "workspace",
+      "kind": "family",
+      "since": "0.9.0",
+      "status": "stable",
+      "sub": {
+        "list": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
+            }
+          ]
+        },
+        "show": {
+          "flags": [
+            {
+              "name": "harness",
+              "takesValue": true
+            },
+            {
+              "name": "json",
+              "takesValue": false
             }
           ]
         }

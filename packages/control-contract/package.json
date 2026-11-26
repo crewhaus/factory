@@ -9,7 +9,9 @@
     ".": "./src/index.ts",
     "./schemas": "./src/schemas/index.ts",
     "./http": "./src/http/index.ts",
-    "./delegation": "./src/delegation.ts"
+    "./delegation": "./src/delegation.ts",
+    "./knowledge": "./src/knowledge.ts",
+    "./search": "./src/search.ts"
   },
   "scripts": {
     "test": "bun test src"

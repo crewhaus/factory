@@ -310,6 +310,82 @@ describe("transcript envelope", () => {
     expect(body["evicted"]).toBe(false);
   });
 
+  test("synthetic messages are marked by what wrote them, flat and masked, and never become turns", async () => {
+    const t = boot({ now: () => NOW });
+    const sess = "sess_00000000000000ac";
+    const key = ["sk", "proj", "q".repeat(32)].join("-");
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "markers"), {
+      specName: "markers",
+      sessions: [
+        {
+          id: sess,
+          updatedAt: iso(NOW - DAY),
+          log: [
+            logLine("user_message", {
+              content: "[wake]",
+              synthetic: true,
+              control: { synthetic: true, lane: "heartbeat", reason: "poke" },
+            }),
+            logLine("user_message", { content: "what changed?" }),
+            logLine("user_message", { content: "Tools: Read, Write", synthetic: true, toolset: 2 }),
+            logLine("verdict", { gate: "eval", outcome: "fail" }),
+            logLine("user_message", { content: "The answer missed the date.", synthetic: true }),
+            logLine("provability_graded", { level: "grounded", passed: false }),
+            logLine("user_message", { content: "Cite your\nsources.", synthetic: true }),
+            logLine("assistant_message", { content: "done" }),
+            logLine("user_message", { content: `key ${key}`, synthetic: true }),
+          ],
+        },
+      ],
+    });
+    const id = await register(t, dir);
+    const { status, body } = await t.api(`/api/h/${id}/sessions/${sess}`);
+    expect(status).toBe(200);
+    expect(body["markers"]).toEqual([
+      { line: 0, kind: "wake", text: "[wake]" },
+      { line: 2, kind: "toolset", text: "Tools: Read, Write" },
+      { line: 4, kind: "eval-nudge", text: "The answer missed the date." },
+      { line: 6, kind: "provability-nudge", text: "Cite your sources." },
+      { line: 8, kind: "other", text: expect.not.stringContaining(key) },
+    ]);
+    const turns = body["turns"] as Array<Record<string, unknown>>;
+    expect(turns.map((x) => `${x["role"]}: ${x["text"]}`)).toEqual([
+      "user: what changed?",
+      "assistant: done",
+    ]);
+  });
+
+  test("raw lines label the model's thinking blocks", async () => {
+    const t = boot({ now: () => NOW });
+    const sess = "sess_00000000000000ad";
+    const dir = makeFixtureHarness(join(t.harnessesRoot, "thinking"), {
+      specName: "thinking",
+      sessions: [
+        {
+          id: sess,
+          updatedAt: iso(NOW - DAY),
+          log: [
+            logLine("user_message", { content: "hi" }),
+            logLine("assistant_message", {
+              content: [
+                { type: "thinking", thinking: "consider", signature: "s" },
+                { type: "redacted_thinking", data: "x" },
+                { type: "text", text: "hello" },
+              ],
+            }),
+          ],
+        },
+      ],
+    });
+    const id = await register(t, dir);
+    const raw = await t.api(`/api/h/${id}/sessions/${sess}?raw=1`);
+    expect(raw.status).toBe(200);
+    expect(raw.body["annotations"]).toEqual([
+      { line: 1, path: ["payload", "content", 0], label: "thinking" },
+      { line: 1, path: ["payload", "content", 1], label: "redacted-thinking" },
+    ]);
+  });
+
   test("raw escape hatch returns capped raw lines; evicted ids return the durable summary; unknown 404s", async () => {
     const t = boot({ now: () => NOW });
     const sess = "sess_00000000000000ba";

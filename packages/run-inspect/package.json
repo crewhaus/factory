@@ -16,10 +16,12 @@
     "@crewhaus/control-records": "workspace:*",
     "@crewhaus/event-log": "workspace:*",
     "@crewhaus/feedback-distill": "workspace:*",
+    "@crewhaus/harness-supervisor": "workspace:*",
     "@crewhaus/session-store": "workspace:*"
   },
   "devDependencies": {
-    "@crewhaus/spec-patch": "workspace:*"
+    "@crewhaus/spec-patch": "workspace:*",
+    "@crewhaus/tool-safety": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

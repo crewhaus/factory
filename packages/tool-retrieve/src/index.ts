@@ -30,7 +30,11 @@ import { type ChunkStrategy, type Document, chunk } from "@crewhaus/chunker";
 import { type Embedder, createEmbedder } from "@crewhaus/embedder";
 import { CrewhausError } from "@crewhaus/errors";
 import { buildTool } from "@crewhaus/tool-builder";
-import type { RegisteredTool, ToolReadRef } from "@crewhaus/tool-catalog";
+import {
+  type RegisteredTool,
+  type ToolReadRef,
+  markReportsKnowledge,
+} from "@crewhaus/tool-catalog";
 import { redactUrlCredentials, redactUrlCredentialsInText } from "@crewhaus/tool-safety/env";
 import { writeFileSafe } from "@crewhaus/tool-safety/fs";
 import { type VectorBackendId, type VectorStore, createVectorStore } from "@crewhaus/vector-store";
@@ -207,7 +211,7 @@ function makeRetrieveTool(
   getConfig: () => RetrieveConfig | undefined,
   opts: { readonly local?: boolean } = {},
 ): RegisteredTool {
-  return buildTool({
+  const tool = buildTool({
     name: "Retrieve",
     description:
       "Retrieve top-k chunks from the configured vector store for a natural-language query. Pass `query` (required), optional `k` (default 5), and optional `filter` (metadata predicates). Returns a numbered list of hits with citations.",
@@ -238,6 +242,7 @@ function makeRetrieveTool(
       return formatHits(hits);
     },
   });
+  return markReportsKnowledge(tool);
 }
 
 /**

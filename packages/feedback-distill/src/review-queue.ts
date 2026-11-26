@@ -26,12 +26,20 @@
  * re-exports it unchanged) because the DAEMON distill step needs the B19 tie
  * feeder: a split verdict captured by a channel/gateway daemon has no CLI
  * teardown to route it, and the queue is the only place it can surface.
- * The module imports nothing but `node:fs`/`node:path`, so a compiled bundle
- * carries it fine.
+ * Beside `node:fs`/`node:path` the module imports only the control records'
+ * file primitives, which spawn nothing and open no socket, so a compiled
+ * bundle carries it fine.
+ *
+ * An entry is resolved once, whichever surface asks: the resolver takes the
+ * entry's claim (an exclusive create under `.crewhaus/run/control/claims/`)
+ * before it writes anything, and the resolved line records who resolved it and
+ * through which door.
  */
 
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { controlPaths, harnessLedger, publishClaim, readClaim } from "@crewhaus/control-records";
 
 export const REVIEW_QUEUE_SCHEMA_VERSION = 1 as const;
 
@@ -69,6 +77,10 @@ export type ReviewQueueEntry = {
   resolution?: string;
   /** ISO 8601 — when the item was resolved. */
   resolvedTs?: string;
+  /** Who resolved it, as a stored actor (a member id, or a keyed digest of the local user). */
+  resolvedBy?: string;
+  /** The door it was resolved through (`home`, `cli`, …). */
+  via?: string;
   /** Short display excerpt (sample input, vote split, mine signal) — already
    *  redacted by the feeder; never the full payload. */
   context?: string;
@@ -171,26 +183,126 @@ export function enqueueReviewEntries(
   return { added: fresh.length, skipped: entries.length - fresh.length };
 }
 
-export type ResolveReviewResult =
-  | { outcome: "resolved"; entry: ReviewQueueEntry }
-  | { outcome: "already-resolved"; entry: ReviewQueueEntry }
-  | { outcome: "not-found" };
+/** Who resolves an entry, as the resolved line records it: a stored actor and a door. */
+export type ReviewActor = { readonly by: string; readonly via: string };
+
+/** Who took an entry first, as its claim says. */
+export type ReviewClaimHolder = {
+  readonly by?: string;
+  readonly via?: string;
+  readonly at: string;
+};
+
+export type ReviewClaimAnswer =
+  | { readonly outcome: "claimed" }
+  | { readonly outcome: "taken"; readonly winner: ReviewClaimHolder }
+  | { readonly outcome: "unavailable"; readonly reason: string };
+
+/** How long a claim holds an entry that nothing resolved: its taker is gone by then. */
+export const REVIEW_CLAIM_STALE_MS = 10 * 60_000;
+
+/** At most this many takers may leave an entry claimed and unresolved. */
+const REVIEW_CLAIM_TAKEOVERS = 8;
 
 /**
- * Close one item: append an updated line (status resolved + the human's
- * resolution) for the id. Append-only — the open line stays in the file as
- * the audit trail; readers reduce to the resolution.
+ * The claim's name for an entry: a digest of its id, which may be longer than a claim's
+ * name and hold runs of characters a name does not.
+ */
+export function reviewClaimName(id: string, takeover = 0): string {
+  const digest = createHash("sha256").update(id, "utf8").digest("hex").slice(0, 40);
+  return `review/r${digest}${takeover === 0 ? "" : `.${takeover}`}`;
+}
+
+/** The claims beside every other control claim of the harness. */
+function reviewClaims(rootDir: string) {
+  return harnessLedger(rootDir, { file: join(controlPaths(rootDir).controlDir, "review.jsonl") });
+}
+
+function holderOf(content: {
+  readonly at: string;
+  readonly record: Readonly<Record<string, unknown>>;
+}): ReviewClaimHolder {
+  const { by, via, at } = content.record;
+  return {
+    ...(typeof by === "string" ? { by } : {}),
+    ...(typeof via === "string" ? { via } : {}),
+    at: typeof at === "string" ? at : content.at,
+  };
+}
+
+/**
+ * Take an entry for one resolver, before it writes anything: `claimed` for the first,
+ * `taken` naming the holder for everyone else. A claim {@link REVIEW_CLAIM_STALE_MS} old
+ * whose entry is still open was left by a taker that never finished; the next resolver
+ * takes it over, again exclusively. The claim holds ids only.
+ */
+export function claimReviewEntry(
+  rootDir: string,
+  id: string,
+  opts: { readonly at: string; readonly actor?: ReviewActor },
+): ReviewClaimAnswer {
+  const ledger = reviewClaims(rootDir);
+  const record = { id, at: opts.at, ...(opts.actor !== undefined ? { ...opts.actor } : {}) };
+  for (let takeover = 0; takeover <= REVIEW_CLAIM_TAKEOVERS; takeover++) {
+    const name = reviewClaimName(id, takeover);
+    const published = publishClaim(ledger, name, record);
+    if (published.ok) return { outcome: "claimed" };
+    if (published.code !== "exists") return { outcome: "unavailable", reason: published.reason };
+    const held = readClaim(ledger, name);
+    if (!held.ok) return { outcome: "unavailable", reason: held.reason };
+    const winner = holderOf(held.content);
+    const age = Date.parse(opts.at) - Date.parse(winner.at);
+    const stillOpen = readReviewQueue(rootDir).find((entry) => entry.id === id)?.status === "open";
+    if (!stillOpen || !(age > REVIEW_CLAIM_STALE_MS)) return { outcome: "taken", winner };
+  }
+  return {
+    outcome: "unavailable",
+    reason: "this item was claimed and left unresolved too often; resolve it by hand",
+  };
+}
+
+export type ResolveReviewResult =
+  | { outcome: "resolved"; entry: ReviewQueueEntry }
+  | { outcome: "already-resolved"; entry: ReviewQueueEntry; winner?: ReviewClaimHolder }
+  | { outcome: "not-found" }
+  /** The entry's claim could not be taken or read, so nothing was written. */
+  | { outcome: "unavailable"; reason: string };
+
+/**
+ * Close one item: take its claim, then append an updated line (status resolved, the
+ * human's resolution, and who and where when `actor` says). Append-only — the open line
+ * stays in the file as the audit trail; readers reduce to the resolution. Of two
+ * resolvers one appends; the other is `already-resolved`. `claimed`: the caller took the
+ * entry's claim itself ({@link claimReviewEntry}).
  */
 export function resolveReviewEntry(
   rootDir: string,
   id: string,
   resolution: string,
   resolvedTs: string,
+  actor?: ReviewActor,
+  opts: { readonly claimed?: boolean } = {},
 ): ResolveReviewResult {
   const entry = readReviewQueue(rootDir).find((e) => e.id === id);
   if (entry === undefined) return { outcome: "not-found" };
   if (entry.status === "resolved") return { outcome: "already-resolved", entry };
-  const updated: ReviewQueueEntry = { ...entry, status: "resolved", resolution, resolvedTs };
+  if (opts.claimed !== true) {
+    const claim = claimReviewEntry(rootDir, id, {
+      at: resolvedTs,
+      ...(actor !== undefined ? { actor } : {}),
+    });
+    if (claim.outcome === "taken") {
+      return { outcome: "already-resolved", entry, winner: claim.winner };
+    }
+    if (claim.outcome === "unavailable") return claim;
+  }
+  const updated: ReviewQueueEntry = {
+    ...entry,
+    status: "resolved",
+    resolution,
+    resolvedTs,
+    ...(actor !== undefined ? { resolvedBy: actor.by, via: actor.via } : {}),
+  };
   appendFileSync(reviewQueuePath(rootDir), `${JSON.stringify(updated)}\n`, { mode: 0o600 });
   return { outcome: "resolved", entry: updated };
 }

@@ -4,7 +4,7 @@
  * together.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   LogBuilder,
@@ -247,6 +247,31 @@ describe("each gap reason has a fixture", () => {
       gap: { reason: "unsupported" },
     });
     sawGap([context.changedSince.gap?.reason as InspectGapReason]);
+  });
+
+  test("pruned: the run names a supervised execution whose events retention removed", () => {
+    const run = runId(1);
+    const exec = "run_00000000000000e1";
+    const b = new LogBuilder();
+    simpleRun(b, run, 0x100, { execution: exec });
+    const { dir } = harnessWith({
+      log: b.text(),
+      rows: [
+        { id: run, state: "succeeded", trigger: { kind: "cli" }, session: SESSION, sessionAt: 0 },
+      ],
+    });
+    // Without a prune record, the missing file is only not recorded.
+    expect(foldSummary(load(dir, run)).gaps).toContainEqual({ reason: "not-recorded" });
+    mkdirSync(join(dir, ".crewhaus", "run"), { recursive: true });
+    writeFileSync(
+      join(dir, ".crewhaus", "run", "pruned.jsonl"),
+      `${JSON.stringify({ v: 1, at: "2026-11-14T12:00:00.000Z", runs: [exec] })}\n`,
+    );
+    const summary = foldSummary(load(dir, run));
+    expect(summary.gaps).toContainEqual({ reason: "pruned" });
+    expect(summary.gaps.some((g) => g.reason === "not-supervised")).toBe(false);
+    expect(summary.trace).toEqual({ present: false, events: 0, truncated: false });
+    sawGap(summary.gaps.map((g) => g.reason));
   });
 
   test("the reasons produced here and those produced elsewhere are the whole vocabulary, and do not overlap", () => {

@@ -2,7 +2,10 @@
  * Item 24 — model-scan / doctor --models / pricing-sync tests.
  */
 import { describe, expect, test } from "bun:test";
+import { lower } from "@crewhaus/compiler";
 import type { PricingTable } from "@crewhaus/cost-tracker";
+import { auxModelsFor, enumerateModelSlots } from "@crewhaus/ir/slots";
+import { parseSpec } from "@crewhaus/spec";
 import {
   type ScanCell,
   buildMarketScan,
@@ -189,6 +192,37 @@ describe("buildModelChecks (doctor --models)", () => {
     });
     const aux = checks.find((c) => c.label.includes("compaction.model"));
     expect(aux?.pass).toBe(false);
+  });
+
+  test("a federated sub-agent's peer URL is never checked as a model", () => {
+    const slots = enumerateModelSlots(
+      lower(
+        parseSpec(`
+name: federated
+target: cli
+agent:
+  model: claude-opus-4-7
+  instructions: hi
+  sub_agents:
+    peer:
+      description: a remote peer
+      instructions: delegate
+      federation:
+        url: https://peer.example.com
+compaction:
+  model: claude-mystery-2
+`),
+      ),
+    );
+    expect(slots.some((s) => s.kind === "federation")).toBe(true);
+    const checks = buildModelChecks("claude-opus-4-7", {
+      pricing: PRICING,
+      now: new Date("2026-06-01"),
+      auxModels: auxModelsFor(slots),
+    });
+    // Not vacuous: the aux slot beside it is still checked.
+    expect(checks.some((c) => c.label.includes("compaction.model"))).toBe(true);
+    expect(checks.filter((c) => JSON.stringify(c).includes("peer.example.com"))).toEqual([]);
   });
 });
 

@@ -12,7 +12,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WORK_LOG_KEYS, mintId, mintRunId } from "@crewhaus/control-contract";
-import { append } from "@crewhaus/control-records";
+import { append, runsLedger } from "@crewhaus/control-records";
 import { ACCEPT_RULE, WORK_ACTOR_RULES } from "./actors";
 import { foldWork, readWorkLines } from "./fold";
 import { type WorkActor, revisionRelOf, workDirOf, workLedger } from "./records";
@@ -352,6 +352,8 @@ describe("who may do what", () => {
   test("the rules, as a table", () => {
     expect(WORK_ACTOR_RULES.accept).toEqual(["person", "system"]);
     expect(WORK_ACTOR_RULES.decline).toEqual(["person"]);
+    // The system reopens only under the pull request tracker's rule.
+    expect(WORK_ACTOR_RULES.reopen).toEqual(["person", "system"]);
     expect(WORK_ACTOR_RULES.cancel).not.toContain("harness");
     expect(WORK_ACTOR_RULES.rank).toEqual(["person"]);
     expect(WORK_ACTOR_RULES.open).not.toContain("harness");
@@ -424,6 +426,28 @@ describe("who may do what", () => {
   });
 });
 
+/** Record a run of this harness in its runs ledger, so evidence can name it. */
+function recordRun(dir: string, session = "sess_0000000000000001"): string {
+  const run = mintRunId();
+  const written = append(runsLedger(dir), {
+    id: run,
+    state: "running",
+    at: new Date().toISOString(),
+    trigger: { kind: "cli" },
+    session,
+  });
+  if (!written.ok) throw new Error("the run row could not be written");
+  return run;
+}
+
+/** Observed evidence naming a run this harness's runs ledger holds. */
+function observedIn(dir: string) {
+  return {
+    ...OBSERVED,
+    evidence: [{ ...OBSERVED.evidence[0], ref: recordRun(dir) }],
+  };
+}
+
 describe("the owner's accept policy", () => {
   test("a listed kind is accepted by the runtime with the rule; an unlisted one is not", async () => {
     const dir = harness();
@@ -472,9 +496,13 @@ describe("the owner's accept policy", () => {
           title: "Excel export",
           kind: "feature",
           basis: "speculative",
-          assessment: { ...HYPOTHESIS, evidence: [...HYPOTHESIS.evidence, ...OBSERVED.evidence] },
+          assessment: {
+            ...HYPOTHESIS,
+            evidence: [...HYPOTHESIS.evidence, ...observedIn(dir).evidence],
+          },
         },
-        HARNESS,
+        // The proposing run has its own row and session, so its runs are told from others.
+        { ...HARNESS, run: recordRun(dir, "sess_0000000000000002") },
         { policy },
       ),
     );
@@ -498,8 +526,13 @@ describe("the owner's accept policy, by basis", () => {
     expect(guess.item.history.map((line) => line.event)).toEqual(["opened"]);
     const seen = ok(
       await store.propose(
-        { title: "Fix the CSV import", kind: "fix", basis: "speculative", assessment: OBSERVED },
-        HARNESS,
+        {
+          title: "Fix the CSV import",
+          kind: "fix",
+          basis: "speculative",
+          assessment: observedIn(dir),
+        },
+        { ...HARNESS, run: recordRun(dir, "sess_0000000000000002") },
         { policy },
       ),
     );

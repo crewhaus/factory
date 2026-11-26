@@ -424,6 +424,69 @@ describe("optimizeSpec — FR-003 budget gate", () => {
     expect(lines.filter((l) => l.startsWith("reserve"))).toHaveLength(3);
   });
 
+  test("a mutation call that answered without usage, or failed, is counted, never released", async () => {
+    const specPath = join(tmpRoot, "crewhaus.yaml");
+    writeFileSync(specPath, CLI_YAML);
+    const recording = (lines: string[]) => ({
+      reserve: async ({ id, usdMicros }: { id: string; usdMicros: number }) => {
+        lines.push(`reserve ${id.replace(/^rsv_.*_(\d+)$/, "$1")} ${usdMicros}`);
+        return { admit: true as const };
+      },
+      settle: async ({ id, usdMicros }: { id: string; usdMicros: number | null }) => {
+        lines.push(`settle ${id.replace(/^rsv_.*_(\d+)$/, "$1")} ${usdMicros}`);
+      },
+      release: async (id: string) => {
+        lines.push(`release ${id}`);
+      },
+    });
+    const run = (mutator: MutationProvider, lines: string[], out: string) =>
+      optimizeSpec({
+        specPath,
+        fitness: async (p: string) => p.length / 100,
+        trainSet: [{ id: "t1", input: "x", expected_output: "y" }],
+        devSet: [{ id: "d1", input: "x", expected_output: "y" }],
+        iterations: 1,
+        mutator,
+        outDir: join(tmpRoot, out),
+        spendLedger: recording(lines),
+      });
+
+    // Answered without usage: an unknown call.
+    const silent: MutationProvider & { modelId: string; maxOutputTokens: number } = {
+      name: "silent",
+      modelId: "claude-sonnet-4-5",
+      maxOutputTokens: 100,
+      next: async () => ({ prompt: BIG_PROMPT, mutations: [{ kind: "rephrase-instruction" }] }),
+    };
+    const silentLines: string[] = [];
+    await run(silent, silentLines, "out-silent");
+    expect(silentLines.map((l) => l.split(" ").slice(0, 1).join(" "))).toEqual([
+      "reserve",
+      "settle",
+    ]);
+    expect(silentLines[1]).toBe(`settle ${silentLines[1]?.split(" ")[1]} null`);
+
+    // Failed after it was sent: counted at its reserved worst case.
+    const failing = {
+      ...silent,
+      name: "failing",
+      next: async () => Promise.reject(new Error("boom")),
+    };
+    const failLines: string[] = [];
+    await expect(run(failing, failLines, "out-failing")).rejects.toThrow("boom");
+    expect(failLines).toHaveLength(2);
+    const reserved = failLines[0]?.split(" ")[2];
+    expect(Number(reserved)).toBeGreaterThan(0);
+    expect(failLines[1]?.split(" ")[2]).toBe(reserved);
+
+    // Unpriced and failed: nothing was reserved, so it is an unknown call, with no release.
+    const unpriced = { ...failing, modelId: "no-such-model-9" };
+    const unpricedLines: string[] = [];
+    await expect(run(unpriced, unpricedLines, "out-unpriced-fail")).rejects.toThrow("boom");
+    expect(unpricedLines.filter((l) => l.startsWith("release"))).toEqual([]);
+    expect(unpricedLines.map((l) => l.split(" ")[2])).toEqual(["null"]);
+  });
+
   test("omitting budgetUsd preserves iterations-cap behaviour", async () => {
     const specPath = join(tmpRoot, "crewhaus.yaml");
     writeFileSync(specPath, CLI_YAML);

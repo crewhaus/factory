@@ -93,7 +93,10 @@ export type DeploymentActivateRequest = {
 };
 
 export type RunCreateRequest = {
-  readonly input: string;
+  /** The run's input. Exactly one of `input` and `from`. */
+  readonly input?: string;
+  /** A run of this harness whose recorded request the new run starts with. */
+  readonly from?: string;
   readonly subject?: string;
   /** Defaults to `reject`. */
   readonly admission?: "reject" | "queue";

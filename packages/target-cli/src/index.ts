@@ -28,6 +28,7 @@ import {
   type ResolvedTools,
   SANDBOX_AVAILABLE_EXPR,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   builtinToolsFor,
   readmeToolFacts,
   resolveBuiltinTools,
@@ -127,7 +128,7 @@ export const BUILTIN_TOOL_MAP: Readonly<Record<string, BuiltinToolEntry>> = Obje
 function resolveTools(
   toolNames: readonly string[],
   toolConfigs: Readonly<Record<string, unknown>>,
-  chains?: SpecChainBlocks,
+  blocks?: SpecChainBlocks & SpecRepositoryBlocks,
 ): {
   imports: string[];
   inits: string[];
@@ -137,7 +138,7 @@ function resolveTools(
   if (toolNames.length === 0) return { imports: [], inits: [], registrations: [], sandbox: false };
   let resolved: ResolvedTools;
   try {
-    resolved = resolveBuiltinTools("cli", [{ tools: toolNames, toolConfigs }], chains);
+    resolved = resolveBuiltinTools("cli", [{ tools: toolNames, toolConfigs }], blocks);
   } catch (err) {
     if (err instanceof BuiltinToolError) throw new TargetEmitError(err.message, err);
     throw err;

@@ -141,6 +141,17 @@ export type SandboxExecOptions = {
   readonly env?: Readonly<Record<string, string>>;
   /** Per-call mount additions; src must pass the whitelist. */
   readonly mounts?: ReadonlyArray<SandboxMount>;
+  /**
+   * The directory the program starts in: an absolute container path, for the
+   * docker and podman backends. Unset: the image's own.
+   */
+  readonly workdir?: string;
+  /**
+   * The user the program runs as, `<uid>:<gid>`, for the docker and podman
+   * backends, so a file it writes into a mount belongs to the host user who
+   * mounted it. Unset: the image's own.
+   */
+  readonly user?: string;
   /** Override the sandbox's default timeout (ms, > 0). */
   readonly timeoutMs?: number;
   /**
@@ -395,6 +406,18 @@ function validateMount(m: SandboxMount, whitelist: ReadonlyArray<string>): void 
   if (!ok) {
     const roots = whitelist.join(", ");
     throw new SandboxError(`mount src "${m.src}" is not under any whitelisted root (${roots})`);
+  }
+}
+
+function validateWorkdir(dir: string): void {
+  if (!dir.startsWith("/") || dir.split("/").includes("..") || /[\n\0]/.test(dir)) {
+    throw new SandboxError(`workdir "${dir}" must be an absolute path with no ".."`);
+  }
+}
+
+function validateUser(user: string): void {
+  if (!/^\d{1,10}:\d{1,10}$/.test(user)) {
+    throw new SandboxError(`user "${user}" must be <uid>:<gid>`);
   }
 }
 
@@ -877,6 +900,14 @@ class DockerLikeSandbox implements Sandbox {
         validateEnvKey(k);
         args.push("-e", `${k}=${v}`);
       }
+    }
+    if (opts.workdir !== undefined) {
+      validateWorkdir(opts.workdir);
+      args.push("--workdir", opts.workdir);
+    }
+    if (opts.user !== undefined) {
+      validateUser(opts.user);
+      args.push("--user", opts.user);
     }
     args.push(opts.image, ...opts.argv);
     return args;

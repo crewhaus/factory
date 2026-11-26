@@ -43,6 +43,8 @@ export {
   rollUpCategories,
 };
 export {
+  ACTION_CLASSES,
+  type ActionClass,
   BUILTIN_TOOLS,
   type BootRegistrar,
   type RegistrarChecks,
@@ -54,7 +56,10 @@ export {
   TOOL_BOOT_REGISTRARS,
 } from "./builtins";
 export {
+  type RepositoryBindingConfig,
+  type RepositoryBootConfig,
   type SpecChainBlocks,
+  type SpecRepositoryBlocks,
   type ToolConfigCheck,
   type ToolConfigEnv,
   type ToolConfigInit,
@@ -66,6 +71,7 @@ export {
   checkToolConfigs,
   malformedToolConfigRefs,
   planChainInits,
+  planRepositoryInits,
   planToolConfigInits,
   type ReadmeToolFact,
   readmeToolFacts,

@@ -1,4 +1,8 @@
-import { declaredPricingKey } from "@crewhaus/cost-tracker/pricing";
+import {
+  DEFAULT_PRICING,
+  declaredPricingKey,
+  resolvePricing,
+} from "@crewhaus/cost-tracker/pricing";
 import { z } from "zod";
 import type { Spec } from "../index";
 import type { SpecAddIssue } from "./delta-090";
@@ -89,5 +93,109 @@ export function modelPriceIssues(data: Spec, custom: SpecAddIssue): void {
         `models.${name}.price differs from models.${seen.name}.price for the same model: a model has one price.`,
       );
     }
+  }
+}
+
+/**
+ * The family of a model string whose pricing key another spelling shares:
+ * the prefix that tells two strings with one `(provider, wire id)` apart.
+ *   - Priced as `openai <wire id>`: `local`, `azure`, an OpenAI-compatible
+ *     host's id (`groq`, `openrouter`, …) or `openai`.
+ *   - Priced as `anthropic <wire id>`: `vertex` (`vertex/claude-*`) or
+ *     `anthropic` (a direct `claude-*`).
+ *   - Priced as `gemini <wire id>`: `vertex` (`vertex/gemini-*`) or `gemini`.
+ *   - `bedrock` for every Bedrock string: its geo prefixes are one model's
+ *     inference profiles, so they share a price by design.
+ * Undefined for a string the router would refuse.
+ */
+export function priceFamilyOf(model: string): string | undefined {
+  const key = declaredPricingKey(model);
+  if (key === undefined) return undefined;
+  const slash = model.indexOf("/");
+  const prefix = slash > 0 ? model.slice(0, slash) : undefined;
+  switch (key.provider) {
+    case "openai":
+      return prefix;
+    case "anthropic":
+      return prefix === "vertex" ? "vertex" : "anthropic";
+    case "gemini":
+      return prefix === "vertex" ? "vertex" : "gemini";
+    case "bedrock":
+      return "bedrock";
+    default:
+      return undefined;
+  }
+}
+
+/** A model string as a refusal shows it: a local model's endpoint is left out. */
+function shownModel(model: string): string {
+  if (!model.startsWith("local/")) return model;
+  const at = model.indexOf("@");
+  return at === -1 ? model : `${model.slice(0, at)}@…`;
+}
+
+/** A place a spec names a model: its label (`models.groq`, `steps[0].model`) and the string. */
+export type ModelUse = { readonly label: string; readonly model: string };
+
+/**
+ * Why a price declared at `at` for `model` would also price the calls of a
+ * model it does not name, or undefined when it names only its own. The
+ * runtime keeps a declared price under the `(provider, wire id)` it prices
+ * calls by, so every string with that key shares it:
+ *   - a price on a `local/`, `azure/` or compatible-host string whose key the
+ *     built-in pricing table prices would also price that table model's
+ *     calls (a price on an `openai/`, direct, Vertex or Bedrock string
+ *     replaces the table's on purpose, which the compiler notes);
+ *   - a price on any string whose key one of `others` has under another
+ *     family ({@link priceFamilyOf}: `vertex/claude-*` beside a direct
+ *     `claude-*`, `vertex/gemini-*` beside `gemini/`, a local model beside
+ *     `openai/`) would also price that string's calls. Strings of one family
+ *     (two `@url`s of one local model, two Bedrock regions) share a price by
+ *     design.
+ * The parse check passes the spec's other `models:` profiles; the lowering
+ * passes every slot of the lowered IR, which parse cannot see.
+ */
+export function declaredPriceKeyRefusal(
+  at: string,
+  model: string,
+  others: ReadonlyArray<ModelUse>,
+): string | undefined {
+  const key = declaredPricingKey(model);
+  const family = priceFamilyOf(model);
+  if (key === undefined || family === undefined) return undefined;
+  const priced = `${shownModel(model)} is priced as ${key.provider} ${key.modelId}`;
+  if (
+    key.provider === "openai" &&
+    family !== "openai" &&
+    resolvePricing(DEFAULT_PRICING, key.provider, key.modelId) !== undefined
+  ) {
+    return `${at}: ${priced}, which the pricing table already prices; a declared price would also price those calls. Remove the price, or name a model the table does not price.`;
+  }
+  for (const other of others) {
+    const otherFamily = priceFamilyOf(other.model);
+    if (otherFamily === undefined || otherFamily === family) continue;
+    const otherKey = declaredPricingKey(other.model);
+    if (otherKey?.provider !== key.provider || otherKey.modelId !== key.modelId) continue;
+    return `${at}: ${priced}, and so is ${other.label} (${shownModel(other.model)}); a declared price would also price its calls. Remove the price, or keep only one of the two models.`;
+  }
+  return undefined;
+}
+
+/**
+ * A declared price names one model: refused when it would also price another
+ * model's calls, by the built-in table or by another `models:` profile (see
+ * {@link declaredPriceKeyRefusal}). Appended last to the 0.9.0 checks.
+ */
+export function modelPriceKeyIssues(data: Spec, custom: SpecAddIssue): void {
+  const models = "models" in data ? data.models : undefined;
+  if (models === undefined) return;
+  const profiles = Object.entries(models);
+  for (const [name, profile] of profiles) {
+    if (profile.price === undefined || SENTINELS.has(profile.model)) continue;
+    const others = profiles
+      .filter(([other]) => other !== name)
+      .map(([other, p]) => ({ label: `models.${other}`, model: p.model }));
+    const refusal = declaredPriceKeyRefusal(`models.${name}.price`, profile.model, others);
+    if (refusal !== undefined) custom(["models", name, "price"], refusal);
   }
 }

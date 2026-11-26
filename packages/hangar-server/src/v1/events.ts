@@ -56,7 +56,13 @@ import {
   traceLineEvent,
 } from "./event-map";
 import { harnessOf, liveDirOf } from "./resolve";
-import { RUN_LOOKUP_LINES, findExecution, findRun, supervisorLedgerOf } from "./runs";
+import {
+  RUN_LOOKUP_LINES,
+  executionRowsIn,
+  findExecution,
+  findRun,
+  supervisorLedgerOf,
+} from "./runs";
 import { type StreamBatch, type StreamFrame, type StreamPlan, streamEnvelope } from "./stream";
 
 /** What one batch of a stream reads per source. */
@@ -340,6 +346,19 @@ function executionsInOrder(rows: readonly LedgerRecord[]): string[] {
 }
 
 /**
+ * Whether the execution's supervisor row says another process holds its trace capture:
+ * the newest row that says either way, `held-elsewhere`.
+ */
+function captureHeldElsewhere(dir: string, execution: string): boolean {
+  for (const row of executionRowsIn(dir, execution)) {
+    const capture = row["traceCapture"];
+    if (capture === "held-elsewhere") return true;
+    if (capture === "captured") return false;
+  }
+  return false;
+}
+
+/**
  * A canonical run's stream: its rows, and its trace for a caller who may read content.
  *
  * The trace read is one execution's. A fresh stream reads the newest one its rows name;
@@ -371,6 +390,9 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
     return traceLineEvent(record, harness, runId);
   };
   let unreachableSession = false;
+  // Another process holds the execution's trace capture: said once, before any trace frame.
+  let captureHeld =
+    content && execution !== undefined && captureHeldElsewhere(found.dir, execution);
   const sources: LineSource[] = [
     {
       name: "rows",
@@ -431,6 +453,16 @@ function canonicalRunStream(ctx: V1Context, runId: string): StreamPlan & { scrub
       return false;
     });
     const frames = batch.frames;
+    if (captureHeld) {
+      captureHeld = false;
+      frames.unshift(
+        streamEnvelope("stream.gap", start, new Date().toISOString(), {
+          reason: "unreadable",
+          source: "trace",
+          cause: "capture-held",
+        }),
+      );
+    }
     if (unreachableSession) {
       unreachableSession = false;
       frames.unshift(

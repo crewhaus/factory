@@ -104,6 +104,12 @@ export async function runSample(args: {
    * persisted anywhere: the artifacts stay byte-identical.
    */
   onInvokerError?: (err: unknown) => void;
+  /**
+   * Observes what a grader THREW, for the same reason: a judge call the
+   * budget refused is not infra noise, and the run loop keeps the sample's
+   * output and other grades without re-running it. Not persisted.
+   */
+  onGraderError?: (err: unknown) => void;
 }): Promise<SampleResult> {
   const { sample, invoker, outDir, model } = args;
   const trialSuffix = args.trial !== undefined && args.trial > 1 ? `.trial${args.trial}` : "";
@@ -295,6 +301,7 @@ export async function runSample(args: {
           statusReason: "no_judge_credentials",
         };
       } else {
+        args.onGraderError?.(err);
         graderErrors.push(`${g.name}: ${msg}`);
         result = {
           passed: false,
