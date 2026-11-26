@@ -12,6 +12,7 @@
  */
 
 import { getSession, recoverSession } from "./api.js";
+import { reportReach } from "./ui/connectivity.js";
 
 const PROTOCOL = "crewhaus.hangar.v1";
 const KEY_RE = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -106,6 +107,10 @@ function errorOf(status, body) {
     ...(typeof error.needs === "string" ? { needs: error.needs } : {}),
     ...(typeof error.reason === "string" ? { reason: error.reason } : {}),
     ...(typeof error.retryAfterMs === "number" ? { retryAfterMs: error.retryAfterMs } : {}),
+    // The record as it stands now, on a 409 or a 412: who decided it, and through which door.
+    ...(error.current !== null && typeof error.current === "object"
+      ? { current: error.current }
+      : {}),
   };
 }
 
@@ -164,12 +169,14 @@ async function attempt(id, opts, fetchImpl) {
       ...(opts.body !== undefined ? { body: JSON.stringify(opts.body) } : {}),
     });
   } catch {
+    reportReach(false);
     return {
       ok: false,
       status: 0,
       error: { code: "unavailable", message: "Home could not be reached." },
     };
   }
+  reportReach(true);
   const body = await res.json().catch(() => undefined);
   return res.ok
     ? { ok: true, status: res.status, body }

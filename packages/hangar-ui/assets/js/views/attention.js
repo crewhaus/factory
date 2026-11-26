@@ -455,8 +455,12 @@ export function bandsOf(items) {
   );
 }
 
-/** What the list says above its bands: harnesses it could not read or check, and freshness. Pure. */
-export function listNotes(list) {
+/**
+ * What a list read only in part says, so a short list never reads as whole: the
+ * harnesses whose requests could not be read, and that more items wait than were read,
+ * with the command that reads them all. Counts stay as shown. Pure.
+ */
+export function partialNotes(list) {
   const names = list?.names ?? [];
   const notes = [];
   const unreachable = Array.isArray(list?.unreachable) ? list.unreachable : [];
@@ -468,6 +472,22 @@ export function listNotes(list) {
         : `Couldn't read the requests of ${who.slice(0, -1).join(", ")} and ${who[who.length - 1]}: each keeps its sessions folder outside its folder.`,
     );
   }
+  const truncated = list?.truncated;
+  if (truncated !== null && typeof truncated === "object") {
+    const what =
+      truncated.reason === "harness_capped"
+        ? "Some harnesses have more items than were read."
+        : "More items are waiting than this list shows.";
+    const verb =
+      typeof truncated.verb === "string" && truncated.verb !== "" ? truncated.verb : null;
+    notes.push(verb === null ? what : `${what} To see them all, run ${verb}`);
+  }
+  return notes;
+}
+
+/** What the list says above its bands: harnesses it could not read or check, and freshness. Pure. */
+export function listNotes(list) {
+  const notes = partialNotes(list);
   const unchecked = Array.isArray(list?.advisorUnchecked) ? list.advisorUnchecked : [];
   if (unchecked.length > 0) {
     notes.push("Advisor findings appear after Home has checked a harness.");

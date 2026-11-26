@@ -50,6 +50,7 @@ export const TWINS = {
   deployActivate: { argv: ["deploy", "activate", "{dep}", "--harness", "{hrn}"] },
   deployList: { argv: ["deploy", "list", "--harness", "{hrn}"] },
   accessMembers: { argv: ["access", "members"] },
+  hangarStatus: { argv: ["hangar", "status"] },
   accessTokens: { argv: ["access", "tokens"] },
   accessRevokeGrant: { argv: ["access", "revoke", "{grt}"] },
   accessRevokeInvite: { argv: ["access", "revoke", "{inv}"] },

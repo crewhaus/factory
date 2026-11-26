@@ -31,6 +31,7 @@ import { openDialog } from "./ui/dialog.js";
 import { comboboxKey, wireCombobox } from "./ui/listbox.js";
 import { timeEl } from "./ui/time.js";
 import { fmtRelativeTime } from "./util.js";
+import { createAction } from "./v1.js";
 
 /** Debounce for keystroke → request. Short enough to feel live, long enough
  *  that a fast typist issues one request per word, not per letter. */
@@ -64,6 +65,43 @@ const ACTION_EXECUTORS = {
   procRestart: (id) => api.procRestart(id),
   procDrain: (id) => api.procDrain(id),
 };
+
+/**
+ * The versioned-API controls an action may run in place of a `route`: the same receipted
+ * request as the button on the harness's header. Anything else renders disabled.
+ */
+const OPERATION_ACTIONS = new Set(["controls.pause", "controls.resume"]);
+
+/**
+ * Run an action row: an `operation` row through one `createAction` (its receipt line is
+ * the answer), a `route` row through its process executor. Answers `{ok, words}`.
+ * `deps` is injected by a test.
+ */
+export async function runOmniAction(row, deps = { createAction, executors: ACTION_EXECUTORS }) {
+  if (typeof row?.operation === "string" && row.operation !== "") {
+    if (!OPERATION_ACTIONS.has(row.operation)) {
+      return { ok: false, words: `This build cannot run “${row.operation}” from the command menu` };
+    }
+    const answer = await deps
+      .createAction(row.operation, { params: { h: String(row.params?.id ?? "") }, body: {} })
+      .run();
+    if (!answer.ok) {
+      return { ok: false, words: String(answer.error?.message ?? "refused") };
+    }
+    const line = typeof answer.body?.line === "string" ? answer.body.line : `${row.title} — sent`;
+    return { ok: true, words: line };
+  }
+  const executor = deps.executors[row?.route];
+  if (executor === undefined) {
+    return { ok: false, words: `This build cannot run “${row?.route}” from the command menu` };
+  }
+  const res = await executor(row.params?.id);
+  // The process routes answer a typed refusal as a BODY; surface it.
+  if (res && res.ok === false) {
+    return { ok: false, words: String(res.body?.message ?? res.body?.reason ?? "refused") };
+  }
+  return { ok: true, words: `${row.title} — sent` };
+}
 
 let menuCount = 0;
 
@@ -134,7 +172,7 @@ export function openOmnibox(opts = {}) {
     const row = rows[index];
     if (row === undefined) return;
     armed = index;
-    const runnable = canRunAction(row.route);
+    const runnable = canRunAction(row.route, row.operation);
     const run = el("button", {
       class: "btn btn-danger",
       type: "button",
@@ -235,20 +273,14 @@ export function openOmnibox(opts = {}) {
   };
 
   const runAction = async (row) => {
-    const executor = ACTION_EXECUTORS[row.route];
-    if (executor === undefined) {
-      toast(`This build cannot run “${row.route}” from the command menu`, "error");
+    if (!canRunAction(row.route, row.operation)) {
+      toast(`This build cannot run “${row.operation ?? row.route}” from the command menu`, "error");
       return;
     }
     disarm();
     try {
-      const res = await executor(row.params?.id);
-      // The process routes answer a typed refusal as a BODY; surface it.
-      if (res && res.ok === false) {
-        toast(String(res.body?.message ?? res.body?.reason ?? "refused"), "error");
-      } else {
-        toast(`${row.title} — sent`, "info");
-      }
+      const done = await runOmniAction(row);
+      toast(done.words, done.ok ? "info" : "error");
     } catch (err) {
       toast(err instanceof Error ? err.message : String(err), "error");
     }
@@ -375,6 +407,7 @@ export function omniRows(payload) {
       subtitle: "",
       href: "#/",
       route: String(a.route ?? ""),
+      operation: typeof a.operation === "string" && a.operation !== "" ? a.operation : null,
       params: a.params && typeof a.params === "object" ? a.params : {},
       cliTwin: String(a.cliTwin ?? ""),
       // Never trusted from the payload: an action is confirmed here, always.
@@ -383,8 +416,10 @@ export function omniRows(payload) {
   ];
 }
 
-/** True when this build can execute the named action route. Exported so the
- *  row can render disabled-with-reason rather than failing on click. */
-export function canRunAction(route) {
+/** True when this build can execute the named action: a known versioned-API control, or
+ *  a known process route. Exported so the row can render disabled-with-reason rather than
+ *  failing on click. */
+export function canRunAction(route, operation = null) {
+  if (typeof operation === "string" && operation !== "") return OPERATION_ACTIONS.has(operation);
   return Object.hasOwn(ACTION_EXECUTORS, String(route)) && Object.hasOwn(ROUTES, String(route));
 }

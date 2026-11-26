@@ -55,8 +55,8 @@ describe("the destinations", () => {
     expect(d.DESTINATIONS.filter((x) => x.badge !== undefined).map((x) => x.id)).toEqual(["home"]);
   });
 
-  test("the connection kinds are the two with a fleet view", () => {
-    expect(d.CONNECTION_KINDS.map((k) => k.id)).toEqual(["credentials", "thredz"]);
+  test("the connection kinds with a fleet view, Hosts among them", () => {
+    expect(d.CONNECTION_KINDS.map((k) => k.id)).toEqual(["credentials", "thredz", "hosts"]);
   });
 
   test("the Settings pages", () => {
@@ -66,7 +66,12 @@ describe("the destinations", () => {
       "home",
       "account",
       "plugins",
+      "access",
     ]);
+  });
+
+  test("the Harnesses views, Spend among them", () => {
+    expect(d.HARNESS_VIEWS.map((v) => v.id)).toEqual(["health", "feedback", "spend"]);
   });
 });
 

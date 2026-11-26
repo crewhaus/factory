@@ -40,7 +40,16 @@ export type EnvelopeFields = Omit<EventEnvelope, "v" | "id">;
 export type StreamSourceDecl = {
   readonly name: CursorSource;
   source(harnessDir: string): RecordSource;
-  eventOf(record: Readonly<Record<string, unknown>>, harness: string): EnvelopeFields | undefined;
+  /**
+   * `harnessDir` is the folder the stream reads and `source` the records this source
+   * opened there, for a source that judges a line by its neighbours.
+   */
+  eventOf(
+    record: Readonly<Record<string, unknown>>,
+    harness: string,
+    harnessDir?: string,
+    source?: RecordSource,
+  ): EnvelopeFields | undefined;
 };
 
 /** The run states a run ends in. */

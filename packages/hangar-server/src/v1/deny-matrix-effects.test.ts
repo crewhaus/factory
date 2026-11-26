@@ -610,6 +610,18 @@ describe("a decision on a harness whose approver list names another Home is refu
           path: `/api/h/${h.id}/approvals/${P1}/grant`,
           body: {},
         },
+        {
+          door: "defer",
+          kind: "decisions.defer",
+          path: `/api/v1/decisions/${h.id}/decision/${P1}/defer`,
+          body: { until: new Date(Date.now() + 86_400_000).toISOString(), reason: "scheduled" },
+        },
+        {
+          door: "deny",
+          kind: "decisions.resolve",
+          path: `/api/h/${h.id}/approvals/${P1}/deny`,
+          body: {},
+        },
       ] as const;
       const callers = [
         { who: "owner", secret: home.session },
@@ -632,12 +644,13 @@ describe("a decision on a harness whose approver list names another Home is refu
           const folded = foldReadOnly(sessions);
           expect(folded.records[0]?.decision).toBeUndefined();
           expect(folded.records[0]?.supersededBy).toBeUndefined();
+          expect(folded.records[0]?.deferredUntil).toBeUndefined();
           expect(claimFiles(sessions, "decision")).toEqual([]);
           expect(claimFiles(sessions, "supersede")).toEqual([]);
           asked += 1;
         }
       }
-      expect(asked).toBe(6);
+      expect(asked).toBe(10);
 
       // The same owner's grants once the list names this Home: the refusal was the root.
       writeApprovers(h.dir, h.id, operator.principal, realpathSync(home.t.hangarRoot));
@@ -663,7 +676,7 @@ describe("a decision on a harness whose approver list names another Home is refu
     } finally {
       rmSync(another, { recursive: true, force: true });
     }
-  }, 30_000); // a member's device sign-in and eight decisions through a live server
+  }, 30_000); // a member's device sign-in and twelve decisions through a live server
 });
 
 // ---------------------------------------------------------------------------

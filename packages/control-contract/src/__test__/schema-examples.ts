@@ -201,6 +201,7 @@ export const EXAMPLES: Readonly<Record<string, unknown>> = {
   linkList: list(LINK),
   listEnvelope: list("anything"),
   listQuery: {},
+  decisionListQuery: { harness: "hrn_0123456789abcdef" },
   me: { principal: MEMBER, grants: [], can: {} },
   member: MEMBER,
   memberList: list(MEMBER),

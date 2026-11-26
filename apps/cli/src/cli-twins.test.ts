@@ -241,7 +241,8 @@ const OFFERS: LaunchOffers = {
 describe("the server's twins, by import", () => {
   test("the omnibox's, with a path that needs quoting", () => {
     const twins = actionCliTwins("/srv/harnesses/poly");
-    expect(twins.length).toBe(4);
+    // Start, stop, restart and drain the process; pause and resume new work.
+    expect(twins.length).toBe(6);
     for (const twin of twins) {
       expectRunnable("omnibox", twin);
       expect(twin).not.toContain("--dir");
@@ -448,8 +449,8 @@ describe("the server's twins, by import", () => {
     }
     // Thirty-nine operation twins, thirty-one command kinds and eight route rows, each
     // rendered twice: pause, resume, disable and enable are `crewhaus daemon` verbs. The
-    // inbox's three reads and the inspector's four came later.
-    expect(checked).toBeGreaterThanOrEqual(156 + 2 * 4);
+    // inbox's three reads and the inspector's four came later, and Home's status line after them.
+    expect(checked).toBeGreaterThanOrEqual(156 + 2 * 4 + 2);
   });
 });
 
@@ -653,7 +654,7 @@ describe("one quoting rule", () => {
       );
       expect(sup.twinSafe(tainted("a"))).toBe(false);
     }
-    expect(twins).toBe(CONTROL.length * (sup.TWIN_ACTIONS.length + 4 + 1 + 2));
+    expect(twins).toBe(CONTROL.length * (sup.TWIN_ACTIONS.length + 6 + 1 + 2));
     // A plain value is still quoted exactly as before.
     expect(sup.cliTwinFor("stop", { dir: "/srv/my poly" })).toBe(
       "cd '/srv/my poly' && crewhaus daemon stop",

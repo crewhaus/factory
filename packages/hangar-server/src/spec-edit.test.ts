@@ -2036,7 +2036,10 @@ describe("builders", () => {
             confirmName: "spec-edit-fixture",
           }),
         );
-        expect(res.status).toBeGreaterThanOrEqual(400);
+        expect([res.status, res.body["error"]]).toEqual([
+          400,
+          "path escapes the harness directory",
+        ]);
         expect(existsSync(outside)).toBe(false);
       } finally {
         await t.stop();

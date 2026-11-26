@@ -887,6 +887,33 @@ describe("one request, decided from Home, Slack and the CLI at once", () => {
   });
 });
 
+describe("the door a decision came through, on its record", () => {
+  test("a decision made on the Slack card answers slack, and one made with the CLI answers cli", async () => {
+    const bySlack = "appr_00000000000c3001";
+    const byCli = "appr_00000000000c3002";
+    const h = await governed("doors", [approval(bySlack), approval(byCli)]);
+    const slack = slackDoor(h.dir);
+    try {
+      const clicked = await slack.click(bySlack, "grant");
+      expect(clicked.status).toBe(200);
+      await drain();
+      const cli = await cliDoor()(h.dir, byCli, "deny");
+      expect(cli.outcome).toBe("decided");
+      const slackRead = await home.call("GET", `/api/v1/decisions/${h.id}/decision/${bySlack}`);
+      expect(slackRead.status).toBe(200);
+      expect(slackRead.body["decision"]).toBe("grant");
+      expect(slackRead.body["decidedVia"]).toBe("slack");
+      const cliRead = await home.call("GET", `/api/v1/decisions/${h.id}/decision/${byCli}`);
+      expect(cliRead.status).toBe(200);
+      expect(cliRead.body["decision"]).toBe("deny");
+      expect(cliRead.body["decidedVia"]).toBe("cli");
+      expect(String(cliRead.body["decidedByText"]).startsWith("Decided by ")).toBe(true);
+    } finally {
+      slack.close();
+    }
+  });
+});
+
 describe("a grant is spent once, by whoever may still have decided it, for the call it was for", () => {
   /** A spend, as the runtime asks for one just before the call runs. */
   const spendOf = (dir: string) => ({
@@ -1073,4 +1100,52 @@ describe("an 0.8.x writer and an 0.8.x bundle meet the 0.9.0 heads", () => {
     const one = await home.call("GET", `/api/v1/harnesses/${h.id}`);
     expect(one.status).toBe(200);
   });
+});
+
+describe("Home's pause against a build without the reload route", () => {
+  test("Home asks the harness once, answers 'Recorded, not enforced', and the daemon effect is skipped", async () => {
+    const asked: string[] = [];
+    const fetch = (async (input: string | URL | Request) => {
+      asked.push(String(input instanceof Request ? input.url : input));
+      return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+    }) as typeof globalThis.fetch;
+    const { createControlClient } = await import("@crewhaus/gateway-protocol/control-client");
+    const { makeFixtureHarness } = await import("./fixture");
+    const old = await v1Home({ controlClient: createControlClient({ fetch }) });
+    try {
+      const dir = makeFixtureHarness(join(old.t.harnessesRoot, "old-build"), {
+        specName: "old-build",
+        target: "channel",
+        controlToken: ["old", "build", "control", "bearer"].join("-"),
+        bundle: { entry: "daemon.ts" },
+      });
+      const added = await old.t.api("/api/harnesses", {
+        method: "POST",
+        body: JSON.stringify({ dir }),
+      });
+      const id = (added.body["entry"] as { id: string }).id;
+      expect(
+        (await old.t.api(`/api/h/${id}/proc/start`, { method: "POST", body: "{}" })).status,
+      ).toBeLessThan(300);
+      old.t.ops
+        ?.last()
+        ?.writeLog(
+          "[control] crewhaus.control.v1 listening on http://127.0.0.1:41803 (token: .crewhaus/run/control-token)\n",
+        );
+      old.t.clock?.advance(300); // one pump tick
+      const res = await old.call("POST", `/api/v1/harnesses/${id}/controls/pause`, { body: {} });
+      expect(res.status).toBe(200);
+      expect(res.body["line"]).toBe(
+        "Recorded, not enforced: this build predates pause. Recompile to apply it.",
+      );
+      expect(asked).toEqual(["http://127.0.0.1:41803/control/v1/operator/reload"]);
+      const effects = (res.body["receipt"] as Record<string, unknown>)["effects"] as Record<
+        string,
+        unknown
+      >[];
+      expect(effects.find((effect) => effect["kind"] === "daemon")?.["status"]).toBe("skipped");
+    } finally {
+      await old.t.stop();
+    }
+  }, 30_000); // a second Home, a device sign-in and a started daemon
 });

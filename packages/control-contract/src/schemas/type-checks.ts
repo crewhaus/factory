@@ -70,6 +70,7 @@ export type SchemaTypeChecks = [
   Expect<Same<z.infer<typeof S.decisionBinding>, T.DecisionBinding>>,
   Expect<Same<z.infer<typeof S.decisionDeferRequest>, T.DecisionDeferRequest>>,
   Expect<Same<z.infer<typeof S.decisionList>, T.DecisionList>>,
+  Expect<Same<z.infer<typeof S.decisionListQuery>, T.DecisionListQuery>>,
   Expect<Same<z.infer<typeof S.decisionOverlays>, T.DecisionOverlays>>,
   Expect<Same<z.infer<typeof S.decisionResolveRequest>, T.DecisionResolveRequest>>,
   Expect<Same<z.infer<typeof S.decisionResolved>, T.DecisionResolved>>,

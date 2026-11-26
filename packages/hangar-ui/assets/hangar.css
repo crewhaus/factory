@@ -3039,3 +3039,62 @@ figure.chart svg {
     scroll-behavior: auto;
   }
 }
+
+/* Home's status line: words, each a link, wrapping on a narrow screen. */
+.home-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.5rem;
+  align-items: baseline;
+  margin-bottom: 1rem;
+}
+.home-status-note {
+  flex-basis: 100%;
+}
+
+/* A harness's operator controls: one row per control, its reason and twin beside it. */
+.harness-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+.control-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.control-detail {
+  flex-basis: 100%;
+}
+
+/* One decision card everywhere: its input scrolls inside the card, never the page. */
+.decision-card .decision-input {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.decision-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+/* The Library's "Group by" choice, above the rail's buckets. */
+.rail-group-by {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin-bottom: 0.75rem;
+}
+
+/* Access: every field fits the card, and a long link or token wraps inside it. */
+.access-card select,
+.access-card input {
+  max-width: 100%;
+}
+.access-card code {
+  overflow-wrap: anywhere;
+  word-break: break-all;
+}

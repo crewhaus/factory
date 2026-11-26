@@ -5,6 +5,7 @@
  */
 import type { DeviceRequests } from "@crewhaus/access-control";
 import type { OperationRow, ReceiptVia } from "@crewhaus/control-contract";
+import type { LeaseProbe } from "@crewhaus/control-records";
 import type { ApiRunCapacity, ControlService, Projection } from "@crewhaus/control-service";
 import type { ControlClient, ControlTarget } from "@crewhaus/gateway-protocol/control-client";
 import type { HangarHarnessEntry, HangarRegistry } from "@crewhaus/harness-registry";
@@ -90,6 +91,8 @@ export type V1Deps = {
   /** The control client Home reaches daemons with, and where a harness's daemon listens. */
   readonly controlClient?: ControlClient;
   readonly controlTarget?: (entry: HangarHarnessEntry) => Promise<ControlTarget>;
+  /** Asked whether a process a runfile names is alive. Absent: a runfile counts as live. */
+  readonly processProbe?: LeaseProbe;
   /**
    * Where a harness's daemon listens, for a read: the port Home holds, or, for a live
    * daemon it does not hold yet, the port its runfile records. Never attaches anything.

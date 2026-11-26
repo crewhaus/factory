@@ -1,13 +1,16 @@
 /**
  * Harness detail — Overview tab: the process card (M2's Start/Stop/Restart/
- * Drain, with the preflight-refusal flow), health checklist, eval trend
- * mini-line, memory-fabric mini-cards, cost mini-chart, the spending limit
- * (`./budget.js`), and the expandable preflight report. Every absent payload
- * renders as "nothing yet".
+ * Drain, with the preflight-refusal flow), the cards that read the versioned
+ * API (`./overview-cards.js`: status, purpose, what needs you here, what is
+ * working, recent outcomes, operating limits), health checklist, the quality of
+ * the latest comparable evaluation, memory-fabric mini-cards, cost mini-chart,
+ * the spending limit (`./budget.js`), and the expandable preflight report.
+ * Every absent payload renders as "nothing yet".
  */
 
 import { api } from "../api.js";
 import { clear, collapsible, dot, el, emptyState, skeleton } from "../dom.js";
+import { openRunStream } from "../runview/stream.js";
 import { chart, chartModel } from "../ui/chart.js";
 import {
   fmtCount,
@@ -20,29 +23,116 @@ import {
 } from "../util.js";
 import { budgetCard } from "./budget.js";
 import { dayRow, totalText } from "./costs.js";
+import { qualityCard, v1OverviewCards } from "./overview-cards.js";
 import { procCard } from "./proc.js";
 
 export async function renderOverview(root, ctx) {
   clear(root).appendChild(skeleton(5));
-  const [preflightRes, evalsRes, costsRes, budgetRes] = await Promise.allSettled([
+  const [preflightRes, evalsRes, costsRes, budgetRes, v1Res] = await Promise.allSettled([
     api.preflight(ctx.id),
     api.evals(ctx.id),
     api.costs(ctx.id),
     budgetCard(ctx),
+    v1OverviewCards(ctx),
   ]);
   clear(root);
   // The process picture came with the page load — render it without a
   // second fetch, at the top, because it is the only card with verbs.
   if (ctx.proc) root.appendChild(procCard(ctx.proc, ctx, ctx.reload ?? (() => {})));
   const grid = el("div", { class: "ov-grid" });
+  for (const node of settled(v1Res) ?? []) grid.appendChild(node);
   grid.appendChild(healthCard(ctx.detail));
-  grid.appendChild(evalTrendCard(settled(evalsRes)));
+  grid.appendChild(qualityCard(settled(evalsRes), ctx.id));
   grid.appendChild(memoryCard(ctx.detail));
   grid.appendChild(costCard(settled(costsRes)));
   const budget = settled(budgetRes);
   if (budget !== null) grid.appendChild(budget);
   root.appendChild(grid);
   root.appendChild(preflightCard(settled(preflightRes)));
+  if (budget !== null) followBudget(budget, ctx);
+}
+
+/**
+ * Whether a card holds something a person is in the middle of: focus inside it, or a
+ * typed value in one of its fields. Such a card is never replaced under them. Pure over
+ * the nodes it is given.
+ */
+export function holdsDraft(
+  node,
+  active = typeof document === "undefined" ? null : document.activeElement,
+) {
+  if (node === null || node === undefined) return false;
+  if (
+    active !== null &&
+    active !== undefined &&
+    typeof node.contains === "function" &&
+    node.contains(active)
+  ) {
+    return true;
+  }
+  const fields =
+    typeof node.querySelectorAll === "function"
+      ? [...node.querySelectorAll("input, textarea")]
+      : [];
+  return fields.some((field) => field.type !== "hidden" && String(field.value ?? "") !== "");
+}
+
+/**
+ * Keep the spending card current: on each `budget.*` event of this harness's stream, the
+ * card reads `budget.get` again and takes its place. While a person is typing a raise or
+ * has focus in the card, it is left as it is and read again once focus leaves it with
+ * nothing typed. The stream closes with the page.
+ */
+function followBudget(first, ctx) {
+  if (typeof window === "undefined" || ctx.signal?.aborted) return;
+  let shown = first;
+  let pending = false;
+  let stale = false;
+  const refresh = () => {
+    if (pending) return;
+    if (holdsDraft(shown)) {
+      if (!stale) {
+        stale = true;
+        const card = shown;
+        const onLeave = () => {
+          // After the focus has moved: the card is read again only once it holds nothing.
+          setTimeout(() => {
+            if (card !== shown || holdsDraft(card)) return;
+            card.removeEventListener("focusout", onLeave);
+            stale = false;
+            refresh();
+          }, 0);
+        };
+        card.addEventListener("focusout", onLeave);
+      }
+      return;
+    }
+    pending = true;
+    void budgetCard(ctx)
+      .then((next) => {
+        if (next === null || ctx.signal?.aborted || !shown.isConnected) return;
+        // A draft begun while the card was being read is kept as well.
+        if (holdsDraft(shown)) {
+          pending = false;
+          refresh();
+          return;
+        }
+        shown.replaceWith(next);
+        shown = next;
+        stale = false;
+      })
+      .finally(() => {
+        pending = false;
+      });
+  };
+  const stream = openRunStream({
+    path: `/api/v1/harnesses/${encodeURIComponent(ctx.id)}/events`,
+    onFrame: (frame) => {
+      if (String(frame.event ?? "").startsWith("budget.")) refresh();
+    },
+    onEnd: () => {},
+  });
+  ctx.signal?.addEventListener("abort", () => stream.close());
 }
 
 function settled(res) {

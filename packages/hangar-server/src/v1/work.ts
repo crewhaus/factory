@@ -670,6 +670,6 @@ export const HOME_RUNTIME: HomeAreaRuntime = {
 
     ...WORKSPACES_HOME.streamSources,
 
-    // ...BUDGET_HOME.streamSources,
+    ...BUDGET_HOME.streamSources,
   ],
 };

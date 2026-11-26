@@ -5,6 +5,8 @@
  * harness command whose effect appends one topup carrying its receipt, for the current
  * period only: a raise for any other period answers 412 with the current one.
  *
+ * Its ledger lines reach the harness's stream as `budget.*` events (`./budget-stream.ts`).
+ *
  * Also the area's sweep (one summary line per closed period, and a closed period's
  * segments removed once the period after it has closed) and its capability keys
  * (`budget.period`, `budget.reservations`), unsupported for a bundle compiled before
@@ -19,6 +21,7 @@ import { resolveContained } from "../safety";
 import type { Sweep } from "../scheduler-host";
 import type { HomePorts } from "../sweeps";
 import type { HomeAreaRuntime } from "./areas";
+import { BUDGET_STREAM_SOURCE } from "./budget-stream";
 import { readCompiledWith } from "./compiler";
 import type { CapabilityProvider, V1Handler } from "./context";
 import { V1Error } from "./errors";
@@ -188,4 +191,5 @@ export const BUDGET_HOME = {
   sweeps: [BUDGET_SWEEP],
   handlers: BUDGET_HANDLERS,
   capabilityProviders: BUDGET_CAPABILITIES,
+  streamSources: [BUDGET_STREAM_SOURCE],
 } as const satisfies Omit<HomeAreaRuntime, "area">;

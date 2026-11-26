@@ -48,7 +48,12 @@ export const thredzProxy: Journey = {
     }
 
     const responses = await recorder.received();
-    const unread = unreadResponses(responses);
+    // Home's status line keeps its fleet stream open from the first paint. Its frames are
+    // the overview's changes (ids, states and counts), never a harness's settings or
+    // environment, and its headers are checked with every other response's below.
+    const unread = unreadResponses(responses).filter(
+      (what) => what !== "a live stream from /api/v1/events",
+    );
     if (unread.length > 0) throw new Error(`these responses went unread: ${unread.join(", ")}`);
     // The search that finds nothing below must be able to find something: the
     // harness list carries the id, and every response carries a content type.

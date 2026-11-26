@@ -36,7 +36,9 @@ import { SECTIONS, sectionById, subViewGroups, subViewOf } from "./sections/inde
 import { shapeAccentVars, shapeLabel } from "./shapes.js";
 import { cliTwinFor, procRow } from "./supervision.js";
 import { badgeStrip } from "./ui/badges.js";
+import { onReachChange, reachWords } from "./ui/connectivity.js";
 import { announce } from "./ui/live.js";
+import { createVersionGuard, fullLoad, guardedLoad, tabHasDraft } from "./ui/version-guard.js";
 
 /** Where the releases and the docs live, linked from Help. */
 const RELEASES_URL = "https://github.com/crewhaus/factory/releases";
@@ -55,6 +57,9 @@ let viewRoot = null;
 let footRoot = null;
 let bannerRoot = null;
 let firstRunRoot = null;
+// Its own slot: the update banner and the connectivity banner, never cleared by another.
+let statusRoot = null;
+let versionGuard = null;
 let navCounts = {};
 let notificationsStarted = false;
 let lastRoute = null;
@@ -328,6 +333,7 @@ export function renderShell(appRoot, nextHooks = {}) {
     menu.node,
   ]);
   bannerRoot = el("div", { class: "banner-slot", id: "banners" });
+  statusRoot = el("div", { class: "banner-slot", id: "status-banners" });
   // Its own slot: the read-only banner clears `bannerRoot` when it loads.
   firstRunRoot = el("div", { class: "firstrun-slot", id: "first-run" });
   viewRoot = el("main", { class: "view", id: "view", tabindex: "-1" });
@@ -340,12 +346,14 @@ export function renderShell(appRoot, nextHooks = {}) {
   appRoot.appendChild(skipLink());
   appRoot.appendChild(head);
   appRoot.appendChild(bannerRoot);
+  appRoot.appendChild(statusRoot);
   appRoot.appendChild(firstRunRoot);
   appRoot.appendChild(viewRoot);
   appRoot.appendChild(footRoot);
   mountFirstRun(firstRunRoot);
   drawNav(null);
   loadVersion();
+  watchVersionAndReach();
   loadNavCounts();
   startNotifications();
   loadReadOnlyBanner();
@@ -484,6 +492,71 @@ function startNotifications() {
   });
 }
 
+/** The guard that keeps this tab on one release of Home; `null` before the shell mounts. */
+export function homeVersionGuard() {
+  return versionGuard;
+}
+
+/** Load a lazy screen for a navigation to `target`, or load the page whole when Home was updated. */
+export function guardedImport(load, target = window.location.hash) {
+  return guardedLoad(versionGuard, load, target);
+}
+
+/**
+ * Keep this tab on one release, and say when Home cannot be reached: the version is read
+ * at boot, again when the tab is visible again or the connection comes back, and before
+ * every lazy screen. Each banner has its own node in the status slot, drawn as plain
+ * markup; its words are spoken through the page's polite live region, which exists from
+ * the start, so a banner that appears is announced.
+ */
+function watchVersionAndReach() {
+  const updated = el("div", { class: "status-banner-updated" });
+  const reach = el("div", { class: "status-banner-reach" });
+  statusRoot.replaceChildren(updated, reach);
+  versionGuard = createVersionGuard({
+    readVersion: () => api.version(),
+    fullLoad,
+    hasDraft: () => tabHasDraft(window.sessionStorage),
+    onUpdated: () => {
+      const words = "Home was updated. Reload to use the new version.";
+      updated.replaceChildren(
+        el("div", { class: "banner" }, [
+          el("span", { text: words }),
+          el("button", {
+            class: "btn",
+            type: "button",
+            text: "Reload",
+            onClick: () => window.location.reload(),
+          }),
+        ]),
+      );
+      announce(words);
+    },
+  });
+  void versionGuard.boot();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden !== true) void versionGuard?.resumed();
+  });
+  window.addEventListener("online", () => void versionGuard?.resumed());
+  let retry = null;
+  let cleared = null;
+  onReachChange((state) => {
+    if (cleared !== null) window.clearTimeout(cleared);
+    const words = reachWords(state);
+    reach.replaceChildren(el("div", { class: "banner", text: words }));
+    announce(words);
+    if (state === "down") {
+      // Ask again now and then, so the banner clears on its own once Home answers.
+      retry ??= window.setInterval(() => void api.version().catch(() => undefined), 15_000);
+      return;
+    }
+    if (retry !== null) window.clearInterval(retry);
+    retry = null;
+    void versionGuard?.resumed();
+    cleared = window.setTimeout(() => reach.replaceChildren(), 5_000);
+  });
+}
+
 async function loadVersion() {
   for (const old of footRoot.querySelectorAll(".foot-version")) old.remove();
   let node;
@@ -558,8 +631,8 @@ export async function renderRoute(route, container, { signal }) {
   if (route.view === "harness") return renderHarnessPage(container, route, signal);
   if (route.view === "inspect-ref") {
     // An object link: resolved, then replaced by the object's page with the inspector over it.
-    const panel = await import("./inspect/panel.js");
-    if (signal.aborted) return {};
+    const panel = await guardedImport(() => import("./inspect/panel.js"));
+    if (panel === null || signal.aborted) return {};
     return panel.renderRefRoute(container, route, {
       signal,
       go: (hash) => {
@@ -576,8 +649,8 @@ export async function renderRoute(route, container, { signal }) {
   const row = route.sub === null ? area.index : fleetPage(area, route.sub);
   const body = container.querySelector(".page-body") ?? container;
   const ctx = { route, signal, setSub: () => {} };
-  const mod = await row.load();
-  if (signal.aborted) return {};
+  const mod = await guardedImport(() => row.load());
+  if (mod === null || signal.aborted) return {};
   await row.render(mod, body, ctx);
   return {};
 }
@@ -726,8 +799,8 @@ async function renderHarnessPage(container, route, signal) {
     return { harness: name };
   }
   const row = route.sub === null ? section.index : subViewOf(section, route.sub);
-  const mod = await row.load();
-  if (signal.aborted) return { harness: name };
+  const mod = await guardedImport(() => row.load());
+  if (mod === null || signal.aborted) return { harness: name };
   await row.render(mod, body, ctx);
   return { harness: name };
 }
@@ -917,9 +990,27 @@ function harnessHeader(detail, route, ctx) {
         : null,
       badgeStrip(detail.badges, detail.badgeSupport, detail.badgeNote, target, detail.badgeVerb),
       supervisionStrip(ctx),
+      controlsSlot(ctx),
     ],
   );
   return head;
+}
+
+/**
+ * The operator controls, drawn once `harnesses.get` says what this caller may do here; a
+ * read that fails leaves the header as it is.
+ */
+function controlsSlot(ctx) {
+  const slot = el("div", { class: "h-controls", role: "group", "aria-label": "Controls" });
+  void (async () => {
+    const controls = await guardedImport(() => import("./views/harness-controls.js"));
+    if (controls === null) return;
+    const { call } = await import("./v1.js");
+    const answer = await call("harnesses.get", { params: { h: ctx.id } });
+    if (ctx.signal?.aborted || !answer.ok) return;
+    slot.replaceChildren(controls.renderHarnessControls(answer.body, ctx));
+  })().catch(() => undefined);
+  return slot;
 }
 
 /** Supervision pill + bundle freshness + control availability + remedy. */

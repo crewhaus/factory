@@ -297,10 +297,19 @@ export {
   type EvalResultsExport,
   type ExportFormat,
   HOME_MODULE,
+  HOME_REACHED_BY,
+  type HarnessAccess,
+  type HarnessAccessGrant,
+  type HarnessAccessMember,
   type HarnessExportList,
   type HarnessExportRow,
   type HarnessExportStarted,
+  type HomeReachedBy,
+  type HomeSpend,
+  type HomeStatus,
+  type HomeStatusCounts,
   type SpecExport,
+  type SpendRow,
 } from "./areas/home.js";
 export {
   CONTEXT_CALL_RE,
@@ -493,6 +502,7 @@ export {
   parseId,
 } from "./ids.js";
 export {
+  type DecisionListQuery,
   EMPTY_REASONS,
   type EmptyReason,
   type ListEmpty,

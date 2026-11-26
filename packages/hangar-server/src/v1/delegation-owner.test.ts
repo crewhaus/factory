@@ -2,7 +2,8 @@
  * Home's own key manages delegation rules on a governed harness exactly as it manages
  * standing rules: it acts as the owner Home's access records name, so it may turn a rule
  * on, change it and end it where the harness's approver list names that owner, and is
- * refused where the list names someone else. The list's `you` flags say the same.
+ * refused where the list names someone else. The list's `you` flags say the same. A caller
+ * with its own actor, a service caller among them, acts on delegation rules only as itself.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
@@ -151,5 +152,88 @@ describe("Home's own key and delegation rules", () => {
       {},
     );
     expect(standing.status).toBe(403);
+  });
+});
+
+describe("a service caller and delegation rules", () => {
+  test("a caller with an actor and a system principal acts only as itself, and is refused an owner's write", async () => {
+    const { openHangarRegistry } = await import("@crewhaus/harness-registry");
+    const { systemAccess } = await import("../access");
+    const { OPERATION_BY_ID } = await import("./match");
+    const { DELEGATION_HANDLERS } = await import("./delegations");
+    const { V1Error } = await import("./errors");
+    const control = home.t.server.controlService;
+    // A live rule on the harness whose approver list names Home's owner.
+    const rule = await plantRule(mine.dir, mine.id, home.owner);
+    // Every actor the owner's check is asked about.
+    const asked: unknown[] = [];
+    const decisions = {
+      ...control.decisions,
+      mayManageRules: (dir: string, actor: unknown) => {
+        asked.push(actor);
+        return control.decisions.mayManageRules(dir, actor as never);
+      },
+    };
+    const sys = systemAccess("sweep");
+    // Its authority allows the write's permission: only the owner's check can refuse it.
+    const access = {
+      ...sys,
+      authorize: () => ({ allow: true as const, grant: sys.caller.principal }),
+    };
+    const op = OPERATION_BY_ID.get("delegations.revoke");
+    if (op === undefined) throw new Error("no delegations.revoke operation");
+    const ctx = {
+      req: new Request("http://127.0.0.1/"),
+      url: new URL("http://127.0.0.1/"),
+      op,
+      params: { h: mine.id, rule },
+      query: {},
+      body: {},
+      access,
+      deps: {
+        hangarRoot: home.t.hangarRoot,
+        registry: openHangarRegistry({ root: home.t.registryRoot, env: {} }),
+        control: { ...control, decisions },
+        now: Date.now,
+      },
+      via: "system",
+      actor: sys.caller.principal,
+      refResolvers: new Map(),
+      capabilityProviders: [],
+      projections: [],
+      streamSources: [],
+    } as unknown as Parameters<NonNullable<(typeof DELEGATION_HANDLERS)["delegations.revoke"]>>[0];
+    let thrown: unknown;
+    try {
+      await DELEGATION_HANDLERS["delegations.revoke"]?.(ctx);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(V1Error);
+    const input = (thrown as InstanceType<typeof V1Error>).input;
+    expect([input.status, input.reason]).toEqual([403, "owner_only"]);
+    expect(input.message).toBe(
+      "Only this harness's owner turns a delegation rule on, changes it or ends it.",
+    );
+    // It was asked about as itself, never as Home's bootstrap owner.
+    expect(asked).toEqual([{ kind: "principal", principal: "sys:sweep" }]);
+    // The rule stands.
+    const listed = await asHome("GET", `/api/v1/harnesses/${mine.id}/delegations`);
+    const row = (listed.body["items"] as { id: string; state: string }[]).find(
+      (item) => item.id === rule,
+    );
+    expect(row?.state).toBe("active");
+    // The library gives a system actor the same answer on its own.
+    const direct = await control.delegations.revoke(
+      { dir: mine.dir, id: mine.id, name: "governed-mine" },
+      { rule, actor: { kind: "principal", principal: "sys:sweep" }, cmd: mintId("cmd") },
+    );
+    expect(direct.ok).toBe(false);
+    if (!direct.ok) {
+      expect(direct.code).toBe("forbidden");
+      expect(direct.reason).toBe(
+        "The system never turns a delegation rule on, changes or resumes one: a person does.",
+      );
+    }
   });
 });

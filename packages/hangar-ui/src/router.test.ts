@@ -146,7 +146,7 @@ describe("unknown addresses are notfound, never a throw", () => {
       "#/harnesses/health/extra",
       "#/people/someone",
       "#/connections/models",
-      "#/settings/access",
+      "#/settings/elsewhere",
       `#/h/${ID}/work/bogus`,
       `#/h/${ID}/setup/spec/extra`,
       `#/h/${ID}/work/runs/run_1/extra`,
@@ -181,10 +181,11 @@ describe("ROUTE_TEMPLATES", () => {
   test("every fleet and harness template, derived from the tables", () => {
     const fleetTemplates = ROUTE_TEMPLATES.filter((t) => !t.startsWith("#/h/"));
     const harnessTemplates = ROUTE_TEMPLATES.filter((t) => t.startsWith("#/h/"));
-    // The device sign-in page is a fleet address of its own.
-    expect(fleetTemplates.length).toBe(19);
-    // Setup › Delegations is the twenty-eighth; Work › Work items and an item's page follow.
-    expect(harnessTemplates.length).toBe(30);
+    // The device sign-in page is a fleet address of its own; Spend, Hosts and Access follow.
+    expect(fleetTemplates.length).toBe(22);
+    // Setup › Delegations is the twenty-eighth; Work › Work items and an item's page
+    // follow, then Setup › Access.
+    expect(harnessTemplates.length).toBe(31);
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/setup/delegations");
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items");
     expect(ROUTE_TEMPLATES).toContain("#/h/:id/work/items/:wi");

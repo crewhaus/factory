@@ -971,6 +971,13 @@ function ownIdentityFile(ctx: M3Context): { dev: bigint; ino: bigint } | undefin
 /** A `"privateKey"` member, as JSON text spells one. */
 const PRIVATE_KEY_MEMBER_RE = /"privateKey"\s*:/;
 
+/** JSON text with each `\u00XX` escape read as the character it spells, as a parser reads it. */
+function withJsonEscapesRead(text: string): string {
+  return text.replace(/\\u00([0-9a-fA-F]{2})/g, (_, hex: string) =>
+    String.fromCharCode(Number.parseInt(hex, 16)),
+  );
+}
+
 /** A parsed document that holds a private key at its top level. */
 function holdsPrivateKey(parsed: unknown): boolean {
   return (
@@ -986,9 +993,10 @@ function holdsPrivateKey(parsed: unknown): boolean {
  * never a parser's message (either could carry key bytes). Decided from the open file the
  * bytes were read from: by path (the requested path, or the place it really is, names an
  * identity file), by being this harness's own identity file (the same device and inode,
- * whatever the path or link), or by holding a private key: parsed, or, for a `.json` that
- * does not parse or was cut short, a `"privateKey"` member in its text. A file that does
- * not parse projects to nothing. Undefined when the read is not of an identity file.
+ * whatever the path or link), or by holding a private key: parsed, or, for any file that
+ * does not parse or was cut short, whatever its name, a `"privateKey"` member in its text
+ * as a parser would read it. A file that does not parse projects to nothing. Undefined
+ * when the read is not of an identity file.
  *
  * First consumer: {@link readInspected}, so every view of a file answers the same.
  */
@@ -1016,7 +1024,7 @@ function identityAnswer(
   const whole = !read.truncated && parsed !== null;
   const byContent = whole
     ? holdsPrivateKey(parsed)
-    : resolved.toLowerCase().endsWith(".json") && PRIVATE_KEY_MEMBER_RE.test(read.text);
+    : PRIVATE_KEY_MEMBER_RE.test(withJsonEscapesRead(read.text));
   if (!byPath && !byInode && !byContent) return undefined;
   return {
     document: identityProjection(parsed),
@@ -1048,19 +1056,22 @@ export function _setInspectOpenHookForTest(
  * open: `resolved` is taken through every link once, that one place passes the exclusion
  * and nested-harness checks (the same 403 as before the open), and its device and inode
  * equal the open file's. Whatever the path leads to by the time this runs, the bytes
- * answered are those of a file that passed the checks.
+ * answered are those of a file that passed the checks. With `place`, the file must also
+ * really be that one place in the harness.
  */
 function approvedRead(
   ctx: M3Context,
   segments: readonly string[],
   resolved: string,
   opened: OpenedRead,
+  /** When set, the one place the file must really be, as segments under the harness. */
+  place?: readonly string[],
 ): OpenedRead {
   if (opened.dev === null || opened.ino === null) return NOTHING_READ;
   const real = realThroughLinks(resolved);
-  if (ctx.harnessDir !== null && segmentsUnder(ctx.harnessDir, real) === undefined) {
-    return NOTHING_READ;
-  }
+  const under = ctx.harnessDir === null ? undefined : segmentsUnder(ctx.harnessDir, real);
+  if (ctx.harnessDir !== null && under === undefined) return NOTHING_READ;
+  if (place !== undefined && !sameSegments(under, place)) return NOTHING_READ;
   refuseReal(ctx, segments, real);
   try {
     const stat = statSync(real, { bigint: true, throwIfNoEntry: false });
@@ -1793,14 +1804,20 @@ export const settingsWrite: M3Handler = (ctx) => {
   const path = ctx.contain(def.segments);
   refuseSettingsPlace(ctx, def.segments, path);
   const existed = existsSync(path);
-  // One open of the file this write would replace: only a regular file that is not an
-  // identity file, by name, inode or content, is shown in the diff or replaced.
+  // One open of the file this write would replace: only this harness's own settings file,
+  // a regular file that is not an identity file, by name, inode or content, is shown in
+  // the diff, compared for its security keys or replaced.
   let before: { readonly text: string; readonly truncated: boolean } = {
     text: "",
     truncated: false,
   };
   if (existed) {
-    const read = readOpened(path);
+    openHook?.(path, "before-open");
+    const opened = readOpened(path);
+    openHook?.(path, "before-approval");
+    // Approved after the open, as every inspect read is: only the bytes of this harness's
+    // own settings file, as it is now, are shown in the diff or compared below.
+    const read = approvedRead(ctx, def.segments, path, opened, def.segments);
     if (read.dev === null || identityAnswer(ctx, def.segments, path, read) !== undefined) {
       notOwnSettingsFile(def.segments);
     }

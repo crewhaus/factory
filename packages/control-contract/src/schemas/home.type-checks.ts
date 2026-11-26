@@ -18,4 +18,7 @@ export type HomeSchemaTypeChecks = [
     >
   >,
   Expect<Same<z.infer<typeof S.harnessExportList>, T.HarnessExportList>>,
+  Expect<Same<z.infer<typeof S.homeStatus>, T.HomeStatus>>,
+  Expect<Same<z.infer<typeof S.homeSpend>, T.HomeSpend>>,
+  Expect<Same<z.infer<typeof S.harnessAccess>, T.HarnessAccess>>,
 ];

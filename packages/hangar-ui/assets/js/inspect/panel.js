@@ -247,8 +247,12 @@ async function drawTab(content, ref, tab, signal) {
   const body = answer.body ?? {};
   if (tab.id === "summary") {
     const harness = harnessOfRef(ref);
+    // A decision's Summary is its decision card: who decided is the server's sentence.
+    const decisionSlot =
+      ref.kind === "decision" ? el("div", { class: "inspector-decision" }) : null;
     content.replaceChildren(
       el("p", { class: "inspector-summary", text: String(body.summary ?? "") }),
+      ...(decisionSlot !== null ? [decisionSlot] : []),
       el("dl", { class: "kv" }, [
         el("dt", { text: "Revision" }),
         el("dd", { class: "mono", text: String(body.rev ?? "—") }),
@@ -260,6 +264,14 @@ async function drawTab(content, ref, tab, signal) {
           : []),
       ]),
     );
+    if (decisionSlot !== null) {
+      const [one, cards] = await Promise.all([
+        call("decisions.get", { params: { ref: refText } }),
+        import("../views/decision-card.js"),
+      ]);
+      if (signal.aborted) return;
+      if (one.ok) decisionSlot.replaceChildren(cards.renderDecisionCard(one.body));
+    }
     return;
   }
   // Technical: the ref, its kind, its revisions, and the request that resolves it.

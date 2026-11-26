@@ -590,11 +590,14 @@ const harnessEvents: V1Handler = async (ctx) => {
     });
   }
   const cursor = resumeCursor(ctx, "vector");
-  const sources: LineSource[] = ctx.streamSources.map((decl: StreamSourceDecl) => ({
-    name: decl.name,
-    source: decl.source(dir),
-    eventOf: (record) => decl.eventOf(record, entry.id),
-  }));
+  const sources: LineSource[] = ctx.streamSources.map((decl: StreamSourceDecl) => {
+    const source = decl.source(dir);
+    return {
+      name: decl.name,
+      source,
+      eventOf: (record) => decl.eventOf(record, entry.id, dir, source),
+    };
+  });
   const map: Record<string, RecordSource> = {};
   for (const s of sources) map[s.name] = s.source;
   // From now, unless the client says where it was.

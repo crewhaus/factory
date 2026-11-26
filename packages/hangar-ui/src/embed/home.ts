@@ -49,6 +49,7 @@ import supervisionJs from "../../assets/js/supervision.js" with { type: "text" }
 import badgesUiJs from "../../assets/js/ui/badges.js" with { type: "text" };
 import chartUiJs from "../../assets/js/ui/chart.js" with { type: "text" };
 import conflictUiJs from "../../assets/js/ui/conflict.js" with { type: "text" };
+import connectivityUiJs from "../../assets/js/ui/connectivity.js" with { type: "text" };
 import dialogUiJs from "../../assets/js/ui/dialog.js" with { type: "text" };
 import draftUiJs from "../../assets/js/ui/draft.js" with { type: "text" };
 import emptyUiJs from "../../assets/js/ui/empty.js" with { type: "text" };
@@ -60,8 +61,10 @@ import schemaFormUiJs from "../../assets/js/ui/schema-form.js" with { type: "tex
 import timeUiJs from "../../assets/js/ui/time.js" with { type: "text" };
 import toggleUiJs from "../../assets/js/ui/toggle.js" with { type: "text" };
 import tooltipUiJs from "../../assets/js/ui/tooltip.js" with { type: "text" };
+import versionGuardUiJs from "../../assets/js/ui/version-guard.js" with { type: "text" };
 import utilJs from "../../assets/js/util.js" with { type: "text" };
 import v1Js from "../../assets/js/v1.js" with { type: "text" };
+import accessViewJs from "../../assets/js/views/access.js" with { type: "text" };
 import activityViewJs from "../../assets/js/views/activity.js" with { type: "text" };
 import advisorViewJs from "../../assets/js/views/advisor.js" with { type: "text" };
 import channelsViewJs from "../../assets/js/views/channels.js" with { type: "text" };
@@ -70,21 +73,25 @@ import controlViewJs from "../../assets/js/views/control.js" with { type: "text"
 import costsViewJs from "../../assets/js/views/costs.js" with { type: "text" };
 import credsViewJs from "../../assets/js/views/creds.js" with { type: "text" };
 import dataViewJs from "../../assets/js/views/data.js" with { type: "text" };
+import decisionCardViewJs from "../../assets/js/views/decision-card.js" with { type: "text" };
 import deployViewJs from "../../assets/js/views/deploy.js" with { type: "text" };
 import deviceViewJs from "../../assets/js/views/device.js" with { type: "text" };
 import evalsLabViewJs from "../../assets/js/views/evals-lab.js" with { type: "text" };
 import evalsViewJs from "../../assets/js/views/evals.js" with { type: "text" };
 import feedbackViewJs from "../../assets/js/views/feedback.js" with { type: "text" };
+import harnessControlsViewJs from "../../assets/js/views/harness-controls.js" with { type: "text" };
 import healthViewJs from "../../assets/js/views/health.js" with { type: "text" };
 import homeViewJs from "../../assets/js/views/home.js" with { type: "text" };
 import inspectViewJs from "../../assets/js/views/inspect.js" with { type: "text" };
 import jobsViewJs from "../../assets/js/views/jobs.js" with { type: "text" };
+import libraryGroupViewJs from "../../assets/js/views/library-group.js" with { type: "text" };
 import libraryViewJs from "../../assets/js/views/library.js" with { type: "text" };
 import memoryFabricViewJs from "../../assets/js/views/memory-fabric.js" with { type: "text" };
 import memoryViewJs from "../../assets/js/views/memory.js" with { type: "text" };
 import modelsViewJs from "../../assets/js/views/models.js" with { type: "text" };
 import needsYouViewJs from "../../assets/js/views/needs-you.js" with { type: "text" };
 import onboardingViewJs from "../../assets/js/views/onboarding.js" with { type: "text" };
+import overviewCardsViewJs from "../../assets/js/views/overview-cards.js" with { type: "text" };
 import overviewViewJs from "../../assets/js/views/overview.js" with { type: "text" };
 import panesViewJs from "../../assets/js/views/panes.js" with { type: "text" };
 import peopleViewJs from "../../assets/js/views/people.js" with { type: "text" };
@@ -99,6 +106,7 @@ import settingsViewJs from "../../assets/js/views/settings.js" with { type: "tex
 import signInViewJs from "../../assets/js/views/sign-in.js" with { type: "text" };
 import specEditViewJs from "../../assets/js/views/spec-edit.js" with { type: "text" };
 import specViewJs from "../../assets/js/views/spec.js" with { type: "text" };
+import spendViewJs from "../../assets/js/views/spend.js" with { type: "text" };
 import thredzViewJs from "../../assets/js/views/thredz.js" with { type: "text" };
 import { type HangarAsset, asset } from "./asset";
 
@@ -157,6 +165,14 @@ export const homeAssets: Readonly<Record<string, HangarAsset>> = {
   "/assets/js/ui/time.js": asset(timeUiJs, "time.js"),
   "/assets/js/ui/toggle.js": asset(toggleUiJs, "toggle.js"),
   "/assets/js/ui/tooltip.js": asset(tooltipUiJs, "tooltip.js"),
+  "/assets/js/ui/connectivity.js": asset(connectivityUiJs, "connectivity.js"),
+  "/assets/js/ui/version-guard.js": asset(versionGuardUiJs, "version-guard.js"),
+  "/assets/js/views/access.js": asset(accessViewJs, "access.js"),
+  "/assets/js/views/decision-card.js": asset(decisionCardViewJs, "decision-card.js"),
+  "/assets/js/views/harness-controls.js": asset(harnessControlsViewJs, "harness-controls.js"),
+  "/assets/js/views/library-group.js": asset(libraryGroupViewJs, "library-group.js"),
+  "/assets/js/views/overview-cards.js": asset(overviewCardsViewJs, "overview-cards.js"),
+  "/assets/js/views/spend.js": asset(spendViewJs, "spend.js"),
   "/assets/js/util.js": asset(utilJs, "util.js"),
   "/assets/js/views/activity.js": asset(activityViewJs, "activity.js"),
   "/assets/js/views/advisor.js": asset(advisorViewJs, "advisor.js"),

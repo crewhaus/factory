@@ -271,8 +271,15 @@ export type Decision = DecisionRecordView & {
   readonly fallback?: IfUnanswered;
   readonly assignedTo?: string;
   readonly harness?: string;
+  /** The decision as `<harness>/decision/<id>`. */
+  readonly ref?: string;
   readonly choices?: readonly string[];
   readonly evidenceRefs?: readonly string[];
+  /**
+   * Who decided, in the words every surface shows: a delegated decision names its rule and
+   * revision, a person's names the person. Absent while it waits.
+   */
+  readonly decidedByText?: string;
 };
 
 export type DecisionResolved = {
@@ -324,6 +331,12 @@ export type HarnessOverview = {
   readonly stale?: boolean;
   /** How this read was served: a saved projection, or a bounded fold on the spot. */
   readonly freshness?: "projection" | "direct-fold";
+  /** The purpose the spec declares (`intent.purpose`), when it declares one. */
+  readonly purpose?: string;
+  /** The owner's display name, when Home knows one. */
+  readonly ownerLabel?: string;
+  /** What the caller may do on this harness, by control: `harnesses.get` only. */
+  readonly you?: Readonly<Record<string, boolean>>;
 };
 
 export type HarnessCapabilities = {
@@ -630,7 +643,10 @@ export type RefResolved = {
 export type HarnessList = ListEnvelope<HarnessOverview>;
 export type DeploymentList = ListEnvelope<Deployment>;
 export type RunList = ListEnvelope<Run>;
-export type DecisionList = ListEnvelope<Decision>;
+export type DecisionList = ListEnvelope<Decision> & {
+  /** The harnesses whose decisions were capped, so the list is short by them. */
+  readonly truncatedHarnesses?: readonly string[];
+};
 export type RuleList = ListEnvelope<StandingRule>;
 export type CommandList = ListEnvelope<CommandReceipt>;
 export type MemberList = ListEnvelope<Member>;

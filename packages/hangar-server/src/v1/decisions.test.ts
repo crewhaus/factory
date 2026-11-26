@@ -226,3 +226,413 @@ describe("a decision is settled only where the caller may settle it", () => {
     expect(mine.status).toBe(200);
   }, 30_000); // a member's device sign-in and ten requests through a live server
 });
+
+// ---------------------------------------------------------------------------
+// Both kinds of decision, who decided each, and a decision about a person
+// ---------------------------------------------------------------------------
+
+const DAY = 86_400_000;
+const T1 = Date.parse("2026-11-02T09:00:00.000Z");
+const HEX64 = "a".repeat(64);
+const SHA = `sha256:${"b".repeat(64)}`;
+
+/** A delegation rule row as the rules ledger keeps it. */
+function ruleRow(id: string, owner: string, hrn: string, over: Record<string, unknown> = {}) {
+  return {
+    v: 1,
+    at: new Date(T1).toISOString(),
+    id,
+    state: "enabled",
+    kind: "delegate",
+    action: "merge",
+    revision: 1,
+    scope: { harness: hrn },
+    terms: { days: 30 },
+    termsDigest: HEX64,
+    ceilingDigest: SHA,
+    policyRevision: SHA,
+    consequencesDigest: HEX64,
+    expiresAt: new Date(Date.now() + 30 * DAY).toISOString(),
+    owner,
+    by: owner,
+    cmd: "cmd_01jc0000000000000000000001",
+    ...over,
+  };
+}
+
+describe("merge and rollout decisions, and who decided", () => {
+  let kinds: V1Home;
+  let h: { id: string; dir: string };
+  let other: { id: string; dir: string };
+  let olive: { principal: string; secret: string };
+  let sam: { principal: string; secret: string };
+  let vic: { principal: string; secret: string };
+  const RULE = "rule_01jc0000000000000000000002";
+  const GRANTED = "dec_01jc0000000000000000000003";
+  const PENDING = "dec_01jc0000000000000000000004";
+  const PERSON = "appr_00000000000000e1";
+  const PEOPLE = "appr_00000000000000e2";
+  const HIDDEN = "dec_01jc0000000000000000000005";
+
+  beforeAll(async () => {
+    const { casAppend, decisionsLedger, delegationsLedger, openActionDecision } = await import(
+      "@crewhaus/control-records"
+    );
+    // A people domain that lets only the owner of Home see a person's records.
+    kinds = await v1Home({
+      domains: {
+        people: (request) =>
+          request.principal.id === request.snapshot.owner && request.ref !== undefined
+            ? { allow: true, grant: "owner-sees-people" }
+            : { allow: false, needs: request.permission, role: null },
+      },
+    });
+    h = await kinds.harness("merger", {
+      approvals: [approval(PERSON), approval(PEOPLE, { sensitivity: "people" })],
+    });
+    other = await kinds.harness("elsewhere", { approvals: [] });
+    olive = await kinds.member("Olive", "owner");
+    sam = await kinds.member("Sam", "operator", { scope: `harness:${h.id}` });
+    vic = await kinds.member("Vic", "viewer", { scope: `harness:${other.id}` });
+    // The rule: turned on by Olive, then revised once.
+    const rules = delegationsLedger(h.dir);
+    const first = await casAppend(rules, RULE, null, ruleRow(RULE, olive.principal, h.id));
+    if (!first.ok) throw new Error(first.reason);
+    const second = await casAppend(
+      rules,
+      RULE,
+      "enabled",
+      ruleRow(RULE, olive.principal, h.id, {
+        state: "revised",
+        revision: 2,
+        at: new Date(T1 + 3 * DAY).toISOString(),
+      }),
+    );
+    if (!second.ok) throw new Error(second.reason);
+    // A merge the rule decided, applied by a pass Sam ran: Sam decided nothing.
+    const subject = { ref: `${h.id}/work/wi_01jc0000000000000000000a01`, revision: "rev-1" };
+    for (const id of [GRANTED, PENDING]) {
+      const opened = await openActionDecision(h.dir, {
+        id,
+        kind: "merge",
+        subject,
+        requiredClass: "maintainer",
+        proposedBy: "sys:scheduler",
+        now: Date.now() - 60_000,
+      });
+      if (!opened.ok) throw new Error(opened.reason);
+    }
+    const granted = await casAppend(decisionsLedger(h.dir), GRANTED, "pending", {
+      id: GRANTED,
+      kind: "merge",
+      actionClass: "ship",
+      createdAt: new Date(Date.now() - 60_000).toISOString(),
+      expiresAt: new Date(Date.now() + 6 * DAY).toISOString(),
+      requiredClass: "maintainer",
+      subject,
+      proposedBy: "sys:scheduler",
+      state: "granted",
+      decision: "grant",
+      decidedAt: new Date(Date.now() - 30_000).toISOString(),
+      resolvedBy: "delegation",
+      delegation: { rule: RULE, revision: 2 },
+      appliedBy: sam.principal,
+    });
+    if (!granted.ok || !granted.applied) throw new Error("the delegated grant was not written");
+    // A decision in a harness only the owner reads.
+    const hidden = await openActionDecision(other.dir, {
+      id: HIDDEN,
+      kind: "rollout",
+      subject: { ref: `${other.id}/work/wi_01jc0000000000000000000a02`, revision: "rev-2" },
+      requiredClass: "maintainer",
+      proposedBy: "sys:scheduler",
+      now: Date.now(),
+    });
+    if (!hidden.ok) throw new Error(hidden.reason);
+    // A person decides the tool approval, through Home.
+    const decided = await kinds.call(
+      "POST",
+      `/api/v1/decisions/${h.id}/decision/${PERSON}/resolve`,
+      { body: { choice: "grant" }, secret: sam.secret },
+    );
+    if (decided.status !== 200) throw new Error(`decide: ${decided.status}`);
+  }, 60_000); // three members' device sign-ins and a live server
+
+  afterAll(async () => {
+    await kinds?.t.stop();
+  });
+
+  const items = (body: Record<string, unknown>) => body["items"] as Record<string, unknown>[];
+
+  test("the list holds both kinds, each saying who decided it in the server's words", async () => {
+    const res = await kinds.call("GET", "/api/v1/decisions");
+    expect(res.status).toBe(200);
+    const byId = new Map(items(res.body).map((row) => [row["id"], row]));
+    const merge = byId.get(GRANTED);
+    const tool = byId.get(PERSON);
+    expect(merge?.["kind"]).toBe("merge");
+    expect(merge?.["state"]).toBe("granted");
+    expect(merge?.["ref"]).toBe(`${h.id}/decision/${GRANTED}`);
+    const text = String(merge?.["decidedByText"]);
+    expect(text.startsWith("Decided by delegation rule")).toBe(true);
+    expect(text).toContain("(revision 2)");
+    expect(text).toContain("turned on by Olive");
+    expect(text).not.toContain("Sam");
+    expect(text).not.toContain(sam.principal);
+    expect(tool?.["decidedByText"]).toBe("Decided by Sam");
+    // A pending one says nothing about who decided.
+    expect(byId.get(PENDING)?.["state"]).toBe("pending");
+    expect(byId.get(PENDING)?.["decidedByText"]).toBeUndefined();
+  });
+
+  test("one decision in one harness: the scoped ref and the bare id with its harness", async () => {
+    const scoped = await kinds.call("GET", `/api/v1/decisions/${h.id}/decision/${GRANTED}`);
+    expect(scoped.status).toBe(200);
+    expect(String(scoped.body["decidedByText"])).toContain("(revision 2)");
+    const bare = await kinds.call("GET", `/api/v1/decisions/${GRANTED}?harness=${h.id}`);
+    expect(bare.status).toBe(200);
+    expect(bare.body["id"]).toBe(GRANTED);
+    const resolved = await kinds.call("GET", `/api/v1/refs/${h.id}/decision/${GRANTED}`);
+    expect(resolved.status).toBe(200);
+    expect(resolved.body["kind"]).toBe("decision");
+    expect(String(resolved.body["rev"]).startsWith("granted:")).toBe(true);
+  });
+
+  test("a caller who may not read the harness sees neither kind, and finds neither", async () => {
+    const list = await kinds.call("GET", "/api/v1/decisions", { secret: vic.secret });
+    expect(list.status).toBe(200);
+    const ids = items(list.body).map((row) => row["id"]);
+    expect(ids).not.toContain(GRANTED);
+    expect(ids).not.toContain(PERSON);
+    for (const id of [GRANTED, PERSON]) {
+      const one = await kinds.call("GET", `/api/v1/decisions/${h.id}/decision/${id}`, {
+        secret: vic.secret,
+      });
+      expect(one.status).toBe(403);
+      expect((one.body["error"] as Record<string, unknown>)["reason"]).toBe("permission");
+      expect(JSON.stringify(one.body)).not.toContain("Decided by");
+      const bare = await kinds.call("GET", `/api/v1/decisions/${id}`, { secret: vic.secret });
+      expect(bare.status).toBe(422);
+      expect(
+        (
+          ((bare.body["error"] as Record<string, unknown>)["details"] as Record<string, unknown>)[
+            "candidates"
+          ] as unknown[]
+        ).length,
+      ).toBe(0);
+    }
+  });
+
+  test("granting a pending merge decides it once; a second answer hears it was decided", async () => {
+    const at = `/api/v1/decisions/${h.id}/decision/${PENDING}/resolve`;
+    const first = await kinds.call("POST", at, { body: { choice: "grant" } });
+    expect(first.status).toBe(200);
+    const decision = first.body["decision"] as Record<string, unknown>;
+    expect(decision["state"]).toBe("granted");
+    expect(decision["kind"]).toBe("merge");
+    const again = await kinds.call("POST", at, { body: { choice: "deny" } });
+    expect(again.status).toBe(409);
+    const error = again.body["error"] as Record<string, unknown>;
+    expect(error["reason"]).toBe("already_decided");
+    expect((error["current"] as Record<string, unknown>)["decision"]).toBe("grant");
+    // A merge decision is granted or denied: it is not deferred, and nothing is written.
+    const deferred = await kinds.call(
+      "POST",
+      `/api/v1/decisions/${h.id}/decision/${GRANTED}/defer`,
+      { body: { until: new Date(Date.now() + DAY).toISOString(), reason: "scheduled" } },
+    );
+    expect(deferred.status).toBe(422);
+    expect((deferred.body["error"] as Record<string, unknown>)["reason"]).toBe("grant_or_deny");
+  });
+
+  test("a decision about a person is not found by a caller who may not see people's records", async () => {
+    const ghost = "appr_00000000000000ef";
+    // Sam reads the harness, but holds no people.derived.read.
+    const missingGet = await kinds.call("GET", `/api/v1/decisions/${h.id}/decision/${ghost}`, {
+      secret: sam.secret,
+    });
+    const peopleGet = await kinds.call("GET", `/api/v1/decisions/${h.id}/decision/${PEOPLE}`, {
+      secret: sam.secret,
+    });
+    expect(missingGet.status).toBe(404);
+    expect(peopleGet.status).toBe(404);
+    expect(peopleGet.body).toEqual(missingGet.body);
+    const missingRef = await kinds.call("GET", `/api/v1/refs/${h.id}/decision/${ghost}`, {
+      secret: sam.secret,
+    });
+    const peopleRef = await kinds.call("GET", `/api/v1/refs/${h.id}/decision/${PEOPLE}`, {
+      secret: sam.secret,
+    });
+    expect(missingRef.status).toBe(404);
+    expect((missingRef.body["error"] as Record<string, unknown>)["reason"]).toBe("ref_unknown");
+    expect(peopleRef.status).toBe(404);
+    expect(peopleRef.body).toEqual(missingRef.body);
+    const samList = await kinds.call("GET", "/api/v1/decisions", { secret: sam.secret });
+    expect(items(samList.body).map((row) => row["id"])).not.toContain(PEOPLE);
+    // The owner of Home may see it, in every route.
+    const ownerGet = await kinds.call("GET", `/api/v1/decisions/${h.id}/decision/${PEOPLE}`);
+    expect(ownerGet.status).toBe(200);
+    expect(ownerGet.body["sensitivity"]).toBe("people");
+    const ownerRef = await kinds.call("GET", `/api/v1/refs/${h.id}/decision/${PEOPLE}`);
+    expect(ownerRef.status).toBe(200);
+    const ownerList = await kinds.call("GET", "/api/v1/decisions");
+    expect(items(ownerList.body).map((row) => row["id"])).toContain(PEOPLE);
+  });
+
+  test("?harness= lists one harness; one the caller may not read lists as empty", async () => {
+    const one = await kinds.call("GET", `/api/v1/decisions?harness=${h.id}`);
+    expect(one.status).toBe(200);
+    expect(new Set(items(one.body).map((row) => row["harness"]))).toEqual(new Set([h.id]));
+    const notMine = await kinds.call("GET", `/api/v1/decisions?harness=${h.id}`, {
+      secret: vic.secret,
+    });
+    const nothing = await kinds.call("GET", `/api/v1/decisions?harness=${other.id}`, {
+      secret: sam.secret,
+    });
+    expect(notMine.status).toBe(200);
+    expect(items(notMine.body)).toEqual([]);
+    expect(nothing.status).toBe(200);
+    const shape = (body: Record<string, unknown>) => ({
+      items: body["items"],
+      empty: body["empty"],
+    });
+    expect(shape(notMine.body)).toEqual(shape(nothing.body));
+    const unknown = await kinds.call("GET", `/api/v1/decisions?owner=${h.id}`);
+    expect(unknown.status).toBe(400);
+  });
+
+  test("a harness whose approvals were capped is named in the list", async () => {
+    const many = Array.from({ length: 5002 }, (_, k) =>
+      approval(`appr_${k.toString(16).padStart(16, "0")}`),
+    );
+    const capped = await kinds.harness("capped", { approvals: many });
+    const res = await kinds.call("GET", `/api/v1/decisions?harness=${capped.id}&limit=5`);
+    expect(res.status).toBe(200);
+    expect(res.body["truncatedHarnesses"]).toEqual([capped.id]);
+    const whole = await kinds.call("GET", `/api/v1/decisions?harness=${h.id}`);
+    expect(whole.body["truncatedHarnesses"]).toBeUndefined();
+  }, 20_000); // five thousand approvals written and folded
+
+  test("a record naming a door Home does not know answers it as unknown, and a stored local id is never shown", async () => {
+    const odd = await kinds.harness("odd-door", {
+      approvals: [
+        approval("appr_00000000000000ea", {
+          decision: "grant",
+          decidedAt: STAMP,
+          decidedVia: "carrier-pigeon",
+        }),
+        approval("appr_00000000000000eb", {
+          decision: "deny",
+          decidedAt: STAMP,
+          decidedBy: `local:#${"e".repeat(64)}`,
+          decidedByPrincipal: `local:#${"e".repeat(64)}`,
+          decidedVia: "cli",
+        }),
+      ],
+    });
+    const local = await kinds.call(
+      "GET",
+      `/api/v1/decisions/${odd.id}/decision/appr_00000000000000eb`,
+    );
+    expect(local.body["decidedByText"]).toBe("Decided by a person");
+    expect(local.body["decidedVia"]).toBe("cli");
+    const res = await kinds.call(
+      "GET",
+      `/api/v1/decisions/${odd.id}/decision/appr_00000000000000ea`,
+    );
+    expect(res.status).toBe(200);
+    expect(res.body["decision"]).toBe("grant");
+    expect(res.body["decidedVia"]).toBe("unknown");
+    // Nobody Home can name decided it: the text says a person, never a stored id.
+    expect(res.body["decidedByText"]).toBe("Decided by a person");
+  });
+});
+
+describe("a list of decisions still waiting", () => {
+  test("only what waits, kept before the page is cut: an older request is never lost behind settled ones", async () => {
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    const settled = [1, 2, 3, 4, 5].map((n) =>
+      approval(`appr_00000000000000f${n}`, {
+        createdAt: new Date(Date.now() - n * 1000).toISOString(),
+        decision: "grant",
+        decidedAt: STAMP,
+      }),
+    );
+    const busy = await home.harness("busy", {
+      approvals: [...settled, approval("appr_00000000000000f9", { createdAt: old })],
+    });
+    const all = await home.call("GET", `/api/v1/decisions?harness=${busy.id}&limit=5`);
+    expect((all.body["items"] as Record<string, unknown>[]).map((r) => r["state"])).not.toContain(
+      "pending",
+    );
+    const waiting = await home.call(
+      "GET",
+      `/api/v1/decisions?harness=${busy.id}&state=pending&limit=5`,
+    );
+    expect(waiting.status).toBe(200);
+    const rows = waiting.body["items"] as Record<string, unknown>[];
+    expect(rows.map((r) => r["id"])).toEqual(["appr_00000000000000f9"]);
+    expect(waiting.body["truncated"]).toBeUndefined();
+    const odd = await home.call("GET", `/api/v1/decisions?harness=${busy.id}&state=granted`);
+    expect(odd.status).toBe(400);
+    expect((odd.body["error"] as Record<string, unknown>)["reason"]).toBe("state");
+  });
+});
+
+describe("deciding on a harness Home governs", () => {
+  test("decided only while the harness's list of who may decide is in place", async () => {
+    const { openActionDecision } = await import("@crewhaus/control-records");
+    const { refreshApproverProjections } = await import("@crewhaus/access-control");
+    const { rmSync } = await import("node:fs");
+    const gov = await v1Home();
+    try {
+      const g = await gov.harness("governed", { approvals: [] });
+      const sam = await gov.member("Sam", "operator", { scope: `harness:${g.id}` });
+      const subject = { ref: `${g.id}/work/wi_01jc0000000000000000000b01`, revision: "rev-1" };
+      const [first, second] = ["dec_01jc0000000000000000000b02", "dec_01jc0000000000000000000b03"];
+      for (const id of [first, second]) {
+        const opened = await openActionDecision(g.dir, {
+          id,
+          kind: "merge",
+          subject,
+          requiredClass: "maintainer",
+          proposedBy: "sys:scheduler",
+          now: Date.now() - 60_000,
+        });
+        if (!opened.ok) throw new Error(opened.reason);
+      }
+      const synced = await refreshApproverProjections(gov.t.hangarRoot, {
+        harnesses: [{ id: g.id, dir: g.dir, groups: [] }],
+        now: Date.now(),
+      });
+      expect(synced.projections.failed).toEqual([]);
+      const listFile = join(g.dir, ".crewhaus", "run", "control", "approvers.json");
+      expect(existsSync(listFile)).toBe(true);
+      const decide = (id: string) =>
+        gov.call("POST", `/api/v1/decisions/${g.id}/decision/${id}/resolve`, {
+          body: { choice: "grant" },
+          secret: sam.secret,
+        });
+      // With the list in place, an operator may not grant a merge that needs a maintainer.
+      const refused = await decide(first);
+      expect(refused.status).toBe(403);
+      expect((refused.body["error"] as Record<string, unknown>)["reason"]).toBe("decider");
+      // With it gone, nothing is decided until it is back.
+      rmSync(listFile);
+      const before = receiptLines(g.dir, "decisions.resolve").length;
+      const held = await decide(second);
+      expect(held.status).toBe(409);
+      const error = held.body["error"] as Record<string, unknown>;
+      expect(error["reason"]).toBe("approvers_unsynced");
+      expect(String(error["remedy"])).toContain("crewhaus access sync");
+      const states = receiptLines(g.dir, "decisions.resolve")
+        .slice(before)
+        .map((r) => r["state"]);
+      expect(states[states.length - 1]).toBe("rejected");
+      const after = await gov.call("GET", `/api/v1/decisions/${g.id}/decision/${second}`);
+      expect(after.body["state"]).toBe("pending");
+    } finally {
+      await gov.t.stop();
+    }
+  }, 30_000); // a second booted Home and a member's device sign-in
+});

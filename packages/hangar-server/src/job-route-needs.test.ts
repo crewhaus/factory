@@ -944,6 +944,7 @@ describe("every job route carries what it checked into the job's start-time chec
         "v1/budget.ts get",
         "v1/decisions.ts decisionCommand",
         "v1/delegations.ts list",
+        "v1/harnesses.ts get",
         "v1/home.ts seesHostPaths",
         "v1/meta.ts me",
         "v1/meta.ts resolvePrincipal",

@@ -482,6 +482,8 @@ export const decision = z
       .optional(),
     decidedByPrincipal: storedActor.optional(),
     decidedVia: z.string().optional(),
+    // Who decided, in the words every surface shows: the server's, never composed by a client.
+    decidedByText: z.string().optional(),
     // A fresh request's id, or the run whose cancel withdrew this one (`run-cancelled`).
     supersededBy: z.union([decisionId, canonicalRunId]).optional(),
     supersededReason: oneOf(
@@ -510,6 +512,7 @@ export const decision = z
     fallback: oneOf(IF_UNANSWERED).optional(),
     assignedTo: storedActor.optional(),
     harness: harnessId.optional(),
+    ref: refString.optional(),
     choices: z.array(z.string()).optional(),
     evidenceRefs: z.array(z.string()).optional(),
     terms: standingRuleTerms.optional(),
@@ -539,7 +542,18 @@ export const decision = z
   })
   .passthrough();
 
-export const decisionList = listOf(decision);
+/** The harnesses whose decisions were capped are named, so a short list never reads as whole. */
+export const decisionList = listOf(decision).extend({
+  truncatedHarnesses: z.array(harnessId).optional(),
+});
+
+/**
+ * `decisions.list`'s query: a page, optionally of one harness, and optionally only the
+ * decisions still waiting (`state: "pending"`, kept before the page is cut).
+ */
+export const decisionListQuery = listQuery
+  .extend({ harness: harnessId.optional(), state: z.literal("pending").optional() })
+  .strict();
 
 export const decisionResolveRequest = z
   .object({
@@ -642,6 +656,9 @@ export const harnessOverview = z
     asOf: timestamp.optional(),
     stale: z.boolean().optional(),
     freshness: z.enum(["projection", "direct-fold"]).optional(),
+    purpose: z.string().optional(),
+    ownerLabel: z.string().optional(),
+    you: z.record(z.boolean()).optional(),
   })
   .passthrough();
 
@@ -1154,6 +1171,7 @@ export const CORE_SCHEMAS: Readonly<Record<string, z.ZodTypeAny>> = {
   decisionBinding,
   decisionDeferRequest,
   decisionList,
+  decisionListQuery,
   decisionOverlays,
   decisionResolveRequest,
   decisionResolved,

@@ -55,6 +55,7 @@ const MAX_BODY_BYTES = 256 * 1024;
 /** The query names each request schema takes; an operation with a `{ref}`, `{cmd}` or `{run}` also takes `harness`. */
 const QUERY_NAMES: Readonly<Record<string, readonly string[]>> = {
   listQuery: ["limit", "cursor"],
+  decisionListQuery: ["limit", "cursor", "harness", "state"],
   streamQuery: ["after"],
   noBody: [],
   attentionListQuery: ["harness", "kind", "band", "state", "limit", "cursor"],

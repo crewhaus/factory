@@ -120,9 +120,10 @@ describe("the gate is every route", () => {
     }
   });
 
-  test("the toured screens are twelve of them, each a route the gate holds", () => {
-    expect(TOURED_TEMPLATES.length).toBe(12);
-    expect(new Set(TOURED_TEMPLATES).size).toBe(12);
+  test("the toured screens are sixteen of them, each a route the gate holds", () => {
+    // Spend, Access, a harness's Setup › Access and Connections › Hosts joined the twelve.
+    expect(TOURED_TEMPLATES.length).toBe(16);
+    expect(new Set(TOURED_TEMPLATES).size).toBe(16);
     for (const template of TOURED_TEMPLATES) {
       expect(`${template}:${GATED.includes(template)}`).toBe(`${template}:true`);
     }

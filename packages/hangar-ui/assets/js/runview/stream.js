@@ -59,11 +59,20 @@ export function streamPath(run, harness) {
 }
 
 /**
- * Open one connection. `lastEventId` resumes after that cursor. Answers
+ * Open one connection: a run's stream, or any other v1 stream `path` names (Home's
+ * fleet stream, a harness's). `lastEventId` resumes after that cursor. Answers
  * `{close}`; `onEnd(reason)` gets `"ended"`, `"dropped"`, `"refused:<status>"`
  * or `"closed"` (this side closed it).
  */
-export function openRunStream({ run, harness, lastEventId = null, onFrame, onEnd, fetchImpl }) {
+export function openRunStream({
+  run,
+  harness,
+  path = null,
+  lastEventId = null,
+  onFrame,
+  onEnd,
+  fetchImpl,
+}) {
   const controller = new AbortController();
   let ended = false;
   const end = (reason) => {
@@ -80,7 +89,10 @@ export function openRunStream({ run, harness, lastEventId = null, onFrame, onEnd
       headers["Last-Event-ID"] = lastEventId;
     let res;
     try {
-      res = await doFetch(streamPath(run, harness), { headers, signal: controller.signal });
+      res = await doFetch(path ?? streamPath(run, harness), {
+        headers,
+        signal: controller.signal,
+      });
     } catch {
       end(controller.signal.aborted ? "closed" : "dropped");
       return;
