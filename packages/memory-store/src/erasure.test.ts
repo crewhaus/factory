@@ -300,6 +300,16 @@ describe("a purge holds the store's locks", () => {
     expect(live()).toBe("theirs\n");
   });
 
+  test("a live file rewritten in place under it, keeping its inode, is left as it is", async () => {
+    const s = store();
+    const { id } = await s.remember(MARKER);
+    _setPurgeSeamsForTest({
+      beforeFinalRead: () => writeFileSync(join(root, `${SPEC}.jsonl`), "theirs\n"),
+    });
+    await expect(purge(at(), [id], grantFor([id]))).rejects.toThrow("was replaced while");
+    expect(live()).toBe("theirs\n");
+  });
+
   test("a compaction that read the file before a purge does not bring the fact back", async () => {
     const s = store();
     const keep = await s.remember("keep me");

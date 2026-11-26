@@ -233,16 +233,23 @@ async function eraseFacts(
     if (first !== undefined && liveLines.some((text) => concerns(parseLine(text), ids))) {
       const end = first.bytes.lastIndexOf(0x0a) + 1;
       await seams.beforeFinalRead?.();
-      // What a writer that went round a stolen lock appended meanwhile is kept.
-      const tail = readFrom(end);
-      if (tail === undefined || tail.ino !== first.ino) {
+      // What a writer that went round a stolen lock appended meanwhile is kept. The file is
+      // the same one only when its inode and every byte already read are unchanged: a file
+      // system can give a new file the inode of one just removed.
+      const again = readFrom(0);
+      if (
+        again === undefined ||
+        again.ino !== first.ino ||
+        again.bytes.length < end ||
+        !again.bytes.subarray(0, end).equals(first.bytes.subarray(0, end))
+      ) {
         throw new MemoryStoreError(
           `${fileName} in ${root} was replaced while it was being erased; nothing in it was changed`,
         );
       }
       const all = [
         ...split(first.bytes.subarray(0, end).toString("utf8")),
-        ...split(tail.bytes.toString("utf8")),
+        ...split(again.bytes.subarray(end).toString("utf8")),
       ];
       const kept = all.filter((text) => !concerns(parseLine(text), ids));
       rewrite(fileName, kept);
