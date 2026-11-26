@@ -14,7 +14,7 @@ const ROOT = join(import.meta.dir, "..", "..", "..");
 const SELF = "@crewhaus/compile-service";
 
 describe("who depends on the compile service", () => {
-  test("exactly the CLI; a later consumer adds itself here", () => {
+  test("exactly the CLI and Home's server; a later consumer adds itself here", () => {
     const dependents: string[] = [];
     let read = 0;
     for (const group of ["packages", "apps"]) {
@@ -37,7 +37,7 @@ describe("who depends on the compile service", () => {
       }
     }
     expect(read).toBeGreaterThan(100);
-    expect(dependents.sort()).toEqual(["crewhaus"]);
+    expect(dependents.sort()).toEqual(["@crewhaus/hangar-server", "crewhaus"]);
   });
 
   test("no compiled bundle of any shape lists it", () => {

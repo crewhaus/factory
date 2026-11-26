@@ -1346,6 +1346,7 @@
         "@crewhaus/attention": "workspace:*",
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
+        "@crewhaus/compile-service": "workspace:*",
         "@crewhaus/continuity-store": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
