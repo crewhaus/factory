@@ -44,9 +44,10 @@ import {
 } from "node:fs";
 import { appendFileSync } from "node:fs";
 import { hostname } from "node:os";
-import { basename, dirname } from "node:path";
+import { basename, dirname, isAbsolute, relative } from "node:path";
 import { CANONICAL_RUN_ID_RE } from "@crewhaus/control-contract";
-import { argvMatchesCommandLine, startTimesMatch } from "./process-ops";
+import { appendRecord, openRecordFd, readAt } from "@crewhaus/control-records";
+import { startTimesMatch } from "./process-ops";
 import { type Scrubber, noopScrubber, scrubDeep } from "./scrub";
 import { START_TIME_TOLERANCE_MS } from "./types";
 
@@ -292,6 +293,11 @@ export type LogPumpOptions = {
    * sits in the events file. Default: beside the events file.
    */
   readonly runIndexFile?: string;
+  /**
+   * The folder the run index must stay inside (the harness): it is written and read only
+   * as a file proven inside it, never through a link. Default: the index's own folder.
+   */
+  readonly root?: string;
 };
 
 export const DEFAULT_MAX_CHUNK_BYTES = 1024 * 1024;
@@ -448,13 +454,15 @@ export function readPumpLease(lockFile: string): PumpLease | undefined {
 /**
  * Whether a lease may be broken: a lease is kept only while a crewhaus manager provably
  * holds it. That is, the lease names this host; its pid is alive (or the platform would
- * not say); it records the holder's start time and command line; and the process now
- * running under that pid started at that time and runs that command, as far as the
- * platform can tell. A lease that records no start time or no command line, another
- * host's lease (it cannot be probed from here), a pid that now has another start time, and
- * a pid that now runs another program may all be broken. When the platform would not say
- * the start time or the command line, that check is passed: two live managers must never
- * both write. Its age never frees it: a pump runs as long as its run does.
+ * not say); it records the holder's start time and a manager's command line (`crewhaus`
+ * or `bun`, then a manager verb, {@link MANAGER_VERBS}); and the process now running
+ * under that pid started at that time and runs that command, word for word
+ * ({@link commandLineRuns}), as far as the platform can tell. A lease that records no
+ * start time or no manager's command line, another host's lease (it cannot be probed from
+ * here), a pid that now has another start time, and a pid that now runs another program
+ * may all be broken. When the platform would not say the start time or the command line,
+ * that check is passed: two live managers must never both write. Its age never frees it:
+ * a pump runs as long as its run does.
  */
 export function pumpLeaseUnproven(
   lease: PumpLease,
@@ -465,14 +473,71 @@ export function pumpLeaseUnproven(
   if (lease.host !== host) return true;
   if (probe.isAlive(lease.pid) === false) return true;
   if (lease.pidStartTimeMs === undefined) return true;
-  const argv = (lease.argv ?? []).filter((word) => word !== "");
-  if (argv.length === 0) return true;
+  const argv = wordsOf(lease.argv ?? []);
+  if (!namesManager(argv)) return true;
   const observed = probe.startTimeMs(lease.pid);
   if (observed !== undefined && !startTimesMatch(observed, lease.pidStartTimeMs, toleranceMs)) {
     return true;
   }
   const line = probe.commandLine?.(lease.pid);
-  if (line !== undefined && !argvMatchesCommandLine(line, argv)) return true;
+  if (line !== undefined && !commandLineRuns(line, argv)) return true;
+  return false;
+}
+
+/** The executables a crewhaus manager runs as: the compiled CLI, or Bun running its source. */
+export const MANAGER_EXECUTABLES: ReadonlySet<string> = new Set([
+  "crewhaus",
+  "crewhaus.exe",
+  "bun",
+  "bun.exe",
+]);
+
+/** The CLI verbs whose process supervises runs and pumps their traces. */
+export const MANAGER_VERBS: ReadonlySet<string> = new Set(["hangar", "daemon"]);
+
+/** A command line's words: split on whitespace, each without the quotes a shell or Windows adds. */
+function wordsOf(parts: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const part of parts) {
+    for (const word of part.split(/\s+/)) {
+      const bare = word.replace(/^"+|"+$/g, "");
+      if (bare !== "") out.push(bare);
+    }
+  }
+  return out;
+}
+
+/** The last path segment of a word, by either separator. */
+function baseName(word: string): string {
+  const parts = word.split(/[\\/]/);
+  return parts[parts.length - 1] ?? word;
+}
+
+/** Whether recorded words name a crewhaus manager: its executable, then a manager verb. */
+function namesManager(argv: readonly string[]): boolean {
+  const [exe, ...rest] = argv;
+  if (exe === undefined || !MANAGER_EXECUTABLES.has(exe)) return false;
+  return rest.some((word) => MANAGER_VERBS.has(word));
+}
+
+/**
+ * Whether the command line the OS shows runs the recorded words, by whole words: the
+ * first recorded word is the name of an observed word (the executable, shown by its
+ * path), and the rest follow it as consecutive whole words, the script a Bun-run manager
+ * names allowed between the two.
+ */
+export function commandLineRuns(commandLine: string, argv: readonly string[]): boolean {
+  const seen = wordsOf([commandLine]);
+  const words = wordsOf(argv);
+  const [exe, ...rest] = words;
+  if (exe === undefined) return false;
+  for (let i = 0; i < seen.length; i++) {
+    if (baseName(seen[i] as string) !== exe) continue;
+    if (rest.length === 0) return true;
+    for (let j = i + 1; j + rest.length <= seen.length; j++) {
+      if (rest.every((word, k) => seen[j + k] === word)) return true;
+    }
+  }
   return false;
 }
 
@@ -559,14 +624,40 @@ export function parseRunIndex(text: string): RunIndexEntry[] {
   return out;
 }
 
+/** Where a run index sits for the contained reads and writes: its root, and its path there. */
+type IndexPlace = { readonly root: string; readonly rel: string };
+
+function indexPlace(runIndexFile: string, root: string | undefined): IndexPlace | undefined {
+  if (root === undefined) return { root: dirname(runIndexFile), rel: basename(runIndexFile) };
+  const rel = relative(root, runIndexFile);
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel) ? { root, rel } : undefined;
+}
+
 /** The runs an index names below `eventsBytes`: what is already indexed and still there. */
-function indexedRuns(runIndexFile: string, eventsBytes: number): Set<string> {
-  const text = readSmallRecord(runIndexFile, RUN_INDEX_MAX_BYTES);
+function indexedRuns(place: IndexPlace | undefined, eventsBytes: number): Set<string> {
   const out = new Set<string>();
-  if (text === undefined) return out;
+  if (place === undefined) return out;
+  const opened = openRecordFd(place.root, place.rel);
+  if (!opened.ok) return out;
+  let text: string;
+  try {
+    if (opened.stats.size > RUN_INDEX_MAX_BYTES) return out;
+    const buf = Buffer.alloc(opened.stats.size);
+    const got = readAt(opened.fd, buf, buf.length, 0);
+    text = buf.subarray(0, got).toString("utf8");
+  } finally {
+    closeSync(opened.fd);
+  }
   for (const entry of parseRunIndex(text)) if (entry.off < eventsBytes) out.add(entry.run);
   return out;
 }
+
+/**
+ * This process's start, from its own clock: asking the OS can mean starting a helper
+ * program, which can time out, and the clock's answer is within the start-time tolerance
+ * of what any probe later reads for this pid.
+ */
+const OWN_START_MS = Date.now() - process.uptime() * 1000;
 
 export type LogPump = {
   /** Consume everything new, persist events, advance the cursor. */
@@ -612,6 +703,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
   const ownHost = options.host ?? hostname();
   const ownArgv = (options.argv ?? ownCommandArgv()).slice(0, LEASE_ARGV_MAX);
   const runIndexFile = options.runIndexFile ?? runIndexPathFor(options.eventsFile);
+  const indexAt = indexPlace(runIndexFile, options.root);
   const ownId = randomBytes(8).toString("hex");
   let held = false;
   /** The canonical runs the index already names, read back when the lease is taken. */
@@ -629,7 +721,8 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       if (readPumpLease(lockFile)?.pump === ownId) return true;
       held = false;
     }
-    const started = probe.startTimeMs(ownPid);
+    // This process's own start comes from its clock; the probe answers for other pids.
+    const started = ownPid === process.pid ? OWN_START_MS : probe.startTimeMs(ownPid);
     const lease: PumpLease = {
       v: 1,
       pid: ownPid,
@@ -652,7 +745,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
     held = true;
     // Another pump may have advanced the cursor since this one read it.
     cursor = readCursor(options.cursorFile) ?? cursor;
-    indexed = indexedRuns(runIndexFile, currentEventsBytes());
+    indexed = indexedRuns(indexAt, currentEventsBytes());
     return true;
   };
 
@@ -688,11 +781,13 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       off += Buffer.byteLength(line, "utf8");
     }
     appendFileSync(options.eventsFile, lines.join(""), { mode: 0o600 });
-    if (firsts.length > 0) {
+    // Written only as a file proven inside the root; when it is refused, a reader without
+    // an index entry scans the events file instead.
+    if (firsts.length > 0 && indexAt !== undefined) {
       try {
-        appendFileSync(runIndexFile, firsts.join(""), { mode: 0o600 });
+        appendRecord(indexAt.root, indexAt.rel, firsts.join(""));
       } catch {
-        // A reader without an index entry scans the events file instead.
+        // As refused.
       }
     }
     return currentEventsBytes();
@@ -801,7 +896,7 @@ export function createLogPump(options: LogPumpOptions): LogPump {
       }
       // Index entries past the cut no longer count: their runs are indexed again as their
       // events are derived again.
-      indexed = indexedRuns(runIndexFile, cursor.eventsBytes);
+      indexed = indexedRuns(indexAt, cursor.eventsBytes);
     },
     close: releaseLease,
   };

@@ -162,6 +162,8 @@ export type RunIndex = {
   /** `payload.kind` of each compaction line, by its span. */
   readonly compactionKind: ReadonlyMap<string, string>;
   readonly tools: readonly ToolCall[];
+  /** Each tool call by the `tool_use` line that opened it. */
+  readonly toolByUse: ReadonlyMap<SessionLine, ToolCall>;
   readonly verdicts: readonly VerdictInfo[];
   readonly manifests: readonly SessionLine[];
   /** The session turn of each line, when it can be told. */
@@ -320,7 +322,9 @@ export function indexRun(loaded: LoadedRun): RunIndex {
   const tools = toolCallsOf(lines, spans);
   const toolBySpan = new Map<string, ToolCall>();
   const toolByCall = new Map<number, ToolCall>();
+  const toolByUse = new Map<SessionLine, ToolCall>();
   for (const tool of tools) {
+    toolByUse.set(tool.use, tool);
     if (tool.span !== undefined) toolBySpan.set(tool.span, tool);
     if (tool.call !== undefined && !toolByCall.has(tool.call)) toolByCall.set(tool.call, tool);
   }
@@ -356,6 +360,7 @@ export function indexRun(loaded: LoadedRun): RunIndex {
     unfinished,
     compactionKind,
     tools,
+    toolByUse,
     verdicts,
     manifests,
     turnOf,

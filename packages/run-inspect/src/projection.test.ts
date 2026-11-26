@@ -108,4 +108,34 @@ describe("the inspect read model", () => {
     expect(summary.status.value).toMatchObject({ state: "failed", failureClass: "billing" });
     expect(summary.execution.value).toEqual({ id: "run_00000000000000c1" });
   });
+
+  test("a summary from the model equals one from the ledger: a records-off channel run that moved executions", () => {
+    const run = runId(5);
+    const rows = [
+      {
+        id: run,
+        state: "running",
+        at: "2026-11-14T11:00:00.000Z",
+        session: SESSION,
+        sessionAt: 0,
+        execution: "run_00000000000000a1",
+        trigger: { kind: "channel", via: "gateway", source: { platform: "slack" } },
+      },
+      { id: run, state: "running", execution: "run_00000000000000b2" },
+      { id: run, state: "succeeded", at: "2026-11-14T11:00:05.000Z" },
+    ];
+    // Run records were off: the session's lines name no run.
+    const text = `${JSON.stringify({ ts: 1, kind: "user_message", payload: { content: "hi" } })}\n`;
+    const model = items(rows).reduce(foldInspectModel, emptyInspectModel());
+    const summaryFrom = (given: ReadonlyArray<Readonly<Record<string, unknown>>>) => {
+      const loaded = loadedRunFromText(text, { now: NOW, session: SESSION, run, rows: given });
+      if (!loaded.ok) throw new Error(loaded.message);
+      return foldSummary(loaded);
+    };
+    const scanned = summaryFrom(rows);
+    const fromModel = summaryFrom([...(rowsFromModel(model, run)?.values() ?? [])].flat());
+    expect(scanned.trigger.value).toMatchObject({ platform: "slack", via: "gateway" });
+    expect(scanned.execution.value).toEqual({ id: "run_00000000000000a1" });
+    expect(fromModel).toEqual(scanned);
+  });
 });

@@ -62,6 +62,7 @@ import {
   rowsFromModel,
   runLinesOf,
   runsOfWork,
+  timelineAll,
 } from "@crewhaus/run-inspect";
 import { REDACTED_VALUE, isCredentialKey } from "@crewhaus/spec-patch";
 import { readHarnessEnvFiles } from "../env-file";
@@ -355,7 +356,7 @@ const request: V1Handler = async (ctx) => {
           : "The request that started this run.",
     verb: `crewhaus commands show ${cmd}`,
     ...(receipt !== undefined ? { receipt } : {}),
-    ...(content ? { input } : { hidden: ["content"] }),
+    ...(content ? { input } : { hidden: ["content"], gaps: [NO_ACCESS] }),
   });
 };
 
@@ -363,30 +364,18 @@ const exportRun: V1Handler = async (ctx) => {
   const { found, dir } = located(ctx);
   const loaded = load(dir, found.runId, ctx);
   const view = foldSummary(loaded);
+  // The whole timeline, built once and cut here.
+  const all = timelineAll(loaded, "full");
   const entries: TimelineEntry[] = [];
   let bytes = 0;
-  let truncated = false;
-  let before: string | undefined;
-  for (;;) {
-    const page = foldTimeline(loaded, {
-      view: "full",
-      limit: 500,
-      ...(before !== undefined ? { before } : {}),
-    });
-    if ("ok" in page) throw refusalError(page);
-    for (const entry of page.entries) {
-      bytes += JSON.stringify(entry).length;
-      if (entries.length >= EXPORT_MAX_ENTRIES || bytes > EXPORT_MAX_BYTES) {
-        truncated = true;
-        break;
-      }
-      entries.push(entry);
-    }
-    if (truncated || page.next === undefined) {
-      truncated ||= page.truncated;
+  let truncated = all.truncated;
+  for (const entry of all.entries) {
+    bytes += JSON.stringify(entry).length;
+    if (entries.length >= EXPORT_MAX_ENTRIES || bytes > EXPORT_MAX_BYTES) {
+      truncated = true;
       break;
     }
-    before = page.next;
+    entries.push(entry);
   }
   return answer(
     dir,

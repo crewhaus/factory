@@ -31,12 +31,28 @@ export type InspectRunSkeleton = {
   failureClass?: string;
   /** The approval the run waits on, when it waits on one. */
   decision?: string;
-  /** What started it: the trigger's kind, its lane and whether a wake did. */
+  /**
+   * What started it, from its first row: the trigger's kind, its lane, the door it came
+   * through, the channel's platform and whether a wake did.
+   */
   trigger?: string;
   lane?: string;
+  via?: string;
+  platform?: string;
   synthetic?: true;
+  /** A newer row's trigger, while the newest row carries one: the summary reads it first. */
+  newestTrigger?: TriggerSkeleton;
   startedAt?: string;
   endedAt?: string;
+};
+
+/** A run row's trigger, its codes only. */
+export type TriggerSkeleton = {
+  kind: string;
+  lane?: string;
+  via?: string;
+  platform?: string;
+  synthetic?: true;
 };
 
 export type InspectModel = {
@@ -63,6 +79,28 @@ function codeOf(value: unknown): string | undefined {
 
 function matching(value: unknown, re: RegExp): string | undefined {
   return typeof value === "string" && re.test(value) ? value : undefined;
+}
+
+/** A row's trigger as the skeleton keeps it; `undefined` when it records none. */
+function triggerSkeletonOf(value: unknown): TriggerSkeleton | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const t = value as Readonly<Record<string, unknown>>;
+  const kind = codeOf(t["kind"]);
+  if (kind === undefined) return undefined;
+  const lane = codeOf(t["lane"]);
+  const via = codeOf(t["via"]);
+  const source = t["source"];
+  const platform =
+    typeof source === "object" && source !== null && !Array.isArray(source)
+      ? codeOf((source as Readonly<Record<string, unknown>>)["platform"])
+      : undefined;
+  return {
+    kind,
+    ...(lane !== undefined ? { lane } : {}),
+    ...(via !== undefined ? { via } : {}),
+    ...(platform !== undefined ? { platform } : {}),
+    ...(t["synthetic"] === true ? { synthetic: true as const } : {}),
+  };
 }
 
 export function emptyInspectModel(): InspectModel {
@@ -93,6 +131,7 @@ export function foldInspectModel(state: InspectModel, item: ResumeItem): Inspect
   const runState = codeOf(row["state"]);
   if (id === undefined || runState === undefined) return state;
   let skeleton = Object.hasOwn(state.runs, id) ? state.runs[id] : undefined;
+  const trigger = triggerSkeletonOf(row["trigger"]);
   if (skeleton === undefined) {
     const ids = Object.keys(state.runs);
     if (ids.length >= INSPECT_MODEL_MAX) {
@@ -103,8 +142,17 @@ export function foldInspectModel(state: InspectModel, item: ResumeItem): Inspect
       unlisted(state.bySession, oldest);
       state.truncated = true;
     }
+    // The first row's trigger: the one a summary reads when the newest row has none.
     skeleton = { state: runState };
+    if (trigger !== undefined) {
+      const { kind, ...first } = trigger;
+      Object.assign(skeleton, { trigger: kind, ...first });
+    }
     state.runs[id] = skeleton;
+  } else if (trigger !== undefined) {
+    skeleton.newestTrigger = trigger;
+  } else {
+    Reflect.deleteProperty(skeleton, "newestTrigger");
   }
   skeleton.state = runState;
   const at = typeof row["at"] === "string" && CODE_RE.test(row["at"]) ? row["at"] : undefined;
@@ -124,8 +172,9 @@ export function foldInspectModel(state: InspectModel, item: ResumeItem): Inspect
   ) {
     skeleton.sessionAt = sessionAt;
   }
+  // The first execution its rows name, as the folds read it.
   const execution = matching(row["execution"], EXECUTION_ID_RE);
-  if (execution !== undefined) skeleton.execution = execution;
+  if (execution !== undefined && skeleton.execution === undefined) skeleton.execution = execution;
   const parent = matching(row["parent"], CANONICAL_RUN_ID_RE);
   if (parent !== undefined && skeleton.parent === undefined) {
     skeleton.parent = parent;
@@ -133,8 +182,10 @@ export function foldInspectModel(state: InspectModel, item: ResumeItem): Inspect
   }
   const continues = matching(row["continues"], CANONICAL_RUN_ID_RE);
   if (continues !== undefined) skeleton.continues = continues;
+  // As the newest row says: the summary reads the state's companions from it.
   const continuedIn = matching(row["continuedIn"], CANONICAL_RUN_ID_RE);
   if (continuedIn !== undefined) skeleton.continuedIn = continuedIn;
+  else Reflect.deleteProperty(skeleton, "continuedIn");
   const workItem = matching(row["workItem"], WORK_ID_RE);
   if (workItem !== undefined && skeleton.workItem === undefined) {
     skeleton.workItem = workItem;
@@ -142,36 +193,43 @@ export function foldInspectModel(state: InspectModel, item: ResumeItem): Inspect
   }
   const failureClass = codeOf(row["failureClass"]);
   if (failureClass !== undefined) skeleton.failureClass = failureClass;
+  else Reflect.deleteProperty(skeleton, "failureClass");
   const decision = codeOf(row["decision"]);
   if (decision !== undefined) skeleton.decision = decision;
-  const trigger = row["trigger"];
-  if (typeof trigger === "object" && trigger !== null && !Array.isArray(trigger)) {
-    const t = trigger as Readonly<Record<string, unknown>>;
-    const kind = codeOf(t["kind"]);
-    if (kind !== undefined) skeleton.trigger = kind;
-    const lane = codeOf(t["lane"]);
-    if (lane !== undefined) skeleton.lane = lane;
-    if (t["synthetic"] === true) skeleton.synthetic = true;
-  }
   return state;
 }
 
-/** A skeleton as the run row `loadRun` reads. */
+/** A trigger skeleton as a run row records it. */
+function triggerRowOf(t: TriggerSkeleton): Readonly<Record<string, unknown>> {
+  const { platform, ...rest } = t;
+  return { ...rest, ...(platform !== undefined ? { source: { platform } } : {}) };
+}
+
+/** A skeleton as the run row `loadRun` reads: the trigger the summary would read. */
 function rowOf(id: string, skeleton: InspectRunSkeleton): RunRow {
-  const { trigger, lane, synthetic, startedAt: _startedAt, endedAt: _endedAt, ...rest } = skeleton;
-  return {
-    id,
-    ...rest,
-    ...(trigger !== undefined
+  const {
+    trigger,
+    lane,
+    via,
+    platform,
+    synthetic,
+    newestTrigger,
+    startedAt: _startedAt,
+    endedAt: _endedAt,
+    ...rest
+  } = skeleton;
+  const first: TriggerSkeleton | undefined =
+    trigger !== undefined
       ? {
-          trigger: {
-            kind: trigger,
-            ...(lane !== undefined ? { lane } : {}),
-            ...(synthetic === true ? { synthetic } : {}),
-          },
+          kind: trigger,
+          ...(lane !== undefined ? { lane } : {}),
+          ...(via !== undefined ? { via } : {}),
+          ...(platform !== undefined ? { platform } : {}),
+          ...(synthetic === true ? { synthetic } : {}),
         }
-      : {}),
-  };
+      : undefined;
+  const shown = newestTrigger ?? first;
+  return { id, ...rest, ...(shown !== undefined ? { trigger: triggerRowOf(shown) } : {}) };
 }
 
 /**

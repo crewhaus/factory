@@ -4,6 +4,7 @@
  * the filesystem.
  */
 import { closeSync } from "node:fs";
+import { join } from "node:path";
 import {
   CANONICAL_RUN_ID_RE,
   type CursorPosition,
@@ -24,6 +25,7 @@ import {
   openContained,
   readForward,
   scanBackForWakeMarkers,
+  sessionsPlace,
 } from "./lines";
 import { type InspectGap, type InspectRefusal, type InspectSubject, refusal } from "./model";
 
@@ -57,6 +59,7 @@ export type RunMode = "stamped" | "records-off" | "legacy" | "unread";
 export type LoadedRun = {
   readonly ok: true;
   readonly subject: InspectSubject;
+  /** The run's session; empty for a run whose rows name none yet (queued, or failed first). */
   readonly session: string;
   readonly run?: string;
   readonly mode: RunMode;
@@ -352,8 +355,10 @@ function continuationOf(
  * from the row's `sessionAt` (a session id reads the whole log), the decision log of the
  * session root, and, when the run names a supervised execution, that execution's events
  * for the run. The session root is the one `containedSessionRoot` answers for the
- * harness; a root outside the harness is refused, and the session log is opened only as
- * a file proven inside it.
+ * harness; a root outside the harness is refused, and the session log and the decision
+ * log are opened only as files proven inside the harness when they open. A run whose rows
+ * name no session yet (queued or preparing, or failed before it had one) reads no
+ * transcript: its records are its rows, with a `not-recorded` gap.
  *
  * A run whose stamp (or, with run records off, whose row) says an operator's wake started
  * it, read from `sessionAt`, also gets a look-behind: at most 64 KiB backward from
@@ -382,7 +387,10 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
     return refusal("invalid", "--run goes with a session id, not a run id");
   }
   const root = containedSessionRoot(harnessDir, input.envVars);
-  if (root === undefined) {
+  // Every read below is rooted at the harness, so the folder checked here cannot be
+  // swapped for a link out of it before the reads.
+  const place = root !== undefined ? sessionsPlace(harnessDir, root) : undefined;
+  if (root === undefined || place === undefined) {
     return refusal(
       "unsupported",
       "this harness's sessions folder lies outside the harness directory, so its records are not read",
@@ -404,6 +412,9 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
   let session: string;
   let readFrom = 0;
   let pinnedRun: string | undefined;
+  // A run queued or preparing, or one that failed before it had a session: its rows are
+  // all there is to read.
+  let sessionless = false;
   if (byRunRef) {
     const rows = ledger.byRun.get(ref) ?? [];
     if (rows.length === 0) {
@@ -414,16 +425,11 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
       );
     }
     const found = sessionOf(rows);
-    if (found === undefined) {
-      return refusal(
-        "not_found",
-        `run ${ref} names no session, so it has no transcript to read`,
-        `crewhaus runs show ${ref}`,
-      );
-    }
-    session = found;
+    sessionless = found === undefined;
+    session = found ?? "";
     readFrom = sessionAtOf(rows) ?? 0;
     pinnedRun = ref;
+    if (sessionless) gaps.push({ reason: "not-recorded" });
   } else {
     session = ref;
   }
@@ -433,11 +439,13 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
     if (sessionOf(rows) === session) rowRuns.push({ run: id, at: sessionAtOf(rows) ?? 0 });
   }
 
-  const opened = openContained(root, `${session}.jsonl`);
+  const opened = sessionless ? undefined : openContained(place, `${session}.jsonl`);
   let lines: readonly SessionLine[] = [];
   let markers: readonly SessionLine[] = [];
   let readTo = readFrom;
-  if (!opened.ok) {
+  if (opened === undefined) {
+    // No transcript to open: the summary answers from the rows.
+  } else if (!opened.ok) {
     if (!opened.missing) return refusal("unsupported", opened.reason);
     if (rowRuns.length === 0) {
       return refusal(
@@ -489,7 +497,9 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
   const rows = run !== undefined ? (ledger.byRun.get(run) ?? []) : [];
   const shaped = shape({ session, run, lines, rows, byRun: ledger.byRun, sessionRuns });
 
-  const decisionRead = readDecisionLog(root);
+  const decisionRead = sessionless
+    ? { lines: [], skipped: 0, truncated: false }
+    : readDecisionLog(join(place.harness, place.rel), { within: place.harness });
   if (decisionRead.skipped > 0) gaps.push({ reason: "torn", count: decisionRead.skipped });
   if (decisionRead.truncated) gaps.push({ reason: "truncated" });
   const decisions = decisionRead.lines
@@ -504,7 +514,12 @@ export function loadRun(input: LoadRunInput): LoadedRun | InspectRefusal {
       : undefined;
   return {
     ok: true,
-    subject: run !== undefined ? { kind: "run", run, session } : { kind: "legacy", session },
+    subject:
+      run === undefined
+        ? { kind: "legacy", session }
+        : sessionless
+          ? { kind: "run", run }
+          : { kind: "run", run, session },
     session,
     ...(run !== undefined ? { run } : {}),
     mode: shaped.mode,

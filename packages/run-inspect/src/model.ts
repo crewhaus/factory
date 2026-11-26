@@ -120,7 +120,8 @@ export function refusal(
 
 /** What is inspected: one run, or a session whose runs cannot be told apart. */
 export type InspectSubject =
-  | { readonly kind: "run"; readonly run: string; readonly session: string }
+  /** `session` is absent while the run's rows name none (queued, or failed before one). */
+  | { readonly kind: "run"; readonly run: string; readonly session?: string }
   | { readonly kind: "legacy"; readonly session: string };
 
 /** A run's status in words: always a word, never a colour alone. */

@@ -258,6 +258,76 @@ describe("the inspection area", () => {
     expect(errorOf(why.body)["needs"]).toBe("h.read.content");
   });
 
+  test("without the content right, the request and session views leave content out and say so", async () => {
+    const c = await cliHarness("inspect-gated-request");
+    const asked = ["Gated", "input", "7c4e"].join(" ");
+    const started = await home.call("POST", `/api/v1/harnesses/${c.id}/runs`, {
+      body: { input: asked },
+    });
+    expect(started.status).toBe(202);
+    const run = String((started.body["run"] as Record<string, unknown>)["id"]);
+    const reader = await home.service("inspect-gated-reader", [c.id, h.id], {
+      permissions: ["h.read"],
+    });
+    const request = await home.call("GET", `/api/v1/runs/${run}/request`, {
+      secret: reader.secret,
+    });
+    expect(request.status).toBe(200);
+    expect(request.body["present"]).toBe(true);
+    expect("input" in request.body).toBe(false);
+    expect(request.body["hidden"]).toEqual(["content"]);
+    expect((request.body["gaps"] as Array<{ reason: string }>).map((g) => g.reason)).toEqual([
+      "no-access",
+    ]);
+    expect(JSON.stringify(request.body)).not.toContain(asked);
+    expect(responseOf("inspect.request")?.safeParse(request.body).success).toBe(true);
+    const session = await home.call(
+      "GET",
+      `/api/v1/harnesses/${h.id}/sessions/${SESSION}/inspect`,
+      { secret: reader.secret },
+    );
+    expect(session.status).toBe(200);
+    const summary = session.body["summary"] as Record<string, unknown>;
+    for (const field of ["asked", "outcome", "wake"]) expect(field in summary).toBe(false);
+    expect(summary["hidden"]).toEqual(["content"]);
+    expect((summary["gaps"] as Array<{ reason: string }>).map((g) => g.reason)).toContain(
+      "no-access",
+    );
+    expect(JSON.stringify(session.body)).not.toContain("please check the notes");
+  }, 20_000); // a run started, a sign-in and two reads
+
+  test("a run with no session yet is explained from its rows: queued, or failed while preparing", async () => {
+    const early = await home.harness("inspect-early");
+    const at = new Date(AT).toISOString();
+    const [queued, failed] = [mintRunId(), mintRunId()];
+    for (const row of [
+      { id: queued, state: "queued", at, trigger: { kind: "api" } },
+      { id: failed, state: "preparing", at, trigger: { kind: "api" } },
+      { id: failed, state: "failed", at, failureClass: "compile" },
+    ]) {
+      if (!append(runsLedger(early.dir), row).ok) throw new Error("row not written");
+    }
+    for (const [run, state] of [
+      [queued, "queued"],
+      [failed, "failed"],
+    ] as const) {
+      expect((await home.call("GET", `/api/v1/runs/${run}`)).status).toBe(200);
+      const summary = await home.call("GET", `/api/v1/runs/${run}/inspect`);
+      expect([run, summary.status]).toEqual([run, 200]);
+      expect(responseOf("inspect.summary")?.safeParse(summary.body).success).toBe(true);
+      expect(summary.body["status"]).toMatchObject({ value: { state } });
+      expect(summary.body["trigger"]).toMatchObject({ value: { kind: "api" } });
+      expect((summary.body["gaps"] as Array<{ reason: string }>).map((g) => g.reason)).toContain(
+        "not-recorded",
+      );
+      const page = await home.call("GET", `/api/v1/runs/${run}/timeline`);
+      expect(page.status).toBe(200);
+      expect(page.body).toMatchObject({ entries: [], empty: "no-data" });
+    }
+    const failedSummary = await home.call("GET", `/api/v1/runs/${failed}/inspect`);
+    expect(failedSummary.body["status"]).toMatchObject({ value: { failureClass: "compile" } });
+  });
+
   test("the query takes only its own names; a bad view is 400 naming view", async () => {
     const bogus = await home.call("GET", `/api/v1/runs/${RUN}/timeline?bogus=1`);
     expect(bogus.status).toBe(400);

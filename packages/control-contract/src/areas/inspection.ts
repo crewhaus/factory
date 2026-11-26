@@ -272,6 +272,8 @@ export type InspectRequestAnswer = {
   readonly receipt?: Loose;
   readonly input?: { readonly source: InspectInputSource; readonly text: string } | null;
   readonly hidden?: InspectHidden;
+  /** `no-access` when the input was left out for want of the right to read content. */
+  readonly gaps?: readonly InspectGapView[];
 };
 
 /** `inspect.export`: the run's records as one JSON document to save. */

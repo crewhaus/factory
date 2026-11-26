@@ -106,6 +106,7 @@ export const inspectRequest = z
       .nullable()
       .optional(),
     hidden,
+    gaps: gaps.optional(),
   })
   .passthrough();
 

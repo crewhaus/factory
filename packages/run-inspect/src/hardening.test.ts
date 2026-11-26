@@ -9,6 +9,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import {
   appendFileSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   realpathSync,
@@ -26,6 +27,8 @@ import {
   LogBuilder,
   NOW,
   SESSION,
+  apprId,
+  decisionLine,
   harnessWith,
   removeFixtures,
   runId,
@@ -40,6 +43,7 @@ import {
   foldWhy,
   loadRun,
   loadedRunFromText,
+  timelineAll,
 } from "./index";
 
 const outsideDirs: string[] = [];
@@ -154,6 +158,88 @@ describe("the session log is opened only as a file proven inside the sessions fo
   });
 });
 
+describe("the run's records are read only as files proven inside the harness", () => {
+  /** A harness and, outside it, a sessions folder holding a canary log and decision line. */
+  function swappable() {
+    const run = runId(1);
+    const b = new LogBuilder();
+    simpleRun(b, run, 0x100);
+    const { dir, sessions } = harnessWith({
+      log: b.text(),
+      rows: [{ id: run, state: "succeeded", session: SESSION, sessionAt: 0 }],
+      decisions: [decisionLine("park", apprId(1), { runId: run })],
+    });
+    const outside = realpathSync(mkdtempSync(join(tmpdir(), "run-inspect-outside-")));
+    outsideDirs.push(outside);
+    const canary = new LogBuilder();
+    simpleRun(canary, runId(2), 0x200, { ask: "CANARY-OUTSIDE" });
+    writeFileSync(join(outside, `${SESSION}.jsonl`), canary.text());
+    const segments = join(outside, "approvals.d", "decisions");
+    mkdirSync(segments, { recursive: true });
+    writeFileSync(
+      join(segments, "000001.jsonl"),
+      `${JSON.stringify(decisionLine("park", apprId(7), { runId: run }))}\n`,
+    );
+    const swap = () => {
+      renameSync(sessions, `${sessions}.moved`);
+      symlinkSync(outside, sessions);
+    };
+    return { run, dir, swap };
+  }
+
+  test("a sessions folder swapped for a link out after the root was checked: the log is refused, nothing outside read", () => {
+    const { run, dir, swap } = swappable();
+    let swapped = 0;
+    // The swap lands after the root's check and the ledger read, as the log is opened.
+    _setIoTapForTest({
+      open: (given) => {
+        if (!given.endsWith(`${SESSION}.jsonl`) || swapped > 0) return;
+        swapped += 1;
+        swap();
+      },
+    });
+    const reads: Array<[number, number]> = [];
+    let answer: ReturnType<typeof loadRun>;
+    try {
+      answer = loadRun({
+        harnessDir: dir,
+        ref: run,
+        envVars: {},
+        now: NOW,
+        onRead: (position, length) => reads.push([position, length]),
+      });
+    } finally {
+      _setIoTapForTest(undefined);
+    }
+    expect(swapped).toBe(1);
+    expect(answer).toMatchObject({ ok: false, code: "unsupported" });
+    expect((answer as { message: string }).message).toContain("leads out");
+    expect(reads).toEqual([]);
+    expect(JSON.stringify(answer)).not.toContain("CANARY");
+  });
+
+  test("swapped as the decision log is read: no outside decision is read", () => {
+    const { run, dir, swap } = swappable();
+    let swapped = 0;
+    _setIoTapForTest({
+      open: (given) => {
+        if (!given.includes("approvals.d") || swapped > 0) return;
+        swapped += 1;
+        swap();
+      },
+    });
+    let loaded: LoadedRun;
+    try {
+      loaded = load(dir, run);
+    } finally {
+      _setIoTapForTest(undefined);
+    }
+    expect(swapped).toBe(1);
+    expect(loaded.decisions).toEqual([]);
+    expect(JSON.stringify(loaded)).not.toContain(apprId(7));
+  });
+});
+
 describe("free text in a fixed line is one line", () => {
   test("a marker reason holding a newline and U+202E is flat in the summary and the timeline", () => {
     const b = new LogBuilder();
@@ -245,6 +331,29 @@ describe("a run with nothing read", () => {
     const reasons = foldSummary(loaded).gaps.map((g) => g.reason);
     expect(reasons).toContain("evicted");
     expect(reasons).not.toContain("records-off");
+  });
+
+  test("a run whose rows name no session yet answers from its rows", () => {
+    const [queued, failed] = [runId(1), runId(2)];
+    const { dir } = harnessWith({
+      rows: [
+        { id: queued, state: "queued", trigger: { kind: "api" } },
+        { id: failed, state: "preparing", trigger: { kind: "api" } },
+        { id: failed, state: "failed", failureClass: "compile" },
+      ],
+    });
+    const q = load(dir, queued);
+    expect(q.mode).toBe("unread");
+    const summary = foldSummary(q);
+    expect(summary.subject).toEqual({ kind: "run", run: queued });
+    expect(summary.status.value).toMatchObject({ state: "queued" });
+    expect(summary.trigger.value).toMatchObject({ kind: "api" });
+    expect(summary.gaps.map((g) => g.reason)).toContain("not-recorded");
+    expect(foldTimeline(q, { view: "full" })).toMatchObject({ entries: [], empty: "no-data" });
+    expect(foldSummary(load(dir, failed)).status.value).toMatchObject({
+      state: "failed",
+      failureClass: "compile",
+    });
   });
 
   test("a run whose lines carry its id but whose stamp is missing keeps those lines", () => {
@@ -453,4 +562,90 @@ describe("paging after an entry", () => {
       code: "invalid",
     });
   });
+});
+
+describe("the timeline's work grows with the run, not with its square", () => {
+  /** A run of `n` session lines and `n` execution events between them, in time. */
+  function busyRun(n: number): LoadedRun {
+    const run = runId(1);
+    const b = new LogBuilder();
+    for (let i = 0; i < n; i++) b.add("user_message", { content: `ask ${i}` }, { run });
+    const loaded = fromText(b.text(), run);
+    const t0 = NOW - 60_000;
+    const entries = Array.from({ length: n }, (_, i) => ({
+      off: i * 100,
+      event: {
+        kind: "tool_call_end",
+        runId: run,
+        toolName: "Bash",
+        isError: false,
+        // Between session lines i and i + 1, newest last.
+        timestamp: new Date(t0 + 10 * (i + 1) + 5).toISOString(),
+      },
+    }));
+    return {
+      ...loaded,
+      executionEvents: {
+        present: true,
+        pruned: false,
+        entries,
+        truncated: false,
+        torn: 0,
+        from: "index",
+      },
+    };
+  }
+
+  /** How many elements `find` and `findIndex` visit while `fn` runs. */
+  function visits(fn: () => void): number {
+    const proto = Array.prototype as unknown as Record<string, unknown>;
+    const saved = { find: proto["find"], findIndex: proto["findIndex"] };
+    let count = 0;
+    for (const name of ["find", "findIndex"] as const) {
+      const real = saved[name] as (this: unknown[], p: (...a: unknown[]) => unknown) => unknown;
+      proto[name] = function (this: unknown[], predicate: (...a: unknown[]) => unknown) {
+        return real.call(this, (...args: unknown[]) => {
+          count += 1;
+          return predicate(...args);
+        });
+      };
+    }
+    try {
+      fn();
+    } finally {
+      proto["find"] = saved.find;
+      proto["findIndex"] = saved.findIndex;
+    }
+    return count;
+  }
+
+  test("2 000 lines and 2 000 events are placed in one pass, in time order", () => {
+    const loaded = busyRun(2_000);
+    let all: ReturnType<typeof timelineAll> | undefined;
+    const work = visits(() => {
+      all = timelineAll(loaded);
+    });
+    // Linear in the run: a few visits per entry at most.
+    expect(work).toBeLessThan(20_000);
+    const ids = (all?.entries ?? []).map((entry) => entry.id);
+    expect(ids.filter((id) => id.startsWith("x:"))).toHaveLength(2_000);
+    // Newest first: the last event, then the last line, and so on down.
+    expect(ids.slice(0, 2)).toEqual(["x:199900", `s:${ids[1]?.slice(2)}`]);
+    expect(ids.at(-1)?.startsWith("s:")).toBe(true);
+    // The same entries a page-by-page read gives.
+    const paged: string[] = [];
+    let before: string | undefined;
+    for (;;) {
+      const page = foldTimeline(loaded, {
+        view: "full",
+        limit: 500,
+        ...(before ? { before } : {}),
+      });
+      if ("ok" in page) throw new Error(page.message);
+      paged.push(...page.entries.map((entry) => entry.id));
+      if (page.next === undefined) break;
+      before = page.next;
+    }
+    expect(paged).toEqual(ids);
+  }, 20_000); // eight folds of a 4 000-entry run
 });

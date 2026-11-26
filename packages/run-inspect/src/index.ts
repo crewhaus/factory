@@ -111,6 +111,7 @@ export {
   TIMELINE_MAX_LIMIT,
   type TimelineOptions,
   foldTimeline,
+  timelineAll,
 } from "./fold-timeline";
 export { foldSpanTree } from "./fold-spans";
 export { WHY_ACTION_RE, foldWhy } from "./fold-why";

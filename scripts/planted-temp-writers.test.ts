@@ -176,8 +176,8 @@ const APPEND_EXEMPT: Readonly<Record<string, Exemption>> = {
     reason: `a supervised harness's log under .crewhaus/run. ${APPEND_FOLLOW_UP}`,
   },
   "packages/harness-supervisor/src/trace-pump.ts": {
-    sites: 2,
-    reason: `the trace pump's events file and its run index, beside it under .crewhaus/run. ${APPEND_FOLLOW_UP}`,
+    sites: 1,
+    reason: `the trace pump's events file under .crewhaus/run. ${APPEND_FOLLOW_UP}`,
   },
   "packages/smoke-harness/src/runtime.ts": {
     sites: 1,

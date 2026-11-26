@@ -23,7 +23,7 @@
  * store is handed a session root and never learns which harness owns it, and inside
  * a tenant scope every path it writes must stay under the tenant's session root.
  */
-import { join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import {
   APPROVAL_ID_RE,
   type CursorPosition,
@@ -68,6 +68,19 @@ export const PLACES_DIGEST_LABEL = "decision.places";
 export const BINDING_DIGEST_LABEL = "decision.binding";
 /** The label of an unlinked local actor's stored form, `local:#<digest>`. */
 export const LOCAL_ACTOR_LABEL = "local-actor";
+
+/** The session root's ledger, rooted at `within`, which holds it; `undefined` when it does not. */
+function ledgerWithin(within: string, rootDir: string): Ledger | undefined {
+  const base = resolve(within);
+  const rel = relative(base, resolve(rootDir));
+  if (rel.startsWith("..") || isAbsolute(rel)) return undefined;
+  return {
+    root: base,
+    records: { dir: join(rel, DECISION_LOG_DIR) },
+    lock: join(rel, APPROVALS_LOCK_FILE),
+    claims: join(rel, APPROVALS_CLAIMS_DIR),
+  };
+}
 
 /** The session root's ledger: its log segments, its lock and its claims. */
 export function approvalsLedger(rootDir: string): Ledger {
@@ -284,19 +297,25 @@ function isDecisionLogLine(record: Readonly<Record<string, unknown>>): boolean {
  *
  * Read-only: it takes no lock and no claim, reads no key, and creates nothing; a root
  * with no decision log answers no lines. Pass the root `containedSessionRoot` answers
- * for the harness, never one taken from a request.
+ * for the harness, never one taken from a request. With `within` (the harness), every
+ * segment is opened as a file proven inside `within`, so a session root swapped for a
+ * link out of it after it was checked is read as no log; `rootDir` must lie inside it.
  *
  * First consumer: `@crewhaus/run-inspect`, which shows an approval's later outcome.
  */
 export function readDecisionLog(
   rootDir: string,
-  options: { readonly maxLines?: number } = {},
+  options: { readonly maxLines?: number; readonly within?: string } = {},
 ): DecisionLogRead {
   const maxLines = options.maxLines ?? DECISION_LOG_READ_MAX;
   if (!Number.isInteger(maxLines) || maxLines < 1) {
     throw new RangeError("session-store: maxLines must be a whole number of at least 1");
   }
-  const ledger = approvalsLedger(rootDir);
+  const ledger =
+    options.within !== undefined ? ledgerWithin(options.within, rootDir) : approvalsLedger(rootDir);
+  if (ledger === undefined) {
+    throw new RangeError("session-store: a decision log read within a folder reads inside it");
+  }
   const newestFirst: DecisionLogEntry[] = [];
   let skipped = 0;
   let visited = 0;

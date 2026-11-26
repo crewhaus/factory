@@ -7,10 +7,12 @@
 import { type Stats, lstatSync, readSync } from "node:fs";
 import { type AcquireFileLockOptions, withFileLock } from "@crewhaus/infra-utils";
 import {
+  type AppendResult,
   type ContainedFd,
   type ContainedRead,
   type SafeFsCode,
   type SafeFsFailure,
+  appendContained,
   openForReadFd,
   openForReadSync,
 } from "@crewhaus/tool-safety/fs";
@@ -54,6 +56,22 @@ export function openRecordFd(root: string, given: string, followLeafSymlink = fa
 export function readRecordFile(root: string, given: string, maxBytes: number): ContainedRead {
   tap.open?.(given);
   return openForReadSync(root, given, { maxBytes, followLeafSymlink: false });
+}
+
+/**
+ * Append `text` to a record contained to `root`: a link at the name, or one on the way
+ * there that leads out of the root, is refused, and so is a file with another name (a
+ * hard link). A file this creates is `mode` (default `0600`). Its parent must exist.
+ *
+ * First consumer: harness-supervisor's per-execution run index (`<exec>.runs.jsonl`).
+ */
+export function appendRecord(
+  root: string,
+  given: string,
+  text: string,
+  mode = 0o600,
+): AppendResult {
+  return appendContained(root, given, text, { mode, hardLinks: "refuse" });
 }
 
 /**

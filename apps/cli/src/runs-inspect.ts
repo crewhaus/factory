@@ -166,7 +166,9 @@ function summaryLines(summary: InspectSummary, harnessFlag: string | undefined):
   const status = summary.status.value;
   const subject =
     summary.subject.kind === "run"
-      ? `Run ${summary.subject.run} · session ${summary.subject.session}`
+      ? summary.subject.session !== undefined
+        ? `Run ${summary.subject.run} · session ${summary.subject.session}`
+        : `Run ${summary.subject.run} · no session yet`
       : `Session ${summary.subject.session} (its runs can't be told apart)`;
   const facts = [
     summary.startedAt !== undefined ? `started ${summary.startedAt}` : undefined,

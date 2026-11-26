@@ -1044,6 +1044,7 @@ export function createHarnessSupervisor(options: SupervisorOptions): HarnessSupe
       eventsFile: runEventsPath(options.harnessDir, id),
       cursorFile: runCursorPath(options.harnessDir, id),
       lockFile: runPumpLockPath(options.harnessDir, id),
+      root: options.harnessDir,
       probe: options.ops,
       pid: ownerPid,
       scrub,
