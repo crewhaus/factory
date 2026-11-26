@@ -31,6 +31,7 @@ are the run ledger and the receipts. Directories are created only on a write pat
 | `operator.json` | whether intake is paused and the deployment disabled |
 | `approvers.json` | the harness's copy of who may decide what, Home's address (`homeUrl`) when the owner set one, and the Home root whose access records wrote it (`accessRoot`) |
 | `runs/NNNNNN.jsonl` | the run ledger (`runsLedger(harnessDir)`, on the run machine) |
+| `attention/NNNNNN.jsonl` | what people did about inbox items (`attentionActionsLedger(harnessDir)`, on no machine): ids, closed codes and times |
 
 `controlPaths(harnessDir).heartbeatFile` is `.crewhaus/run/control-heartbeat.json`, beside the control
 token and outside `control/`: when a daemon last said it was alive.

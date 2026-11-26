@@ -1910,6 +1910,19 @@ export const FEDERATION_SCHEMA: ParseArgsSchema = {
   ],
 };
 
+// `crewhaus deploy approve <spec> --env <env>`: one answer to a protected environment's
+// approval (deploy-approve-cmd.ts).
+export const DEPLOY_APPROVE_SCHEMA: ParseArgsSchema = {
+  flags: [
+    { name: "env", takesValue: true },
+    { name: "version", takesValue: true },
+    { name: "deny", takesValue: false },
+    { name: "harness", takesValue: true },
+    { name: "json", takesValue: false },
+    { name: "help", short: "h" },
+  ],
+};
+
 // `crewhaus deploy activate [<dep>]` / `crewhaus deploy list`: a harness's deployment
 // records. The handlers in deploy-activate-cmd.ts read the same flags.
 export const DEPLOY_ACTIVATE_SCHEMA: ParseArgsSchema = {

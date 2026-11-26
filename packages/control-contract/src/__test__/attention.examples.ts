@@ -1,5 +1,5 @@
 /** One minimal valid value per attention schema, with ids from the real minters. */
-import { attIdFromDigest, attentionRef, encodeCursor } from "../index.js";
+import { attIdFromDigest, attentionRef, encodeCursor, mintId } from "../index.js";
 
 const AT = "2026-11-07T00:00:00.000Z";
 const HRN = "hrn_0123456789abcdef";
@@ -24,9 +24,46 @@ const ITEM = {
   freshness: { asOf: AT, mode: "direct-fold" },
 };
 
+const RECEIPT = {
+  id: mintId("cmd"),
+  v: 1,
+  kind: "attention.resolve",
+  actor: mintId("prn"),
+  target: `home/harness/${HRN}`,
+  via: "home",
+  fingerprint: "ab",
+  state: "succeeded",
+  acceptedAt: AT,
+  effects: [],
+  retry: { retryable: false, safety: "never" },
+};
+
 export const EXAMPLES = {
+  attentionActed: {
+    receipt: RECEIPT,
+    ref: attentionRef(ATT),
+    harness: HRN,
+    event: "resolved",
+    state: "resolved",
+  },
+  attentionAssignRequest: { to: mintId("prn") },
+  attentionDeferRequest: { until: AT, reason: "scheduled" },
+  attentionDismissRequest: { reasonCode: "known", note: "seen before" },
+  attentionMessageRequest: { text: "Waiting on the vendor." },
+  attentionMessages: {
+    ref: attentionRef(ATT),
+    items: [{ at: AT, by: mintId("prn"), via: "home", text: "Waiting on the vendor." }],
+  },
+  attentionNoteRequest: {},
+  attentionResolveRequest: { choice: "grant", expect: "open" },
+  attentionSnoozeRequest: { harness: HRN, until: AT },
   attentionItem: ITEM,
-  attentionList: { items: [ITEM], snapshotAt: CURSOR, unreachable: [HRN] },
+  attentionList: {
+    items: [ITEM],
+    snapshotAt: CURSOR,
+    unreachable: [HRN],
+    you: [{ harness: HRN, act: true, class: "maintainer", content: false, can: ["h.deploy"] }],
+  },
   attentionListQuery: { kind: "permission", state: "open", limit: 10 },
   attentionMetrics: {
     since: AT,

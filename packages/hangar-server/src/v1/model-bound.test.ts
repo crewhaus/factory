@@ -104,8 +104,9 @@ describe("every free-text request field says whether it reaches a model", () => 
   test("the walk finds every such row, and each declares every such field", () => {
     const walked = undeclared(OPERATIONS);
     expect(walked.missing).toEqual([]);
-    // The core's rows, and three work rows whose text a person or a caller writes.
-    expect(walked.checked).toBe(21);
+    // The core's rows, three work rows whose text a person or a caller writes, and the five
+    // inbox rows that take a person's note or message.
+    expect(walked.checked).toBe(26);
   });
 
   test("a planted undeclared field is caught", () => {

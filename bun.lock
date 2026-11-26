@@ -26,6 +26,7 @@
         "@crewhaus/audit-log": "workspace:*",
         "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/canary-controller": "workspace:*",
+        "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/chunker": "workspace:*",
         "@crewhaus/claim-ledger": "workspace:*",
         "@crewhaus/cloud-adapter-flyio": "workspace:*",
@@ -350,13 +351,19 @@
       "name": "@crewhaus/attention",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/access-control": "workspace:*",
         "@crewhaus/control-contract": "workspace:*",
         "@crewhaus/control-records": "workspace:*",
+        "@crewhaus/control-service": "workspace:*",
+        "@crewhaus/deployment-controller": "workspace:*",
         "@crewhaus/feedback-distill": "workspace:*",
         "@crewhaus/harness-advice": "workspace:*",
         "@crewhaus/preflight": "workspace:*",
         "@crewhaus/session-store": "workspace:*",
         "@crewhaus/tool-safety": "workspace:*",
+      },
+      "devDependencies": {
+        "@crewhaus/checkpoint-store": "workspace:*",
       },
     },
     "packages/audit-encryption": {
@@ -845,9 +852,12 @@
       "version": "0.8.3",
       "dependencies": {
         "@crewhaus/audit-log": "workspace:*",
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/ir": "workspace:*",
         "@crewhaus/spec-registry": "workspace:*",
+        "@crewhaus/tool-safety": "workspace:*",
       },
     },
     "packages/docker-images": {
@@ -1169,8 +1179,11 @@
       "name": "@crewhaus/feedback-distill",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/control-contract": "workspace:*",
+        "@crewhaus/control-records": "workspace:*",
         "@crewhaus/dataset-registry": "workspace:*",
         "@crewhaus/eval-dataset": "workspace:*",
+        "@crewhaus/event-log": "workspace:*",
         "@crewhaus/pii-redactor": "workspace:*",
       },
     },
@@ -1292,6 +1305,7 @@
       "name": "@crewhaus/graph-engine",
       "version": "0.8.3",
       "dependencies": {
+        "@crewhaus/boundary-classifier": "workspace:*",
         "@crewhaus/checkpoint-store": "workspace:*",
         "@crewhaus/errors": "workspace:*",
         "@crewhaus/run-context": "workspace:*",

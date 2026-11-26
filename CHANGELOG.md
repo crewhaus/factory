@@ -952,6 +952,21 @@ these on: they reach every harness that uses what each one names.
   `internal_error`. Sending the same request again starts a new run that
   spends again, so a client that retries a 429 should check `retryable` first.
 
+- **A graph run paused for a decision says so, and is resumed once.** A pause
+  records in the run's `_meta.json` (`pendingHitl`) which checkpoint waits, and
+  a resume clears it. A pause can be resumed once, and only where the run waits:
+  a second resume answers that it was already decided, and one naming another
+  checkpoint, or a run that recorded a pause and waits nowhere now, that the run
+  is not waiting there. A resume started for one pause never settles another:
+  `crewhaus runs resume` and Home bind it to the pause they read as waiting (or
+  the one `--checkpoint` names), and the build's engine, told it in
+  `CREWHAUS_GRAPH_RESUME_CHECKPOINT`, refuses to resume the run anywhere else.
+  The decision is checked at `api` before the paused node reads it: one the
+  check refuses fails the resume, and the pause still waits. A run
+  whose resumed step fails is run again from its checkpoint with
+  `--branch-from`. It reaches a `graph` harness with `hitl:` nodes once it is
+  compiled again.
+
 ## [0.8.3] - 2026-11-15
 
 A Cloudflare Worker built with `crewhaus compile --emit-as cf-worker` answers

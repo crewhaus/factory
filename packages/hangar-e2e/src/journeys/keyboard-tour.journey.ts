@@ -41,8 +41,7 @@ const fail = (what: string): never => {
 };
 
 /** The addresses this tour uses, by what they are. */
-const APPROVALS = "#/home/needs-you?type=approvals";
-const REVIEW = "#/home/needs-you?type=review";
+const REQUESTS = "#/home/needs-you?kind=permission";
 const CHANGES = "#/home/changes";
 
 async function activeIs(page: Page, handle: JSHandle): Promise<boolean> {
@@ -76,20 +75,6 @@ async function until(page: Page, what: string, check: () => Promise<boolean>): P
       : `<${active.tagName.toLowerCase()} class="${active.className}"> ${(active.textContent ?? "").trim().slice(0, 40)}`;
   });
   fail(`never happened: ${what} (focus is on ${focus}, at ${page.url()})`);
-}
-
-/** Every grant the browser sends, counted. */
-function grantCounter(page: Page): () => number {
-  let grants = 0;
-  page.on("request", (request) => {
-    if (
-      request.method() === "POST" &&
-      /\/approvals\/[^/]+\/grant$/.test(new URL(request.url()).pathname)
-    ) {
-      grants += 1;
-    }
-  });
-  return () => grants;
 }
 
 /** The sign-in screen by keyboard alone: focus starts on its heading, every control is
@@ -544,44 +529,85 @@ async function commandMenu(session: Session, starts: () => number): Promise<void
   if (starts() !== 1) fail(`Run it sent ${starts()} starts, not 1`);
 }
 
+/** Verdicts sent: `attention.resolve`, whatever the choice. */
+function verdictCounter(page: Page): () => number {
+  let n = 0;
+  page.on("request", (request) => {
+    if (request.method() === "POST" && /\/attention\/[^?]+\/resolve$/.test(request.url())) n += 1;
+  });
+  return () => n;
+}
+
+/** The refs of the cards shown, in order, and the one that has focus. */
+async function cards(page: Page): Promise<{ readonly refs: string[]; readonly focused: string }> {
+  return await page.evaluate(() => ({
+    refs: [...document.querySelectorAll(".attention-card")].map(
+      (row) => row.getAttribute("data-ref") ?? "",
+    ),
+    focused: document.activeElement?.getAttribute("data-ref") ?? "",
+  }));
+}
+
 async function inbox(session: Session, harness: RouteHarness): Promise<void> {
   const { page } = session;
-  const grants = grantCounter(page);
-  const row = '.inbox-card[tabindex="0"]';
-  await freshVisit(session, APPROVALS);
+  const verdicts = verdictCounter(page);
+  const row = '.attention-card[tabindex="0"]';
+  const CONFIRM = "dialog[open] .attention-form";
+  const dialogs = () => page.locator("dialog[open]").count();
+  await freshVisit(session, REQUESTS);
+  const before = await cards(page);
+  if (before.refs.length !== 3) fail(`${before.refs.length} requests are shown, not 3`);
+
+  // A letter opens the confirm step, on its button, and sends nothing; Escape cancels it.
   await page.locator(row).focus();
   await page.keyboard.press("g");
-  await waitFor(page, ".inbox-armed", "the armed prompt");
-  if (grants() !== 0) fail("g alone sent a grant");
-  await until(page, "the polite region to say what Enter will do", async () =>
-    ((await page.locator('[data-live="polite"]').textContent()) ?? "").includes("Grant"),
-  );
+  await waitFor(page, CONFIRM, "the confirm step");
+  if (!(await activeMatches(page, 'dialog[open] button[type="submit"]')))
+    fail("the confirm step did not put focus on its button");
+  const said = await page.locator("dialog[open]").innerText();
+  if (!said.includes("Allows this one call, and the run goes on."))
+    fail(`the confirm step does not say what it does: ${said}`);
   await page.keyboard.press("Escape");
-  if ((await page.locator(".inbox-armed").count()) !== 0) fail("Escape left the row armed");
-  if (grants() !== 0) fail("Escape sent a grant");
+  await until(page, "Escape to close the confirm step", async () => (await dialogs()) === 0);
+  if (verdicts() !== 0) fail("a letter and Escape sent a verdict");
+  if ((await cards(page)).focused !== before.refs[0])
+    fail("Escape did not give focus back to the card");
 
+  // Enter confirms: one verdict, focus on the next card, and what is left is said.
   await page.keyboard.press("g");
+  await waitFor(page, CONFIRM, "the confirm step");
   await page.keyboard.press("Enter");
-  await until(page, "g then Enter to send one grant", async () => grants() === 1);
-  await settle(page, "the inbox after a grant");
-  await until(page, "focus to return to a row", async () => activeMatches(page, ".inbox-card"));
-  if (grants() !== 1) fail(`g then Enter sent ${grants()} grants`);
-
-  // Enter on the row's own Grant button is that button's: one grant.
-  const button = page.locator(`${row} .inbox-actions button:text-is("Grant")`);
-  await button.focus();
-  await page.keyboard.press("Enter");
-  await until(page, "Enter on Grant to send one grant", async () => grants() === 2);
-  await settle(page, "the inbox after a second grant");
-  await until(page, "focus to return to the remaining row", async () =>
-    activeMatches(page, ".inbox-card"),
+  await until(page, "Enter to send one verdict", async () => verdicts() === 1);
+  await settle(page, "the inbox after a verdict");
+  await until(
+    page,
+    "focus to move to the next card",
+    async () => (await cards(page)).focused === before.refs[1],
+  );
+  if ((await cards(page)).refs.join() !== before.refs.slice(1).join())
+    fail("the decided request is still listed");
+  await until(page, "what is left to be said", async () =>
+    ((await page.locator('[data-live="polite"]').textContent()) ?? "").includes("2 left."),
   );
 
-  // Outside the list, the inbox keys are nobody's.
+  // Enter on the card's own button opens the same step, and Enter there confirms it.
+  await page.locator(`${row} .attention-verdict[data-choice="deny"]`).focus();
+  await page.keyboard.press("Enter");
+  await waitFor(page, CONFIRM, "the confirm step from the button");
+  if (verdicts() !== 1) fail("the card's own button sent a verdict without asking");
+  await page.keyboard.press("Enter");
+  await until(page, "the second verdict", async () => verdicts() === 2);
+  await settle(page, "the inbox after a second verdict");
+  await until(
+    page,
+    "focus to move to the remaining card",
+    async () => (await cards(page)).focused === before.refs[2],
+  );
+
+  // Outside the list, its letters are nobody's.
   await page.getByRole("button", { name: "Show settled" }).focus();
   await page.keyboard.press("g");
-  if ((await page.locator(".inbox-armed").count()) !== 0) fail("g outside the list armed a row");
-  if (grants() !== 2) fail("g outside the list sent a grant");
+  if ((await dialogs()) !== 0) fail("g outside the list opened a confirm step");
 
   // Single-key shortcuts off: no letter does anything, in the list too.
   await page.evaluate(() =>
@@ -589,40 +615,32 @@ async function inbox(session: Session, harness: RouteHarness): Promise<void> {
   );
   await page.locator(row).focus();
   await page.keyboard.press("g");
-  if ((await page.locator(".inbox-armed").count()) !== 0)
-    fail("g armed a row with single-key shortcuts off");
+  if ((await dialogs()) !== 0) fail("g opened a confirm step with single-key shortcuts off");
   await page.evaluate(() => localStorage.removeItem("hangar.prefs"));
 
-  // `?` in the list is the inbox's help; outside it, the global sheet.
+  // `?` opens the sheet from the list too; it names the list's keys.
   await page.locator(row).focus();
   await page.keyboard.press("?");
-  await waitFor(page, ".keyhelp li", "the inbox help");
-  if ((await page.locator("dialog.sheet[open]").count()) !== 0)
-    fail("? in the list opened the global sheet too");
-  await page.keyboard.press("?");
-  await page.getByRole("button", { name: "Show settled" }).focus();
-  await page.keyboard.press("?");
-  await waitFor(page, "dialog.sheet[open]", "the global sheet from outside the list");
+  await waitFor(page, "dialog.sheet[open]", "the sheet from inside the list");
+  if (!(await page.locator("dialog.sheet[open]").innerText()).includes("choose allow or refuse"))
+    fail("the sheet does not name the list's verdict keys");
   await resetOverlays(page);
 
-  // `.` goes into the row menu, Escape comes back to the row.
-  await page.locator(row).focus();
-  await page.keyboard.press(".");
-  await until(page, ". to move focus into the row menu", async () =>
-    activeWithin(page, ".rowmenu"),
-  );
-  await page.keyboard.press("Escape");
-  await until(page, "Escape to return focus to the row", async () =>
-    activeMatches(page, ".inbox-card"),
-  );
-
-  // Enter on an unarmed row opens it.
+  // Putting one off asks for a time, shows its command, and gives focus back when cancelled.
+  const putOff = page.locator(`${row} button[data-act="defer"]`);
+  await putOff.focus();
   await page.keyboard.press("Enter");
-  await until(page, "unarmed Enter to follow the row's link", async () =>
-    (await page.evaluate(() => globalThis.location.hash)).startsWith("#/h/"),
-  );
-  await settle(page, "the row's harness");
-  if (grants() !== 2) fail(`the inbox sent ${grants()} grants, not 2`);
+  await waitFor(page, "dialog[open] .attention-set", "the times to put it off until");
+  if (
+    !(await page.locator("dialog[open] .cli-twin code").innerText()).includes(
+      "crewhaus inbox defer att_",
+    )
+  )
+    fail("putting it off does not show its command");
+  await page.keyboard.press("Escape");
+  if (!(await activeMatches(page, 'button[data-act="defer"]')))
+    fail("cancelling did not give focus back to the button");
+  if (verdicts() !== 2) fail(`the inbox sent ${verdicts()} verdicts, not 2`);
 
   // Over a typed confirmation, `?` and `/` open nothing.
   await freshVisit(session, routeFor("#/h/:id/setup/spec", harness));
@@ -704,11 +722,9 @@ async function panelsAndToggles(session: Session, harness: RouteHarness): Promis
     '[aria-label="digest window"] button:has-text("7 days")',
     "the window toggle",
   );
-  // The inboxes repaint their list on a toggle; the toggle itself is kept.
-  await freshVisit(session, APPROVALS);
+  // The inbox repaints its list on a toggle; the toggle itself is kept.
+  await freshVisit(session, REQUESTS);
   await keepsFocus(page, 'button.toggle:has-text("Show settled")', "the Show settled toggle");
-  await freshVisit(session, REVIEW);
-  await keepsFocus(page, 'button.toggle:has-text("Show resolved")', "the Show resolved toggle");
 }
 
 async function keyedRefresh(session: Session): Promise<void> {

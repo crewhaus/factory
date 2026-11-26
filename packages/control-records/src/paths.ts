@@ -70,6 +70,8 @@ export type ControlPaths = {
   readonly budgetLockFile: string;
   /** Written when a period's cap is used up; intake reads it. */
   readonly budgetStateFile: string;
+  /** What people did about inbox items, in size segments: content-free. */
+  readonly attentionDir: string;
 };
 
 /**
@@ -103,6 +105,7 @@ export function controlPaths(harnessDir: string): ControlPaths {
     budgetDir: join(controlDir, "budget"),
     budgetLockFile: join(controlDir, "budget", "lock"),
     budgetStateFile: join(controlDir, "budget-state.json"),
+    attentionDir: join(controlDir, "attention"),
   };
 }
 
@@ -125,6 +128,17 @@ export function harnessLedger(
     claims: paths.claimsDir,
     ...(options.machine !== undefined ? { machine: options.machine } : {}),
   };
+}
+
+/**
+ * What people did about a harness's inbox items (assigned, put off, set aside, decided),
+ * one line each: ids, closed codes and times. It is on no machine: a line its item's
+ * lifecycle does not allow stays, is counted and is never applied.
+ *
+ * First consumers: the inbox's fold, its writers and the harness's event stream.
+ */
+export function attentionActionsLedger(harnessDir: string): Ledger {
+  return harnessLedger(harnessDir, { dir: controlPaths(harnessDir).attentionDir });
 }
 
 /**

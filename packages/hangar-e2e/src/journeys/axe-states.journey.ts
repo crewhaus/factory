@@ -1,10 +1,11 @@
 /**
  * A route's first paint is not its whole UI. This sweeps the screens' other
  * states — every overlay, the header's lists, a section's sub-view list, an
- * armed inbox row, a filtered digest, an open disclosure, each panel of the
- * memory fabric and of the Thredz screen, and the harness list under each
- * Readability choice — with the same matrix and the same verdict as the
- * first-paint sweep: any violation fails.
+ * inbox verdict to confirm, an item put off, given to someone or discussed, a
+ * filtered digest, an open disclosure, each panel of the memory fabric and of
+ * the Thredz screen, and the harness list under each Readability choice — with
+ * the same matrix and the same verdict as the first-paint sweep: any violation
+ * fails.
  *
  * Its rows are `<template>><state>`, written to their own artifact
  * (`axe-states-report.json`).
@@ -21,7 +22,7 @@ export const axeStates: Journey = {
   id: "axe-states",
   shard: "axe",
   proves:
-    "Every overlay and state of the screens — the dialogs, the command menu, the header's Help, Settings and Menu lists, a section's sub-view list, the tooltip, an armed inbox row, the row menu, a filtered digest, every memory and Thredz panel, and each Readability choice — has no axe violation in either theme at either width.",
+    "Every overlay and state of the screens — the dialogs, the command menu, the header's Help, Settings and Menu lists, a section's sub-view list, the tooltip, an inbox verdict to confirm, an item put off, given to someone or discussed, a filtered digest, every memory and Thredz panel, and each Readability choice — has no axe violation in either theme at either width.",
   run: async (scope) => {
     const world = await a11yFleet(scope, "axe-states");
     const states = screenStates(world.harness);

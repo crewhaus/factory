@@ -120,6 +120,12 @@ describe("what the package exports", () => {
       [
         "ACTION_DECISION_TTL_MS",
         "CACHE_INDEX_DIR",
+        "CHUNK_BYTES",
+        "DEPLOY_QUORUM_TTL_MS",
+        "attentionActionsLedger",
+        "deployQuorumOf",
+        "deployQuorumState",
+        "readDeployQuorums",
         "RESERVED_INDEX_NAMES",
         "_setIoTapForTest",
         "openRecordFd",

@@ -2,23 +2,30 @@
   "name": "@crewhaus/attention",
   "version": "0.8.3",
   "type": "module",
-  "description": "One inbox for every decision and problem across harnesses: read-only adapters over approvals, decisions, the review queue, the Advisor and run outcomes, with derived ids, cause keys and cross-harness groups",
+  "description": "One inbox for every decision and problem across harnesses: read-only adapters over approvals, decisions, the review queue, paused graph runs, the Advisor and run outcomes, with derived ids, cause keys and cross-harness groups, and the acts a person takes on an item",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./act": "./src/act/index.ts"
   },
   "scripts": {
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/access-control": "workspace:*",
     "@crewhaus/control-contract": "workspace:*",
     "@crewhaus/control-records": "workspace:*",
+    "@crewhaus/control-service": "workspace:*",
+    "@crewhaus/deployment-controller": "workspace:*",
     "@crewhaus/feedback-distill": "workspace:*",
     "@crewhaus/harness-advice": "workspace:*",
     "@crewhaus/preflight": "workspace:*",
     "@crewhaus/session-store": "workspace:*",
     "@crewhaus/tool-safety": "workspace:*"
+  },
+  "devDependencies": {
+    "@crewhaus/checkpoint-store": "workspace:*"
   },
   "license": "Apache-2.0",
   "author": {

@@ -12,6 +12,7 @@
     "test": "bun test src"
   },
   "dependencies": {
+    "@crewhaus/boundary-classifier": "workspace:*",
     "@crewhaus/checkpoint-store": "workspace:*",
     "@crewhaus/errors": "workspace:*",
     "@crewhaus/run-context": "workspace:*",

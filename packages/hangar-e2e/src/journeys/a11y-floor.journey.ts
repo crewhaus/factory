@@ -30,8 +30,9 @@ import type { Journey } from "./journey";
 /** Needs you, All: every request with what its harness sent. */
 const NEEDS_YOU = "#/home/needs-you";
 
-/** The approvals inbox, where the announcements are heard. */
-const APPROVALS = "#/home/needs-you?type=approvals";
+/** The requests waiting, where a verdict is heard; and where a write is refused and taken. */
+const REQUESTS = "#/home/needs-you?kind=permission";
+const RESULTS = "#/h/:id/quality/results";
 
 const note = (out: string[], where: string, findings: readonly (A11yFinding | undefined)[]) => {
   for (const finding of findings) {
@@ -191,12 +192,12 @@ async function withHeldRequest(
 
 async function reducedMotion(session: Session, out: string[]): Promise<void> {
   const { page } = session;
-  const approvals = /\/api\/approvals(\?|$)/;
+  const inbox = /\/api\/v1\/attention(\?|$)/;
   const animations = () => page.evaluate(() => document.getAnimations().length);
 
   // The system's setting.
   await freshVisit(session, HOME_ROUTE);
-  await withHeldRequest(session, approvals, APPROVALS, async () => {
+  await withHeldRequest(session, inbox, REQUESTS, async () => {
     await page.emulateMedia({ reducedMotion: "no-preference" });
     if ((await animations()) === 0) {
       out.push("reduced motion: the skeleton does not animate at all, so no check below can fail");
@@ -212,7 +213,7 @@ async function reducedMotion(session: Session, out: string[]): Promise<void> {
   await page.reload();
   await settle(page, "a reload");
   await freshVisit(session, HOME_ROUTE);
-  await withHeldRequest(session, approvals, APPROVALS, async () => {
+  await withHeldRequest(session, inbox, REQUESTS, async () => {
     if ((await page.evaluate(() => document.documentElement.dataset["motion"])) !== "reduce") {
       out.push("reduced motion (Readability): the choice did not reach the root element");
     }
@@ -227,7 +228,11 @@ async function reducedMotion(session: Session, out: string[]): Promise<void> {
   await settle(page, "a reload");
 }
 
-async function announcements(session: Session, out: string[]): Promise<void> {
+async function announcements(
+  session: Session,
+  harness: RouteHarness,
+  out: string[],
+): Promise<void> {
   const { page } = session;
   const region = (which: string) => page.locator(`[data-live="${which}"]`);
   const waitText = async (which: string, text: string): Promise<boolean> => {
@@ -237,38 +242,51 @@ async function announcements(session: Session, out: string[]): Promise<void> {
     }
     return false;
   };
-  await freshVisit(session, APPROVALS);
-  await page.locator('.inbox-card[tabindex="0"] .inbox-actions button:text-is("Grant")').click();
-  await waitFor(page, ".toast-info", "an information toast");
-  if ((await page.locator(".toast[role=alert], .toast [role=alert]").count()) > 0) {
-    out.push("an information toast is an alert");
+  // A verdict is confirmed in its dialog, and said politely with what is left.
+  await freshVisit(session, REQUESTS);
+  await page.locator('.attention-verdict[data-choice="grant"]').first().click();
+  await waitFor(page, "dialog[open] .attention-form", "the confirm step");
+  await page.keyboard.press("Enter");
+  if (!(await waitText("polite", "Allowed. 2 left."))) {
+    out.push("a decided request was not said politely, with how many are left");
   }
-  if (!(await waitText("polite", "Granted")))
-    out.push("an information toast was not said politely");
-  if (((await region("assertive").textContent()) ?? "").includes("Granted")) {
-    out.push("an information toast was said assertively");
+  if (((await region("assertive").textContent()) ?? "").includes("Allowed")) {
+    out.push("a decided request was said assertively");
   }
-  await settle(page, "the inbox after a grant");
+  await settle(page, "the inbox after a verdict");
 
   // A write the server refuses is an error: assertive, and it stays.
-  await page.route(DENY, (route) =>
+  await page.route(PIN, (route) =>
     route.fulfill({ status: 400, contentType: "text/plain", body: "refused for this test" }),
   );
-  await freshVisit(session, APPROVALS);
-  await page.locator('.inbox-card[tabindex="0"] .inbox-actions button:text-is("Deny")').click();
+  await freshVisit(session, routeFor(RESULTS, harness));
+  const pin = page.locator('button:text-is("Pin baseline")').first();
+  await pin.click();
   await waitFor(page, ".toast-error", "an error toast");
-  if (!(await waitText("assertive", "Deny failed")))
+  if (!(await waitText("assertive", "Re-pin failed")))
     out.push("a failed write was not said assertively");
   if (
     (await page.locator('.toast-error button[aria-label="Dismiss this message"]').count()) !== 1
   ) {
     out.push("an error toast has no close button");
   }
-  await page.unroute(DENY);
+  await page.unroute(PIN);
+
+  // The same write, taken: information, polite, and never an alert.
+  await pin.click();
+  await waitFor(page, ".toast-info", "an information toast");
+  if ((await page.locator(".toast[role=alert], .toast [role=alert]").count()) > 0) {
+    out.push("an information toast is an alert");
+  }
+  if (!(await waitText("polite", "Baseline re-pinned")))
+    out.push("an information toast was not said politely");
+  if (((await region("assertive").textContent()) ?? "").includes("Baseline re-pinned")) {
+    out.push("an information toast was said assertively");
+  }
 }
 
-/** Every deny, answered with a refusal by the test itself. */
-const DENY = /\/api\/h\/[^/]+\/approvals\/[^/]+\/deny$/;
+/** The baseline pin, refused once by the test itself. */
+const PIN = /\/api\/h\/[^/]+\/evals\/baseline$/;
 
 export const a11yFloor: Journey = {
   id: "a11y-floor",
@@ -278,13 +296,10 @@ export const a11yFloor: Journey = {
   run: async (scope) => {
     const world = await a11yFleet(scope, "a11y-floor");
     const id = world.harness.id;
-    // The deny this journey refuses itself, for whichever row is selected.
+    // The pin this journey refuses itself, once.
     const expectedStatuses = [
       ...world.expectedStatuses,
-      ...world.harness.approvalIds.map((approval) => ({
-        pathname: `/api/h/${encodeURIComponent(id)}/approvals/${encodeURIComponent(approval)}/deny`,
-        status: 400,
-      })),
+      { pathname: `/api/h/${encodeURIComponent(id)}/evals/baseline`, status: 400 },
     ];
     const out: string[] = [];
 
@@ -333,7 +348,7 @@ export const a11yFloor: Journey = {
     await settle(session.page, "a reload");
     await overlaySnapshots(session, world.harness, out);
     await reducedMotion(session, out);
-    await announcements(session, out);
+    await announcements(session, world.harness, out);
     session.assertClean();
     if (out.length > 0) throw new Error(`the accessibility floor broke:\n  ${out.join("\n  ")}`);
   },

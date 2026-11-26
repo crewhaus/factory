@@ -83,6 +83,12 @@ class MemoryCheckpointStore implements CheckpointStore {
     return undefined;
   }
 
+  async markWaiting(): Promise<void> {}
+
+  async claimResume(): Promise<"claimed" | "taken"> {
+    return "taken";
+  }
+
   async drop(graphRunId: GraphRunId): Promise<void> {
     this.byRun.delete(graphRunId);
   }

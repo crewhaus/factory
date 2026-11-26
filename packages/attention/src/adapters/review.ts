@@ -5,8 +5,10 @@
  * id winning, as the queue's own reader folds it.
  */
 import { join } from "node:path";
+import { type AttentionChoice, SESSION_ID_RE } from "@crewhaus/control-contract";
 import { REVIEW_KINDS, isReviewQueueEntry } from "@crewhaus/feedback-distill";
-import { dirFits, draftItem, msOf, shellWord } from "../items";
+import { attIdOf } from "../ids";
+import { decideChoice, draftItem, msOf, timeOf } from "../items";
 import { type AttentionReader, READ_CAPS } from "../read";
 import type { AttentionModel, Drafted, ItemContext, ReviewFact } from "../types";
 
@@ -26,19 +28,28 @@ export const REVIEW_ENTRY_ID_RE = new RegExp(
   `^rev_(?:${REVIEW_KINDS.join("|")})_[A-Za-z0-9._-]{0,256}$`,
 );
 
+/** Whether the entry points at a session's turn, which a rating settles. */
+function adjudicable(entry: Readonly<Record<string, unknown>>): boolean {
+  const ref = entry["sourceRef"] as { sessionId?: unknown; turn?: unknown } | undefined;
+  return (
+    typeof ref?.sessionId === "string" &&
+    SESSION_ID_RE.test(ref.sessionId) &&
+    typeof ref.turn === "number"
+  );
+}
+
 function latestById(records: readonly unknown[]) {
   const byId = new Map<string, Record<string, unknown>>();
   for (const record of records) {
-    if (isReviewQueueEntry(record) && REVIEW_ENTRY_ID_RE.test(record.id))
+    if (
+      isReviewQueueEntry(record) &&
+      REVIEW_ENTRY_ID_RE.test(record.id) &&
+      timeOf(record.ts) !== undefined
+    ) {
       byId.set(record.id, record as unknown as Record<string, unknown>);
+    }
   }
   return byId;
-}
-
-/** The command that resolves one entry, or `undefined` when its id or folder fits none. */
-function resolveTwin(dir: string, id: string): string | undefined {
-  if (!dirFits(dir) || !REVIEW_ENTRY_ID_RE.test(id)) return undefined;
-  return `cd ${shellWord(dir)} && crewhaus review resolve ${shellWord(id)}`;
 }
 
 /** The review section, re-read only when the queue changed; `prev` itself when it did not. */
@@ -53,12 +64,14 @@ export function readReviewSection(
   if (read.state !== "read") return { stamp, facts: [] };
   const facts: ReviewFact[] = [];
   for (const entry of latestById(read.records).values()) {
+    const resolvedTs = timeOf(entry["resolvedTs"]);
     facts.push({
       id: entry["id"] as string,
       reviewKind: entry["kind"] as string,
       ts: entry["ts"] as string,
       status: entry["status"] === "resolved" ? "resolved" : "open",
-      ...(typeof entry["resolvedTs"] === "string" ? { resolvedTs: entry["resolvedTs"] } : {}),
+      ...(adjudicable(entry) ? { adjudicable: true as const } : {}),
+      ...(resolvedTs !== undefined ? { resolvedTs } : {}),
     });
   }
   return { stamp, facts, ...(read.truncated ? { truncated: true as const } : {}) };
@@ -75,16 +88,10 @@ export function reviewBodies(dir: string, reader: AttentionReader): ReadonlyMap<
   return out;
 }
 
-function resolveChoice(dir: string, id: string) {
-  const cliTwin = resolveTwin(dir, id);
-  return cliTwin !== undefined
-    ? { id: "resolve", needs: "operator" as const, cliTwin }
-    : {
-        id: "resolve",
-        needs: "operator" as const,
-        cliTwin: null,
-        nullReason: "This harness's folder fits no command; resolve it in Home's Review.",
-      };
+/** A verdict on the entry, or, where it points at a session's turn, a rating of it. */
+function choicesOf(att: string, fact: ReviewFact): AttentionChoice[] {
+  const ids = fact.adjudicable === true ? ["up", "down", "pass", "fail"] : ["pass", "fail"];
+  return ids.map((id) => decideChoice(att, id, "operator"));
 }
 
 /** One item per open entry, and (settled) per entry resolved in the last 30 days. */
@@ -112,7 +119,7 @@ export function reviewItems(
         count: 0,
         evidence: [{ kind: "review", ref: fact.id, label: fact.reviewKind }],
         revision: [{ id: fact.id, state: fact.status }],
-        choices: open ? [resolveChoice(ctx.dir, fact.id)] : [],
+        choices: open ? choicesOf(attIdOf(ctx.harness, "review", `rev:${fact.id}`), fact) : [],
         requiredClass: "operator",
         state: open ? "open" : "resolved",
         ...(open

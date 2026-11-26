@@ -12,6 +12,7 @@ import type {
   DelegationScope,
   DelegationSubject,
   DelegationTerms,
+  DeployQuorumSubject,
   ReceiptEffect,
   ReceiptExecutor,
 } from "@crewhaus/control-contract";
@@ -89,10 +90,15 @@ export type ActivationGateContext = {
 /** A check every activation passes, in composition order. */
 export type ActivationGate = {
   readonly name: string;
-  check(
-    ctx: ActivationGateContext,
-  ): Promise<
-    { readonly ok: true } | { readonly ok: false; readonly reason: string; readonly verb?: string }
+  check(ctx: ActivationGateContext): Promise<
+    | { readonly ok: true }
+    | {
+        readonly ok: false;
+        readonly reason: string;
+        readonly verb?: string;
+        /** The quorum whose answer would lift the refusal, when one would. */
+        readonly quorum?: DeployQuorumSubject;
+      }
   >;
 };
 

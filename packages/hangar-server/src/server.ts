@@ -121,7 +121,7 @@ import {
   shellQuote,
 } from "@crewhaus/harness-supervisor";
 import { EXPORT_JOB_KIND } from "@crewhaus/harness-supervisor/job-kinds";
-import { runPreflight } from "@crewhaus/preflight";
+import { type PortChecker, runPreflight } from "@crewhaus/preflight";
 import {
   type AccessView,
   type Caller,
@@ -438,6 +438,8 @@ export type HangarServerOptions = {
   readonly schedulerTimers?: SchedulerTimers;
   /** Gathers one harness's Advisor findings for the attention sweep; injected in tests. */
   readonly advisorItems?: HomePorts["advisorItems"];
+  /** How an Advisor read a person opened looks at a port; injected in tests. */
+  readonly checkPort?: PortChecker;
   /** When the machine last booted, epoch ms; injected in tests. */
   readonly hostBootedAt?: () => number;
 };
@@ -906,6 +908,21 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       actor: null,
       via: noAuth ? "no-auth" : "bootstrap",
     };
+  /**
+   * This request's caller as a harness's own records store one; `undefined` outside a
+   * harness, and where its digest key cannot be read.
+   */
+  const storedCaller = async (dir: string | null): Promise<string | undefined> => {
+    if (dir === null) return undefined;
+    const { principal, via } = requestCaller();
+    return controlService.decisions
+      .storedActorOf(dir, {
+        kind: "principal",
+        principal,
+        ...(via === "service" ? { service: true as const } : {}),
+      })
+      .catch(() => undefined);
+  };
   const loadOwnerOr = (label: string): string => {
     const read = signIn.snapshot();
     return read.state === "present" ? (read.snapshot.owner ?? label) : label;
@@ -2028,6 +2045,8 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
       now,
       operator,
       principal: requestCaller().principal,
+      storedActor: async () => storedCaller(dir),
+      ...(opts.checkPort !== undefined ? { checkPort: opts.checkPort } : {}),
       authorize: (permission, target) => {
         const access = currentRequestAccess();
         const at = target ?? (entry !== null ? { harness: entry.id } : undefined);
@@ -2395,12 +2414,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
           throw new HttpError(400, 'missing "verdict" — one of: up, down, pass, fail');
         }
         const note = typeof body["note"] === "string" ? body["note"] : undefined;
+        const reviewDir = liveDirOr404(entry);
+        const principal = requestCaller().principal;
+        // A harness whose digest key cannot be read records no one; the verdict stands.
+        const by = await storedCaller(reviewDir);
         const result = await adjudicateReview({
-          harnessDir: liveDirOr404(entry),
+          harnessDir: reviewDir,
           itemId,
           verdict,
           ...(note !== undefined ? { note } : {}),
-          by: requestCaller().principal,
+          by: principal,
+          ...(by !== undefined ? { actor: { by, via: "home" } } : {}),
           nowIso: new Date(now()).toISOString(),
         });
         if (result.outcome === "not-found") throw new HttpError(404, "no such review item");
@@ -3420,6 +3444,17 @@ export function startHangarServer(opts: HangarServerOptions = {}): HangarServer 
         argv,
         commandId: command.commandId,
         by: command.by,
+      }),
+    // What an inbox item's choice starts: a closed command in the harness folder.
+    submitItemJob: (entry, job, command) =>
+      processes.jobs.submit({
+        harnessDir: entry.dir,
+        harnessId: entry.id,
+        kind: job.kind,
+        argv: job.argv,
+        commandId: command.commandId,
+        by: command.by,
+        ...(job.needs.length > 0 ? { needs: [...job.needs] } : {}),
       }),
     ...(processes.apiRunCapacity !== undefined
       ? { apiRunCapacity: processes.apiRunCapacity.bind(processes) }

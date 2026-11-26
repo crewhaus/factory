@@ -69,6 +69,20 @@ export type V1Deps = {
     argv: readonly string[],
     command: { readonly commandId: string; readonly by: string },
   ) => JobRecord;
+  /**
+   * Queue a closed command an inbox item's choice starts (a graph run's resume, an approved
+   * version's move, an Advisor finding's job), carrying out the command named and checked
+   * again for `needs` when it starts. Absent: Home starts no jobs, and the choice is refused.
+   */
+  readonly submitItemJob?: (
+    entry: HangarHarnessEntry,
+    job: {
+      readonly kind: string;
+      readonly argv: readonly string[];
+      readonly needs: readonly string[];
+    },
+    command: { readonly commandId: string; readonly by: string },
+  ) => JobRecord;
   /** Stop the job a run Home started is running in; `false` when Home holds none for it. */
   readonly stopRunJob?: (entry: HangarHarnessEntry, runId: string) => Promise<boolean>;
   /** Whether Home has room for one more API job run on a harness. Absent: no cap is asked. */

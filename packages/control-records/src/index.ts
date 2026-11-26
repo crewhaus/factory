@@ -9,6 +9,7 @@ export {
   type Ledger,
   type RecordSource,
   type RecordsAt,
+  attentionActionsLedger,
   controlPaths,
   harnessLedger,
   runsLedger,
@@ -43,6 +44,7 @@ export {
 export { type DropAnswer, dropSegmentsBefore } from "./retention";
 export { type IoTap, _setIoTapForTest } from "./io";
 export { openRecordFd, readAt, readRecordFile } from "./io";
+export { CHUNK_BYTES } from "./lines";
 export { _setRollBytesForTest } from "./segments";
 export {
   CACHE_INDEX_DIR,
@@ -189,6 +191,8 @@ export {
   readActionDecisions,
   type ChangeAdoptionRow,
   type ChangeAdoptionSubjectRow,
+  DEPLOY_QUORUM_TTL_MS,
+  type DeployQuorumRow,
   type LedgerRead,
   PROPOSAL_TTL_MS,
   type ProposalRow,
@@ -198,9 +202,12 @@ export {
   changeAdoptionState,
   createStandingRuleReader,
   decisionsLedger,
+  deployQuorumOf,
+  deployQuorumState,
   proposalOf,
   proposalState,
   readChangeAdoptions,
+  readDeployQuorums,
   readProposals,
   readStandingRules,
   ruleIsLive,

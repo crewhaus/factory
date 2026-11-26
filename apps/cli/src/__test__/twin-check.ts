@@ -432,8 +432,118 @@ export const REQUIRED: Readonly<Record<string, Requirement>> = {
     pins: [
       {
         file: "inbox-cmd.ts",
-        text: 'if (raw === undefined) return fail("invalid", SHOW_NEEDS_ONE);',
+        text: 'if (id === undefined) return fail("invalid", SHOW_NEEDS_ONE);',
       },
+    ],
+  },
+  "inbox decide": {
+    positionals: { min: 2, max: 2 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: '"name the choice, one of those' },
+    ],
+  },
+  "inbox assign": {
+    positionals: { min: 1, max: 1 },
+    flags: ["to"],
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: '"name the member with --to prn_…"' },
+    ],
+  },
+  "inbox unassign": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+    ],
+  },
+  "inbox defer": {
+    positionals: { min: 1, max: 1 },
+    flags: ["until", "reason"],
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: '"say until when with --until"' },
+      { file: "inbox-acts.ts", text: "`--reason is one of ${DEFER_REASONS.join" },
+    ],
+  },
+  "inbox undefer": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+    ],
+  },
+  "inbox snooze": {
+    positionals: { min: 1, max: 1 },
+    flags: ["until"],
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: '"say until when with --until"' },
+    ],
+  },
+  "inbox dismiss": {
+    positionals: { min: 1, max: 1 },
+    flags: ["reason"],
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: "`--reason is one of ${DISMISS_REASONS.join" },
+    ],
+  },
+  "inbox reopen": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+    ],
+  },
+  "inbox acknowledge": {
+    positionals: { min: 1, max: 1 },
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+    ],
+  },
+  "inbox discuss": {
+    positionals: { min: 1, max: 1 },
+    flags: ["file"],
+    pins: [
+      {
+        file: "inbox-cmd.ts",
+        text: "name an item, att_… (see \\`crewhaus inbox list\\`)",
+      },
+      { file: "inbox-acts.ts", text: '"name the message\'s file with --file"' },
+    ],
+  },
+  "deploy approve": {
+    positionals: { min: 1, max: 1 },
+    flags: ["env"],
+    pins: [
+      { file: "deploy-approve-cmd.ts", text: '"name the spec, as it is registered"' },
+      { file: "deploy-approve-cmd.ts", text: '"name the environment with --env"' },
     ],
   },
   "people add": {
